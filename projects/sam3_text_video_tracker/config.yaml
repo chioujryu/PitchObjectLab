@@ -1,0 +1,38 @@
+model: /home/new_users/zhiyu/projects/PitchObjectLab/sam3.pt
+source: /home/new_users/zhiyu/datasets/soccer/clip/shot_1983838565822828546.mp4
+text_prompt: "soccer ball"
+
+output_video: "projects/sam3_text_video_tracker/outputs/tracked.mp4"
+output_csv: "projects/sam3_text_video_tracker/outputs/tracking_log.csv"
+
+imgsz: 1280
+conf: 0.25
+iou: 0.5
+half: true
+min_score: 0.2 # 0.2
+
+# First target selection
+# - highest_score: pick highest confidence target
+# - largest: pick largest area target
+init_pick: "highest_score"
+target_index: 0
+
+# Re-identification controls (when target id is lost)
+reid_max_lost: 80   # 60
+reid_min_iou: 0.1
+reid_hist_weight: 0.15    # 0.15
+reid_area_weight: 0.15   # 0.15
+
+# Temporal smoothing
+use_ema_smoothing: true
+ema_alpha: 0.5   # 0.5
+use_kalman: true
+
+# Visualization
+draw_mask: false
+mask_alpha: 0.35
+draw_all_candidates: true
+save_debug_frame: false
+
+vid_stride: 1
+output_full_video: true
