@@ -1,0 +1,191 @@
+# Standalone SAHI test-original config for test_rf_detr_model.py.
+# Same execution schema as rf_detr_test.yaml, with test-original data paths.
+
+runtime:
+  # Print wrapper status text. Options: true, false.
+  verbose: true
+  # Estimate outputs and exit before model loading/inference. Options: true, false.
+  dry_run: false
+  # Ask before writing output files. Options: true, false.
+  confirm_before_run: true
+  # Skip confirmation after reviewing the estimate. Options: true, false.
+  yes: false
+  # Seed for deterministic sampling. Options: integer.
+  seed: 0
+
+model:
+  # RF-DETR model size. Options: base, nano, small, medium, large, seg-preview, seg-nano, seg-small, seg-medium, seg-large, seg-xlarge, seg-2xlarge.
+  size: medium
+  # Checkpoint to test. Options: default, null/false, hosted key, or local checkpoint path.
+  pretrain_weights: /home/new_users/zhiyu/projects/PitchObjectLab/runs/detect/站立運動員_足球_球門檢測數據集2025/train/rfdetr_medium_e50_b8_val1_test1_20260526214556/checkpoint_best_ema.pth
+  # Input resolution override. Options: null or valid RF-DETR resolution integer.
+  resolution: null
+  # Class count override. Options: null or positive integer.
+  num_classes: 3
+  # Device selector. Options: auto, cpu, cuda, cuda:0, 0, 1, mps, -1.
+  device: cuda:0
+  # Automatic mixed precision. Options: true, false.
+  amp: true
+  # Prediction confidence threshold. Options: 0.0-1.0.
+  confidence_threshold: 0.5
+  # Optional model label to dataset category-id mapping. Options: {}, false, or {model_label: dataset_category_id}.
+  category_remapping: {}
+  # Extra RF-DETR ModelConfig keys. Options: any supported model config key.
+  extra_model_args: {}
+
+dataset:
+  # Dataset source format. Options: auto, rfdetr, roboflow, ultralytics_yolo, coco_json, pascal_voc, dota, labelme_json.
+  source_format: ultralytics_yolo
+  # Source dataset root. Options: RF-DETR/Roboflow root, YOLO root, VOC root, DOTA root, LabelMe root, or COCO root.
+  dataset_dir: /home/new_users/zhiyu/datasets/soccer/spatial_perception/Xbotgo/站立运动员、足球、球门检测数据集V1/outputs/YoloFormat/all_parameters_object_crop_960_classesall_max_samplesall
+  # Ultralytics YOLO dataset YAML. Options: empty string to auto-find, or YAML path.
+  data_yaml: /home/new_users/zhiyu/datasets/soccer/spatial_perception/Xbotgo/站立运动员、足球、球门检测数据集V1/outputs/YoloFormat/all_parameters_object_crop_960_classesall_max_samplesall/dataset.yaml
+  # COCO annotation file for coco_json. Options: empty string or JSON path.
+  coco_json: ""
+  # Image directory for coco_json. Options: empty string or image folder path.
+  image_dir: ""
+  # RF-DETR cache root. Options: relative or absolute path.
+  cache_root: dataset_cache
+  # Rebuild matching cache. Options: true, false.
+  refresh_cache: false
+  # Cache image placement. Options: auto, hardlink, symlink, junction, copy.
+  link_mode: auto
+  # Split ratio for unsplit datasets. Options: [train, valid, test] positive numbers.
+  split_ratio: [8, 1, 1]
+  # Deterministic split seed. Options: integer.
+  split_seed: 0
+  # Dataset file type forwarded to RF-DETR. Options: roboflow, coco, yolo, o365.
+  dataset_file: roboflow
+
+output:
+  # Exact output directory. Options: empty string, absolute path, relative path, or placeholder template.
+  output_dir: ""
+  # Output root when output_dir is empty. Supports placeholders such as {model_size}, {test_split}, {timestamp}.
+  root: /home/new_users/zhiyu/projects/PitchObjectLab/runs/detect/站立運動員_足球_球門檢測數據集2025/test
+  # Run folder name. Options: pure string or placeholder template.
+  name: "rfdetr_test_{model_size}_{test_split}_{timestamp}"
+  # Allow existing output directory. Options: true, false.
+  exist_ok: false
+
+test:
+  # Dataset split. Options: test-original, test, val, valid, train.
+  split: test-original
+  test_mode:
+    # Test mode. Options: full_image, class_crop, sahi.
+    mode: sahi
+  crop:
+    # Crop class IDs. Empty means all predicted classes.
+    class_ids: []
+    # Crop class names. Empty means all predicted classes.
+    class_names:
+      - standing_player
+    # Crop source. Options: prediction.
+    source: prediction
+    # Source prediction confidence. Options: 0.0-1.0.
+    source_conf: 0.25
+    # Fixed crop padding. Options: non-negative integer.
+    padding_pixels: 0
+    # Relative crop padding. Options: non-negative float.
+    padding_ratio: 0.05
+    # Fallback when no crop class is predicted. Options: full_image.
+    fallback: full_image
+  sahi:
+    # Slice height. Options: positive integer.
+    slice_height: 640
+    # Slice width. Options: positive integer.
+    slice_width: 640
+    # Height overlap. Options: 0.0-0.9.
+    overlap_height_ratio: 0.2
+    # Width overlap. Options: 0.0-0.9.
+    overlap_width_ratio: 0.2
+    # Merge full-image prediction with slices. Options: true, false.
+    standard_prediction: true
+    # SAHI postprocess type. Options: GREEDYNMM, NMM, NMS, LSNMS. GREEDYNMM is recommended for small slices.
+    postprocess_type: GREEDYNMM
+    # SAHI match metric. Options: IOS, IOU. IOS is recommended when small slice boxes cover parts of the same object.
+    postprocess_match_metric: IOS
+    # Merge/NMS threshold. Options: 0.0-1.0. Raise to merge fewer boxes; lower to merge more boxes.
+    postprocess_match_threshold: 0.5
+    # Class-agnostic merge. Options: true, false.
+    postprocess_class_agnostic: false
+    # SAHI batch size. Options: positive integer.
+    batch_size: 1
+  visual_samples:
+    # Save sampled GT/prediction images. Options: true, false.
+    enabled: true
+    # Max sampled images; also caps error cases by default. Options: null or non-negative integer.
+    max_images: 100
+    # Output subfolder. Options: folder name or placeholder template.
+    output_subdir: visuals
+    # Sampling mode. Options: first, last, random.
+    sampling_mode: first
+    # Random seed. Options: null or integer.
+    random_seed: null
+    # Filter source. Options: ground_truth, prediction, either, both.
+    filter_source: either
+    # Filter match. Options: any, all.
+    filter_match: any
+    # Filter class IDs. Empty means no class filter.
+    class_ids: []
+    # Filter class names. Empty means no class filter.
+    class_names: []
+    # Minimum GT instances. Options: non-negative integer.
+    min_gt_instances: 0
+    # Minimum predictions. Options: non-negative integer.
+    min_predictions: 0
+    # Minimum score for candidate filtering. Options: null or 0.0-1.0.
+    filter_min_score: 0.25
+    # Minimum score drawn. Options: null or 0.0-1.0.
+    draw_min_score: 0.25
+  # Write per-class metrics. Options: true, false.
+  classwise: true
+  # Show progress bars. Options: true, false.
+  progress_bar: true
+  # Save plots. Options: true, false.
+  plots: true
+  # Save raw dataset case images. Options: true, false.
+  save_dataset_cases: true
+  # Model-input batch grid size. Options: positive integer.
+  model_input_batch_size: 9
+  # Adapter batch size. Options: positive integer.
+  batch_size: 1
+  # Adapter dataloader workers. Options: 0 or positive integer.
+  num_workers: 0
+  # Max detections for metrics. Options: positive integer.
+  max_dets: 500
+  # IoU threshold for matching. Options: 0.0-1.0.
+  match_iou_threshold: 0.5
+  error_cases:
+    # Save football diagnostics. Options: true, false.
+    enabled: true
+    # Target category IDs. Empty means use target_class_names.
+    target_class_ids: []
+    # Target category names. Default: football.
+    target_class_names:
+      - football
+    # Shared max diagnostic images. Options: null or non-negative integer.
+    max_images: 100
+    # Legacy missed-image cap. Options: null or non-negative integer.
+    max_missed_images: 100
+    # Legacy false-positive-image cap. Options: null or non-negative integer.
+    max_false_positive_images: 100
+    # Confidence for error matching. Options: null or 0.0-1.0.
+    confidence_threshold: null
+    # IoU for error matching. Options: null or 0.0-1.0.
+    match_iou_threshold: null
+    # Output subfolder. Options: folder name or placeholder template.
+    output_subdir: error_cases
+    # Image format. Options: jpg, png.
+    format: jpg
+    # JPEG quality. Options: 1-100.
+    jpeg_quality: 92
+
+evaluation:
+  # Evaluation type. Options: auto, bbox, segm, segmentation, mask, masks.
+  type: auto
+  # Write per-class metrics. Options: true, false.
+  classwise: true
+  # COCO max detections. Options: one, two, or three positive integers.
+  max_detections: [1, 10, 500]
+  # Operating-point IoU threshold. Options: 0.0-1.0.
+  match_iou_threshold: 0.5

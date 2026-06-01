@@ -1,0 +1,288 @@
+# Main config for object_detection_dataset_evaluator.py.
+# Every path can be absolute or relative. Relative paths are resolved from this project folder and repo root when possible.
+
+runtime:
+  # Print wrapper status text in bright blue. Options: true, false.
+  verbose: true
+  # Suppress most non-critical text. Options: true, false. If true, it wins over verbose.
+  quiet: false
+  # Validate config, count inputs, estimate output files/size, then exit before inference. Options: true, false.
+  dry_run: false
+  # Ask before running because JSON, CSV, plots, and visual images may consume disk space. Options: true, false.
+  confirm_before_run: true
+  # Skip the confirmation prompt. Options: true, false. CLI --yes sets this true.
+  yes: false
+  # Blue English banner printed at startup. Options: any short English text.
+  banner: OBJECT DETECTION DATASET EVALUATION
+  # Random seed used for deterministic demo sampling and plot colors. Options: any integer.
+  seed: 0
+
+inference:
+  # Test/inference mode. Options: full_image, sahi, class_crop.
+  mode: sahi
+  # Use SAHI for inference. Options: true to use SAHI sliced/full-image inference, false to use direct Ultralytics full-image inference.
+  # Backward-compatible with inference.mode; mode wins when both are set.
+  use_sahi: true
+
+test_mode:
+  # Shared test mode selector used by evaluator/trainer integrations. Options: full_image, sahi, class_crop.
+  mode: sahi
+
+crop:
+  # Class IDs used to find class_crop windows from model predictions. Empty means all predicted classes are eligible.
+  class_ids: []
+  # Class names used to find class_crop windows from model predictions. Empty means all predicted classes are eligible.
+  class_names: []
+  # Crop source. Currently prediction is supported. Options: prediction.
+  source: prediction
+  # Confidence threshold for the first pass that finds the crop window. Options: 0.0-1.0.
+  source_conf: 0.25
+  # Fixed padding in pixels around the predicted class union box. Options: non-negative integer.
+  padding_pixels: 0
+  # Relative padding around the predicted class union box. Options: non-negative float, e.g. 0.05.
+  padding_ratio: 0.05
+  # Behavior when no crop class is predicted. Options: full_image.
+  fallback: full_image
+
+dataset:
+  # Dataset format. Options: yolo, coco.
+  format: yolo
+  # Split to evaluate when format is yolo and data_yaml contains train/val/test. Options: train, val, test, or a custom key in the YAML.
+  split: val
+  # Ultralytics dataset YAML. Used when format is yolo. Options: path/to/data.yaml or empty string when using the fields below.
+  data_yaml: ultralytics/cfg/datasets/coco8.yaml
+  # Dataset root used when data_yaml is empty. Options: absolute path or path relative to this project/repo.
+  path: ""
+  # YOLO image source for train split when data_yaml is empty. Options: images/train, a txt file, absolute folder, or list.
+  train: images/train
+  # YOLO image source for val split when data_yaml is empty. Options: images/val, a txt file, absolute folder, or list.
+  val: images/val
+  # YOLO image source for test split when data_yaml is empty. Options: images/test, a txt file, absolute folder, or list.
+  test: images/test
+  # Optional label directory override for YOLO labels. Options: empty string to infer by replacing images with labels, or a folder path.
+  labels_dir: ""
+  # Class names for YOLO conversion when data_yaml is empty. Options: dict like {0: person}, or list like [person, car].
+  names:
+    0: person
+  # COCO annotation JSON path when format is coco. Options: path/to/instances_val.json.
+  coco_json: ""
+  # COCO image directory when format is coco. Options: folder containing files referenced by coco_json images.file_name.
+  image_dir: ""
+  # Limit number of images before inference. Options: null for all images, or a positive integer.
+  max_images: null
+  # Include images with no label file or no annotations. Options: true, false.
+  include_empty_images: true
+  # Sort images for repeatable runs. Options: true, false.
+  sort_images: true
+
+model:
+  # Model integration. Options: ultralytics for direct non-SAHI mode; SAHI mode also supports yolov5, mmdet, huggingface, torchvision, rtdetr, yoloe, yolo-world, roboflow.
+  type: ultralytics
+  # Model weights or model name. Options: yolo26n.pt, yolo26m.pt, path/to/best.pt, or another model path supported by the selected inference engine.
+  path: yolo26n.pt
+  # Optional model config path for frameworks like MMDetection. Options: empty string, path/to/config.py.
+  config_path: ""
+  # Minimum model confidence before detections are returned. Options: 0.001-1.0. Lower values produce better curves but larger outputs.
+  confidence_threshold: 0.25
+  # Inference device. Options: cpu, cuda:0, cuda:1, 0, 1, mps. If CUDA_VISIBLE_DEVICES is set, use the visible ordinal; e.g. CUDA_VISIBLE_DEVICES=6 means this should be cuda:0.
+  device: cpu
+  # Optional list for multi-process image-level parallel inference. Options: [] to use model.device, or [cuda:0, cuda:1]. IDs are also relative to CUDA_VISIBLE_DEVICES.
+  devices: []
+  # Model input image size for integrations that support it. Options: null, 640, 960, 1280.
+  image_size: 640
+  # Optional category mapping passed to SAHI. Options: {} or {"0": "person", "1": "car"}.
+  category_mapping: {}
+  # Optional category remapping passed to SAHI. Options: {} or {"0": 1} when model class IDs need remapping.
+  category_remapping: {}
+  # Load model at initialization. Options: true, false.
+  load_at_init: true
+  # Extra keyword arguments passed to AutoDetectionModel.from_pretrained. Options: {} or model-specific keys.
+  extra_model_args: {}
+  # Extra keyword arguments passed to Ultralytics model.predict when inference.use_sahi is false. Options: {} or keys like {"iou": 0.7, "max_det": 300}.
+  extra_predict_args: {}
+
+sahi:
+  # Enable the SAHI code path. Options: true, false. Usually keep this the same as inference.use_sahi.
+  enabled: true
+  # Enable sliced inference inside SAHI. Options: true, false. If false and SAHI is enabled, only SAHI standard full-image inference is used.
+  sliced_prediction: true
+  # Also run a standard full-image prediction pass inside SAHI sliced inference. Options: true, false.
+  standard_prediction: true
+  # Slice/window height in pixels. Options: 256, 512, 640, 1024, or any positive integer.
+  slice_height: 960
+  # Slice/window width in pixels. Options: 256, 512, 640, 1024, or any positive integer.
+  slice_width: 960
+  # Height overlap ratio between adjacent slices. Options: 0.0-0.9; 0.2 is a common starting point.
+  overlap_height_ratio: 0.2
+  # Width overlap ratio between adjacent slices. Options: 0.0-0.9; 0.2 is a common starting point.
+  overlap_width_ratio: 0.2
+  # Let SAHI choose slice resolution automatically. Options: true, false.
+  auto_slice_resolution: false
+  # Batch size for SAHI/Ultralytics slice inference. Options: positive integer. Larger is faster but uses more VRAM.
+  batch_size: 1
+  # Slice merge postprocess. Options: GREEDYNMM, NMM, NMS, LSNMS.
+  postprocess_type: GREEDYNMM
+  # Match metric for postprocess. Options: IOS, IOU. LSNMS only supports IOU.
+  postprocess_match_metric: IOS
+  # Merge/NMS threshold after sliced prediction. Options: 0.0-1.0.
+  postprocess_match_threshold: 0.5
+  # Ignore class IDs during postprocess merging. Options: true, false.
+  postprocess_class_agnostic: false
+  # Low-memory slice merge buffer. Options: null to disable, or positive integer. Smaller saves RAM but can affect AP.
+  merge_buffer_length: null
+  # SAHI internal verbose level. Options: 0 no print, 1 slices, 2 durations.
+  verbose: 0
+  # Exclude classes by model class name during inference. Options: [] or [car, person].
+  exclude_classes_by_name: []
+  # Exclude classes by model class ID during inference. Options: [] or [0, 1].
+  exclude_classes_by_id: []
+
+evaluation:
+  # COCO evaluation type. Options: bbox. The script is currently optimized for detection boxes.
+  type: bbox
+  # IoU thresholds for COCO mAP. Options: [0.5, 0.55, ..., 0.95], [0.5], or any list of floats.
+  iou_thresholds: [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
+  # Recall thresholds for COCO interpolation. Options: null for COCO default 0.0:0.01:1.0, or a custom list.
+  recall_thresholds: null
+  # Max detections per image for AR/AP summaries. Options: [1, 10, 100], [10, 100, 500].
+  max_detections: [1, 10, 100]
+  # Area thresholds in pixel^2 for small/medium/large. Options: [1024, 9216, 10000000000] for COCO defaults.
+  area_ranges: [1024, 9216, 10000000000]
+  # Write per-class AP/P/R/F1 metrics to per_class_metrics.csv. Options: true, false.
+  classwise: true
+  # IoU threshold used for operating-point precision/recall/F1/confusion matrix. Options: 0.5-0.95.
+  match_iou_threshold: 0.5
+  # Confidence threshold used for reported operating-point P/R/F1. Options: null to reuse model.confidence_threshold, or float 0.0-1.0.
+  operating_confidence_threshold: null
+  # Confidence thresholds for P/R/F1 curves. Options: null for 0.00:0.01:1.00, or a custom list.
+  curve_confidence_thresholds: null
+  # Include per-image TP/FP/FN metrics. Options: true, false.
+  per_image_metrics: true
+  # Include confusion matrix outputs. Options: true, false.
+  confusion_matrix: true
+  # Include PR/P/R/F1 curve plots and CSV. Options: true, false.
+  curves: true
+  # Save COCOeval text summary. Options: true, false.
+  save_coco_summary_text: true
+
+output:
+  # Root output directory. Options: outputs, demo_outputs, absolute path, or placeholders like outputs/{model}/{dataset.split}.
+  dir: projects/object_detection_dataset_evaluator/outputs
+  # Run name. Supports plain strings or placeholders: {timestamp}, {date}, {engine}, {model}, {split}, and config dot-paths like {dataset.split}, {model.image_size}, {sahi.slice_width}.
+  name: det_eval_{engine}_{model}_{split}_{timestamp}
+  # Allow writing into an existing output directory. Options: true, false.
+  exist_ok: false
+  # Save resolved config, source config, and output manifest. Options: true, false.
+  save_config: true
+  # Save COCO result prediction JSON. Options: true, false.
+  save_predictions_json: true
+  # Save generated/normalized COCO ground truth JSON inside output. Options: true, false.
+  save_ground_truth_json: true
+  # Save metrics JSON/CSV tables. Options: true, false.
+  save_metrics: true
+  # Save plots such as PR_curve.png, F1_curve.png, and confusion_matrix.png. Options: true, false.
+  save_plots: true
+  # Save visualized prediction images. Options: true, false. This can create many large files.
+  save_visuals: false
+  # Save raw evaluated image cases under output/datasets. Options: true, false. SAHI mode saves slice crops; non-SAHI mode saves original images.
+  save_dataset_cases: true
+  # Save model input batch grids and model_inputs_manifest.*. Options: true, false.
+  save_model_input_batches: true
+  # Maximum model input batch grids to save. Options: positive integer.
+  max_model_input_batches: 3
+  # Number of model input cases per saved grid. Options: positive integer.
+  model_input_batch_size: 9
+  # Subfolder inside each run directory for evaluated dataset cases. Options: datasets, another folder name, or placeholders like datasets_{split}.
+  dataset_cases_subdir: datasets
+  # Maximum source images used for dataset case output. Options: null for all matching images, or a positive integer.
+  max_dataset_case_images: 5
+  # Maximum slice crops saved per source image when inference.use_sahi is true. Options: positive integer; use a small number for large images.
+  max_slices_per_image: 12
+  # How to choose images for output/datasets cases. Options: random, first, last.
+  dataset_case_sampling_mode: random
+  # Random seed for dataset_case_sampling_mode=random. Options: any integer; null reuses runtime.seed.
+  dataset_case_random_seed: null
+  # Dataset case image format. Options: jpg, png.
+  dataset_case_format: jpg
+  # JPEG quality for dataset_case_format=jpg. Options: 1-100.
+  dataset_case_jpeg_quality: 92
+  # Maximum visualized images to save after filtering. Options: null for all matching images, or a positive integer.
+  max_visuals: 25
+  # Subfolder inside each run directory for rendered visual samples. Options: visuals, visual_samples, another folder name, or placeholders like visuals_{model}.
+  visual_output_subdir: visuals
+  # How to choose images from matching candidates. Options: random, first, last.
+  visual_sampling_mode: random
+  # Order of rendered outputs after sampling. Options: sample to keep random sample order, dataset to sort by dataset order.
+  visual_sample_order: sample
+  # Random seed for visual_sampling_mode=random. Options: any integer; null reuses runtime.seed.
+  visual_random_seed: null
+  # Class names that candidate images must contain. Options: [] for no class filter, or [person, car].
+  visual_filter_class_names: []
+  # Class IDs that candidate images must contain. Options: [] for no class filter, or [0, 1].
+  visual_filter_class_ids: []
+  # Which source decides whether an image contains the requested classes. Options: ground_truth, prediction, either, both.
+  visual_filter_source: ground_truth
+  # Class filter matching behavior. Options: any means at least one requested class, all means every requested class.
+  visual_filter_match: any
+  # Minimum ground-truth objects required for a visual candidate. Options: 0 for no minimum, or a positive integer.
+  visual_min_gt_instances: 0
+  # Minimum predicted objects required for a visual candidate. Options: 0 for no minimum, or a positive integer.
+  visual_min_predictions: 0
+  # Minimum prediction confidence used only when filtering visual candidates. Options: null for no extra filter, or 0.0-1.0.
+  visual_filter_min_score: null
+  # Draw ground-truth boxes on visual outputs. Options: true, false.
+  draw_ground_truth: true
+  # Draw model prediction boxes on visual outputs. Options: true, false.
+  draw_predictions: true
+  # Box draw order. Options: ground_truth_first, predictions_first.
+  visual_draw_order: ground_truth_first
+  # Minimum prediction confidence to draw in visual images. Options: null to draw all returned predictions, or 0.0-1.0.
+  visual_draw_min_score: null
+  # Ground-truth box color. Options: green, red, blue, yellow, cyan, magenta, #00ff00, or [0, 255, 0].
+  gt_color: green
+  # Prediction box color. Options: red, green, blue, yellow, cyan, magenta, #ff0000, or [255, 0, 0].
+  pred_color: red
+  # Visualization image format. Options: jpg, png.
+  visual_format: jpg
+  # JPEG quality for visual_format=jpg. Options: 1-100.
+  visual_jpeg_quality: 92
+  # Hide labels in saved visual images. Options: true, false.
+  hide_labels: false
+  # Hide confidence scores in saved visual images. Options: true, false.
+  hide_conf: false
+  # Bounding box line thickness in visual images. Options: positive integer.
+  rect_th: 2
+  # Label text size in visual images. Options: positive float.
+  text_size: 0.8
+  # Label text thickness in visual images. Options: positive integer.
+  text_th: 1
+  # Keep a compact manifest listing every output file. Options: true, false.
+  save_output_manifest: true
+
+progress:
+  # Show image-level tqdm progress bar. Options: true, false.
+  images: true
+  # Show SAHI per-slice progress bars. Options: true, false. Usually false to avoid nested noisy terminals.
+  slices: false
+  # Show output/datasets case export progress bar. Options: true, false.
+  dataset_cases: true
+  # Show visual rendering tqdm progress bar. Options: true, false.
+  visuals: true
+
+demo:
+  # Enable small demo mode. Options: true, false. CLI --demo sets this true.
+  enabled: false
+  # Demo output folder. Options: any folder path.
+  output_dir: projects/object_detection_dataset_evaluator/demo_outputs
+  # Maximum images in demo mode. Options: positive integer.
+  max_images: 8
+  # Save at most this many visual images in demo mode. Options: positive integer.
+  max_visuals: 4
+  # Save at most this many source images as dataset cases in demo mode. Options: positive integer.
+  max_dataset_case_images: 3
+  # Save at most this many slice crops per image in demo mode. Options: positive integer.
+  max_slices_per_image: 4
+  # Force visual saving in demo mode. Options: true, false.
+  save_visuals: true
+  # Force dataset case saving in demo mode. Options: true, false.
+  save_dataset_cases: true

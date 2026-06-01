@@ -1,0 +1,263 @@
+# Main config for train_dfine_seg_model.py.
+# Paths can be absolute or relative. Relative paths are resolved from the repo root unless noted.
+
+runtime:
+  # Print wrapper status text in bright blue. Options: true, false.
+  verbose: true
+  # Validate config, estimate outputs, and optionally prepare nothing. Options: true, false.
+  dry_run: false
+  # Ask before training creates checkpoints, metrics, plots, debug images, eval images, or dataset cache files. Options: true, false.
+  confirm_before_run: true
+  # Show tqdm progress bars while preparing/converting datasets. Options: true, false.
+  progress_bar: true
+
+network:
+  # Download/mirror region. Options: auto, china, global.
+  region: auto
+  # Python package mirror preference used by setup_dfine_seg_env.py. Options: auto, tsinghua, aliyun, pypi.
+  python_mirror: auto
+  # Model source preference. Options: auto, huggingface, modelscope, local.
+  model_source: auto
+  # Hugging Face mirror endpoint. Options: empty string, https://hf-mirror.com, or another endpoint.
+  hf_endpoint: ""
+  # ModelScope repo id for China model download. Options: ArgoSA/D-FINE-seg or another compatible ModelScope repo.
+  modelscope_repo: ArgoSA/D-FINE-seg
+
+model:
+  # D-FINE-seg task. Options: detect, segment.
+  task: segment
+  # D-FINE model size. Options: n, s, m, l, x.
+  name: s
+  # Pretrained dataset suffix. Options: coco, obj2coco.
+  pretrained_dataset: coco
+  # Pretrained weights path. Options: auto, none, local .pt path, or URL.
+  pretrained_model_path: auto
+  # Number of input image channels. Options: 3 for RGB, 4 for RGB plus one .npy extra channel.
+  in_channels: 3
+
+dataset:
+  # Dataset source format before conversion. Options: auto, dfine_coco, coco_json, roboflow_coco, roboflow_yolo, ultralytics_yolo, labelme, pascal_voc, dota.
+  source_format: auto
+  # Source dataset directory. Options: any Windows/Linux path containing supported annotations.
+  dataset_dir: ""
+  # Optional Ultralytics data.yaml. Options: empty string to auto-find, or path to YAML.
+  data_yaml: ""
+  # Optional single COCO JSON path. Options: empty string to auto-find train/val/test JSON files, or a JSON path.
+  coco_json: ""
+  # Optional COCO train JSON override. Options: empty string, or path.
+  coco_train_json: ""
+  # Optional COCO val JSON override. Options: empty string, or path.
+  coco_val_json: ""
+  # Optional COCO test JSON override. Options: empty string, or path.
+  coco_test_json: ""
+  # Image directory used with COCO JSON. Options: empty string to infer dataset_dir/images, or path.
+  image_dir: ""
+  # Explicit class names. Options: [] to infer, or list/dict such as [person, ball].
+  names: []
+  # Cache root for converted D-FINE COCO layout. Options: dataset_cache, D:/cache/dfine, /mnt/cache/dfine.
+  cache_root: dataset_cache
+  # Rebuild cache even when fingerprint matches. Options: true, false.
+  refresh_cache: false
+  # Unsplit dataset ratio in order train, val, test. Options: three positive numbers such as [0.8, 0.1, 0.1].
+  split_ratio: [0.8, 0.1, 0.1]
+  # Deterministic split seed. Options: any integer.
+  split_seed: 0
+  # How to place images in the cache. Options: auto, hardlink, symlink, copy.
+  link_mode: auto
+  # For segment task with box-only datasets, create rectangular masks. Options: true, false.
+  box_to_mask: false
+
+output:
+  # Exact output directory. Options: empty string to use root/name, or path with placeholders.
+  # Placeholders: {timestamp}, {date}, {time}, {task}, {model_name}, {dataset_name}, {dataset_format}, {epochs}, {batch_size}, {device}, {gpus}, {region}, {imgsz}, {lr}, {workers}.
+  output_dir: ""
+  # Output root when output_dir is empty. Options: runs/detect/dfine_seg/train or any path with placeholders.
+  root: runs/detect/dfine_seg/train
+  # Run folder name when output_dir is empty. Options: plain string or placeholders.
+  name: "dfine_{task}_{model_name}_e{epochs}_b{batch_size}_{dataset_name}_{timestamp}"
+  # Allow using an existing output directory. Options: true, false.
+  exist_ok: false
+
+train:
+  # CUDA/CPU selector. Options: auto, cpu, cuda, cuda:0, 0, 0,1, mps.
+  device: auto
+  # GPU ids used when CUDA is selected. Options: auto, [0], [0,1], or empty list for CPU.
+  gpus: auto
+  # Number of training epochs. Options: any positive integer.
+  epochs: 75
+  # Physical batch size per process. Options: -1 for D-FINE auto batch, or positive integer.
+  batch_size: -1
+  # Gradient accumulation steps. Options: positive integer.
+  b_accum_steps: 1
+  # Input image size [height, width]. Options: [640, 640], [960, 960], or another multiple of 32.
+  img_size: [640, 640]
+  # Preserve aspect ratio using letterbox padding. Options: true, false.
+  keep_ratio: false
+  # Dataloader workers per process. Options: 0 for maximum Windows compatibility, positive integer for speed.
+  num_workers: 4
+  # Automatic mixed precision. Options: true, false.
+  amp_enabled: true
+  # Gradient clipping max norm. Options: 0 disables, positive float enables.
+  clip_max_norm: 0.1
+  # Random seed. Options: any integer.
+  seed: 42
+  # Deterministic cuDNN. Options: true for reproducible/slower, false for faster.
+  cudnn_fixed: false
+  # Use all classes as one target class. Options: true, false.
+  use_one_class: false
+  # Ignore background-only images for the first N epochs. Options: 0 disables, positive integer enables.
+  ignore_background_epochs: 0
+  # Save debug images after preprocessing. Options: true, false.
+  debug_img_processing: false
+  # Save validation/eval prediction images. Options: true, false.
+  to_visualize_eval: true
+  # Enable Weights & Biases logging. Options: true, false.
+  use_wandb: false
+  # Confidence threshold for validation/test. Options: float 0.0-1.0.
+  conf_thresh: 0.5
+  # IoU threshold for validation/test. Options: float 0.0-1.0.
+  iou_thresh: 0.5
+  # Metric names used to choose best checkpoint. Options: f1, iou, mAP_50, mAP_50_95.
+  decision_metrics: [f1, mAP_50, iou]
+  # Number of images processed at once for mask metrics. Options: positive integer.
+  mask_batch_size: 150
+  # Use exponential moving average weights. Options: true, false.
+  use_ema: true
+  # EMA momentum. Options: float in 0.0-1.0.
+  ema_momentum: 0.9998
+  # Use OneCycleLR scheduler. Options: true, false.
+  use_scheduler: true
+  # Base/head learning rate. Options: null to use model default table, or float.
+  base_lr: null
+  # Backbone learning rate. Options: null to use model default table, or float.
+  backbone_lr: null
+  # OneCycleLR pct_start. Options: float 0.0-1.0.
+  cycler_pct_start: 0.1
+  # Weight decay. Options: float.
+  weight_decay: 0.000125
+  # AdamW betas. Options: [0.9, 0.999] or another two-float list.
+  betas: [0.9, 0.999]
+  # Label smoothing. Options: float 0.0-1.0.
+  label_smoothing: 0.0
+  # Early stopping patience in epochs. Options: 0 disables, positive integer enables.
+  early_stopping: 0
+  ddp:
+    # Enable DDP multi-GPU launch through torchrun. Options: true, false.
+    enabled: false
+    # Number of GPUs/processes per node. Options: positive integer.
+    n_gpus: 2
+    # Torchrun master port. Options: integer port such as 29500.
+    master_port: 29500
+
+augmentation:
+  # Preset for advanced Albumentations probabilities. Options: none, light, default, heavy, ultralytics_like, custom.
+  preset: default
+  # HSV hue gain. Options: 0.0-1.0.
+  hsv_h: 0.015
+  # HSV saturation gain. Options: 0.0-1.0.
+  hsv_s: 0.7
+  # HSV brightness/value gain. Options: 0.0-1.0.
+  hsv_v: 0.4
+  # Rotation degrees. Options: 0.0-180.0.
+  degrees: 10.0
+  # Translation fraction for mosaic affine. Options: 0.0-1.0.
+  translate: 0.2
+  # Scale gain. Options: 0.0-1.0.
+  scale: 0.5
+  # Shear degrees. Options: 0.0-180.0.
+  shear: 2.0
+  # Perspective fraction kept for metadata and patched augmentation. Options: 0.0-0.001.
+  perspective: 0.0
+  # Vertical flip probability. Options: 0.0-1.0.
+  flipud: 0.0
+  # Horizontal flip probability. Options: 0.0-1.0.
+  fliplr: 0.3
+  # RGB to BGR channel swap probability. Options: 0.0-1.0.
+  bgr: 0.0
+  # Mosaic probability. Options: 0.0-1.0.
+  mosaic: 0.8
+  # Disable mosaic for final N epochs. Options: 0 keeps mosaic active, positive integer disables near the end.
+  close_mosaic: 5
+  # Mosaic scale range. Options: [0.5, 1.5] or another [min, max].
+  mosaic_scale: [0.5, 1.5]
+  # MixUp probability. Options: 0.0-1.0.
+  mixup: 0.0
+  # CutMix probability. Options: 0.0-1.0.
+  cutmix: 0.0
+  # Segmentation copy-paste probability. Options: 0.0-1.0.
+  copy_paste: 0.0
+  # Copy-paste strategy. Options: flip, mixup.
+  copy_paste_mode: mixup
+  # Multi-scale batch resize probability. Options: 0.0-1.0.
+  multi_scale: 0.0
+  advanced:
+    # Rotation transform probability. Options: 0.0-1.0.
+    rotation_p: 0.05
+    # Random 90-degree rotation probability. Options: 0.0-1.0.
+    rotate_90: 0.03
+    # Convert to grayscale probability. Options: 0.0-1.0.
+    to_gray: 0.01
+    # Blur probability. Options: 0.0-1.0.
+    blur: 0.01
+    # Motion blur probability. Options: 0.0-1.0.
+    motion_blur: 0.01
+    # Gamma adjustment probability. Options: 0.0-1.0.
+    gamma: 0.03
+    # Brightness/contrast brightness probability. Options: 0.0-1.0.
+    brightness: 0.04
+    # Brightness/contrast contrast probability. Options: 0.0-1.0.
+    contrast: 0.04
+    # Gaussian noise probability. Options: 0.0-1.0.
+    noise: 0.01
+    # ISO noise probability. Options: 0.0-1.0.
+    iso_noise: 0.01
+    # CLAHE probability. Options: 0.0-1.0.
+    clahe: 0.01
+    # Sharpen probability. Options: 0.0-1.0.
+    sharpen: 0.01
+    # Image compression probability. Options: 0.0-1.0.
+    compression: 0.01
+    # Coarse dropout probability. Options: 0.0-1.0.
+    coarse_dropout: 0.02
+    # Grid dropout probability. Options: 0.0-1.0.
+    grid_dropout: 0.01
+    # Random shadow probability. Options: 0.0-1.0.
+    random_shadow: 0.01
+    # Random weather-like effect probability. Options: 0.0-1.0.
+    random_weather: 0.005
+    # Downscale/upscale artifact probability. Options: 0.0-1.0.
+    downscale: 0.005
+
+periodic_test:
+  # D-FINE-seg upstream runs final val/test after training. This wrapper keeps the config for output estimates. Options: true, false.
+  enabled: true
+  # Run final test split evaluation after training if a test split exists. Options: true, false.
+  run_final_test: true
+  # Write per-class metrics when upstream extended metrics are available. Options: true, false.
+  classwise: true
+  # Output directory name for final test artifacts under run folder. Options: plain string or placeholders.
+  final_output_dir_name: final_test
+
+export:
+  # Export after training. Options: true, false.
+  enabled: false
+  # Export formats. Options: any subset of [onnx, openvino, coreml, tensorrt].
+  formats: [onnx]
+  # Use half precision where supported. Options: true, false.
+  half: true
+  # Max export batch size. Options: positive integer.
+  max_batch_size: 1
+  # Dynamic input for ONNX/OpenVINO. Options: true, false.
+  dynamic_input: false
+
+demo:
+  # Enable tiny demo constraints. Options: true, false.
+  enabled: false
+  # Demo output directory. Options: any path with output placeholders.
+  output_dir: "projects/dfine_seg_trainer/demo_runs/dfine_demo_{timestamp}"
+  # Maximum epochs in demo mode. Options: positive integer.
+  max_epochs: 2
+  # Maximum batch size in demo mode. Options: positive integer.
+  max_batch_size: 2
+  # Disable image-heavy plots/debug in demo mode. Options: true, false.
+  disable_heavy_outputs: true

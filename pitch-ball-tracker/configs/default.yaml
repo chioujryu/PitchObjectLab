@@ -1,0 +1,98 @@
+model:
+  # SAM3 checkpoint path (leave null to auto-download from HuggingFace)
+  sam3_checkpoint: C:\Users\XBOT\Documents\projects\pitch-ball-tracker\sam3.pt
+  # Model size: small | base | large
+  sam3_type: "large"
+  # Enable FP16 half-precision (reduces VRAM ~50%, requires CUDA)
+  half_precision: false
+  # GPU IDs to use, e.g. [0] or [0, 1]
+  gpus: [0]
+
+inference:
+  # Text prompt(s) sent to SAM3 for ball detection
+  text_prompts:
+    - "ball"
+    - "soccer ball"
+  # Confidence threshold for SAM3 detections
+  confidence_threshold: 0.35
+  # Enable tiled inference for high-resolution frames
+  tiled: false
+  # Tile size in pixels (square)
+  tile_size: 640
+  # Overlap between adjacent tiles in pixels
+  tile_overlap: 128
+  # IoU threshold for NMS when merging tiles
+  tile_merge_iou: 0.5
+
+ball_filter:
+  # Minimum circularity (4π·area / perimeter²), range [0, 1]
+  min_circularity: 0.55
+  # Minimum bounding-box area in pixels²
+  min_area_px: 60
+  # Maximum bounding-box area in pixels²
+  max_area_px: 10000
+  # Maximum allowed aspect ratio (w/h or h/w)
+  max_aspect_ratio: 1.8
+
+motion:
+  # Enable motion-based filtering (removes stationary balls)
+  enabled: true
+  # Optical flow method: farneback | lucas_kanade
+  method: "farneback"
+  # Pixels-per-frame threshold; below this → stationary
+  min_motion_px: 2.0
+  # Number of recent frames to accumulate motion history
+  history_frames: 5
+  # Stationary balls inside the field are kept but with reduced score
+  penalize_stationary_inside: true
+  stationary_score_penalty: 0.4
+
+field:
+  # Enable field-boundary filtering
+  boundary_filter: true
+  # Automatically detect field by green-color segmentation
+  auto_detect: true
+  # Manually specify field polygon as list of [x, y] points (overrides auto)
+  # manual_polygon: [[100, 50], [1820, 50], [1900, 1000], [20, 1000]]
+  manual_polygon: null
+  # HSV range for green field detection [H_lo, H_hi, S_lo, S_hi, V_lo, V_hi]
+  green_hsv_range: [35, 90, 40, 255, 40, 255]
+  # Minimum field area fraction (0~1) to consider detection valid
+  min_field_area_ratio: 0.05
+
+tracking:
+  # Max frames a tracklet survives without a matched detection (LOST state)
+  max_age: 30
+  # Minimum consecutive detections before a tentative track is confirmed
+  min_hits: 2
+  # IoU threshold for the first-stage detection-to-track assignment
+  iou_threshold: 0.25
+  # Enable ReID for the third-stage re-identification matching
+  use_reid: true
+
+reid:
+  # Embedding dimension output from the feature extractor
+  embedding_dim: 256
+  # Cosine-similarity threshold for re-identification acceptance
+  similarity_threshold: 0.62
+  # Window size for tracklet-averaged embedding (PRTReID style)
+  avg_window: 12
+  # Extra frames beyond max_age to keep a LOST tracklet for ReID matching
+  lost_track_buffer: 60
+  # EMA decay for the running average embedding
+  ema_alpha: 0.1
+
+output:
+  # Write annotated video to output directory
+  save_video: true
+  # Write track data file to output directory
+  save_tracks: true
+  # Track data format: json | csv
+  track_format: "json"
+  # Draw segmentation masks on video
+  draw_masks: true
+  # Draw motion trail on video
+  draw_trails: true
+  trail_length: 40
+  # Video codec (fourcc), e.g. mp4v, avc1, XVID
+  video_codec: "mp4v"

@@ -1,0 +1,195 @@
+# Standalone config for test_rf_detr_model.py.
+# Parameters are grouped by runtime, model, dataset, output, test, and evaluation.
+
+runtime:
+  # Print wrapper status text. Options: true, false.
+  verbose: true
+  # Estimate outputs and exit before model loading/inference. Options: true, false.
+  dry_run: false
+  # Ask before writing images, metrics, configs, or cache files. Options: true, false.
+  confirm_before_run: true
+  # Skip confirmation after reviewing the estimate. Options: true, false.
+  yes: false
+  # Seed used for deterministic visual sampling. Options: integer.
+  seed: 0
+
+model:
+  # RF-DETR model size. Detection: base, nano, small, medium, large. Segmentation: seg-preview, seg-nano, seg-small, seg-medium, seg-large, seg-xlarge, seg-2xlarge.
+  size: large
+  # RF-DETR checkpoint to test. Options: default, null/false, hosted key, or local .pth/.pt/.ckpt path.
+  pretrain_weights: default
+  # Input resolution override. Options: null for model default, or an int divisible by model window requirements.
+  resolution: null
+  # Class count override. Options: null to infer from dataset, or positive integer.
+  num_classes: null
+  # Device selector. Options: auto, cpu, cuda, cuda:0, 0, 1, mps, -1.
+  device: 0
+  # Automatic mixed precision in RF-DETR. Options: true, false.
+  amp: true
+  # Prediction confidence threshold used by inference and operating metrics. Options: 0.0-1.0.
+  confidence_threshold: 0.25
+  # Optional model label to dataset category-id mapping. Options: empty mapping, false to disable, or {model_label: dataset_category_id}.
+  category_remapping: {}
+  # Extra RF-DETR ModelConfig keys. Options: any supported model config key.
+  extra_model_args: {}
+
+dataset:
+  # Dataset source format. Options: auto, rfdetr, roboflow, ultralytics_yolo, coco_json, pascal_voc, dota, labelme_json.
+  source_format: rfdetr
+  # Source dataset root. Options: RF-DETR/Roboflow root, YOLO root, VOC root, DOTA root, LabelMe root, or COCO root.
+  dataset_dir: dataset_cache/ultralytics_yolo_dataset_43fc76da39887af6
+  # Ultralytics YOLO dataset YAML. Options: empty string to auto-find, or YAML path.
+  data_yaml: ""
+  # COCO annotation file for coco_json source_format. Options: empty string to auto-find, or JSON path.
+  coco_json: ""
+  # Image directory used with coco_json. Options: empty string to infer from dataset_dir, or image folder path.
+  image_dir: ""
+  # RF-DETR-readable cache root. Options: relative path under this project, or absolute path.
+  cache_root: dataset_cache
+  # Rebuild dataset cache even when fingerprint matches. Options: true, false.
+  refresh_cache: false
+  # How to place images in cache. Options: auto, hardlink, symlink, junction, copy.
+  link_mode: auto
+  # Split ratio for unsplit datasets, order train/valid/test. Options: three positive numbers.
+  split_ratio: [8, 1, 1]
+  # Deterministic split seed. Options: integer.
+  split_seed: 0
+  # Dataset file type forwarded to RF-DETR. Options: roboflow, coco, yolo, o365.
+  dataset_file: roboflow
+
+output:
+  # Exact output directory. Options: empty string to use root/name, absolute path, or relative path.
+  # Supports placeholders: {timestamp}, {date}, {time}, {model_size}, {resolution}, {pretrain}, {num_classes},
+  # {dataset_name}, {dataset_file}, {source_format}, {device}, {epochs}, {batch_size}, {grad_accum_steps},
+  # {effective_batch}, {lr}, {lr_encoder}, {weight_decay}, {workers}, {checkpoint_interval},
+  # {eval_interval}, {test_interval_epochs}, {test_interval_minutes}, {test_split}, {logger_project}, {logger_run}.
+  output_dir: ""
+  # Output root when output_dir is empty. Options: pure string or placeholder template.
+  root: runs/rf_detr/test
+  # Run folder name when output_dir is empty. Options: pure string or placeholder template.
+  name: "rfdetr_test_{model_size}_{test_split}_{timestamp}"
+  # Allow writing into an existing output directory. Options: true, false.
+  exist_ok: false
+
+test:
+  # Dataset split to test. Options: test-original, test, val, valid, train.
+  split: test-original
+  test_mode:
+    # Test mode. Options: full_image, class_crop, sahi.
+    mode: class_crop
+  crop:
+    # Class IDs used to find class_crop windows from model predictions. Empty means all predicted classes are eligible.
+    class_ids: []
+    # Class names used to find class_crop windows from model predictions. Empty means all predicted classes are eligible.
+    class_names:
+      - standing_player
+    # Crop source. Options: prediction.
+    source: prediction
+    # Confidence threshold for the first pass that finds the crop window. Options: 0.0-1.0.
+    source_conf: 0.25
+    # Fixed crop padding in pixels. Options: non-negative integer.
+    padding_pixels: 0
+    # Relative crop padding around the union box. Options: non-negative float, e.g. 0.05.
+    padding_ratio: 0.05
+    # Behavior when no crop class is predicted. Options: full_image.
+    fallback: full_image
+  sahi:
+    # Slice height for sahi mode. Options: positive integer.
+    slice_height: 640
+    # Slice width for sahi mode. Options: positive integer.
+    slice_width: 640
+    # Height overlap between adjacent slices. Options: 0.0-0.9.
+    overlap_height_ratio: 0.2
+    # Width overlap between adjacent slices. Options: 0.0-0.9.
+    overlap_width_ratio: 0.2
+    # Also run full-image prediction and merge with slices. Options: true, false.
+    standard_prediction: true
+    # SAHI postprocess type. Options: GREEDYNMM, NMM, NMS, LSNMS. GREEDYNMM is recommended for small slices.
+    postprocess_type: GREEDYNMM
+    # SAHI match metric. Options: IOS, IOU. IOS is recommended when small slice boxes cover parts of the same object.
+    postprocess_match_metric: IOS
+    # Slice merge/NMS threshold. Options: 0.0-1.0. Raise to merge fewer boxes; lower to merge more boxes.
+    postprocess_match_threshold: 0.5
+    # Class-agnostic slice merge. Options: true, false.
+    postprocess_class_agnostic: false
+    # SAHI model input batch size. Options: positive integer.
+    batch_size: 1
+  visual_samples:
+    # Save sampled prediction test images with GT and predictions. Options: true, false.
+    enabled: true
+    # Maximum sampled prediction images to save; also caps error-case images by default. Options: null for all candidates, or non-negative integer.
+    max_images: 25
+    # Visual subfolder under output. Options: folder name or placeholder template.
+    output_subdir: visuals
+    # Sampling mode. Options: first, last, random.
+    sampling_mode: first
+    # Sampling seed for random mode. Options: null to use runtime.seed, or integer.
+    random_seed: null
+    # Candidate filter source. Options: ground_truth, prediction, either, both.
+    filter_source: either
+    # Candidate filter match. Options: any, all.
+    filter_match: any
+    # Candidate class IDs. Empty means no class filter. Options: list of category IDs.
+    class_ids: []
+    # Candidate class names. Empty means no class filter. Options: list of category names, e.g. [football].
+    class_names: []
+    # Minimum GT instances required for candidate selection. Options: non-negative integer.
+    min_gt_instances: 0
+    # Minimum predictions required for candidate selection. Options: non-negative integer.
+    min_predictions: 0
+    # Minimum prediction score used only for candidate filtering. Options: null or 0.0-1.0.
+    filter_min_score: 0.25
+    # Minimum prediction score drawn in visual images. Options: null or 0.0-1.0.
+    draw_min_score: 0.25
+  # Write per-class test metrics JSON/CSV. Options: true, false.
+  classwise: true
+  # Show progress bars while evaluating images and rendering outputs. Options: true, false.
+  progress_bar: true
+  # Save PR/confusion/curve plots. Options: true, false.
+  plots: false
+  # Save raw evaluated dataset case images. Options: true, false.
+  save_dataset_cases: false
+  # Number of images in each saved model-input batch grid. Options: positive integer.
+  model_input_batch_size: 9
+  # Optional model input batch size for TrainConfig adapter. Options: positive integer.
+  batch_size: 1
+  # DataLoader workers for TrainConfig adapter. Options: 0 for Windows compatibility, or positive integer.
+  num_workers: 0
+  # Max detections used in evaluation metrics. Options: positive integer.
+  max_dets: 500
+  # IoU threshold used for operating-point TP/FP/FN and error-case matching. Options: 0.0-1.0.
+  match_iou_threshold: 0.5
+  error_cases:
+    # Save target-class missed/misclassified/false-positive diagnostic images. Options: true, false.
+    enabled: true
+    # Target category IDs. Empty means use target_class_names; if both are empty, default is football.
+    target_class_ids: []
+    # Target category names. Default: football.
+    target_class_names:
+      - football
+    # Shared maximum diagnostic images to save. Options: null for all matching images, or non-negative integer.
+    max_images: 25
+    # Backward-compatible missed-image cap. Options: null or non-negative integer.
+    max_missed_images: 25
+    # Backward-compatible false-positive-image cap. Options: null or non-negative integer.
+    max_false_positive_images: 25
+    # Prediction confidence threshold for error-case matching. Options: null to use model/evaluation threshold, or 0.0-1.0.
+    confidence_threshold: null
+    # IoU threshold for error-case matching. Options: null to use evaluation.match_iou_threshold, or 0.0-1.0.
+    match_iou_threshold: null
+    # Error-case subfolder under output. Options: folder name or placeholder template.
+    output_subdir: error_cases
+    # Image format. Options: jpg, png.
+    format: jpg
+    # JPEG quality when format=jpg. Options: 1-100.
+    jpeg_quality: 92
+
+evaluation:
+  # Evaluation type. Options: auto, bbox, segm, segmentation, mask, masks.
+  type: auto
+  # Write per-class metrics. Options: true, false.
+  classwise: true
+  # COCO max detections list. Options: one, two, or three positive integers.
+  max_detections: [1, 10, 500]
+  # Operating-point and error-case IoU threshold. Options: 0.0-1.0.
+  match_iou_threshold: 0.5

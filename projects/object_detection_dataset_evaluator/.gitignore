@@ -1,0 +1,68 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local uv / Python environments
+.venv/
+.uv-cache/
+venv/
+env/
+.env
+
+# Generated outputs
+outputs/
+runs/
+demo_outputs/
+generated/
+tmp/
+*.log
+
+# Datasets and large local assets
+datasets/
+data/
+images/
+labels/
+annotations/
+videos/
+weights/
+models/
+*.pt
+*.pth
+*.onnx
+*.engine
+*.torchscript
+*.tflite
+*.mlmodel
+*.mlpackage
+
+# Evaluation media and plots
+visuals/
+visual_samples/
+sliced_cases/
+original_cases/
+dataset_cases/
+visuals_metadata.json
+visuals_manifest.csv
+dataset_cases_metadata.json
+dataset_cases_manifest.csv
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.tif
+*.tiff
+*.webp
+*.gif
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+
+# Large tabular/json outputs
+predictions*.json
+ground_truth*.json
+per_image*.csv
+inference_stats*.csv
+threshold_sweep*.csv

@@ -1,0 +1,286 @@
+# Main config for train_ultralytics_model.py.
+# Every path can be absolute or relative. Relative paths are resolved from the repo root when possible.
+
+# Ultralytics model architecture or weights. Options:
+# - Any YAML under ultralytics/cfg/models by filename: rtdetr-l.yaml, yolo26-p2.yaml, yolov8-seg.yaml.
+# - Any YAML under ultralytics/cfg/models by relative path: rt-detr/rtdetr-l.yaml, 26/yolo26-p2.yaml, v8/yolov8-seg.yaml.
+# - Any local/absolute YAML or PT path: /path/to/model.yaml, yolo26n.pt.
+model: yolo26m-p2.yaml
+
+# Task override. Options: auto, detect, segment, classify, pose, obb.
+# Use auto for bundled YAML files so Ultralytics infers the task from the model head.
+task: auto
+
+runtime:
+  # Print wrapper status text in bright blue. Options: true, false.
+  verbose: true
+  # Validate config and estimate outputs without starting training. Options: true, false.
+  dry_run: false
+  # Ask before starting training because checkpoints, plots, json, txt, and metrics files can be large. Options: true, false.
+  confirm_before_run: true
+
+dataset:
+  # Existing YOLO dataset YAML. If non-empty, it has priority over path/train/val/test/names below.
+  data_yaml: ""
+  # Dataset root directory. Replace with a Windows path like D:/datasets/my_dataset or a Linux path like /home/user/datasets/my_dataset.
+  path: /home/new_users/zhiyu/datasets/soccer/spatial_perception/Xbotgo/空中足球数据集V1/yolo_ball_goal
+  # Train image folder relative to path, or an absolute folder/txt path.
+  train: images/train
+  # Validation image folder relative to path, or an absolute folder/txt path.
+  val: images/val
+  # Test image folder relative to path, or an absolute folder/txt path.
+  test: images/test
+  # Class names required when data_yaml is empty. Replace keys/names for your dataset.
+  names:
+    0: player
+    1: goalkeeper
+    2: referee
+    3: ball
+    # 4: other
+  # Optional dataset download URL or script supported by Ultralytics. Options: empty string, URL, or command.
+  download: ""
+
+train:
+  # Pretrained weights. Options: true, false, yolo26m.pt, /path/to/weights.pt.
+  pretrained: yolo26m.pt
+  # Number of training epochs. Options: any positive integer.
+  epochs: 5
+  # Maximum training hours. Options: null to use epochs, or a float number of hours.
+  time: null
+  # Image size for training/validation. Options: 640, 960, 1280, or another int supported by model stride.
+  imgsz: 640
+  # Batch size. Options: positive integer, or a float 0.0-1.0 for Ultralytics AutoBatch fraction.
+  batch: 32
+  # Early stopping patience in epochs. Options: 0 disables early stopping, positive integer enables.
+  # Note: with val_interval > 1, patience counts every training epoch (including non-val epochs).
+  # To wait for N val evaluations before early stopping, set patience = N * val_interval.
+  # Example: val_interval=5, patience=150 gives 30 val evaluations before stopping.
+  patience: 30
+  # CUDA devices or CPU. Options: "0", "7", "0,1", "cpu", "mps", "-1".
+  device: "6"
+  # Output project root. Relative paths are allowed. Supports plain strings or placeholders like runs/{model}/{train.imgsz}.
+  project: aerial-2024-YOLO/train
+  # Run name. Supports plain strings or placeholders: {timestamp}, {date}, {model}, {dataset}, {task}, and config dot-paths like {train.imgsz}, {train.batch}, {dataset.path}.
+  # WARNING: wrap in quotes if the name starts with { to prevent YAML from parsing it as a dict.
+  name: "yolo26m-p2_imgsz640_patience30_mosaic0_translate0.1__{timestamp}"
+  # Allow overwriting project/name. Options: true, false.
+  exist_ok: false
+  # Save checkpoints and training artifacts. Options: true, false.
+  save: true
+  # Save an epoch checkpoint every N epochs. Options: -1 disables, positive integer enables.
+  save_period: -1
+  # Cache images. Options: false, true, ram, disk.
+  cache: false
+  # Number of dataloader workers per process. Options: 0 for maximum compatibility, or positive integer.
+  workers: 8
+  # Optimizer. Options: auto, SGD, MuSGD, Adam, Adamax, AdamW, NAdam, RAdam, RMSProp.
+  optimizer: auto
+  # Pass verbose into Ultralytics internals. Options: true, false.
+  verbose: true
+  # Random seed. Options: any integer.
+  seed: 0
+  # Deterministic training. Options: true for reproducible/slower, false for faster.
+  deterministic: true
+  # Treat all classes as one class. Options: true, false.
+  single_cls: false
+  # Rectangular batches. Options: true, false.
+  rect: false
+  # Cosine LR scheduler. Options: true, false.
+  cos_lr: false
+  # Disable mosaic for final N epochs. Options: 0 keeps mosaic behavior, positive integer closes near the end.
+  close_mosaic: 10
+  # Resume from the latest checkpoint. Options: true, false.
+  resume: false
+  # Automatic mixed precision. Options: true, false.
+  amp: true
+  # Fraction of training data. Options: 1.0 for all data, smaller float for quick experiments.
+  fraction: 1.0
+  # Profile ONNX/TensorRT speed during training. Options: true, false.
+  profile: false
+  # Freeze layers. Options: null, integer count, or list of layer ids.
+  freeze: null
+  # Multi-scale range as fraction of imgsz. Options: 0.0 disables, e.g. 0.5 enables +/-50%.
+  multi_scale: 0.0
+  # Enable torch.compile. Options: false, true, default, reduce-overhead, max-autotune-no-cudagraphs.
+  compile: false
+
+  # Validation interval. Run val every N epochs. Options:
+  #   1  — every epoch (default, identical to standard Ultralytics behaviour)
+  #   5  — every 5th epoch; on other epochs the previous val result is reused so that
+  #         early stopping and best.pt still track real val performance
+  #   0  — disable validation entirely (equivalent to val=false)
+  # With N > 1, patience counts every training epoch. Set patience = N * desired_val_count.
+  val_interval: 1
+
+  # Run validation during training. Options: true, false. Overridden by val_interval when val_interval != 1.
+  val: true
+  # Evaluation split used by normal Ultralytics validation. Options: val, test, train.
+  split: val
+  # Save COCO JSON during validation/test. Options: true, false.
+  save_json: false
+  # Confidence threshold for validation/test. Options: null for Ultralytics default, or float 0.0-1.0.
+  conf: null
+  # IoU threshold for NMS. Options: float 0.0-1.0.
+  iou: 0.7
+  # Maximum detections per image. Options: positive integer.
+  max_det: 300
+  # Use FP16 validation/test if supported. Options: true, false.
+  half: false
+  # Use OpenCV DNN for ONNX inference. Options: true, false.
+  dnn: false
+  # Save plots/images from training/validation. Options: true, false.
+  plots: true
+  # End-to-end head override. Options: null, true, false.
+  end2end: null
+
+  # Initial learning rate. Options: float; SGD often 0.01, AdamW often 0.001.
+  lr0: 0.01
+  # Final learning rate fraction. Options: float; final_lr = lr0 * lrf.
+  lrf: 0.01
+  # Momentum or Adam beta1. Options: float.
+  momentum: 0.937
+  # Weight decay. Options: float.
+  weight_decay: 0.0005
+  # Warmup epochs. Options: float, 0.0 disables.
+  warmup_epochs: 3.0
+  # Initial warmup momentum. Options: float.
+  warmup_momentum: 0.8
+  # Warmup bias learning rate. Options: float.
+  warmup_bias_lr: 0.1
+  # Box loss gain. Options: float.
+  box: 7.5
+  # Classification loss gain. Options: float.
+  cls: 0.5
+  # Class weight power for imbalance. Options: 0.0 disables, 0.0-1.0.
+  cls_pw: 0.0
+  # Distribution focal loss gain. Options: float.
+  dfl: 1.5
+  # Nominal batch size for loss normalization. Options: positive integer.
+  nbs: 64
+
+  # HSV hue augmentation fraction. Options: 0.0-1.0.
+  hsv_h: 0.5
+  # HSV saturation augmentation fraction. Options: 0.0-1.0.
+  hsv_s: 0.5
+  # HSV value/brightness augmentation fraction. Options: 0.0-1.0.
+  hsv_v: 0.5
+  # Rotation degrees. Options: float.
+  degrees: 0.0
+  # Translation fraction. Options: 0.0-1.0.
+  translate: 0.1
+  # Scale gain. Options: float.
+  scale: 0.1
+  # Shear degrees. Options: float.
+  shear: 0.0
+  # Perspective fraction. Options: 0.0-0.001 typical.
+  perspective: 0.0
+  # Vertical flip probability. Options: 0.0-1.0.
+  flipud: 0.0
+  # Horizontal flip probability. Options: 0.0-1.0.
+  fliplr: 0.5
+  # RGB to BGR channel swap probability. Options: 0.0-1.0.
+  bgr: 0.0
+  # Mosaic augmentation probability. Options: 0.0-1.0.
+  mosaic: 0.0
+  # MixUp augmentation probability. Options: 0.0-1.0.
+  mixup: 0.0
+  # CutMix augmentation probability. Options: 0.0-1.0.
+  cutmix: 0.0
+  # Copy-paste probability for segmentation tasks. Options: 0.0-1.0.
+  copy_paste: 0.0
+  # Copy-paste mode for segmentation tasks. Options: flip, mixup.
+  copy_paste_mode: flip
+  # Classification auto augmentation policy. Options: randaugment, autoaugment, augmix.
+  auto_augment: randaugment
+  # Classification random erasing probability. Options: 0.0-1.0.
+  erasing: 0.4
+
+  # Additional Ultralytics train/val keys not listed above. Example: save_txt: true.
+  extra_yolo_args: {}
+
+periodic_test:
+  # Enable scheduled test split evaluation during training. Options: true, false.
+  enabled: true
+  test_mode:
+    # Test mode. Options: full_image, sahi, class_crop.
+    mode: full_image
+  crop:
+    # Class IDs used to find class_crop windows from model predictions. Empty means all predicted classes are eligible.
+    class_ids: []
+    # Class names used to find class_crop windows from model predictions. Empty means all predicted classes are eligible.
+    class_names: []
+    # Crop source. Currently prediction is supported. Options: prediction.
+    source: prediction
+    # Confidence threshold for the first pass that finds the crop window. Options: 0.0-1.0.
+    source_conf: 0.25
+    # Fixed padding in pixels around the predicted class union box. Options: non-negative integer.
+    padding_pixels: 0
+    # Relative padding around the predicted class union box. Options: non-negative float, e.g. 0.05.
+    padding_ratio: 0.05
+    # Behavior when no crop class is predicted. Options: full_image.
+    fallback: full_image
+  sahi:
+    # Slice/window height for periodic/final sahi mode. Options: positive integer.
+    slice_height: 640
+    # Slice/window width for periodic/final sahi mode. Options: positive integer.
+    slice_width: 640
+    # Height overlap ratio between adjacent slices. Options: 0.0-0.9.
+    overlap_height_ratio: 0.2
+    # Width overlap ratio between adjacent slices. Options: 0.0-0.9.
+    overlap_width_ratio: 0.2
+    # Also run full-image prediction and merge it with slices. Options: true, false.
+    standard_prediction: true
+    # Merge/NMS threshold after sliced prediction. Options: 0.0-1.0.
+    postprocess_match_threshold: 0.5
+    # Merge/NMS class-agnostic behavior. Options: true, false.
+    postprocess_class_agnostic: false
+  # Number of model input cases per saved test_batch grid in sahi/class_crop mode. Options: positive integer.
+  model_input_batch_size: 9
+  # Run test every N epochs. Options: 0 disables epoch interval, positive integer enables.
+  test_interval_epochs: 1
+  # Run test every N minutes. Options: 0 disables time interval, positive float enables.
+  test_interval_minutes: 0
+  # Reuse the test dataloader across scheduled test runs for speed. Options: true, false.
+  reuse_test_loader: true
+  # Output directory name under the Ultralytics run folder. Supports placeholders like periodic_{run_name} or periodic_{epoch4}.
+  output_dir_name: periodic_tests
+  # Run one final test split evaluation after training. Options: true, false.
+  run_final_test: true
+  # Final test output directory name under the Ultralytics run folder. Supports placeholders like final_{run_name}.
+  final_output_dir_name: final_test
+  # Write per-class periodic/final test metrics to test_per_class_metrics.json/csv. Options: true, false.
+  classwise: true
+  # Batch size for final test. Options: null to reuse train.batch, or positive integer.
+  batch: null
+  # Save plots during periodic/final test. Options: true, false.
+  plots: true
+  # Save COCO JSON during periodic/final test. Options: true, false.
+  save_json: true
+  # Save YOLO txt predictions during periodic/final test. Options: true, false.
+  save_txt: false
+  # Save confidence in txt predictions. Options: true, false.
+  save_conf: false
+  # Confidence threshold for periodic/final test. Options: null for Ultralytics default, or float 0.0-1.0.
+  conf: null
+  # IoU threshold for periodic/final test. Options: null to reuse train.iou, or float 0.0-1.0.
+  iou: 0.7
+  # Maximum detections per image for periodic/final test. Options: null to reuse train.max_det, or integer.
+  max_det: 300
+  # Use FP16 for final standalone test if supported. Options: true, false.
+  half: false
+
+demo:
+  # Enable small demo output mode. Options: true, false.
+  enabled: false
+  # Demo output project folder. Supports the same placeholders as train.project.
+  project: projects/yolo_trainer/demo_runs
+  # Maximum epochs in demo mode. Options: positive integer.
+  max_epochs: 2
+  # Maximum training data fraction in demo mode. Options: 0.0-1.0.
+  max_fraction: 0.05
+  # Maximum batch in demo mode. Options: positive integer.
+  max_batch: 4
+  # Save plots in demo mode. Options: true, false.
+  plots: false
+  # Scheduled test interval in demo mode. Options: positive integer.
+  test_interval_epochs: 1

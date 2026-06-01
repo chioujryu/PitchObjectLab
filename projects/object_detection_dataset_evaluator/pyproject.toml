@@ -1,0 +1,29 @@
+[project]
+name = "object-detection-dataset-evaluator"
+version = "0.1.0"
+description = "Config-first object detection dataset evaluator with optional SAHI sliced inference."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "colorama>=0.4.6",
+    "matplotlib>=3.8.0",
+    "numpy>=1.23.0",
+    "opencv-python>=4.6.0",
+    "pillow>=9.0.0",
+    "pycocotools>=2.0.7",
+    "pyyaml>=6.0.0",
+    "sahi>=0.11.22",
+    "tqdm>=4.67.0",
+    "ultralytics>=8.3.161",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+ultralytics = { path = "../..", editable = true }
+
+[dependency-groups]
+dev = [
+    "ruff>=0.8.0",
+]

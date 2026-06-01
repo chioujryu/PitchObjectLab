@@ -1,0 +1,68 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local envs
+.venv/
+venv/
+env/
+.env
+
+# Generated configs and outputs
+generated_configs/
+outputs/
+runs/
+demo_runs/
+SN-GSR-YOLO/
+periodic_tests/
+final_test/
+
+# Datasets and large local files
+datasets/
+data/
+images/
+labels/
+weights/
+*.pt
+*.pth
+*.onnx
+*.engine
+*.torchscript
+*.tflite
+*.mlmodel
+*.mlpackage
+
+# Ultralytics artifacts
+args.yaml
+results.csv
+results.png
+labels.jpg
+labels_correlogram.jpg
+train_batch*.jpg
+val_batch*.jpg
+confusion_matrix*.png
+F1_curve.png
+P_curve.png
+PR_curve.png
+R_curve.png
+predictions.json
+
+# Media output
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.tiff
+*.webp
+*.gif
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+
+# Logs
+*.log
+wandb/
+mlruns/

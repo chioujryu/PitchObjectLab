@@ -1,0 +1,351 @@
+# Main config for train_rf_detr_model.py.
+# Every path can be absolute or relative. Relative paths are resolved from the repo root when possible.
+
+runtime:
+  # Print wrapper status text in bright blue. Options: true, false.
+  verbose: true
+  # Validate config and estimate output files without starting training. Options: true, false.
+  dry_run: false
+  # Ask before creating checkpoints, logs, metrics, plots, or dataset grids. Options: true, false.
+  confirm_before_run: true
+
+model:
+  # RF-DETR model size. Detection: base, nano, small, medium, large. Segmentation: seg-preview, seg-nano, seg-small, seg-medium, seg-large, seg-xlarge, seg-2xlarge.
+  size: large
+  # Input resolution override. Options: null to use model default, or an int divisible by patch_size * num_windows.
+  resolution: null
+  # Pretrained weights. Options: default, null/false to disable, hosted key like rf-detr-medium.pth, or a local .pth path.
+  pretrain_weights: default
+  # Optional class count override. Options: null to auto-detect from dataset, or a positive integer.
+  num_classes: null
+  # Model construction device. Options: auto, cpu, cuda, cuda:0. Training device is controlled by train.device.
+  device: auto
+  # Automatic mixed precision behavior in RF-DETR model config. Options: true, false.
+  amp: true
+  # Extra RF-DETR ModelConfig keys. Options: any supported model key such as freeze_encoder, gradient_checkpointing, compile, num_queries.
+  extra_model_args: {}
+
+dataset:
+  # Dataset source format before this trainer prepares it. Options:
+  # auto              - auto-detect supported layouts.
+  # rfdetr / roboflow - dataset_dir already contains RF-DETR-readable Roboflow COCO/YOLO layout.
+  # ultralytics_yolo  - Ultralytics YOLO data.yaml + images/labels.
+  # coco_json         - COCO JSON annotations.
+  # pascal_voc        - Pascal VOC XML annotations.
+  # dota              - Native DOTA labelTxt/labels with oriented boxes converted to axis-aligned boxes.
+  # labelme_json      - LabelMe JSON annotations.
+  source_format: rfdetr
+  # Source dataset root. Options: RF-DETR/Roboflow root, YOLO root, VOC root, DOTA root, LabelMe root, or COCO root.
+  dataset_dir: dataset_cache/ultralytics_yolo_dataset_43fc76da39887af6
+  # Ultralytics YOLO dataset YAML. Options: empty string to auto-find data.yaml/data.yml/dataset.yaml in dataset_dir, or a YAML path.
+  data_yaml: ""
+  # COCO annotation file for single-file COCO datasets. Options: empty string to auto-find common annotations/*.json files.
+  coco_json: ""
+  # Image directory used with coco_json when image file names are relative. Options: empty string to infer from dataset_dir.
+  image_dir: ""
+  # RF-DETR-readable converted dataset cache root. Relative paths resolve under projects/rf_detr_trainer.
+  cache_root: dataset_cache
+  # Rebuild a matching cache even when source_fingerprint.json says it can be reused. Options: true, false.
+  refresh_cache: false
+  # Deterministic split ratio for unsplit datasets. Order: train, valid, test.
+  split_ratio: [8, 1, 1]
+  # Deterministic split seed for unsplit datasets. Options: integer.
+  split_seed: 0
+  # How to place images in the RF-DETR cache. Options:
+  # auto     - try hardlinks, then symlinks; does not copy unless link_mode=copy.
+  # hardlink - create file hardlinks, fastest and compact when source/cache share a volume.
+  # symlink  - create file symlinks.
+  # junction - legacy alias for auto for file-level cache images.
+  # copy     - copy images into dataset_cache; uses much more disk.
+  link_mode: auto
+  # Legacy prepared dataset folder name. Cache conversion ignores this; retained for old configs.
+  prepared_dir_name: prepared_dataset
+  # Legacy prepared dataset overwrite flag. Cache conversion ignores this; use refresh_cache instead.
+  overwrite_prepared_dataset: false
+  # Dataset format passed to RF-DETR TrainConfig. Options: roboflow, coco, yolo, o365. roboflow auto-detects COCO/YOLO and is recommended.
+  dataset_file: roboflow
+
+output:
+  # Exact output directory. Options: empty string to use root/name, or any Windows/Linux path.
+  # Supports placeholders:
+  # {timestamp}, {date}, {time}, {model_size}, {resolution}, {pretrain}, {num_classes},
+  # {dataset_name}, {dataset_file}, {source_format}, {device}, {epochs}, {batch_size}, {grad_accum_steps},
+  # {effective_batch}, {lr}, {lr_encoder}, {weight_decay}, {workers}, {checkpoint_interval},
+  # {eval_interval}, {test_interval_epochs}, {test_interval_minutes}, {test_split},
+  # {logger_project}, {logger_run}.
+  # Example: "D:/runs/rf_detr/{dataset_name}/{model_size}_e{epochs}_b{batch_size}_{timestamp}"
+  output_dir: ""
+  # Output root when output_dir is empty. Options: runs/rf_detr, D:/runs/{dataset_name}, /mnt/runs/rf_detr.
+  # Supports the same placeholders as output_dir.
+  root: runs/rf_detr/train
+  # Run folder name when output_dir is empty. Options: pure string or placeholder template.
+  # Supports the same placeholders as output_dir.
+  name: "rfdetr_{model_size}_e{epochs}_b{batch_size}_val{eval_interval}_test{test_interval_epochs}_{timestamp}"
+  # Allow using an existing output directory. Options: true, false.
+  exist_ok: false
+
+train:
+  # RF-DETR dataset root forwarded into TrainConfig. Options: empty to copy dataset.dataset_dir, or explicit path.
+  dataset_dir: dataset_cache/ultralytics_yolo_dataset_43fc76da39887af6
+  # Dataset file type. Options: roboflow, coco, yolo, o365. roboflow auto-detects Roboflow COCO/YOLO layouts.
+  dataset_file: roboflow
+  # CUDA/CPU selector. Options: auto, cpu, cuda, 0, 1, 0,1, cuda:0, mps, -1.
+  device: 0
+  # Number of training epochs. Options: any positive integer.
+  epochs: 1
+  # Micro batch size per optimizer step. Options: positive integer, or auto for RF-DETR auto-batch probing.
+  batch_size: 1
+  # Gradient accumulation steps. Effective per-device batch = batch_size * grad_accum_steps. Options: positive integer.
+  grad_accum_steps: 8
+  # Per-device effective batch target when batch_size=auto. Options: positive integer.
+  auto_batch_target_effective: 16
+  # Max labels per image assumption for auto-batch probing. Options: positive integer.
+  auto_batch_max_targets_per_image: 100
+  # EMA memory headroom for auto-batch probing. Options: float in (0, 1].
+  auto_batch_ema_headroom: 0.7
+  # Decoder/head learning rate. Options: float, commonly 0.0001.
+  lr: 0.0001
+  # Encoder learning rate. Options: float, commonly 0.00015.
+  lr_encoder: 0.00015
+  # Weight decay. Options: float.
+  weight_decay: 0.0001
+  # Learning rate drop epoch for step scheduler. Options: positive integer.
+  lr_drop: 100
+  # Learning rate scheduler. Options: step, cosine.
+  lr_scheduler: step
+  # Minimum LR factor for cosine scheduler. Options: 0.0-1.0.
+  lr_min_factor: 0.0
+  # Warmup epochs. Options: 0.0 disables, positive float enables.
+  warmup_epochs: 0.0
+  # ViT layer-wise LR decay. Options: float, commonly 0.8.
+  lr_vit_layer_decay: 0.8
+  # Component LR decay. Options: float, commonly 0.7.
+  lr_component_decay: 0.7
+  # AdamW gradient clipping max norm. Options: positive float.
+  clip_max_norm: 0.1
+  # Save archive checkpoint every N epochs. Options: positive integer.
+  checkpoint_interval: 10
+  # Resume checkpoint path. Options: null, or path to RF-DETR .pth/.ckpt checkpoint.
+  resume: null
+  # Use exponential moving average weights. Options: true, false.
+  use_ema: true
+  # EMA decay. Options: float in 0.0-1.0.
+  ema_decay: 0.993
+  # EMA tau. Options: positive integer.
+  ema_tau: 100
+  # EMA update interval in optimizer steps. Options: positive integer.
+  ema_update_interval: 1
+  # Dataloader workers. Options: 0 for maximum Windows compatibility, or positive integer.
+  num_workers: 4
+  # Enable early stopping. Options: true, false.
+  early_stopping: false
+  # Early stopping patience in validation evaluations. Options: positive integer.
+  early_stopping_patience: 10
+  # Early stopping min mAP delta. Options: non-negative float.
+  early_stopping_min_delta: 0.001
+  # Monitor EMA for early stopping. Options: true, false.
+  early_stopping_use_ema: false
+  # RF-DETR validation metric interval. Options: 1 every epoch, 5 every 5 epochs, positive integer.
+  eval_interval: 1
+  # Max detections for evaluation metrics. Options: positive integer, commonly 300 or 500.
+  eval_max_dets: 500
+  # Log per-class validation AP in RF-DETR logs. Options: true, false.
+  log_per_class_metrics: true
+  # RF-DETR progress bar style. Options: tqdm, rich, null.
+  progress_bar: tqdm
+  # TensorBoard logging. Options: true, false.
+  tensorboard: true
+  # Weights & Biases logging. Options: true, false.
+  wandb: false
+  # MLflow logging. Options: true, false.
+  mlflow: false
+  # Project name for external loggers. Options: null or a string.
+  project: rf_detr
+  # Run name for external loggers. Options: null or a string.
+  run: null
+  # RF-DETR built-in final trainer.test. Options: false recommended because this wrapper writes its own final_test metrics, true for extra built-in test.
+  run_test: false
+  # Multi-scale training. Options: true, false.
+  multi_scale: false
+  # Expanded training scales. Options: true, false.
+  expanded_scales: false
+  # Random resize via padding. Options: true, false.
+  do_random_resize_via_padding: false
+  # Square resize divisible by 64. Options: true, false.
+  square_resize_div_64: true
+  # Drop path rate. Options: float 0.0-1.0.
+  drop_path: 0.0
+  # Group DETR groups. Options: positive integer.
+  group_detr: 13
+  # IA BCE loss. Options: true, false.
+  ia_bce_loss: true
+  # Classification loss coefficient. Options: positive float.
+  cls_loss_coef: 1.0
+  # Number of selected predictions. Options: positive integer.
+  num_select: 300
+  # PyTorch Lightning accelerator. Options: auto, cpu, gpu, mps.
+  accelerator: auto
+  # PyTorch Lightning devices. Options: 1, auto, positive integer. train.device overrides this for common cases.
+  devices: auto
+  # PyTorch Lightning strategy. Options: auto, ddp, ddp_spawn, fsdp, deepspeed.
+  strategy: auto
+  # Number of distributed nodes. Options: positive integer.
+  num_nodes: 1
+  # Sync BatchNorm for distributed training. Options: true, false.
+  sync_bn: false
+  # FP16 evaluation flag. Options: true, false.
+  fp16_eval: false
+  # Do not save weights. Options: true, false.
+  dont_save_weights: false
+  # Save augmented train/validation dataset grid images before training. Options: true, false. This writes image files to output_dir/dataset_grids.
+  save_dataset_grids: true
+  # Compute validation loss during validation. Options: true, false.
+  compute_val_loss: true
+  # Compute test loss in Lightning test_step. Options: true, false. Wrapper manual test focuses on metrics.
+  compute_test_loss: true
+  # DataLoader pin_memory. Options: null for auto, true, false.
+  pin_memory: null
+  # DataLoader persistent_workers. Options: null for auto, true, false.
+  persistent_workers: null
+  # DataLoader prefetch_factor. Options: null for auto, positive integer.
+  prefetch_factor: null
+  # Augmentation config dictionary. Options: null or RF-DETR aug_config keys.
+  aug_config: null
+  # Extra RF-DETR TrainConfig keys not listed above. Example: {freeze_encoder: true}
+  extra_train_args: {}
+
+periodic_test:
+  # Enable scheduled test-set evaluation during training. Options: true, false.
+  enabled: true
+  test_mode:
+    # Test mode. Options: full_image, sahi, class_crop.
+    mode: sahi
+  crop:
+    # Class IDs used to find class_crop windows from model predictions. Empty means all predicted classes are eligible.
+    class_ids: []
+    # Class names used to find class_crop windows from model predictions. Empty means all predicted classes are eligible.
+    class_names: []
+    # Crop source. Currently prediction is supported. Options: prediction.
+    source: prediction
+    # Confidence threshold for the first pass that finds the crop window. Options: 0.0-1.0.
+    source_conf: 0.25
+    # Fixed padding in pixels around the predicted class union box. Options: non-negative integer.
+    padding_pixels: 0
+    # Relative padding around the predicted class union box. Options: non-negative float, e.g. 0.05.
+    padding_ratio: 0.05
+    # Behavior when no crop class is predicted. Options: full_image.
+    fallback: full_image
+  sahi:
+    # Slice/window height for periodic/final sahi mode. Options: positive integer.
+    slice_height: 640
+    # Slice/window width for periodic/final sahi mode. Options: positive integer.
+    slice_width: 640
+    # Height overlap ratio between adjacent slices. Options: 0.0-0.9.
+    overlap_height_ratio: 0.2
+    # Width overlap ratio between adjacent slices. Options: 0.0-0.9.
+    overlap_width_ratio: 0.2
+    # Also run full-image prediction and merge it with slices. Options: true, false.
+    standard_prediction: true
+    # SAHI postprocess type. Options: GREEDYNMM, NMM, NMS, LSNMS. GREEDYNMM is recommended for small slices.
+    postprocess_type: GREEDYNMM
+    # SAHI match metric. Options: IOS, IOU. IOS is recommended when small slice boxes cover parts of the same object.
+    postprocess_match_metric: IOS
+    # Merge/NMS threshold after sliced prediction. Options: 0.0-1.0. Raise to merge fewer boxes; lower to merge more boxes.
+    postprocess_match_threshold: 0.5
+    # Merge/NMS class-agnostic behavior. Options: true, false.
+    postprocess_class_agnostic: false
+    # SAHI model input batch size. Options: positive integer.
+    batch_size: 1
+  visual_samples:
+    # Save sampled prediction test images with GT and predictions during periodic/final tests. Options: true, false.
+    enabled: false
+    # Maximum sampled prediction images to save; also caps error-case images by default. Options: null for all candidates, or non-negative integer.
+    max_images: 25
+    # Visual subfolder under each test output directory. Options: folder name or placeholder template.
+    output_subdir: visuals
+    # Sampling mode. Options: first, last, random.
+    sampling_mode: first
+    # Sampling seed for random mode. Options: null to use runtime.seed, or integer.
+    random_seed: null
+    # Candidate filter source. Options: ground_truth, prediction, either, both.
+    filter_source: either
+    # Candidate filter match. Options: any, all.
+    filter_match: any
+    # Candidate class IDs. Empty means no class filter.
+    class_ids: []
+    # Candidate class names. Empty means no class filter. Example: [football].
+    class_names: []
+    # Minimum GT instances required for visual candidates. Options: non-negative integer.
+    min_gt_instances: 0
+    # Minimum predictions required for visual candidates. Options: non-negative integer.
+    min_predictions: 0
+    # Minimum prediction score used only for candidate filtering. Options: null or 0.0-1.0.
+    filter_min_score: 0.25
+    # Minimum prediction score drawn in visual images. Options: null or 0.0-1.0.
+    draw_min_score: 0.25
+  # Number of model input cases per saved test_batch grid. Options: positive integer.
+  model_input_batch_size: 9
+  # Split used for scheduled and final wrapper tests. Options: test-original, test, val, valid, train.
+  split: test-original
+  # Run test every N epochs. Options: 0 disables epoch interval, positive integer enables.
+  test_interval_epochs: 10
+  # Run test every N minutes. Options: 0 disables time interval, positive float enables.
+  test_interval_minutes: 0
+  # Output directory name under the run folder for scheduled tests. Options: pure string or placeholder template.
+  # Supports the same placeholders as output.output_dir.
+  output_dir_name: periodic_tests
+  # Run final test after training finishes. Options: true, false.
+  run_final_test: true
+  # Output directory name under the run folder for final test. Options: pure string or placeholder template.
+  # Supports the same placeholders as output.output_dir.
+  final_output_dir_name: final_test
+  # Write per-class test metrics JSON/CSV. Options: true, false. true is recommended.
+  classwise: true
+  error_cases:
+    # Save target-class missed/misclassified/false-positive examples after scheduled/final tests. Options: true, false.
+    enabled: true
+    # Target category IDs. Empty means use target_class_names; if both are empty, default is football.
+    target_class_ids: []
+    # Target category names. Default: football.
+    target_class_names:
+      - football
+    # Shared maximum diagnostic images to save per test run. Options: null for all matching images, or a non-negative integer.
+    max_images: 25
+    # Backward-compatible missed-object image cap. Options: null for all matching images, or a non-negative integer.
+    max_missed_images: 25
+    # Backward-compatible false-positive image cap. Options: null for all matching images, or a non-negative integer.
+    max_false_positive_images: 25
+    # Prediction confidence threshold for error-case matching. Options: null to use model/evaluation threshold, or 0.0-1.0.
+    confidence_threshold: null
+    # IoU threshold for error-case matching. Options: null to use evaluation.match_iou_threshold, or 0.0-1.0.
+    match_iou_threshold: null
+    # Subfolder inside each test output directory. Options: folder name or placeholder template.
+    output_subdir: error_cases
+    # Image format. Options: jpg, png.
+    format: jpg
+    # JPEG quality when format=jpg. Options: 1-100.
+    jpeg_quality: 92
+  # Show a progress bar during manual scheduled/final test. Options: true, false.
+  progress_bar: true
+
+trainer:
+  # Extra PyTorch Lightning Trainer kwargs. Options: any Trainer key such as precision, fast_dev_run, limit_train_batches.
+  extra_trainer_args: {}
+
+demo:
+  # Enable small demo output mode. Options: true, false.
+  enabled: false
+  # Demo exact output directory. Options: any path. Supports the same placeholders as output.output_dir.
+  output_dir: "demo_runs/demo_{model_size}_e{epochs}_{timestamp}"
+  # Maximum epochs in demo mode. Options: positive integer.
+  max_epochs: 2
+  # Maximum micro batch size in demo mode. Options: positive integer.
+  max_batch_size: 2
+  # Maximum gradient accumulation steps in demo mode. Options: positive integer.
+  max_grad_accum_steps: 1
+  # Checkpoint interval in demo mode. Options: positive integer.
+  checkpoint_interval: 1
+  # Test interval in demo mode. Options: positive integer.
+  test_interval_epochs: 1
+  # Progress bar in demo mode. Options: tqdm, rich, null.
+  progress_bar: tqdm

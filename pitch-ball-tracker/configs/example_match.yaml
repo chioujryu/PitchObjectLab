@@ -1,0 +1,40 @@
+# Example config for a standard soccer broadcast (1080p, single GPU)
+# Usage: uv run pitch-track --input match.mp4 --config configs/example_match.yaml
+
+defaults: default
+
+model:
+  half_precision: true
+  gpus: [0]
+
+inference:
+  tiled: false
+  confidence_threshold: 0.25
+  text_prompts:
+    - "soccer ball"
+    - "ball"
+
+ball_filter:
+  min_circularity: 0.35
+  min_area_px: 60
+  max_area_px: 6000
+
+motion:
+  min_motion_px: 1.5
+  history_frames: 4
+  enabled: false
+
+tracking:
+  max_age: 25
+  min_hits: 1
+  use_reid: true
+
+reid:
+  similarity_threshold: 0.60
+  avg_window: 10
+  lost_track_buffer: 50
+
+output:
+  draw_masks: true
+  draw_trails: true
+  trail_length: 30

@@ -1,0 +1,82 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local uv/Python environments
+.venv/
+venv/
+env/
+.env
+.uv-cache/
+
+# Training outputs
+dataset_cache/
+runs/
+run/
+outputs/
+demo_runs/
+periodic_tests/
+final_test/
+prepared_dataset/
+lightning_logs/
+tensorboard/
+wandb/
+mlruns/
+
+# RF-DETR checkpoints and model exports
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.engine
+*.torchscript
+*.safetensors
+checkpoint*.pth
+last*.ckpt
+
+# Datasets and generated data
+datasets/
+dataset/
+data/
+images/
+labels/
+annotations/
+train/
+valid/
+val/
+test/
+_annotations.coco.json
+C:\\tmp/
+C:*/
+
+# Media and generated plots/grids
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.tiff
+*.webp
+*.gif
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.mpg
+*.mpeg
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+*.jsonl
+
+# Metrics/log artifacts that can be regenerated
+*.log
+metrics.csv
+test_metrics.json
+test_metrics.csv
+test_per_class_metrics.json
+test_per_class_metrics.csv

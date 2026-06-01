@@ -1,0 +1,6 @@
+interface:
+  display_name: "RF-DETR Trainer"
+  short_description: "RF-DETR config, testing, and setup workflow"
+  default_prompt: "Use $rf-detr-trainer to update the RF-DETR training or testing workflow safely."
+policy:
+  allow_implicit_invocation: true
