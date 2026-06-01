@@ -32,6 +32,41 @@ class SahiPostprocessTest(unittest.TestCase):
         self.assertEqual(merged[0]["merged_prediction_count"], 2)
         self.assertEqual(merged[0]["bbox"], [10.0, 10.0, 100.0, 100.0])
 
+    def test_greedynmm_ios_merges_transitive_small_slice_duplicates(self):
+        predictions = [
+            {"image_id": 1, "category_id": 1, "bbox": [0, 0, 60, 80], "score": 0.9},
+            {"image_id": 1, "category_id": 1, "bbox": [30, 0, 60, 80], "score": 0.85},
+            {"image_id": 1, "category_id": 1, "bbox": [60, 0, 60, 80], "score": 0.8},
+        ]
+
+        merged = test_modes.postprocess_sahi_coco_predictions(
+            predictions,
+            postprocess_type="GREEDYNMM",
+            match_metric="IOS",
+            match_threshold=0.5,
+            class_agnostic=False,
+        )
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["merged_prediction_count"], 3)
+        self.assertEqual(merged[0]["bbox"], [0.0, 0.0, 120.0, 80.0])
+
+    def test_greedynmm_ios_keeps_non_overlapping_same_class_boxes(self):
+        predictions = [
+            {"image_id": 1, "category_id": 1, "bbox": [0, 0, 50, 80], "score": 0.9},
+            {"image_id": 1, "category_id": 1, "bbox": [50, 0, 50, 80], "score": 0.8},
+        ]
+
+        merged = test_modes.postprocess_sahi_coco_predictions(
+            predictions,
+            postprocess_type="GREEDYNMM",
+            match_metric="IOS",
+            match_threshold=0.5,
+            class_agnostic=False,
+        )
+
+        self.assertEqual(len(merged), 2)
+
     def test_iou_metric_does_not_merge_low_iou_partial_slice_box(self):
         predictions = [
             {"image_id": 1, "category_id": 1, "bbox": [10, 10, 100, 100], "score": 0.9},

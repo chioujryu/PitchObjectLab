@@ -133,6 +133,10 @@ test:
     class_ids: []
     # Candidate class names. Empty means no class filter. Options: list of category names, e.g. [football].
     class_names: []
+    # Category IDs to draw in visual images. Empty means draw all GT/prediction classes. Options: list of category IDs.
+    render_class_ids: []
+    # Category names to draw in visual images. Empty means draw all GT/prediction classes. Options: list of category names.
+    render_class_names: []
     # Minimum GT instances required for candidate selection. Options: non-negative integer.
     min_gt_instances: 0
     # Minimum predictions required for candidate selection. Options: non-negative integer.
@@ -167,6 +171,10 @@ test:
     # Target category names. Default: football.
     target_class_names:
       - football
+    # Category IDs to draw in error-case images. Empty means draw all GT/prediction classes. Options: list of category IDs.
+    render_class_ids: []
+    # Category names to draw in error-case images. Empty means draw all GT/prediction classes. Options: list of category names.
+    render_class_names: []
     # Shared maximum diagnostic images to save. Options: null for all matching images, or non-negative integer.
     max_images: 25
     # Backward-compatible missed-image cap. Options: null or non-negative integer.

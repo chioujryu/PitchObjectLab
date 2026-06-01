@@ -2,6 +2,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from PIL import Image
 
@@ -105,6 +106,55 @@ class RfDetrTestDiagnosticsTest(unittest.TestCase):
             self.assertTrue((root / "out" / "error_cases" / "error_case_events.csv").exists())
             self.assertTrue((root / "out" / "error_cases" / "error_cases_metadata.json").exists())
             self.assertEqual(len([row for row in manifest if row["kind"] == "error_case"]), 3)
+
+    def test_render_visual_image_limits_drawn_classes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "image.jpg"
+            Image.new("RGB", (100, 100), color=(255, 255, 255)).save(image_path)
+            image = evaluator.ImageRecord(image_id=1, file_name=image_path.name, path=str(image_path), width=100, height=100)
+            config = {
+                "output": {
+                    "draw_ground_truth": True,
+                    "draw_predictions": True,
+                    "hide_labels": False,
+                    "hide_conf": False,
+                    "gt_color": "green",
+                    "pred_color": "red",
+                    "visual_jpeg_quality": 92,
+                }
+            }
+            annotations = [
+                {"image_id": 1, "category_id": 0, "bbox": [0, 0, 10, 10]},
+                {"image_id": 1, "category_id": 1, "bbox": [20, 20, 10, 10]},
+            ]
+            predictions = [
+                {"image_id": 1, "category_id": 0, "bbox": [0, 0, 10, 10], "score": 0.9},
+                {"image_id": 1, "category_id": 1, "bbox": [20, 20, 10, 10], "score": 0.8},
+            ]
+
+            with mock.patch.object(evaluator, "draw_labeled_box") as draw_box:
+                evaluator.render_visual_image(
+                    image=image,
+                    annotations=annotations,
+                    predictions=predictions,
+                    categories=[{"id": 0, "name": "standing_player"}, {"id": 1, "name": "football"}],
+                    config=config,
+                    output_info={"run_id": "test", "config_hash": "hash"},
+                    output_path=root / "visual.jpg",
+                    render_class_ids=[1],
+                )
+
+            self.assertEqual([call.args[2] for call in draw_box.call_args_list], ["GT football", "P football 0.80"])
+
+    def test_error_case_target_and_render_classes_are_independent(self):
+        categories = [{"id": 0, "name": "standing_player"}, {"id": 1, "name": "football"}]
+
+        target_ids = evaluator.resolve_error_case_class_ids(categories, {})
+        render_ids = evaluator.resolve_error_case_render_class_ids(categories, {"render_class_names": ["standing_player"]})
+
+        self.assertEqual(target_ids, [1])
+        self.assertEqual(render_ids, [0])
 
 
 if __name__ == "__main__":

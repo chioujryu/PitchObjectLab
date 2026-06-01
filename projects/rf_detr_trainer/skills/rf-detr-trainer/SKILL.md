@@ -27,7 +27,9 @@ Use this skill when editing `projects/rf_detr_trainer` or related object-detecti
 
 - `test_rf_detr_model.py` supports `full_image`, `sahi`, and `class_crop`.
 - Use `test.visual_samples.max_images` to limit saved prediction images.
+- Use `test.visual_samples.class_ids/class_names` only to choose visual candidate images; use `test.visual_samples.render_class_ids/render_class_names` to limit which GT/prediction classes are drawn.
 - Football diagnostics default to `test.error_cases.target_class_names: [football]`.
+- Use `test.error_cases.target_class_ids/target_class_names` to choose missed/misclassified/false-positive target classes; use `test.error_cases.render_class_ids/render_class_names` only to limit rendered GT/prediction classes. Empty render lists mean draw all classes.
 - Error-case images should include GT boxes, predicted boxes, prediction class names, and scores.
 - Diagnose three cases: target missed, target misclassified, and target false positive.
 - For RF-DETR SAHI tests, small slices can create duplicate boxes for the same object. Keep defaults at `postprocess_type: GREEDYNMM`, `postprocess_match_metric: IOS`, and `postprocess_class_agnostic: false` unless the user explicitly wants another tradeoff.

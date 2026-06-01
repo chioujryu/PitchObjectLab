@@ -156,8 +156,18 @@ class RFDETRModelSizeTest(unittest.TestCase):
                     "split": "valid",
                     "test_mode": {"mode": "class_crop"},
                     "crop": {"class_names": ["ball"], "source_conf": 0.2},
+                    "visual_samples": {
+                        "enabled": True,
+                        "class_names": ["player"],
+                        "render_class_names": ["football"],
+                    },
                     "classwise": False,
-                    "error_cases": {"enabled": True, "class_ids": [0], "max_missed_images": 2},
+                    "error_cases": {
+                        "enabled": True,
+                        "class_ids": [0],
+                        "render_class_names": ["player", "football"],
+                        "max_missed_images": 2,
+                    },
                 },
             }
             evaluator_config = trainer.build_rfdetr_evaluator_config(
@@ -173,7 +183,10 @@ class RFDETRModelSizeTest(unittest.TestCase):
             self.assertEqual(evaluator_config["crop"]["class_names"], ["ball"])
             self.assertFalse(evaluator_config["evaluation"]["classwise"])
             self.assertEqual(evaluator_config["evaluation"]["max_detections"], [1, 10, 777])
+            self.assertEqual(evaluator_config["output"]["visual_filter_class_names"], ["player"])
+            self.assertEqual(evaluator_config["output"]["visual_render_class_names"], ["football"])
             self.assertTrue(evaluator_config["output"]["error_cases"]["enabled"])
+            self.assertEqual(evaluator_config["output"]["error_cases"]["render_class_names"], ["player", "football"])
             self.assertEqual(evaluator_config["output"]["error_cases"]["max_missed_images"], 2)
 
     def test_rfdetr_evaluator_auto_maps_contiguous_labels_to_coco_category_ids(self):

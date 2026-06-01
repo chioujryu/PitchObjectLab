@@ -275,6 +275,10 @@ periodic_test:
     class_ids: []
     # Candidate class names. Empty means no class filter. Example: [football].
     class_names: []
+    # Category IDs to draw in visual images. Empty means draw all GT/prediction classes. Options: list of category IDs.
+    render_class_ids: []
+    # Category names to draw in visual images. Empty means draw all GT/prediction classes. Example: [football].
+    render_class_names: []
     # Minimum GT instances required for visual candidates. Options: non-negative integer.
     min_gt_instances: 0
     # Minimum predictions required for visual candidates. Options: non-negative integer.
@@ -309,6 +313,10 @@ periodic_test:
     # Target category names. Default: football.
     target_class_names:
       - football
+    # Category IDs to draw in error-case images. Empty means draw all GT/prediction classes. Options: list of category IDs.
+    render_class_ids: []
+    # Category names to draw in error-case images. Empty means draw all GT/prediction classes. Example: [football].
+    render_class_names: []
     # Shared maximum diagnostic images to save per test run. Options: null for all matching images, or a non-negative integer.
     max_images: 25
     # Backward-compatible missed-object image cap. Options: null for all matching images, or a non-negative integer.

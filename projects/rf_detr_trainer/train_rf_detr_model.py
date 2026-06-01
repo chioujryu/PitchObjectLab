@@ -2620,6 +2620,8 @@ def build_rfdetr_evaluator_config(
             "visual_filter_match": visual_cfg.get("filter_match", "any"),
             "visual_filter_class_ids": visual_cfg.get("class_ids", []),
             "visual_filter_class_names": visual_cfg.get("class_names", []),
+            "visual_render_class_ids": visual_cfg.get("render_class_ids", []),
+            "visual_render_class_names": visual_cfg.get("render_class_names", []),
             "visual_min_gt_instances": visual_cfg.get("min_gt_instances", 0),
             "visual_min_predictions": visual_cfg.get("min_predictions", 0),
             "visual_filter_min_score": visual_cfg.get("filter_min_score"),

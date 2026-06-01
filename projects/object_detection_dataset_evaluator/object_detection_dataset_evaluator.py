@@ -93,6 +93,7 @@ IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 TIMESTAMP_FORMAT = "%Y%m%d%H%M%S"
 TEMPLATE_PLACEHOLDER_RE = re.compile(r"\{([A-Za-z0-9_.-]+)\}")
 BACKGROUND_LABEL = "__background__"
+FOOTBALL_ALIASES = ("football", "soccer_ball", "soccer ball", "ball", "足球")
 VISUAL_COLOR_NAMES = {
     "red": (255, 56, 56),
     "green": (20, 184, 116),
@@ -811,31 +812,75 @@ def category_maps(categories: Sequence[Mapping[str, Any]]) -> Tuple[Dict[int, st
     return id_to_name, name_to_id
 
 
-def resolve_visual_filter_class_ids(categories: Sequence[Mapping[str, Any]], output_cfg: Mapping[str, Any]) -> List[int]:
-    """Resolve visual class filters from ids and names."""
+def resolve_category_class_ids(
+    categories: Sequence[Mapping[str, Any]],
+    class_ids: Any,
+    class_names: Any,
+    context: str,
+    default_names: Optional[Sequence[str]] = None,
+) -> List[int]:
+    """Resolve category ids from explicit ids/names with optional football-friendly defaults."""
     id_to_name, name_to_id = category_maps(categories)
     selected: List[int] = []
     seen = set()
 
-    for value in config_list(output_cfg.get("visual_filter_class_ids")):
+    for value in config_list(class_ids):
         category_id = int(value)
         if category_id not in id_to_name:
-            raise ValueError(f"Unknown visual filter category id: {category_id}")
+            raise ValueError(f"Unknown {context} category id: {category_id}")
         if category_id not in seen:
             selected.append(category_id)
             seen.add(category_id)
 
-    for value in config_list(output_cfg.get("visual_filter_class_names")):
+    names = config_list(class_names)
+    if not selected and not names and default_names:
+        names = list(default_names)
+    for value in names:
         name = str(value).strip()
         category_id = name_to_id.get(name.casefold())
+        if category_id is None and name.casefold() == "football":
+            for alias in FOOTBALL_ALIASES:
+                category_id = name_to_id.get(alias.casefold())
+                if category_id is not None:
+                    break
         if category_id is None:
             available = ", ".join(id_to_name.values())
-            raise ValueError(f"Unknown visual filter category name: {name!r}. Available names: {available}")
+            raise ValueError(f"Unknown {context} category name: {name!r}. Available names: {available}")
         if category_id not in seen:
             selected.append(category_id)
             seen.add(category_id)
 
     return selected
+
+
+def resolve_visual_filter_class_ids(categories: Sequence[Mapping[str, Any]], output_cfg: Mapping[str, Any]) -> List[int]:
+    """Resolve visual class filters from ids and names."""
+    return resolve_category_class_ids(
+        categories,
+        output_cfg.get("visual_filter_class_ids"),
+        output_cfg.get("visual_filter_class_names"),
+        "visual filter",
+    )
+
+
+def resolve_visual_render_class_ids(categories: Sequence[Mapping[str, Any]], output_cfg: Mapping[str, Any]) -> List[int]:
+    """Resolve classes drawn in visual sample images; empty means draw every class."""
+    return resolve_category_class_ids(
+        categories,
+        output_cfg.get("visual_render_class_ids"),
+        output_cfg.get("visual_render_class_names"),
+        "visual render",
+    )
+
+
+def resolve_error_case_render_class_ids(categories: Sequence[Mapping[str, Any]], error_cfg: Mapping[str, Any]) -> List[int]:
+    """Resolve classes drawn in error-case images; empty means draw every class."""
+    return resolve_category_class_ids(
+        categories,
+        error_cfg.get("render_class_ids"),
+        error_cfg.get("render_class_names"),
+        "error-case render",
+    )
 
 
 def build_category_presence_index(
@@ -1074,10 +1119,12 @@ def render_visual_image(
     config: Mapping[str, Any],
     output_info: Mapping[str, Any],
     output_path: Path,
+    render_class_ids: Optional[Sequence[int]] = None,
 ) -> None:
     """Render GT and prediction boxes for one sampled image."""
     output_cfg = config["output"]
     id_to_name, _ = category_maps(categories)
+    render_ids = set(int(category_id) for category_id in (render_class_ids or []))
     gt_color = parse_rgb_color(output_cfg.get("gt_color"), VISUAL_COLOR_NAMES["green"])
     pred_color = parse_rgb_color(output_cfg.get("pred_color"), VISUAL_COLOR_NAMES["red"])
     line_width = int(output_cfg.get("rect_th", 2))
@@ -1100,6 +1147,8 @@ def render_visual_image(
             return
         for annotation in annotations:
             category_id = int(annotation["category_id"])
+            if render_ids and category_id not in render_ids:
+                continue
             label = "" if hide_labels else f"GT {id_to_name.get(category_id, category_id)}"
             draw_labeled_box(drawer, annotation.get("bbox", [0, 0, 0, 0]), label, gt_color, line_width, font, size)
 
@@ -1111,6 +1160,8 @@ def render_visual_image(
             if draw_min_score is not None and score < draw_min_score:
                 continue
             category_id = int(prediction["category_id"])
+            if render_ids and category_id not in render_ids:
+                continue
             label = ""
             if not hide_labels:
                 label = f"P {id_to_name.get(category_id, category_id)}"
@@ -1146,6 +1197,9 @@ def render_visual_outputs(
     visuals_dir = output_dir / str(output_cfg.get("visual_output_subdir", "visuals"))
     visuals_dir.mkdir(parents=True, exist_ok=True)
     visual_format = normalize_visual_format(output_cfg.get("visual_format", "jpg"))
+    render_class_ids = resolve_visual_render_class_ids(dataset.categories, output_cfg)
+    id_to_name, _ = category_maps(dataset.categories)
+    render_class_names = [id_to_name.get(int(category_id), str(category_id)) for category_id in render_class_ids]
 
     annotations_by_image: Dict[int, List[Mapping[str, Any]]] = {}
     for annotation in dataset.annotations:
@@ -1179,6 +1233,7 @@ def render_visual_outputs(
             config=config,
             output_info=output_info,
             output_path=visual_path,
+            render_class_ids=render_class_ids,
         )
         detail = selection_info.get("candidate_details", {}).get(str(image_id), {})
         row = {
@@ -1194,6 +1249,8 @@ def render_visual_outputs(
             "filter_source": selection_info["filter_source"],
             "filter_class_ids": json.dumps(selection_info["filter_class_ids"]),
             "filter_class_names": json.dumps(selection_info["filter_class_names"]),
+            "render_class_ids": json.dumps([int(category_id) for category_id in render_class_ids]),
+            "render_class_names": json.dumps(render_class_names, ensure_ascii=False),
             "visual_random_seed": selection_info["visual_random_seed"],
         }
         visual_rows.append(row)
@@ -1205,7 +1262,11 @@ def render_visual_outputs(
         {
             "metadata": output_info,
             "config": config,
-            "selection": {key: value for key, value in selection_info.items() if key != "candidate_details"},
+            "selection": {
+                **{key: value for key, value in selection_info.items() if key != "candidate_details"},
+                "render_class_ids": [int(category_id) for category_id in render_class_ids],
+                "render_class_names": render_class_names,
+            },
             "images": visual_rows,
         },
     )
@@ -1215,37 +1276,13 @@ def render_visual_outputs(
 
 def resolve_error_case_class_ids(categories: Sequence[Mapping[str, Any]], error_cfg: Mapping[str, Any]) -> List[int]:
     """Resolve classes targeted by error-case diagnostics; default to football."""
-    id_to_name, name_to_id = category_maps(categories)
-    selected: List[int] = []
-    seen = set()
-
-    for value in config_list(error_cfg.get("target_class_ids", error_cfg.get("class_ids"))):
-        category_id = int(value)
-        if category_id not in id_to_name:
-            raise ValueError(f"Unknown error-case category id: {category_id}")
-        if category_id not in seen:
-            selected.append(category_id)
-            seen.add(category_id)
-
-    names = config_list(error_cfg.get("target_class_names", error_cfg.get("class_names")))
-    if not selected and not names:
-        names = ["football"]
-    football_aliases = ("football", "soccer_ball", "soccer ball", "ball", "足球")
-    for value in names:
-        name = str(value).strip()
-        category_id = name_to_id.get(name.casefold())
-        if category_id is None and name.casefold() == "football":
-            for alias in football_aliases:
-                category_id = name_to_id.get(alias.casefold())
-                if category_id is not None:
-                    break
-        if category_id is None:
-            available = ", ".join(id_to_name.values())
-            raise ValueError(f"Unknown error-case category name: {name!r}. Available names: {available}")
-        if category_id not in seen:
-            selected.append(category_id)
-            seen.add(category_id)
-    return selected
+    return resolve_category_class_ids(
+        categories,
+        error_cfg.get("target_class_ids", error_cfg.get("class_ids")),
+        error_cfg.get("target_class_names", error_cfg.get("class_names")),
+        "error-case",
+        default_names=["football"],
+    )
 
 
 def error_case_max_images(error_cfg: Mapping[str, Any]) -> int:
@@ -1449,6 +1486,14 @@ def render_error_case_outputs(
     case_dir = output_dir / str(error_cfg.get("output_subdir", "error_cases"))
     case_dir.mkdir(parents=True, exist_ok=True)
     case_format = normalize_visual_format(error_cfg.get("format", output_cfg.get("visual_format", "jpg")))
+    render_class_ids = resolve_error_case_render_class_ids(dataset.categories, error_cfg)
+    id_to_name, _ = category_maps(dataset.categories)
+    render_class_names = [id_to_name.get(int(category_id), str(category_id)) for category_id in render_class_ids]
+    selection_info = {
+        **selection_info,
+        "render_class_ids": [int(category_id) for category_id in render_class_ids],
+        "render_class_names": render_class_names,
+    }
 
     annotations_by_image: Dict[int, List[Mapping[str, Any]]] = {}
     for annotation in dataset.annotations:
@@ -1489,6 +1534,7 @@ def render_error_case_outputs(
             config=config,
             output_info=output_info,
             output_path=case_path,
+            render_class_ids=render_class_ids,
         )
         case_types = sorted({str(event["case_type"]) for event in image_events})
         row = {
@@ -1499,6 +1545,7 @@ def render_error_case_outputs(
             "case_types": json.dumps(case_types, ensure_ascii=False),
             "event_count": len(image_events),
             "target_class_names": json.dumps(selection_info["target_class_names"], ensure_ascii=False),
+            "render_class_names": json.dumps(render_class_names, ensure_ascii=False),
         }
         image_rows.append(row)
         manifest.append({"path": str(case_path), "kind": "error_case", "description": "Rendered target-class GT/prediction diagnostic image.", "config_hash": output_info["config_hash"]})
@@ -3461,6 +3508,8 @@ def normalize_config(config: MutableMapping[str, Any], source_config: Path) -> T
     output_cfg.setdefault("visual_sample_order", "sample")
     output_cfg.setdefault("visual_filter_source", "ground_truth")
     output_cfg.setdefault("visual_filter_match", "any")
+    output_cfg.setdefault("visual_render_class_ids", [])
+    output_cfg.setdefault("visual_render_class_names", [])
     output_cfg.setdefault("draw_ground_truth", True)
     output_cfg.setdefault("draw_predictions", True)
     output_cfg.setdefault("gt_color", "green")
@@ -3475,6 +3524,8 @@ def normalize_config(config: MutableMapping[str, Any], source_config: Path) -> T
         for key in ("target_class_ids", "target_class_names", "class_ids", "class_names")
     )
     output_cfg["error_cases"].setdefault("target_class_names", [] if has_error_class_filter else ["football"])
+    output_cfg["error_cases"].setdefault("render_class_ids", [])
+    output_cfg["error_cases"].setdefault("render_class_names", [])
     output_cfg["error_cases"].setdefault("output_subdir", "error_cases")
     output_cfg["error_cases"].setdefault("max_images", None)
     output_cfg["error_cases"].setdefault("format", output_cfg.get("visual_format", "jpg"))

@@ -14,6 +14,8 @@ Usage:
 Notes:
     - The config controls model, dataset, output, visual sample count, and error-case diagnostics.
     - test.visual_samples.max_images limits saved prediction images and, by default, error-case images.
+    - test.visual_samples.render_class_names/render_class_ids and test.error_cases.render_class_names/render_class_ids
+      independently control which classes are drawn in visual and error-case images.
     - test.error_cases defaults to football diagnostics and writes GT/prediction boxes with scores.
     - Before writing images, metrics, or cache files, the script prints a resource estimate and asks for confirmation unless --yes is used.
 """

@@ -161,6 +161,16 @@ def merge_coco_prediction_cluster(cluster: Sequence[Mapping[str, Any]]) -> Dict[
     return best
 
 
+def coco_box_matches_any_cluster_box(
+    candidate_box: Sequence[float],
+    cluster_boxes: Sequence[Sequence[float]],
+    match_metric: str,
+    match_threshold: float,
+) -> bool:
+    """Return True when a candidate overlaps any box already assigned to a cluster."""
+    return any(bbox_match_score_xyxy(candidate_box, cluster_box, match_metric) >= match_threshold for cluster_box in cluster_boxes)
+
+
 def nms_coco_predictions(
     predictions: Sequence[Mapping[str, Any]],
     iou_threshold: float = 0.5,
@@ -217,19 +227,26 @@ def postprocess_sahi_coco_predictions(
         pending = sorted(group, key=lambda item: float(item.get("score", 0.0)), reverse=True)
         while pending:
             seed = pending.pop(0)
-            seed_box = coco_xywh_to_xyxy(seed.get("bbox", [0, 0, 0, 0]))
             matched: List[Mapping[str, Any]] = [seed]
-            remaining: List[Mapping[str, Any]] = []
-            for candidate in pending:
-                candidate_box = coco_xywh_to_xyxy(candidate.get("bbox", [0, 0, 0, 0]))
-                score = bbox_match_score_xyxy(seed_box, candidate_box, match_metric)
-                if score >= threshold:
-                    if merge_matching:
-                        matched.append(candidate)
-                else:
-                    remaining.append(candidate)
-            kept.append(merge_coco_prediction_cluster(matched) if merge_matching else dict(seed))
-            pending = remaining
+            cluster_boxes: List[Tuple[float, float, float, float]] = [coco_xywh_to_xyxy(seed.get("bbox", [0, 0, 0, 0]))]
+            expanded = True
+            while expanded:
+                expanded = False
+                remaining: List[Mapping[str, Any]] = []
+                for candidate in pending:
+                    candidate_box = coco_xywh_to_xyxy(candidate.get("bbox", [0, 0, 0, 0]))
+                    if coco_box_matches_any_cluster_box(candidate_box, cluster_boxes, match_metric, threshold):
+                        cluster_boxes.append(candidate_box)
+                        expanded = True
+                        if merge_matching:
+                            matched.append(candidate)
+                    else:
+                        remaining.append(candidate)
+                pending = remaining
+            if merge_matching:
+                kept.append(merge_coco_prediction_cluster(matched))
+            else:
+                kept.append(dict(seed))
     kept.sort(key=lambda item: (int(item.get("image_id", 0)), int(item.get("category_id", 0)), -float(item.get("score", 0.0))))
     return kept
 

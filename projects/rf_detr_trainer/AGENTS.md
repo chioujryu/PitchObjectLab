@@ -12,4 +12,6 @@ Apply these rules when changing this project.
 8. When adding packages or model/dataset downloads, first check the public IP region. Use China-friendly mirrors for China/HK/MO/TW regions and official sources elsewhere.
 9. Prefer existing project helpers and vectorized data structures for speed. Avoid unrelated refactors and preserve user-created files.
 10. For SAHI sliced RF-DETR tests, prevent duplicate boxes from small slices with same-class `GREEDYNMM` + `IOS` postprocessing by default. Do not use class-agnostic merging unless the config explicitly asks for it.
-11. Keep large datasets, caches, checkpoints, generated media, and run outputs out of git via `.gitignore`.
+11. Standalone and scheduled RF-DETR test diagnostics must keep visual sample candidate filters separate from rendered-class filters. `visual_samples.render_class_ids/render_class_names` controls rendered classes for sampled visuals, while `error_cases.render_class_ids/render_class_names` controls rendered classes for error-case images.
+12. Error-case diagnostics must default to football when no target class is configured, and must render both ground-truth and prediction boxes with prediction scores for missed, misclassified, and false-positive target-class cases.
+13. Keep large datasets, caches, checkpoints, generated media, and run outputs out of git via `.gitignore`.
