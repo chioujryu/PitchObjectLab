@@ -10,12 +10,12 @@ import re
 import shutil
 import subprocess
 import sys
-import time
+from collections.abc import Mapping, MutableMapping, Sequence
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from string import Formatter
-from typing import Any, Mapping, MutableMapping, Sequence
+from typing import Any
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 

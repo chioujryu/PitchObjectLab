@@ -1,4 +1,4 @@
-from typing import Dict, List, Tuple
+from __future__ import annotations
 
 import cv2
 import numpy as np
@@ -13,7 +13,7 @@ class LiteRT_model:
         self,
         model_path: str,
         n_outputs: int,
-        conf_thresh: float | List[float] = 0.5,
+        conf_thresh: float | list[float] = 0.5,
         binarize_masks: bool = True,
         mask_threshold: float = 0.5,
         rect: bool = False,
@@ -71,14 +71,10 @@ class LiteRT_model:
     def process_boxes(boxes, processed_sizes, orig_sizes, keep_ratio):
         final_boxes = torch.zeros_like(boxes)
         for idx in range(boxes.shape[0]):
-            final_boxes[idx] = norm_xywh_to_abs_xyxy(
-                boxes[idx], processed_sizes[idx][0], processed_sizes[idx][1]
-            )
+            final_boxes[idx] = norm_xywh_to_abs_xyxy(boxes[idx], processed_sizes[idx][0], processed_sizes[idx][1])
         for i in range(len(orig_sizes)):
             if keep_ratio:
-                final_boxes[i] = scale_boxes_ratio_kept(
-                    final_boxes[i], processed_sizes[i], orig_sizes[i]
-                )
+                final_boxes[i] = scale_boxes_ratio_kept(final_boxes[i], processed_sizes[i], orig_sizes[i])
             else:
                 final_boxes[i] = scale_boxes(final_boxes[i], orig_sizes[i], processed_sizes[i])
         return final_boxes
@@ -89,12 +85,12 @@ class LiteRT_model:
         processed_size,
         orig_sizes,
         keep_ratio,
-    ) -> List[torch.Tensor]:
+    ) -> list[torch.Tensor]:
         single = pred_masks.dim() == 3
         if single:
             pred_masks = pred_masks.unsqueeze(0)
 
-        B, Q, Hm, Wm = pred_masks.shape
+        B, _Q, Hm, Wm = pred_masks.shape
         proc_h, proc_w = int(processed_size[0]), int(processed_size[1])
 
         out = []
@@ -120,25 +116,19 @@ class LiteRT_model:
 
         return [out[0]] if single else out
 
-    def _compute_nearest_size(self, shape, target_size, stride=32) -> Tuple[int, int]:
+    def _compute_nearest_size(self, shape, target_size, stride=32) -> tuple[int, int]:
         scale = target_size / max(shape)
-        new_shape = [int(round(dim * scale)) for dim in shape]
+        new_shape = [round(dim * scale) for dim in shape]
         return [max(stride, int(np.ceil(dim / stride) * stride)) for dim in new_shape]
 
     def _preprocess(self, img: NDArray, stride: int = 32, bgr: bool = True) -> NDArray:
         if not self.keep_ratio:
-            img = cv2.resize(
-                img, (self.input_size[1], self.input_size[0]), interpolation=cv2.INTER_LINEAR
-            )
+            img = cv2.resize(img, (self.input_size[1], self.input_size[0]), interpolation=cv2.INTER_LINEAR)
         elif self.rect:
-            target_height, target_width = self._compute_nearest_size(
-                img.shape[:2], max(*self.input_size)
-            )
+            target_height, target_width = self._compute_nearest_size(img.shape[:2], max(*self.input_size))
             img = letterbox(img, (target_height, target_width), stride=stride, auto=False)[0]
         else:
-            img = letterbox(
-                img, (self.input_size[0], self.input_size[1]), stride=stride, auto=False
-            )[0]
+            img = letterbox(img, (self.input_size[0], self.input_size[1]), stride=stride, auto=False)[0]
 
         # 3ch BGR (cv2.imread) needs a swap; 3ch .npy is RGB already; >3ch is RGB+extras.
         if self.channels == 3 and bgr:
@@ -165,12 +155,10 @@ class LiteRT_model:
             for idx, image in enumerate(inputs):
                 processed_inputs[idx] = self._preprocess(image, bgr=bgr)
                 original_sizes.append((image.shape[0], image.shape[1]))
-                processed_sizes.append(
-                    (processed_inputs[idx].shape[1], processed_inputs[idx].shape[2])
-                )
+                processed_sizes.append((processed_inputs[idx].shape[1], processed_inputs[idx].shape[2]))
         return processed_inputs, processed_sizes, original_sizes
 
-    def _predict(self, img: NDArray) -> List[NDArray]:
+    def _predict(self, img: NDArray) -> list[NDArray]:
         self.interpreter.set_tensor(self.input_details[0]["index"], img)
         self.interpreter.invoke()
         outputs = []
@@ -180,12 +168,12 @@ class LiteRT_model:
 
     def _postprocess(
         self,
-        outputs: List[NDArray],
-        processed_sizes: List[Tuple[int, int]],
-        original_sizes: List[Tuple[int, int]],
+        outputs: list[NDArray],
+        processed_sizes: list[tuple[int, int]],
+        original_sizes: list[tuple[int, int]],
         num_top_queries=300,
         use_focal_loss=True,
-    ) -> List[Dict[str, torch.Tensor]]:
+    ) -> list[dict[str, torch.Tensor]]:
         # Output order from _LiteRTRawAdapter: logits, boxes, [masks]
         # TFLite output order may differ from the export order, match by shape
         tensors = [torch.from_numpy(o) for o in outputs]
@@ -257,19 +245,12 @@ class LiteRT_model:
             results.append(out)
         return results
 
-    def __call__(
-        self, inputs: NDArray[np.uint8], bgr: bool = True
-    ) -> List[Dict[str, torch.Tensor]]:
-        """
-        Input image as ndarray (BGR, HWC) or BHWC. Pass ``bgr=False`` for
-        3-channel inputs already in RGB order (e.g., ``.npy`` read via
-        ``read_image_hwc``); ignored for >3 channels.
-        Output:
-            List of batch size length. Each element is a dict {"labels", "boxes", "scores"}
-            labels: torch.Tensor of shape (N,), dtype int64
-            boxes: torch.Tensor of shape (N, 4), dtype float32, abs values
-            scores: torch.Tensor of shape (N,), dtype float32
-            masks: torch.Tensor of shape (N, H, W), dtype float32. N = number of objects
+    def __call__(self, inputs: NDArray[np.uint8], bgr: bool = True) -> list[dict[str, torch.Tensor]]:
+        """Input image as ndarray (BGR, HWC) or BHWC. Pass ``bgr=False`` for 3-channel inputs already in RGB order
+        (e.g., ``.npy`` read via ``read_image_hwc``); ignored for >3 channels. Output: List of batch size
+        length. Each element is a dict {"labels", "boxes", "scores"} labels: torch.Tensor of shape (N,), dtype
+        int64 boxes: torch.Tensor of shape (N, 4), dtype float32, abs values scores: torch.Tensor of shape (N,),
+        dtype float32 masks: torch.Tensor of shape (N, H, W), dtype float32. N = number of objects.
         """
         processed_inputs, processed_sizes, original_sizes = self._prepare_inputs(inputs, bgr=bgr)
         preds = self._predict(processed_inputs)
@@ -296,7 +277,7 @@ def letterbox(
     if not scaleup:
         r = min(r, 1.0)
 
-    new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
+    new_unpad = round(shape[1] * r), round(shape[0] * r)
     dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]
     if auto:
         dw, dh = np.mod(dw, stride), np.mod(dh, stride)
@@ -355,9 +336,7 @@ def scale_boxes(boxes, orig_shape, resized_shape):
     return boxes
 
 
-def norm_xywh_to_abs_xyxy(
-    boxes: torch.Tensor, height: int, width: int, to_round=True
-) -> torch.Tensor:
+def norm_xywh_to_abs_xyxy(boxes: torch.Tensor, height: int, width: int, to_round=True) -> torch.Tensor:
     x_center = boxes[:, 0] * width
     y_center = boxes[:, 1] * height
     box_width = boxes[:, 2] * width
@@ -382,7 +361,7 @@ def norm_xywh_to_abs_xyxy(
 
 
 def cleanup_masks(masks: torch.Tensor, boxes: torch.Tensor) -> torch.Tensor:
-    N, H, W = masks.shape
+    _N, H, W = masks.shape
     device = masks.device
     dtype = masks.dtype
 
@@ -390,11 +369,6 @@ def cleanup_masks(masks: torch.Tensor, boxes: torch.Tensor) -> torch.Tensor:
     xs = torch.arange(W, device=device)[None, None, :]
 
     x1, y1, x2, y2 = boxes.T
-    inside = (
-        (xs >= x1[:, None, None])
-        & (xs < x2[:, None, None])
-        & (ys >= y1[:, None, None])
-        & (ys < y2[:, None, None])
-    )
+    inside = (xs >= x1[:, None, None]) & (xs < x2[:, None, None]) & (ys >= y1[:, None, None]) & (ys < y2[:, None, None])
     masks = masks * inside.to(dtype)
     return masks

@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import torch
@@ -24,11 +23,9 @@ from pitch_ball_tracker.utils.visualization import Visualizer
 
 
 class BallTrackerPipeline:
-    """
-    End-to-end ball-tracking pipeline.
+    """End-to-end ball-tracking pipeline.
 
-    Frame-level data flow:
-      VideoReader
+    Frame-level data flow: VideoReader
         → FieldFilter.update()          (refresh field mask every 30 frames)
         → MotionFilter.update_frame()   (push frame into optical-flow buffer)
         → [SAM3Segmentor | TiledInference].segment()
@@ -38,14 +35,14 @@ class BallTrackerPipeline:
         → Visualizer.draw()
         → VideoWriter.write()
         → track records accumulated
-      → save_tracks()
+    → save_tracks()
     """
 
     def __init__(self, cfg: DictConfig) -> None:
         self.cfg = cfg
         self._device = self._resolve_device()
 
-        logger.info("Initialising pipeline components …")
+        logger.info("Initializing pipeline components …")
         self._segmentor = SAM3Segmentor(cfg)
         self._tiled = TiledInference(self._segmentor, cfg) if cfg.inference.tiled else None
         self._ball_filter = BallFilter(cfg)
@@ -60,9 +57,7 @@ class BallTrackerPipeline:
     # ------------------------------------------------------------------
 
     def run(self, video_path: str | Path, output_dir: str | Path) -> None:
-        """
-        Process an entire video file and write outputs to `output_dir`.
-        """
+        """Process an entire video file and write outputs to `output_dir`."""
         video_path = Path(video_path)
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -72,7 +67,7 @@ class BallTrackerPipeline:
         fps = reader.fps
         w, h = reader.width, reader.height
 
-        writer: Optional[VideoWriter] = None
+        writer: VideoWriter | None = None
         if self.cfg.output.save_video:
             out_video = output_dir / f"{stem}_tracked.mp4"
             writer = VideoWriter(out_video, fps, w, h, codec=self.cfg.output.video_codec)
@@ -93,12 +88,14 @@ class BallTrackerPipeline:
                 # Collect track records
                 for t in confirmed:
                     box = t.get_bbox()
-                    track_records.append({
-                        "frame": frame_idx,
-                        "track_id": t.track_id,
-                        "bbox_xyxy": box.tolist(),
-                        "score": float(t.score),
-                    })
+                    track_records.append(
+                        {
+                            "frame": frame_idx,
+                            "track_id": t.track_id,
+                            "bbox_xyxy": box.tolist(),
+                            "score": float(t.score),
+                        }
+                    )
 
                 if writer is not None:
                     field_mask = self._field_filter._mask
@@ -113,10 +110,7 @@ class BallTrackerPipeline:
                 writer.release()
 
         elapsed = time.perf_counter() - t0
-        logger.info(
-            f"Done: {frame_idx + 1} frames in {elapsed:.1f}s "
-            f"({(frame_idx + 1) / elapsed:.1f} fps)"
-        )
+        logger.info(f"Done: {frame_idx + 1} frames in {elapsed:.1f}s ({(frame_idx + 1) / elapsed:.1f} fps)")
 
         if self.cfg.output.save_tracks:
             self._save_tracks(track_records, output_dir, stem)
@@ -137,11 +131,7 @@ class BallTrackerPipeline:
         self._motion_filter.update_frame(frame)
 
         # 3. Segmentation (tiled or standard)
-        seg_result = (
-            self._tiled.segment(frame)
-            if self._tiled is not None
-            else self._segmentor.segment(frame)
-        )
+        seg_result = self._tiled.segment(frame) if self._tiled is not None else self._segmentor.segment(frame)
 
         if frame_idx < 10 or frame_idx % 30 == 0:
             logger.debug(
@@ -169,7 +159,7 @@ class BallTrackerPipeline:
 
         return confirmed
 
-    def _build_reid(self) -> Optional[BallReIDExtractor]:
+    def _build_reid(self) -> BallReIDExtractor | None:
         if not self.cfg.tracking.use_reid:
             return None
         return BallReIDExtractor(

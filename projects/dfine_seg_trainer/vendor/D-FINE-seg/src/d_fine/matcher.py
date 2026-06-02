@@ -5,8 +5,6 @@ Modules to compute the matching cost and solve the corresponding LSAP.
 Copyright (c) 2024 The D-FINE Authors All Rights Reserved.
 """
 
-from typing import Dict
-
 import numpy as np
 import torch
 import torch.nn as nn
@@ -17,8 +15,7 @@ from .arch.utils import box_cxcywh_to_xyxy, generalized_box_iou
 
 
 def dice_cost(pred_masks: torch.Tensor, gt_masks: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """
-    Compute pairwise Dice cost between predicted and GT masks.
+    """Compute pairwise Dice cost between predicted and GT masks.
 
     Args:
         pred_masks: [num_queries, H, W] sigmoid probabilities
@@ -42,8 +39,7 @@ def dice_cost(pred_masks: torch.Tensor, gt_masks: torch.Tensor, eps: float = 1e-
 def sigmoid_focal_cost(
     pred_logits: torch.Tensor, gt_labels: torch.Tensor, alpha: float = 0.25, gamma: float = 2.0
 ) -> torch.Tensor:
-    """
-    Compute sigmoid focal cost for masks (pixel-wise).
+    """Compute sigmoid focal cost for masks (pixel-wise).
 
     Args:
         pred_logits: [num_queries, H*W] mask logits
@@ -64,19 +60,17 @@ def sigmoid_focal_cost(
 
     # Cost per pair: mean over pixels
     # pos_cost: [Q, HW], gt: [T, HW]
-    cost = torch.einsum("qp,tp->qt", pos_cost, gt_labels) + torch.einsum(
-        "qp,tp->qt", neg_cost, (1 - gt_labels)
-    )
+    cost = torch.einsum("qp,tp->qt", pos_cost, gt_labels) + torch.einsum("qp,tp->qt", neg_cost, (1 - gt_labels))
 
     return cost / pred_logits.shape[1]  # normalize by number of pixels
 
 
 class HungarianMatcher(nn.Module):
-    """This class computes an assignment between the targets and the predictions of the network
+    """This class computes an assignment between the targets and the predictions of the network.
 
-    For efficiency reasons, the targets don't include the no_object. Because of this, in general,
-    there are more predictions than targets. In this case, we do a 1-to-1 matching of the best predictions,
-    while the others are un-matched (and thus treated as non-objects).
+    For efficiency reasons, the targets don't include the no_object. Because of this, in general, there are more
+    predictions than targets. In this case, we do a 1-to-1 matching of the best predictions, while the others are
+    un-matched (and thus treated as non-objects).
     """
 
     __share__ = [
@@ -84,7 +78,7 @@ class HungarianMatcher(nn.Module):
     ]
 
     def __init__(self, weight_dict, use_focal_loss=False, alpha=0.25, gamma=2.0):
-        """Creates the matcher
+        """Creates the matcher.
 
         Params:
             cost_class: This is the relative weight of the classification error in the matching cost
@@ -103,13 +97,11 @@ class HungarianMatcher(nn.Module):
         self.alpha = alpha
         self.gamma = gamma
 
-        assert self.cost_class != 0 or self.cost_bbox != 0 or self.cost_giou != 0, (
-            "all costs cant be 0"
-        )
+        assert self.cost_class != 0 or self.cost_bbox != 0 or self.cost_giou != 0, "all costs can't be 0"
 
     @torch.no_grad()
-    def forward(self, outputs: Dict[str, torch.Tensor], targets, return_topk=False):
-        """Performs the matching
+    def forward(self, outputs: dict[str, torch.Tensor], targets, return_topk=False):
+        """Performs the matching.
 
         Params:
             outputs: This is a dict that contains at least these entries:
@@ -134,9 +126,7 @@ class HungarianMatcher(nn.Module):
         if self.use_focal_loss:
             out_prob = F.sigmoid(outputs["pred_logits"].flatten(0, 1))
         else:
-            out_prob = (
-                outputs["pred_logits"].flatten(0, 1).softmax(-1)
-            )  # [batch_size * num_queries, num_classes]
+            out_prob = outputs["pred_logits"].flatten(0, 1).softmax(-1)  # [batch_size * num_queries, num_classes]
 
         out_bbox = outputs["pred_boxes"].flatten(0, 1)  # [batch_size * num_queries, 4]
 
@@ -146,15 +136,11 @@ class HungarianMatcher(nn.Module):
 
         # Compute the classification cost. Contrary to the loss, we don't use the NLL,
         # but approximate it in 1 - proba[target class].
-        # The 1 is a constant that doesn't change the matching, it can be ommitted.
+        # The 1 is a constant that doesn't change the matching, it can be omitted.
         if self.use_focal_loss:
             out_prob = out_prob[:, tgt_ids]
-            neg_cost_class = (
-                (1 - self.alpha) * (out_prob**self.gamma) * (-(1 - out_prob + 1e-8).log())
-            )
-            pos_cost_class = (
-                self.alpha * ((1 - out_prob) ** self.gamma) * (-(out_prob + 1e-8).log())
-            )
+            neg_cost_class = (1 - self.alpha) * (out_prob**self.gamma) * (-(1 - out_prob + 1e-8).log())
+            pos_cost_class = self.alpha * ((1 - out_prob) ** self.gamma) * (-(out_prob + 1e-8).log())
             cost_class = pos_cost_class - neg_cost_class
         else:
             cost_class = -out_prob[:, tgt_ids]
@@ -162,7 +148,7 @@ class HungarianMatcher(nn.Module):
         # Compute the L1 cost between boxes
         cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
 
-        # Compute the giou cost betwen boxes
+        # Compute the giou cost between boxes
         cost_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
 
         # Final cost matrix: [bs*num_queries, total_targets]
@@ -176,12 +162,9 @@ class HungarianMatcher(nn.Module):
             pred_masks = outputs["pred_masks"]  # [B, Q, Hm, Wm]
             if pred_masks is not None:
                 # Check if any target has masks
-                has_any_masks = any(
-                    "masks" in t and t["masks"] is not None and t["masks"].numel() > 0
-                    for t in targets
-                )
+                has_any_masks = any("masks" in t and t["masks"] is not None and t["masks"].numel() > 0 for t in targets)
                 if has_any_masks:
-                    B_mask, Q_mask, Hm, Wm = pred_masks.shape
+                    _B_mask, Q_mask, Hm, Wm = pred_masks.shape
                     sizes_local = [len(v["boxes"]) for v in targets]
 
                     # Only apply mask cost if Q matches (handles denoising queries mismatch)
@@ -231,9 +214,7 @@ class HungarianMatcher(nn.Module):
                                 gamma=self.gamma,
                             )
 
-                        C[b, :, offset : offset + n_tgt] = (
-                            C[b, :, offset : offset + n_tgt] + cost_mc
-                        )
+                        C[b, :, offset : offset + n_tgt] = C[b, :, offset : offset + n_tgt] + cost_mc
                         offset += n_tgt
 
         C = C.cpu()
@@ -242,17 +223,12 @@ class HungarianMatcher(nn.Module):
         C = torch.nan_to_num(C, nan=1.0)
         indices_pre = [linear_sum_assignment(c[i]) for i, c in enumerate(C.split(sizes, -1))]
         indices = [
-            (torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64))
-            for i, j in indices_pre
+            (torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)) for i, j in indices_pre
         ]
 
         # Compute topk indices
         if return_topk:
-            return {
-                "indices_o2m": self.get_top_k_matches(
-                    C, sizes=sizes, k=return_topk, initial_indices=indices_pre
-                )
-            }
+            return {"indices_o2m": self.get_top_k_matches(C, sizes=sizes, k=return_topk, initial_indices=indices_pre)}
 
         return {"indices": indices}  # , 'indices_o2m': C.min(-1)[1]}
 
@@ -261,15 +237,10 @@ class HungarianMatcher(nn.Module):
         # C_original = C.clone()
         for i in range(k):
             indices_k = (
-                [linear_sum_assignment(c[i]) for i, c in enumerate(C.split(sizes, -1))]
-                if i > 0
-                else initial_indices
+                [linear_sum_assignment(c[i]) for i, c in enumerate(C.split(sizes, -1))] if i > 0 else initial_indices
             )
             indices_list.append(
-                [
-                    (torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64))
-                    for i, j in indices_k
-                ]
+                [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)) for i, j in indices_k]
             )
             for c, idx_k in zip(C.split(sizes, -1), indices_k):
                 idx_k = np.stack(idx_k)
