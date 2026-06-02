@@ -1,4 +1,4 @@
-from typing import Dict, List, Tuple
+from __future__ import annotations
 
 import coremltools as ct
 import cv2
@@ -14,7 +14,7 @@ class CoreML_model:
         self,
         model_path: str,
         n_outputs: int,
-        conf_thresh: float | List[float] = 0.5,
+        conf_thresh: float | list[float] = 0.5,
         binarize_masks: bool = True,
         mask_threshold: float = 0.5,
         rect: bool = False,
@@ -92,18 +92,16 @@ class CoreML_model:
         processed_size,  # (H, W) of network input (after your A.Compose)
         orig_sizes,  # Tensor [B, 2] (H, W)
         keep_ratio: bool,
-    ) -> List[torch.Tensor]:
-        """
-        Returns list of length B with masks resized to original image sizes:
-        Each item: Float Tensor [Q, H_orig, W_orig] in [0,1] (no thresholding here).
-        - Handles letterbox padding removal if keep_ratio=True.
-        - Works for both batched and single-image inputs.
+    ) -> list[torch.Tensor]:
+        """Returns list of length B with masks resized to original image sizes: Each item: Float Tensor [Q, H_orig,
+        W_orig] in [0,1] (no thresholding here). - Handles letterbox padding removal if keep_ratio=True. - Works
+        for both batched and single-image inputs.
         """
         single = pred_masks.dim() == 3  # [Q,Hm,Wm]
         if single:
             pred_masks = pred_masks.unsqueeze(0)  # -> [1,Q,Hm,Wm]
 
-        B, Q, Hm, Wm = pred_masks.shape
+        B, _Q, Hm, Wm = pred_masks.shape
         proc_h, proc_w = int(processed_size[0]), int(processed_size[1])
 
         out = []
@@ -132,27 +130,21 @@ class CoreML_model:
             return [out[0]]
         return out
 
-    def _compute_nearest_size(self, shape, target_size, stride=32) -> Tuple[int, int]:
-        """Get nearest size that is divisible by 32"""
+    def _compute_nearest_size(self, shape, target_size, stride=32) -> tuple[int, int]:
+        """Get nearest size that is divisible by 32."""
         scale = target_size / max(shape)
-        new_shape = [int(round(dim * scale)) for dim in shape]
+        new_shape = [round(dim * scale) for dim in shape]
         return [max(stride, int(np.ceil(dim / stride) * stride)) for dim in new_shape]
 
     def _preprocess(self, img: NDArray, stride: int = 32, bgr: bool = True) -> NDArray:
-        """Resize, RGB, CHW"""
+        """Resize, RGB, CHW."""
         if not self.keep_ratio:
-            img = cv2.resize(
-                img, (self.input_size[1], self.input_size[0]), interpolation=cv2.INTER_LINEAR
-            )
+            img = cv2.resize(img, (self.input_size[1], self.input_size[0]), interpolation=cv2.INTER_LINEAR)
         elif self.rect:
-            target_height, target_width = self._compute_nearest_size(
-                img.shape[:2], max(*self.input_size)
-            )
+            target_height, target_width = self._compute_nearest_size(img.shape[:2], max(*self.input_size))
             img = letterbox(img, (target_height, target_width), stride=stride, auto=False)[0]
         else:
-            img = letterbox(
-                img, (self.input_size[0], self.input_size[1]), stride=stride, auto=False
-            )[0]
+            img = letterbox(img, (self.input_size[0], self.input_size[1]), stride=stride, auto=False)[0]
 
         # 3ch BGR (cv2.imread) needs a swap; 3ch .npy is RGB already; >3ch is RGB+extras.
         if self.channels == 3 and bgr:
@@ -180,30 +172,24 @@ class CoreML_model:
             for idx, image in enumerate(inputs):
                 processed_inputs[idx] = self._preprocess(image, bgr=bgr)
                 original_sizes.append((image.shape[0], image.shape[1]))
-                processed_sizes.append(
-                    (processed_inputs[idx].shape[1], processed_inputs[idx].shape[2])
-                )
+                processed_sizes.append((processed_inputs[idx].shape[1], processed_inputs[idx].shape[2]))
         return processed_inputs, processed_sizes, original_sizes
 
-    def _predict(self, img: NDArray) -> List[np.ndarray]:
+    def _predict(self, img: NDArray) -> list[np.ndarray]:
         result = self.model.predict({self._input_name: img})
         return [result[name] for name in self._output_names]
 
     def _postprocess(
         self,
-        outputs: List[np.ndarray],
-        processed_sizes: List[Tuple[int, int]],
-        original_sizes: List[Tuple[int, int]],
-    ) -> List[Dict[str, torch.Tensor]]:
-        """
-        returns List with BS length. Each element is a dict {"labels", "boxes", "scores"}
-        """
+        outputs: list[np.ndarray],
+        processed_sizes: list[tuple[int, int]],
+        original_sizes: list[tuple[int, int]],
+    ) -> list[dict[str, torch.Tensor]]:
+        """Returns List with BS length. Each element is a dict {"labels", "boxes", "scores"}."""
         labels = torch.from_numpy(outputs[0]).long()  # [B, K]
         boxes = torch.from_numpy(outputs[1]).float()  # [B, K, 4], absolute xyxy in input_size space
         scores = torch.from_numpy(outputs[2]).float()  # [B, K]
-        pred_masks = (
-            torch.from_numpy(outputs[3]).float() if self.has_masks else None
-        )  # [B, K, Hm, Wm]
+        pred_masks = torch.from_numpy(outputs[3]).float() if self.has_masks else None  # [B, K, Hm, Wm]
         B = labels.shape[0]
 
         boxes = self.rescale_boxes(boxes, processed_sizes, original_sizes, self.keep_ratio)
@@ -244,28 +230,20 @@ class CoreML_model:
             results.append(out)
         return results
 
-    def __call__(
-        self, inputs: NDArray[np.uint8], bgr: bool = True
-    ) -> List[Dict[str, torch.Tensor]]:
-        """
-        Input image as ndarray (BGR, HWC) or BHWC. Pass ``bgr=False`` for
-        3-channel inputs already in RGB order (e.g., ``.npy`` read via
-        ``read_image_hwc``); ignored for >3 channels.
-        Output:
-            List of batch size length. Each element is a dict {"labels", "boxes", "scores"}
-            labels: torch.Tensor of shape (N,), dtype int64
-            boxes: torch.Tensor of shape (N, 4), dtype float32, abs values
-            scores: torch.Tensor of shape (N,), dtype float32
-            masks: torch.Tensor of shape (N, H, W), dtype float32. N = number of objects
+    def __call__(self, inputs: NDArray[np.uint8], bgr: bool = True) -> list[dict[str, torch.Tensor]]:
+        """Input image as ndarray (BGR, HWC) or BHWC. Pass ``bgr=False`` for 3-channel inputs already in RGB order
+        (e.g., ``.npy`` read via ``read_image_hwc``); ignored for >3 channels. Output: List of batch size
+        length. Each element is a dict {"labels", "boxes", "scores"} labels: torch.Tensor of shape (N,), dtype
+        int64 boxes: torch.Tensor of shape (N, 4), dtype float32, abs values scores: torch.Tensor of shape (N,),
+        dtype float32 masks: torch.Tensor of shape (N, H, W), dtype float32. N = number of objects.
         """
         processed_inputs, processed_sizes, original_sizes = self._prepare_inputs(inputs, bgr=bgr)
         preds = self._predict(processed_inputs)
         return self._postprocess(preds, processed_sizes, original_sizes)
 
     @staticmethod
-    def mask2poly(masks: np.ndarray, img_shape: Tuple[int, int]) -> List[np.ndarray]:
-        """
-        Convert binary masks to normalized polygon coordinates for YOLO segmentation format.
+    def mask2poly(masks: np.ndarray, img_shape: tuple[int, int]) -> list[np.ndarray]:
+        """Convert binary masks to normalized polygon coordinates for YOLO segmentation format.
 
         Args:
             masks: Binary masks array of shape [N, H, W] where N is number of instances
@@ -320,7 +298,7 @@ def letterbox(
         r = min(r, 1.0)
 
     ratio = r, r
-    new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
+    new_unpad = round(shape[1] * r), round(shape[0] * r)
     dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]
     if auto:
         dw, dh = np.mod(dw, stride), np.mod(dh, stride)
@@ -381,7 +359,7 @@ def scale_boxes(boxes, orig_shape, resized_shape):
 
 
 def cleanup_masks(masks: torch.Tensor, boxes: torch.Tensor) -> torch.Tensor:
-    N, H, W = masks.shape
+    _N, H, W = masks.shape
     device = masks.device
     dtype = masks.dtype
 
@@ -389,11 +367,6 @@ def cleanup_masks(masks: torch.Tensor, boxes: torch.Tensor) -> torch.Tensor:
     xs = torch.arange(W, device=device)[None, None, :]
 
     x1, y1, x2, y2 = boxes.T
-    inside = (
-        (xs >= x1[:, None, None])
-        & (xs < x2[:, None, None])
-        & (ys >= y1[:, None, None])
-        & (ys < y2[:, None, None])
-    )
+    inside = (xs >= x1[:, None, None]) & (xs < x2[:, None, None]) & (ys >= y1[:, None, None]) & (ys < y2[:, None, None])
     masks = masks * inside.to(dtype)
     return masks
