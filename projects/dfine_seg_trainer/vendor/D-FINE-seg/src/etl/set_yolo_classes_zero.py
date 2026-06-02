@@ -48,9 +48,7 @@ def rewrite_file(label_path: Path) -> tuple[bool, int]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Rewrite every YOLO label file so all class ids become 0."
-    )
+    parser = argparse.ArgumentParser(description="Rewrite every YOLO label file so all class ids become 0.")
     parser.add_argument("labels_dir", type=Path, help="Root directory containing .txt label files")
     args = parser.parse_args()
 
@@ -69,9 +67,7 @@ def main() -> None:
         changed_files += int(file_changed)
 
         if total_files % 10000 == 0:
-            print(
-                f"Processed {total_files} files | changed {changed_files} | annotations {total_annotations}"
-            )
+            print(f"Processed {total_files} files | changed {changed_files} | annotations {total_annotations}")
 
     print(f"Processed {total_files} files")
     print(f"Changed {changed_files} files")

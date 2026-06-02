@@ -15,7 +15,6 @@ Deviations from the paper:
 
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import List, Tuple
 
 import numpy as np
 from scipy.optimize import linear_sum_assignment
@@ -23,7 +22,7 @@ from scipy.optimize import linear_sum_assignment
 
 @dataclass
 class Detection:
-    bbox: Tuple[float, float, float, float]  # xyxy, absolute pixels
+    bbox: tuple[float, float, float, float]  # xyxy, absolute pixels
     score: float
     cls_id: int
 
@@ -78,15 +77,15 @@ def _pairwise_centroid_dist(a: np.ndarray, b: np.ndarray, diag: float) -> np.nda
 
 class _Track:
     __slots__ = (
-        "track_id",
-        "cls_id",
-        "score",
-        "mean",
-        "velocity",
-        "state",
         "age",
+        "cls_id",
         "hits",
+        "mean",
+        "score",
+        "state",
         "time_since_update",
+        "track_id",
+        "velocity",
     )
 
     def __init__(self, track_id: int, bbox, score: float, cls_id: int):
@@ -116,8 +115,9 @@ class _Track:
         return _cxywh_to_xyxy(self.predicted_mean(drag))
 
     def predict(self):
-        """Age the track one frame. mean/velocity stay at the last observation
-        and are extrapolated on demand via predicted_mean()."""
+        """Age the track one frame. mean/velocity stay at the last observation and are extrapolated on demand via
+        predicted_mean().
+        """
         self.age += 1
         self.time_since_update += 1
 
@@ -148,16 +148,14 @@ class ByteTrack:
     """Two-stage association tracker with constant-velocity motion.
 
     Args:
-        track_thresh: Score dividing the 'high' and 'low' detection pools. High-
-            pool dets drive the first association; low-pool dets recover tracks
-            in the second.
-        unmatched_thresh: Min score for an unmatched high-pool detection to spawn
-            a new track. Higher → fewer spurious IDs.
-        detrack_thresh: Hard floor — detections below this are dropped entirely.
-            Set below track_thresh to enable the second (low-pool) association.
-        tracking_thresh: Max match cost allowed. Pairs above this cost are
-            rejected, so Hungarian can't force a bad match. With iou_weight=1,
-            cost = 1 - IoU, so tracking_thresh = 0.6 ≈ min IoU 0.4.
+        track_thresh: Score dividing the 'high' and 'low' detection pools. High- pool dets drive the first association;
+            low-pool dets recover tracks in the second.
+        unmatched_thresh: Min score for an unmatched high-pool detection to spawn a new track. Higher → fewer spurious
+            IDs.
+        detrack_thresh: Hard floor — detections below this are dropped entirely. Set below track_thresh to enable the
+            second (low-pool) association.
+        tracking_thresh: Max match cost allowed. Pairs above this cost are rejected, so Hungarian can't force a bad
+            match. With iou_weight=1, cost = 1 - IoU, so tracking_thresh = 0.6 ≈ min IoU 0.4.
         track_buffer: Frames a LOST track is kept alive before removal.
         max_age: Absolute cap on total track age in frames (0 = disabled).
         min_hits: Min consecutive/total matched frames before a track is emitted.
@@ -193,7 +191,7 @@ class ByteTrack:
         self.drag = drag
         self.velocity_alpha = velocity_alpha
 
-        self.tracks: List[_Track] = []
+        self.tracks: list[_Track] = []
         self.frame_idx = 0
         self._next_id = 1
 
@@ -204,9 +202,9 @@ class ByteTrack:
 
     def update(
         self,
-        detections: List[Detection],
-        frame_shape: Tuple[int, int],
-    ) -> List[Tuple[int, int, Tuple[float, float, float, float], float]]:
+        detections: list[Detection],
+        frame_shape: tuple[int, int],
+    ) -> list[tuple[int, int, tuple[float, float, float, float], float]]:
         """Run one frame of tracking.
 
         Args:
@@ -214,8 +212,7 @@ class ByteTrack:
             frame_shape: (height, width), used to normalize the centroid cost.
 
         Returns:
-            list of (track_id, cls_id, (x1, y1, x2, y2), score) for tracks
-            matched this frame with hits >= min_hits.
+            list of (track_id, cls_id, (x1, y1, x2, y2), score) for tracks: matched this frame with hits >= min_hits.
         """
         self.frame_idx += 1
         H, W = frame_shape
@@ -233,9 +230,7 @@ class ByteTrack:
         pool = [t for t in self.tracks if t.state != TrackState.REMOVED]
 
         # ---- 2. First association: all live tracks vs high-pool detections ----
-        matches_hi, unmatched_tracks, unmatched_high = self._associate(
-            pool, high, diag, gate=self.tracking_thresh
-        )
+        matches_hi, unmatched_tracks, unmatched_high = self._associate(pool, high, diag, gate=self.tracking_thresh)
         for t_i, d_i in matches_hi:
             pool[t_i].update(high[d_i].bbox, high[d_i].score, self.velocity_alpha)
 
@@ -266,7 +261,7 @@ class ByteTrack:
                 self._next_id += 1
 
         # ---- 6. Drop stale tracks ----
-        kept: List[_Track] = []
+        kept: list[_Track] = []
         for t in self.tracks:
             if t.state == TrackState.REMOVED:
                 continue
@@ -294,8 +289,8 @@ class ByteTrack:
 
     def _associate(
         self,
-        tracks: List[_Track],
-        dets: List[Detection],
+        tracks: list[_Track],
+        dets: list[Detection],
         diag: float,
         gate: float,
     ):
@@ -319,7 +314,7 @@ class ByteTrack:
 
         row_ind, col_ind = linear_sum_assignment(cost)
 
-        matches: List[Tuple[int, int]] = []
+        matches: list[tuple[int, int]] = []
         matched_rows = set()
         matched_cols = set()
         for r, c in zip(row_ind, col_ind):
