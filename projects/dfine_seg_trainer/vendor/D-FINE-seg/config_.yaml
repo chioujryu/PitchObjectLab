@@ -14,7 +14,7 @@ train:
   coco_dataset: False # set True when annotations are in COCO JSON format (train.json, val.json, test.json)
 
   data_path: ${train.root}/data/dataset # path to dataset
-  path_to_test_data: ${train.root}/data/test  # path to test set, used in infer script
+  path_to_test_data: ${train.root}/data/test # path to test set, used in infer script
   path_to_save: ${train.root}/output/models/${exp} # where to save output
 
   debug_img_path: ${train.root}/output/debug_images
@@ -34,13 +34,13 @@ train:
 
   ### Distributed Training (DDP) ###
   ddp:
-    enabled: False  # set to true to use multi-GPU
-    n_gpus: 2  # how many GPUs / processes per node for torchrun
+    enabled: False # set to true to use multi-GPU
+    n_gpus: 2 # how many GPUs / processes per node for torchrun
 
   decision_metrics: # f1, iou, mAP_50, mAP_50_95, mAP_50_mask, mAP_50_95_mask
-  - f1
-  - mAP_50 # will be swapped with mask version for task = segment
-  - iou
+    - f1
+    - mAP_50 # will be swapped with mask version for task = segment
+    - iou
 
   img_size: [640, 640] # (h, w)
   in_channels: 3 # 3 = RGB (default). >3 expects .npy stacks (RGB+extras) — see README
@@ -109,18 +109,17 @@ train:
       backbone_lr: 0.0004
       base_lr: 0.0008
     s:
-      backbone_lr: 0.00006  # can setup up to 0.0002
-      base_lr: 0.00025  # 0.0004
+      backbone_lr: 0.00006 # can setup up to 0.0002
+      base_lr: 0.00025 # 0.0004
     m:
-      backbone_lr: 0.00002  # 0.000025
-      base_lr: 0.00015  # 0.00025
+      backbone_lr: 0.00002 # 0.000025
+      base_lr: 0.00015 # 0.00025
     l:
       backbone_lr: 0.00001 # 0.00000625 - 0.0000125
       base_lr: 0.00016 # 0.000125 - 0.00025
     x:
-      backbone_lr: 0.000002  # 0.0000015 - 0.0000025
-      base_lr: 0.0002  # 0.0001 - 0.00025
-
+      backbone_lr: 0.000002 # 0.0000015 - 0.0000025
+      base_lr: 0.0002 # 0.0001 - 0.00025
 
 split:
   ignore_negatives: False # only use images with labels
@@ -128,21 +127,18 @@ split:
   train_split: 0.85
   val_split: 0.15 # test_split = 1 - train_split - val_split
 
-
 export: # TensorRT must be done on the inference device
   half: True # tensorrt, openvino
   max_batch_size: 1 # torch, tensorrt, openvino
   dynamic_input: False # applies to onnx and openvino; the tensorrt engine is always built static
   ov_int8_max_drop: 0.01
 
-
 infer:
-  to_crop: True  # if True - saves crops of detected objects
-  to_track: True  # videos only: assign persistent IDs via ByteTrack and write annotated mp4
-  paddings: # if int - amount of pixes, if float - percentage of image size
+  to_crop: True # if True - saves crops of detected objects
+  to_track: True # videos only: assign persistent IDs via ByteTrack and write annotated mp4
+  paddings: # if int - amount of pixels, if float - percentage of image size
     w: 0.05
     h: 0.05
-
 
 ### service ###
 defaults:

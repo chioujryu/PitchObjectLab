@@ -42,7 +42,7 @@ def render(path: Path) -> list[Path]:
 
     outs: list[Path] = []
     stem = path.stem
-    H, W, C = arr.shape
+    _H, _W, C = arr.shape
 
     if C >= 3:
         # First 3 channels = RGB; cv2 writes BGR, so swap.
