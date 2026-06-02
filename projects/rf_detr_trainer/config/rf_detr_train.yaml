@@ -36,9 +36,9 @@ dataset:
   # labelme_json      - LabelMe JSON annotations.
   source_format: rfdetr
   # Source dataset root. Options: RF-DETR/Roboflow root, YOLO root, VOC root, DOTA root, LabelMe root, or COCO root.
-  dataset_dir: dataset_cache/ultralytics_yolo_dataset_43fc76da39887af6
+  dataset_dir: /home/new_users/zhiyu/datasets/soccer/spatial_perception/Xbotgo/站立运动员、足球、球门检测数据集V1/outputs/YoloFormat/all_parameters_sahi_object_crop_classcrop_train_val_960_classesall_max_samplesall
   # Ultralytics YOLO dataset YAML. Options: empty string to auto-find data.yaml/data.yml/dataset.yaml in dataset_dir, or a YAML path.
-  data_yaml: ""
+  data_yaml: "/home/new_users/zhiyu/projects/PitchObjectLab/ultralytics/cfg/datasets/站立運動員_足球_球門檢測數據集2025_all_parameters_sahi_object_crop_classcrop_train_val_960_classesall_max_samplesall.yaml"
   # COCO annotation file for single-file COCO datasets. Options: empty string to auto-find common annotations/*.json files.
   coco_json: ""
   # Image directory used with coco_json when image file names are relative. Options: empty string to infer from dataset_dir.
@@ -77,7 +77,7 @@ output:
   output_dir: ""
   # Output root when output_dir is empty. Options: runs/rf_detr, D:/runs/{dataset_name}, /mnt/runs/rf_detr.
   # Supports the same placeholders as output_dir.
-  root: runs/rf_detr/train
+  root: /home/new_users/zhiyu/projects/PitchObjectLab/runs/detect/站立運動員_足球_球門檢測數據集2025/train
   # Run folder name when output_dir is empty. Options: pure string or placeholder template.
   # Supports the same placeholders as output_dir.
   name: "rfdetr_{model_size}_e{epochs}_b{batch_size}_val{eval_interval}_test{test_interval_epochs}_{timestamp}"
@@ -86,15 +86,15 @@ output:
 
 train:
   # RF-DETR dataset root forwarded into TrainConfig. Options: empty to copy dataset.dataset_dir, or explicit path.
-  dataset_dir: dataset_cache/ultralytics_yolo_dataset_43fc76da39887af6
+  dataset_dir: /home/new_users/zhiyu/datasets/soccer/spatial_perception/Xbotgo/站立运动员、足球、球门检测数据集V1/outputs/YoloFormat/all_parameters_sahi_object_crop_classcrop_train_val_960_classesall_max_samplesall
   # Dataset file type. Options: roboflow, coco, yolo, o365. roboflow auto-detects Roboflow COCO/YOLO layouts.
   dataset_file: roboflow
   # CUDA/CPU selector. Options: auto, cpu, cuda, 0, 1, 0,1, cuda:0, mps, -1.
   device: 0
   # Number of training epochs. Options: any positive integer.
-  epochs: 1
+  epochs: 50
   # Micro batch size per optimizer step. Options: positive integer, or auto for RF-DETR auto-batch probing.
-  batch_size: 1
+  batch_size: 16
   # Gradient accumulation steps. Effective per-device batch = batch_size * grad_accum_steps. Options: positive integer.
   grad_accum_steps: 8
   # Per-device effective batch target when batch_size=auto. Options: positive integer.
@@ -136,9 +136,9 @@ train:
   # EMA update interval in optimizer steps. Options: positive integer.
   ema_update_interval: 1
   # Dataloader workers. Options: 0 for maximum Windows compatibility, or positive integer.
-  num_workers: 4
+  num_workers: 2
   # Enable early stopping. Options: true, false.
-  early_stopping: false
+  early_stopping: true
   # Early stopping patience in validation evaluations. Options: positive integer.
   early_stopping_patience: 10
   # Early stopping min mAP delta. Options: non-negative float.
@@ -166,9 +166,9 @@ train:
   # RF-DETR built-in final trainer.test. Options: false recommended because this wrapper writes its own final_test metrics, true for extra built-in test.
   run_test: false
   # Multi-scale training. Options: true, false.
-  multi_scale: false
+  multi_scale: true
   # Expanded training scales. Options: true, false.
-  expanded_scales: false
+  expanded_scales: true
   # Random resize via padding. Options: true, false.
   do_random_resize_via_padding: false
   # Square resize divisible by 64. Options: true, false.
@@ -216,7 +216,7 @@ train:
 
 periodic_test:
   # Enable scheduled test-set evaluation during training. Options: true, false.
-  enabled: true
+  enabled: false
   test_mode:
     # Test mode. Options: full_image, sahi, class_crop.
     mode: sahi

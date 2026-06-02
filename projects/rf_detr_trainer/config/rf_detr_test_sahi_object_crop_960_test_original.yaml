@@ -27,7 +27,7 @@ model:
   # Automatic mixed precision. Options: true, false.
   amp: true
   # Prediction confidence threshold. Options: 0.0-1.0.
-  confidence_threshold: 0.5
+  confidence_threshold: 0.7
   # Optional model label to dataset category-id mapping. Options: {}, false, or {model_label: dataset_category_id}.
   category_remapping: {}
   # Extra RF-DETR ModelConfig keys. Options: any supported model config key.
@@ -91,19 +91,19 @@ test:
     fallback: full_image
   sahi:
     # Slice height. Options: positive integer.
-    slice_height: 640
+    slice_height: 320
     # Slice width. Options: positive integer.
-    slice_width: 640
+    slice_width: 320
     # Height overlap. Options: 0.0-0.9.
     overlap_height_ratio: 0.2
     # Width overlap. Options: 0.0-0.9.
     overlap_width_ratio: 0.2
-    # Merge full-image prediction with slices. Options: true, false.
-    standard_prediction: true
+    # Merge full-image prediction with slices. Options: true, false. Use false when full-image boxes absorb close slice detections.
+    standard_prediction: false
     # SAHI postprocess type. Options: GREEDYNMM, NMM, NMS, LSNMS. GREEDYNMM is recommended for small slices.
     postprocess_type: GREEDYNMM
-    # SAHI match metric. Options: IOS, IOU. IOS is recommended when small slice boxes cover parts of the same object.
-    postprocess_match_metric: IOS
+    # SAHI match metric. Options: IOS, IOU. IOU keeps close same-class objects separate while IOS merges partial slice duplicates more aggressively.
+    postprocess_match_metric: IOU
     # Merge/NMS threshold. Options: 0.0-1.0. Raise to merge fewer boxes; lower to merge more boxes.
     postprocess_match_threshold: 0.5
     # Class-agnostic merge. Options: true, false.
@@ -138,9 +138,9 @@ test:
     # Minimum predictions. Options: non-negative integer.
     min_predictions: 0
     # Minimum score for candidate filtering. Options: null or 0.0-1.0.
-    filter_min_score: 0.25
+    filter_min_score: 0.7
     # Minimum score drawn. Options: null or 0.0-1.0.
-    draw_min_score: 0.25
+    draw_min_score: 0.7
   # Write per-class metrics. Options: true, false.
   classwise: true
   # Show progress bars. Options: true, false.
@@ -170,7 +170,7 @@ test:
     # Category IDs to draw in error-case images. Empty means draw all GT/prediction classes. Options: list of category IDs.
     render_class_ids: []
     # Category names to draw in error-case images. Empty means draw all GT/prediction classes. Options: list of category names.
-    render_class_names: []
+    render_class_names: [football]
     # Shared max diagnostic images. Options: null or non-negative integer.
     max_images: 100
     # Legacy missed-image cap. Options: null or non-negative integer.
