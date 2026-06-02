@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Generator
 from pathlib import Path
-from typing import Generator, Optional
 
 import cv2
 import numpy as np
@@ -42,7 +42,7 @@ class VideoReader:
             yield frame_idx, frame
             frame_idx += 1
 
-    def __enter__(self) -> "VideoReader":
+    def __enter__(self) -> VideoReader:
         return self
 
     def __exit__(self, *_) -> None:
@@ -74,7 +74,7 @@ class VideoWriter:
     def write(self, frame_bgr: np.ndarray) -> None:
         self._writer.write(frame_bgr)
 
-    def __enter__(self) -> "VideoWriter":
+    def __enter__(self) -> VideoWriter:
         return self
 
     def __exit__(self, *_) -> None:

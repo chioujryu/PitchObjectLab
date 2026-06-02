@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from copy import deepcopy
-from typing import Any, Mapping
+from typing import Any
 
 
 def _float(section: Mapping[str, Any], key: str, default: float) -> float:
@@ -120,19 +121,16 @@ def _preset_defaults(preset: str) -> dict[str, float]:
         "custom": {},
     }
     if preset not in presets:
-        raise ValueError(
-            "augmentation.preset must be one of none, light, default, heavy, ultralytics_like, custom."
-        )
+        raise ValueError("augmentation.preset must be one of none, light, default, heavy, ultralytics_like, custom.")
     return deepcopy(presets[preset])
 
 
 def build_aug_runtime(augmentation: Mapping[str, Any], task: str) -> dict[str, Any]:
     """Build the D-FINE ``train.mosaic_augs`` and ``train.augs`` sections.
 
-    D-FINE-seg natively consumes the classic mosaic and Albumentations keys.
-    This wrapper also persists Ultralytics-style blend augmentation knobs in the
-    runtime config; the vendored snapshot reads the extra keys when patched and
-    otherwise ignores them without breaking older upstream code.
+    D-FINE-seg natively consumes the classic mosaic and Albumentations keys. This wrapper also persists
+    Ultralytics-style blend augmentation knobs in the runtime config; the vendored snapshot reads the extra keys when
+    patched and otherwise ignores them without breaking older upstream code.
     """
     augmentation = augmentation or {}
     preset_values = _preset_defaults(str(augmentation.get("preset", "default")))
@@ -146,7 +144,9 @@ def build_aug_runtime(augmentation: Mapping[str, Any], task: str) -> dict[str, A
     mosaic_augs = {
         "mosaic_prob": _float(augmentation, "mosaic", 0.8),
         "no_mosaic_epochs": int(augmentation.get("close_mosaic", 5) or 0),
-        "mosaic_scale": augmentation.get("mosaic_scale", [1.0 - _float(augmentation, "scale", 0.5), 1.0 + _float(augmentation, "scale", 0.5)]),
+        "mosaic_scale": augmentation.get(
+            "mosaic_scale", [1.0 - _float(augmentation, "scale", 0.5), 1.0 + _float(augmentation, "scale", 0.5)]
+        ),
         "degrees": _float(augmentation, "degrees", 0.0),
         "translate": _float(augmentation, "translate", 0.1),
         "shear": _float(augmentation, "shear", 0.0),
