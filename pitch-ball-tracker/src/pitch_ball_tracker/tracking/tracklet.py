@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections import deque
 from enum import Enum, auto
-from typing import Optional
 
 import numpy as np
 
@@ -10,18 +9,16 @@ from pitch_ball_tracker.tracking.kalman import KalmanBoxTracker
 
 
 class TrackState(Enum):
-    TENTATIVE = auto()   # not yet confirmed
-    CONFIRMED = auto()   # confirmed active track
-    LOST = auto()        # no detection for N frames; Kalman still predicts
-    DELETED = auto()     # ready to be removed
+    TENTATIVE = auto()  # not yet confirmed
+    CONFIRMED = auto()  # confirmed active track
+    LOST = auto()  # no detection for N frames; Kalman still predicts
+    DELETED = auto()  # ready to be removed
 
 
 class Tracklet:
-    """
-    A single object track combining a Kalman filter with a ReID embedding
-    history that follows the PRTReID (tracklet-averaged) approach from
-    SoccerMaster: the stored embedding is a window mean over the last
-    `avg_window` frame embeddings.
+    """A single object track combining a Kalman filter with a ReID embedding history that follows the PRTReID
+    (tracklet-averaged) approach from SoccerMaster: the stored embedding is a window mean over the last `avg_window`
+    frame embeddings.
     """
 
     def __init__(
@@ -36,7 +33,7 @@ class Tracklet:
         self.state = TrackState.TENTATIVE
 
         self.hits: int = 1
-        self.age: int = 1          # total frames since creation
+        self.age: int = 1  # total frames since creation
         self.frames_since_update: int = 0
 
         self._kf = KalmanBoxTracker(bbox_xyxy)
@@ -47,7 +44,7 @@ class Tracklet:
         self._avg_window = avg_window
         self._ema_alpha = ema_alpha
         self._embedding_history: deque[np.ndarray] = deque(maxlen=avg_window)
-        self._ema_embedding: Optional[np.ndarray] = None
+        self._ema_embedding: np.ndarray | None = None
 
     # ------------------------------------------------------------------
     # Kalman interface
@@ -75,23 +72,18 @@ class Tracklet:
     # ------------------------------------------------------------------
 
     def add_embedding(self, embedding: np.ndarray) -> None:
-        """
-        Store a new per-frame embedding and update both the window mean and
-        the exponential moving average.  The window mean is the "PRTReID"
-        representative embedding; EMA provides an alternative for lookup.
+        """Store a new per-frame embedding and update both the window mean and the exponential moving average. The
+        window mean is the "PRTReID" representative embedding; EMA provides an alternative for lookup.
         """
         self._embedding_history.append(embedding.copy())
         if self._ema_embedding is None:
             self._ema_embedding = embedding.copy()
         else:
-            self._ema_embedding = (
-                (1.0 - self._ema_alpha) * self._ema_embedding
-                + self._ema_alpha * embedding
-            )
+            self._ema_embedding = (1.0 - self._ema_alpha) * self._ema_embedding + self._ema_alpha * embedding
 
     @property
-    def reid_embedding(self) -> Optional[np.ndarray]:
-        """Window-averaged embedding (PRTReID style).  None if not yet set."""
+    def reid_embedding(self) -> np.ndarray | None:
+        """Window-averaged embedding (PRTReID style). None if not yet set."""
         if not self._embedding_history:
             return self._ema_embedding
         return np.mean(list(self._embedding_history), axis=0)

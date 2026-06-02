@@ -1,6 +1,7 @@
+from __future__ import annotations
+
 import re
 from pathlib import Path
-from typing import Dict
 
 import torch
 from loguru import logger
@@ -142,7 +143,7 @@ def adjust_head_parameters(cur_state_dict, pretrain_state_dict):
     return pretrain_state_dict
 
 
-def matched_state(state: Dict[str, torch.Tensor], params: Dict[str, torch.Tensor]):
+def matched_state(state: dict[str, torch.Tensor], params: dict[str, torch.Tensor]):
     missed_list = []
     unmatched_list = []
     matched_state = {}
@@ -158,7 +159,7 @@ def matched_state(state: Dict[str, torch.Tensor], params: Dict[str, torch.Tensor
     return matched_state, {"missed": missed_list, "unmatched": unmatched_list}
 
 
-def extract_pretrained_state_dict(state: Dict[str, torch.Tensor]):
+def extract_pretrained_state_dict(state: dict[str, torch.Tensor]):
     """Extract the raw model state dict from legacy or current checkpoint formats."""
     if "ema" in state:
         return state["ema"]["module"]
@@ -173,10 +174,10 @@ STEM_CONV_KEY = "backbone.stem.stem1.conv.weight"
 def inflate_stem_weight(pretrained_w: torch.Tensor, target_in_ch: int) -> torch.Tensor:
     """Expand a 3-channel stem conv weight to ``target_in_ch`` channels.
 
-    First 3 channels copied verbatim; extras initialized to the mean of the
-    pretrained RGB filters (the standard inflation trick for RGB->RGB+X).
+    First 3 channels copied verbatim; extras initialized to the mean of the pretrained RGB filters (the standard
+    inflation trick for RGB->RGB+X).
     """
-    out, in_ch, kh, kw = pretrained_w.shape
+    _out, in_ch, _kh, _kw = pretrained_w.shape
     if in_ch != 3 or target_in_ch <= 3:
         raise ValueError(
             f"inflate_stem_weight expects pretrained in_ch=3 and target>3, "
@@ -188,11 +189,12 @@ def inflate_stem_weight(pretrained_w: torch.Tensor, target_in_ch: int) -> torch.
 
 
 def maybe_inflate_stem(
-    model_state: Dict[str, torch.Tensor],
-    pretrain_state: Dict[str, torch.Tensor],
+    model_state: dict[str, torch.Tensor],
+    pretrain_state: dict[str, torch.Tensor],
 ) -> None:
-    """If the stem shape differs only on input channels (pretrained=3, model>3),
-    replace the pretrained tensor in-place with the inflated version."""
+    """If the stem shape differs only on input channels (pretrained=3, model>3), replace the pretrained tensor in-place
+    with the inflated version.
+    """
     if STEM_CONV_KEY not in model_state or STEM_CONV_KEY not in pretrain_state:
         return
     target_shape = model_state[STEM_CONV_KEY].shape
@@ -215,7 +217,7 @@ def maybe_inflate_stem(
 
 
 def load_tuning_state(model, path: str):
-    """Load model for tuning and adjust mismatched head parameters"""
+    """Load model for tuning and adjust mismatched head parameters."""
     if path.startswith("http"):
         state = torch.hub.load_state_dict_from_url(path, map_location="cpu")
     else:
@@ -240,11 +242,10 @@ def load_tuning_state(model, path: str):
 def ensure_pretrained(path: str | Path) -> str:
     """Resolve a pretrained checkpoint path, fetching from HF if missing.
 
-    If the file already exists, returns the path unchanged. If it's missing and
-    the filename matches the standard `dfine_<size>_<dataset>.pt` pattern, it's
-    downloaded from `HF_REPO_ID` into the same directory. For non-standard
-    filenames (e.g. user-supplied fine-tuning checkpoints), returns the path
-    as-is so the caller raises FileNotFoundError as before.
+    If the file already exists, returns the path unchanged. If it's missing and the filename matches the standard
+    `dfine_<size>_<dataset>.pt` pattern, it's downloaded from `HF_REPO_ID` into the same directory. For non-standard
+    filenames (e.g. user-supplied fine-tuning checkpoints), returns the path as-is so the caller raises
+    FileNotFoundError as before.
     """
     p = Path(path)
     if p.exists():

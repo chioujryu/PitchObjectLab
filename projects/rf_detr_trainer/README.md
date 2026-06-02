@@ -153,7 +153,7 @@ periodic_test:
   enabled: true
   split: test
   test_mode:
-    mode: full_image   # full_image, sahi, class_crop
+    mode: full_image # full_image, sahi, class_crop
   test_interval_epochs: 30
 run_final_test: true
 classwise: true

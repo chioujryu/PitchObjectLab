@@ -1,6 +1,6 @@
 """
 reference
-- https://github.com/PaddlePaddle/PaddleDetection/blob/develop/ppdet/modeling/backbones/hgnet_v2.py
+- https://github.com/PaddlePaddle/PaddleDetection/blob/develop/ppdet/modeling/backbones/hgnet_v2.py.
 
 Copyright (c) 2024 The D-FINE Authors. All Rights Reserved.
 """
@@ -330,13 +330,14 @@ class HG_Stage(nn.Module):
 
 
 class HGNetv2(nn.Module):
-    """
-    HGNetV2
+    """HGNetV2.
+
     Args:
         stem_channels: list. Number of channels for the stem block.
         stage_type: str. The stage configuration of HGNet. such as the number of channels, stride, etc.
         use_lab: boolean. Whether to use LearnableAffineBlock in network.
         lr_mult_list: list. Control the learning rate of different stages.
+
     Returns:
         model: nn.Layer. Specific HGNetV2 model depends on args.
     """
@@ -532,10 +533,8 @@ class HGNetv2(nn.Module):
 
             except (Exception, KeyboardInterrupt) as e:
                 if torch.distributed.get_rank() == 0:
-                    print(f"{str(e)}")
-                    logging.error(
-                        RED + "CRITICAL WARNING: Failed to load pretrained HGNetV2 model" + RESET
-                    )
+                    print(f"{e!s}")
+                    logging.error(RED + "CRITICAL WARNING: Failed to load pretrained HGNetV2 model" + RESET)
                     logging.error(
                         GREEN
                         + "Please check your network connection. Or download the model manually from "

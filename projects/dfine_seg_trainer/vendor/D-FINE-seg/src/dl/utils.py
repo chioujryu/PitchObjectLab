@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 import math
 import os
@@ -6,7 +8,6 @@ import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List
 
 import cv2
 import numpy as np
@@ -41,7 +42,7 @@ def seed_worker(worker_id):  # noqa
     random.seed(worker_seed)
 
 
-def wandb_logger(loss, metrics: Dict[str, float], epoch, mode: str) -> None:
+def wandb_logger(loss, metrics: dict[str, float], epoch, mode: str) -> None:
     log_data = {"epoch": epoch}
     if loss:
         log_data[f"{mode}/loss/"] = loss
@@ -57,7 +58,7 @@ def wandb_logger(loss, metrics: Dict[str, float], epoch, mode: str) -> None:
 
 
 def rename_metric_keys(d, label_to_name):
-    """precision_1 -> precision_class_name"""
+    """Precision_1 -> precision_class_name."""
     out = {}
     if not isinstance(d, dict):
         return out
@@ -72,7 +73,7 @@ def rename_metric_keys(d, label_to_name):
 
 
 def log_metrics_locally(
-    all_metrics: Dict[str, Dict[str, float]], path_to_save: Path, epoch: int, extended=False
+    all_metrics: dict[str, dict[str, float]], path_to_save: Path, epoch: int, extended=False
 ) -> None:
     metrics_df = pd.DataFrame.from_dict(all_metrics, orient="index")
     metrics_df = metrics_df.round(4)
@@ -101,17 +102,13 @@ def log_metrics_locally(
 
 
 def save_metrics(train_metrics, metrics, loss, epoch, path_to_save, use_wandb) -> None:
-    log_metrics_locally(
-        all_metrics={"train": train_metrics, "val": metrics}, path_to_save=path_to_save, epoch=epoch
-    )
+    log_metrics_locally(all_metrics={"train": train_metrics, "val": metrics}, path_to_save=path_to_save, epoch=epoch)
     if use_wandb:
         wandb_logger(loss, train_metrics, epoch, mode="train")
         wandb_logger(None, metrics, epoch, mode="val")
 
 
-def calculate_remaining_time(
-    one_epoch_time, epoch_start_time, epoch, epochs, cur_iter, all_iters
-) -> str:
+def calculate_remaining_time(one_epoch_time, epoch_start_time, epoch, epochs, cur_iter, all_iters) -> str:
     if one_epoch_time is None:
         average_iter_time = (time.time() - epoch_start_time) / cur_iter
         remaining_iters = epochs * all_iters - cur_iter
@@ -200,8 +197,8 @@ def get_aug_params(value, center=0):
         return random.uniform(value[0], value[1])
     else:
         raise ValueError(
-            "Affine params should be either a sequence containing two values\
-                          or single float values. Got {}".format(value)
+            f"Affine params should be either a sequence containing two values\
+                          or single float values. Got {value}"
         )
 
 
@@ -210,16 +207,13 @@ def resample_segments(segments, n=1000):
     for i, s in enumerate(segments):
         x = np.linspace(0, len(s) - 1, n)
         xp = np.arange(len(s))
-        segments[i] = (
-            np.concatenate([np.interp(x, xp, s[:, i]) for i in range(2)]).reshape(2, -1).T
-        )  # segment xy
+        segments[i] = np.concatenate([np.interp(x, xp, s[:, i]) for i in range(2)]).reshape(2, -1).T  # segment xy
     return segments
 
 
 def clip_polygon_to_rect(poly: np.ndarray, width: float, height: float) -> np.ndarray:
-    """
-    Clip a polygon to a rectangle [0, width] x [0, height] using Sutherland-Hodgman algorithm.
-    Returns the clipped polygon as (M, 2) array, or empty (0, 2) if fully outside.
+    """Clip a polygon to a rectangle [0, width] x [0, height] using Sutherland-Hodgman algorithm. Returns the clipped
+    polygon as (M, 2) array, or empty (0, 2) if fully outside.
     """
     if poly.size == 0:
         return np.empty((0, 2), dtype=np.float32)
@@ -283,15 +277,11 @@ def segment2box(segment, width=640, height=640):
     return np.array([x.min(), y.min(), x.max(), y.max()]) if any(x) else np.zeros((1, 4))  # xyxy
 
 
-def box_candidates(
-    box1, box2, wh_thr=2, ar_thr=20, area_thr=0.1, eps=1e-16
-):  # box1(4,n), box2(4,n)
+def box_candidates(box1, box2, wh_thr=2, ar_thr=20, area_thr=0.1, eps=1e-16):  # box1(4,n), box2(4,n)
     w1, h1 = box1[2] - box1[0], box1[3] - box1[1]
     w2, h2 = box2[2] - box2[0], box2[3] - box2[1]
     ar = np.maximum(w2 / (h2 + eps), h2 / (w2 + eps))  # aspect ratio
-    return (
-        (w2 > wh_thr) & (h2 > wh_thr) & (w2 * h2 / (w1 * h1 + eps) > area_thr) & (ar < ar_thr)
-    )  # candidates
+    return (w2 > wh_thr) & (h2 > wh_thr) & (w2 * h2 / (w1 * h1 + eps) > area_thr) & (ar < ar_thr)  # candidates
 
 
 def get_transform_matrix(img_shape, new_shape, degrees, scale, shear, translate):
@@ -314,9 +304,7 @@ def get_transform_matrix(img_shape, new_shape, degrees, scale, shear, translate)
     # Translation
     T = np.eye(3)
     T[0, 2] = random.uniform(0.5 - translate, 0.5 + translate) * new_width  # x translation (pixels)
-    T[1, 2] = (
-        random.uniform(0.5 - translate, 0.5 + translate) * new_height
-    )  # y transla ion (pixels)
+    T[1, 2] = random.uniform(0.5 - translate, 0.5 + translate) * new_height  # y transla ion (pixels)
 
     # Combined rotation matrix
     M = T @ S @ R @ C  # order of operations (right to left) is IMPORTANT
@@ -326,14 +314,15 @@ def get_transform_matrix(img_shape, new_shape, degrees, scale, shear, translate)
 def random_affine(img, targets, segments, target_size, degrees, translate, scales, shear):
     """
     Args:
-      img: (Hbig, Wbig, 3)
-      targets: (N, 5) -> [cls, x1, y1, x2, y2] ABS on the mosaic canvas
-      segments: list[np.ndarray] of length N; each (K,2) ABS polygon on the mosaic canvas
-                If an object comes from bbox-only annotation, pass an empty array for it.
+        img: (Hbig, Wbig, 3)
+        targets: (N, 5) -> [cls, x1, y1, x2, y2] ABS on the mosaic canvas
+        segments: list[np.ndarray] of length N; each (K,2) ABS polygon on the mosaic canvas If an object comes from
+            bbox-only annotation, pass an empty array for it.
+
     Returns:
-      img_aff: final (target_h, target_w, 3)
-      targets_aff: (M, 5) filtered + transformed
-      segments_aff: list[np.ndarray] length=M, transformed polygons
+        img_aff: final (target_h, target_w, 3)
+        targets_aff: (M, 5) filtered + transformed
+        segments_aff: list[np.ndarray] length=M, transformed polygons.
     """
     M, scale = get_transform_matrix(img.shape[:2], target_size, degrees, scales, shear, translate)
 
@@ -410,15 +399,14 @@ def get_mosaic_coordinate(mosaic_image, mosaic_index, xc, yc, w, h, target_h, ta
         small_coord = w - (x2 - x1), 0, w, min(y2 - y1, h)
     # index2 to bottom right part of image
     elif mosaic_index == 3:
-        x1, y1, x2, y2 = xc, yc, min(xc + w, target_w * 2), min(target_h * 2, yc + h)  # noqa
+        x1, y1, x2, y2 = xc, yc, min(xc + w, target_w * 2), min(target_h * 2, yc + h)
         small_coord = 0, 0, min(w, x2 - x1), min(y2 - y1, h)
     return (x1, y1, x2, y2), small_coord
 
 
 def filter_preds(preds, conf_thresh, mask_source="mask_probs"):
-    """
-    Filters predictions by score AND keeps masks in-sync with the kept indices.
-    - If mask_source == "mask_probs" and present, also populates pred["masks"] as uint8 via conf_thresh.
+    """Filters predictions by score AND keeps masks in-sync with the kept indices. - If mask_source == "mask_probs" and
+    present, also populates pred["masks"] as uint8 via conf_thresh.
     """
     for pred in preds:
         keep = pred["scores"] >= conf_thresh
@@ -437,11 +425,7 @@ def filter_preds(preds, conf_thresh, mask_source="mask_probs"):
             # Ensure binary mask view exists (uint8)
             if mask_source == "mask_probs":
                 pred["masks"] = (m > conf_thresh).to(torch.uint8)
-        elif (
-            "masks" in pred
-            and pred["masks"] is not None
-            and getattr(pred["masks"], "numel", lambda: 0)() > 0
-        ):
+        elif "masks" in pred and pred["masks"] is not None and getattr(pred["masks"], "numel", lambda: 0)() > 0:
             pred["masks"] = pred["masks"][keep].to(torch.uint8)
 
     return preds
@@ -489,13 +473,8 @@ def label_color(label: int):
     return palette[int(label) % len(palette)]
 
 
-def draw_mask(
-    img: np.ndarray, mask: np.ndarray, color=(148, 70, 44), alpha: float = 0.4, outline: bool = True
-):
-    """
-    img: BGR uint8 [H,W,3]
-    mask: uint8/bool [H,W] (1=mask)
-    color: (B,G,R)
+def draw_mask(img: np.ndarray, mask: np.ndarray, color=(148, 70, 44), alpha: float = 0.4, outline: bool = True):
+    """img: BGR uint8 [H,W,3] mask: uint8/bool [H,W] (1=mask) color: (B,G,R).
     """
     if mask.dtype != np.uint8:
         mask = mask.astype(np.uint8)
@@ -558,11 +537,8 @@ def visualize(
     mask_alpha_gt: float = 0.35,
     mask_alpha_pred: float = 0.40,
 ):
-    """
-    Saves images with:
-      - GT: green boxes + optional green masks
-      - Preds: brown boxes + colored masks per class
-    Expects pred dicts possibly containing "masks" (uint8)
+    """Saves images with: - GT: green boxes + optional green masks - Preds: brown boxes + colored masks per class
+    Expects pred dicts possibly containing "masks" (uint8).
     """
     from src.dl.dataset import read_image_hwc  # local to avoid circular import
 
@@ -590,9 +566,7 @@ def visualize(
             and gt_dict["masks"].shape[1] != 0
         ):
             for m in gt_dict["masks"]:
-                img = draw_mask(
-                    img, m.numpy(), color=(46, 153, 60), alpha=mask_alpha_gt, outline=True
-                )
+                img = draw_mask(img, m.numpy(), color=(46, 153, 60), alpha=mask_alpha_gt, outline=True)
 
         # Draw GT boxes (green)
         for box, label in zip(gt_dict["boxes"], gt_dict["labels"]):
@@ -601,11 +575,7 @@ def visualize(
         # Prepare predicted masks
         pred_masks_to_draw = None
         if draw_pred_masks:
-            if (
-                "masks" in pred_dict
-                and pred_dict["masks"] is not None
-                and len(pred_dict["masks"]) > 0
-            ):
+            if "masks" in pred_dict and pred_dict["masks"] is not None and len(pred_dict["masks"]) > 0:
                 pred_masks_to_draw = pred_dict["masks"]
         # Draw predicted masks (colored by class)
         if pred_masks_to_draw is not None:
@@ -633,12 +603,12 @@ def visualize(
 class Visualizer:
     """Draws detection / segmentation results with consistent per-class colors for inference."""
 
-    def __init__(self, n_classes: int, class_names: Dict[int, str] = None):
+    def __init__(self, n_classes: int, class_names: dict[int, str] | None = None):
         self.class_names = class_names or {i: str(i) for i in range(n_classes)}
         self.colors = self._generate_colors(n_classes)
 
     @staticmethod
-    def _generate_colors(n: int) -> List[tuple]:
+    def _generate_colors(n: int) -> list[tuple]:
         """Evenly spaced hues on a violet→red arc -> BGR tuples. Class 0 = deep purple, last = red."""
         colors = []
         n = max(n, 1)
@@ -656,13 +626,11 @@ class Visualizer:
         """Draw prediction results on *img* (BGR, uint8).
 
         Args:
-            results: dict with keys ``labels``, ``boxes``, ``scores``,
-                     and optionally ``masks`` and ``track_ids``. When
-                     ``track_ids`` is present the label is prefixed with
-                     ``id=N``.
-            alpha: opacity of bbox outlines and label background rectangles
-                in [0, 1]. Lower values make annotations less likely to fully
-                occlude small neighboring objects. Text stays fully opaque.
+            results: dict with keys ``labels``, ``boxes``, ``scores``, and optionally ``masks`` and ``track_ids``. When
+                ``track_ids`` is present the label is prefixed with ``id=N``.
+            alpha: opacity of bbox outlines and label background rectangles in [0, 1]. Lower values make annotations
+                less likely to fully occlude small neighboring objects. Text stays fully opaque.
+
         Returns:
             Annotated copy of *img*.
         """
@@ -811,9 +779,7 @@ def clip_boxes(boxes, shape):
 def scale_boxes_ratio_kept(boxes, img0_shape, img1_shape, ratio_pad=None, padding=True):
     # Rescale boxes (xyxy) from img1_shape to img0_shape
     if ratio_pad is None:  # calculate from img0_shape
-        gain = min(
-            img1_shape[0] / img0_shape[0], img1_shape[1] / img0_shape[1]
-        )  # gain  = old / new
+        gain = min(img1_shape[0] / img0_shape[0], img1_shape[1] / img0_shape[1])  # gain  = old / new
         pad = (
             round((img1_shape[1] - img0_shape[1] * gain) / 2 - 0.1),
             round((img1_shape[0] - img0_shape[0] * gain) / 2 - 0.1),
@@ -831,10 +797,7 @@ def scale_boxes_ratio_kept(boxes, img0_shape, img1_shape, ratio_pad=None, paddin
 
 
 def scale_boxes(boxes, orig_shape, resized_shape):
-    """
-    boxes in format: [x1, y1, x2, y2], absolute values
-    orig_shape: [height, width]
-    resized_shape: [height, width]
+    """Boxes in format: [x1, y1, x2, y2], absolute values orig_shape: [height, width] resized_shape: [height, width].
     """
     scale_x = orig_shape[1] / resized_shape[1]
     scale_y = orig_shape[0] / resized_shape[0]
@@ -846,30 +809,20 @@ def scale_boxes(boxes, orig_shape, resized_shape):
 
 
 def process_boxes(boxes, processed_size, orig_sizes, keep_ratio, device):
-    """
-    Inputs:
-        boxes: Torch.tensor[batch_size, num_boxes, 4]
-        processed_size: Torch.tensor[2] h, w
-        orig_sizes: Torch.tensor[batch_size, 2] h, w
-        keep_ratio: bool
-        device: Torch.device
+    """Inputs: boxes: Torch.tensor[batch_size, num_boxes, 4] processed_size: Torch.tensor[2] h, w orig_sizes:
+    Torch.tensor[batch_size, 2] h, w keep_ratio: bool device: Torch.device.
 
     Outputs:
         Torch.tensor[batch_size, num_boxes, 4]
-
     """
     bs = orig_sizes.shape[0]
-    processed_sizes = np.repeat(
-        np.array([processed_size[0], processed_size[1]])[None, :], bs, axis=0
-    )
+    processed_sizes = np.repeat(np.array([processed_size[0], processed_size[1]])[None, :], bs, axis=0)
     orig_sizes = orig_sizes.cpu().numpy()
     boxes = boxes.cpu().numpy()
 
     final_boxes = np.zeros_like(boxes)
     for idx, box in enumerate(boxes):
-        final_boxes[idx] = norm_xywh_to_abs_xyxy(
-            box, processed_sizes[idx][0], processed_sizes[idx][1]
-        )
+        final_boxes[idx] = norm_xywh_to_abs_xyxy(box, processed_sizes[idx][0], processed_sizes[idx][1])
 
     for i in range(bs):
         if keep_ratio:
@@ -892,12 +845,10 @@ def process_masks(
     processed_size,  # (H, W) of network input (after your A.Compose)
     orig_sizes,  # Tensor [B, 2] (H, W)
     keep_ratio: bool,
-) -> List[torch.Tensor]:
-    """
-    Returns list of length B with masks resized to original image sizes:
-    Each item: Float Tensor [Q, H_orig, W_orig] in [0,1] (no thresholding here).
-    - Handles letterbox padding removal if keep_ratio=True.
-    - Works for both batched and single-image inputs.
+) -> list[torch.Tensor]:
+    """Returns list of length B with masks resized to original image sizes: Each item: Float Tensor [Q, H_orig, W_orig]
+    in [0,1] (no thresholding here). - Handles letterbox padding removal if keep_ratio=True. - Works for both
+    batched and single-image inputs.
     """
     single = pred_masks.dim() == 3  # [Q,Hm,Wm]
     if single:
@@ -906,7 +857,7 @@ def process_masks(
     if pred_masks.shape[1] == 0:
         return [torch.zeros((0, int(orig_sizes[0, 0]), int(orig_sizes[0, 1])))]
 
-    B, Q, Hm, Wm = pred_masks.shape
+    B, _Q, _Hm, _Wm = pred_masks.shape
     device = pred_masks.device
     dtype = pred_masks.dtype
 
@@ -946,16 +897,13 @@ def process_masks(
 
 def cleanup_masks(masks, boxes):
     # clean up masks outside of the corresponding bbox
-    N, H, W = masks.shape
+    _N, H, W = masks.shape
     ys = torch.arange(H)[None, :, None]  # (1, H, 1)
     xs = torch.arange(W)[None, None, :]  # (1, 1, W)
 
     x1, y1, x2, y2 = boxes.T
     inside = (
-        (xs >= x1[:, None, None])
-        & (xs < x2[:, None, None])
-        & (ys >= y1[:, None, None])
-        & (ys < y2[:, None, None])
+        (xs >= x1[:, None, None]) & (xs < x2[:, None, None]) & (ys >= y1[:, None, None]) & (ys < y2[:, None, None])
     )  # (N, H, W), bool
     masks = masks * inside.to(dtype=masks.dtype)
     return masks
@@ -1028,8 +976,8 @@ class LetterboxRect(DualTransform):
             if not self.scaleup:
                 r = min(r, 1.0)
 
-            new_unpad_w = int(round(w * r))
-            new_unpad_h = int(round(h * r))
+            new_unpad_w = round(w * r)
+            new_unpad_h = round(h * r)
 
             dw = self.width - new_unpad_w
             dh = self.height - new_unpad_h
@@ -1047,10 +995,10 @@ class LetterboxRect(DualTransform):
         dh *= 0.5
 
         # match inference border rounding
-        left = int(round(dw - 0.1))
-        right = int(round(dw + 0.1))
-        top = int(round(dh - 0.1))
-        bottom = int(round(dh + 0.1))
+        left = round(dw - 0.1)
+        right = round(dw + 0.1)
+        top = round(dh - 0.1)
+        bottom = round(dh + 0.1)
 
         return {
             # original size
@@ -1073,9 +1021,7 @@ class LetterboxRect(DualTransform):
         }
 
     # Image transform
-    def apply(
-        self, img, new_w=0, new_h=0, pad_left=0, pad_top=0, pad_right=0, pad_bottom=0, **kwargs
-    ):
+    def apply(self, img, new_w=0, new_h=0, pad_left=0, pad_top=0, pad_right=0, pad_bottom=0, **kwargs):
         # resize if needed
         if img.shape[1] != new_w or img.shape[0] != new_h:
             img = cv2.resize(img, (int(new_w), int(new_h)), interpolation=cv2.INTER_LINEAR)
@@ -1094,17 +1040,13 @@ class LetterboxRect(DualTransform):
         return img
 
     # Mask transform - pad with 0 (not object) instead of image color
-    def apply_to_mask(
-        self, mask, new_w=0, new_h=0, pad_left=0, pad_top=0, pad_right=0, pad_bottom=0, **kwargs
-    ):
+    def apply_to_mask(self, mask, new_w=0, new_h=0, pad_left=0, pad_top=0, pad_right=0, pad_bottom=0, **kwargs):
         # resize if needed - use INTER_LINEAR for smooth edges, then re-threshold
         # INTER_NEAREST causes ladder/wavy patterns on mask edges!
         if mask.shape[1] != new_w or mask.shape[0] != new_h:
             # Convert to float for bilinear interpolation
             mask_float = mask.astype(np.float32)
-            mask_float = cv2.resize(
-                mask_float, (int(new_w), int(new_h)), interpolation=cv2.INTER_LINEAR
-            )
+            mask_float = cv2.resize(mask_float, (int(new_w), int(new_h)), interpolation=cv2.INTER_LINEAR)
             # Re-threshold to binary (0.5 threshold for anti-aliased edges)
             mask = (mask_float > 0.5).astype(mask.dtype)
 
@@ -1179,7 +1121,7 @@ class LetterboxRect(DualTransform):
 
 
 def norm_poly_to_abs(poly_norm_flat: np.ndarray, H: int, W: int) -> np.ndarray:
-    """poly_norm_flat: [x1,y1,x2,y2,...] normalized -> (K,2) absolute"""
+    """Poly_norm_flat: [x1,y1,x2,y2,...] normalized -> (K,2) absolute."""
     if poly_norm_flat.size == 0:
         return np.empty((0, 2), dtype=np.float32)
     pts = poly_norm_flat.reshape(-1, 2).copy()
@@ -1212,9 +1154,8 @@ def poly_abs_to_mask(poly_abs: np.ndarray, h: int, w: int) -> np.ndarray:
 # ============================================================================
 
 
-def masks_to_rle(masks: torch.Tensor) -> List[Dict]:
-    """
-    Encode binary masks to COCO RLE format for memory-efficient storage.
+def masks_to_rle(masks: torch.Tensor) -> list[dict]:
+    """Encode binary masks to COCO RLE format for memory-efficient storage.
 
     Args:
         masks: [N, H, W] uint8 tensor with binary masks (0/1)
@@ -1235,17 +1176,14 @@ def masks_to_rle(masks: torch.Tensor) -> List[Dict]:
         # pycocotools expects Fortran-order (column-major) array
         rle = mask_utils.encode(np.asfortranarray(m))
         # Convert bytes to string for JSON serialization compatibility
-        rle["counts"] = (
-            rle["counts"].decode("utf-8") if isinstance(rle["counts"], bytes) else rle["counts"]
-        )
+        rle["counts"] = rle["counts"].decode("utf-8") if isinstance(rle["counts"], bytes) else rle["counts"]
         rles.append(rle)
 
     return rles
 
 
-def rle_to_masks(rles: List[Dict], device: str = "cpu") -> torch.Tensor:
-    """
-    Decode RLE-encoded masks back to dense tensor format.
+def rle_to_masks(rles: list[dict], device: str = "cpu") -> torch.Tensor:
+    """Decode RLE-encoded masks back to dense tensor format.
 
     Args:
         rles: List of RLE dicts from masks_to_rle()
@@ -1276,10 +1214,9 @@ def rle_to_masks(rles: List[Dict], device: str = "cpu") -> torch.Tensor:
     return torch.from_numpy(masks_np.copy()).to(dtype=torch.uint8, device=device)
 
 
-def encode_sample_masks_to_rle(sample: Dict) -> Dict:
-    """
-    Convert a prediction/GT sample dict to use RLE-encoded masks.
-    Replaces 'masks' tensor with 'masks_rle' list and stores original size.
+def encode_sample_masks_to_rle(sample: dict) -> dict:
+    """Convert a prediction/GT sample dict to use RLE-encoded masks. Replaces 'masks' tensor with 'masks_rle' list and
+    stores original size.
 
     Args:
         sample: Dict with 'masks' key containing [N, H, W] tensor
@@ -1310,9 +1247,8 @@ def encode_sample_masks_to_rle(sample: Dict) -> Dict:
     return sample
 
 
-def decode_sample_rle_to_masks(sample: Dict, device: str = "cpu") -> Dict:
-    """
-    Decode RLE masks back to dense tensor format in a sample dict.
+def decode_sample_rle_to_masks(sample: dict, device: str = "cpu") -> dict:
+    """Decode RLE masks back to dense tensor format in a sample dict.
 
     Args:
         sample: Dict with 'masks_rle' key
@@ -1334,10 +1270,8 @@ def decode_sample_rle_to_masks(sample: Dict, device: str = "cpu") -> Dict:
     return sample
 
 
-def get_rle_memory_size(rles: List[Dict]) -> int:
-    """
-    Estimate memory usage of RLE-encoded masks in bytes.
-    Useful for debugging/monitoring memory savings.
+def get_rle_memory_size(rles: list[dict]) -> int:
+    """Estimate memory usage of RLE-encoded masks in bytes. Useful for debugging/monitoring memory savings.
     """
     if not rles:
         return 0
@@ -1352,9 +1286,7 @@ def get_rle_memory_size(rles: List[Dict]) -> int:
 
 
 def get_dense_mask_memory_size(n_masks: int, h: int, w: int) -> int:
-    """
-    Calculate memory usage of dense masks in bytes.
-    """
+    """Calculate memory usage of dense masks in bytes."""
     return n_masks * h * w  # uint8 = 1 byte per pixel
 
 
@@ -1363,20 +1295,16 @@ def auto_batch_size(
     device: torch.device,
     target_fraction: float = 0.7,
 ) -> int:
-    """
-    Probe the GPU to find the largest batch size that fits within *target_fraction*
-    of total VRAM. Uses a real forward + backward pass with the actual model and
-    dataset to account for activations, loss, etc.
+    """Probe the GPU to find the largest batch size that fits within *target_fraction* of total VRAM. Uses a real
+    forward + backward pass with the actual model and dataset to account for activations, loss, etc.
 
-    Works with both detect and segment tasks.
-    Returns the selected per-device batch size.
-    Runs linearly through powers of 2, then does a binary search.
+    Works with both detect and segment tasks. Returns the selected per-device batch size. Runs linearly through powers
+    of 2, then does a binary search.
     """
+    from src.d_fine.define import build_loss, build_model
+    from src.dl.dataset import Loader
     from torch.amp import GradScaler, autocast
     from torch.utils.data import DataLoader
-
-    from src.d_fine.dfine import build_loss, build_model
-    from src.dl.dataset import Loader
 
     if device.type != "cuda":
         logger.warning("Auto batch size only works on CUDA devices, defaulting to batch_size=4")
@@ -1447,9 +1375,7 @@ def auto_batch_size(
         return 4
 
     sample_img = sample_img.to(device)  # [1, C, H, W]
-    sample_targets = [
-        {k: (v.to(device) if hasattr(v, "to") else v) for k, v in t.items()} for t in sample_targets
-    ]
+    sample_targets = [{k: (v.to(device) if hasattr(v, "to") else v) for k, v in t.items()} for t in sample_targets]
 
     total_mem = torch.cuda.get_device_properties(device).total_memory
     target_mem = int(total_mem * target_fraction)
@@ -1459,9 +1385,7 @@ def auto_batch_size(
     model.train()
     loss_fn.train()
 
-    def _try_batch(
-        bs, model, loss_fn, sample_img, sample_targets, amp_enabled, scaler, device, target_mem
-    ) -> bool:
+    def _try_batch(bs, model, loss_fn, sample_img, sample_targets, amp_enabled, scaler, device, target_mem) -> bool:
         """Run fwd+bwd at batch size *bs*. Return True if it fits within target_mem."""
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(device)
@@ -1532,8 +1456,5 @@ def auto_batch_size(
         del scaler
     torch.cuda.empty_cache()
 
-    logger.info(
-        f"Optimal batch size: {best_bs} "
-        f"(target {target_fraction:.0%} of {total_mem / 1024**3:.1f} GB VRAM)"
-    )
+    logger.info(f"Optimal batch size: {best_bs} (target {target_fraction:.0%} of {total_mem / 1024**3:.1f} GB VRAM)")
     return best_bs
