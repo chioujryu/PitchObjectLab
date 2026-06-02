@@ -7,6 +7,8 @@ YOLO BBox format: class_id x_center y_center width height
 All coordinates are normalized (0-1).
 """
 
+from __future__ import annotations
+
 import argparse
 from pathlib import Path
 
@@ -14,8 +16,7 @@ from tqdm import tqdm
 
 
 def polygon_to_bbox(polygon_coords: list[float]) -> tuple[float, float, float, float]:
-    """
-    Convert polygon coordinates to bounding box.
+    """Convert polygon coordinates to bounding box.
 
     Args:
         polygon_coords: List of [x1, y1, x2, y2, ..., xn, yn] normalized coordinates
@@ -43,8 +44,7 @@ def polygon_to_bbox(polygon_coords: list[float]) -> tuple[float, float, float, f
 
 
 def convert_label_file(input_path: Path, output_path: Path) -> int:
-    """
-    Convert a single label file from polygon to bbox format.
+    """Convert a single label file from polygon to bbox format.
 
     Args:
         input_path: Path to input polygon label file
@@ -55,7 +55,7 @@ def convert_label_file(input_path: Path, output_path: Path) -> int:
     """
     annotations = []
 
-    with open(input_path, "r") as f:
+    with open(input_path) as f:
         lines = f.readlines()
 
     for line in lines:
@@ -101,8 +101,7 @@ def convert_label_file(input_path: Path, output_path: Path) -> int:
 def convert_labels_folder(
     input_folder: str | Path, output_folder: str | Path | None = None, suffix: str = "_det"
 ) -> None:
-    """
-    Convert all label files in a folder from polygon to bbox format.
+    """Convert all label files in a folder from polygon to bbox format.
 
     Args:
         input_folder: Path to folder containing polygon label files
@@ -143,12 +142,8 @@ def convert_labels_folder(
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Convert YOLO polygon labels to YOLO bounding box format"
-    )
-    parser.add_argument(
-        "input_folder", type=str, help="Path to folder containing YOLO polygon label files (.txt)"
-    )
+    parser = argparse.ArgumentParser(description="Convert YOLO polygon labels to YOLO bounding box format")
+    parser.add_argument("input_folder", type=str, help="Path to folder containing YOLO polygon label files (.txt)")
     parser.add_argument(
         "-o",
         "--output",
@@ -166,9 +161,7 @@ def main():
 
     args = parser.parse_args()
 
-    convert_labels_folder(
-        input_folder=args.input_folder, output_folder=args.output, suffix=args.suffix
-    )
+    convert_labels_folder(input_folder=args.input_folder, output_folder=args.output, suffix=args.suffix)
 
 
 if __name__ == "__main__":

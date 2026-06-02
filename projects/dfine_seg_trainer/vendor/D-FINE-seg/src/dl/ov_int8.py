@@ -1,5 +1,4 @@
 from pathlib import Path
-from typing import Dict, List
 
 import hydra
 import nncf
@@ -8,7 +7,6 @@ import openvino as ov
 import torch
 from loguru import logger
 from omegaconf import DictConfig
-
 from src.dl.dataset import Loader
 from src.dl.train import Trainer
 from src.dl.utils import get_latest_experiment_name
@@ -17,10 +15,8 @@ from src.dl.validator import Validator
 
 @hydra.main(version_base=None, config_path="../../", config_name="config")
 def main(cfg: DictConfig):
-    """
-    Run INT8 quantization with accuracy control on OpenVINO IR model using f1 score.
-    Expects FP32 IR at <cfg.train.path_to_save>/model.xml.
-    Supports both detection and segmentation tasks.
+    """Run INT8 quantization with accuracy control on OpenVINO IR model using f1 score. Expects FP32 IR at
+    <cfg.train.path_to_save>/model.xml. Supports both detection and segmentation tasks.
     """
     # Resolve latest experiment (same as in train/export scripts)
     cfg.exp = get_latest_experiment_name(cfg.exp, cfg.train.path_to_save)
@@ -66,9 +62,7 @@ def main(cfg: DictConfig):
     validation_dataset = nncf.Dataset(val_loader, transform_fn)
 
     def validate(compiled_model: ov.CompiledModel, validation_loader) -> float:
-        """
-        compiled_model: openvino.CompiledModel
-        validation_loader: torch.utils.data.DataLoader
+        """compiled_model: openvino.CompiledModel validation_loader: torch.utils.data.DataLoader.
         """
         output_logits = compiled_model.output("logits")
         output_boxes = compiled_model.output("boxes")
@@ -79,8 +73,8 @@ def main(cfg: DictConfig):
             except RuntimeError:
                 logger.warning("masks output not found in model, disabling mask head")
 
-        all_preds: List[Dict[str, torch.Tensor]] = []
-        all_gt: List[Dict[str, torch.Tensor]] = []
+        all_preds: list[dict[str, torch.Tensor]] = []
+        all_gt: list[dict[str, torch.Tensor]] = []
 
         for inputs, targets, _ in validation_loader:
             # inputs: [B, C, H, W], torch on CPU
@@ -138,10 +132,7 @@ def main(cfg: DictConfig):
     max_drop = getattr(cfg.export, "ov_int8_max_drop", 0.01)
     subset_size = getattr(cfg.export, "ov_int8_subset_size", 300)
 
-    logger.info(
-        f"Starting INT8 quantization with accuracy control: "
-        f"max_drop={max_drop}, subset_size={subset_size}"
-    )
+    logger.info(f"Starting INT8 quantization with accuracy control: max_drop={max_drop}, subset_size={subset_size}")
 
     quantized_model = nncf.quantize_with_accuracy_control(
         model,

@@ -6,12 +6,11 @@ import hydra
 import numpy as np
 from loguru import logger
 from omegaconf import DictConfig
-from tqdm import tqdm
-
 from src.dl.dataset import read_image_hwc
 from src.dl.utils import Visualizer, abs_xyxy_to_norm_xywh, get_latest_experiment_name
 from src.infer.byte_track import ByteTrack, Detection
 from src.infer.torch_model import Torch_model
+from tqdm import tqdm
 
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv"}
 
@@ -69,9 +68,7 @@ def save_yolo_annotations(res, output_path, img_path, img_shape):
             else:
                 # YOLO detection format: class_id x_center y_center width height
                 norm_box = abs_xyxy_to_norm_xywh(box[None], img_shape[0], img_shape[1])[0]
-                f.write(
-                    f"{int(class_id)} {norm_box[0]:.6f} {norm_box[1]:.6f} {norm_box[2]:.6f} {norm_box[3]:.6f}\n"
-                )
+                f.write(f"{int(class_id)} {norm_box[0]:.6f} {norm_box[1]:.6f} {norm_box[2]:.6f} {norm_box[3]:.6f}\n")
 
 
 def crops(or_img, res, paddings, output_path, output_stem):
@@ -91,9 +88,7 @@ def crops(or_img, res, paddings, output_path, output_stem):
         cv2.imwrite((str(output_path / "crops" / f"{output_stem}_{crop_id}.jpg")), crop)
 
 
-def run_images(
-    torch_model, folder_path, output_path, label_to_name, to_crop, paddings, conf_thresh
-):
+def run_images(torch_model, folder_path, output_path, label_to_name, to_crop, paddings, conf_thresh):
     batch = 0
     imag_paths = [img.name for img in folder_path.iterdir() if not str(img).startswith(".")]
     labels = set()
@@ -138,9 +133,7 @@ def run_images(
         for class_id in res["labels"]:
             labels.add(class_id)
 
-        save_yolo_annotations(
-            res=res, output_path=output_path / "labels", img_path=img_path, img_shape=img.shape
-        )
+        save_yolo_annotations(res=res, output_path=output_path / "labels", img_path=img_path, img_shape=img.shape)
 
         if to_crop:
             crops(crop_img, res, paddings, output_path, Path(img_path).stem)
@@ -150,9 +143,7 @@ def run_images(
             f.write(f"{label_to_name[int(class_id)]}\n")
 
 
-def run_videos(
-    torch_model, folder_path, output_path, label_to_name, to_crop, paddings, conf_thresh
-):
+def run_videos(torch_model, folder_path, output_path, label_to_name, to_crop, paddings, conf_thresh):
     batch = 0
     vid_paths = [vid.name for vid in folder_path.iterdir() if not str(vid.name).startswith(".")]
     labels = set()
@@ -240,8 +231,7 @@ def _run_video_tracked(torch_model, tracker, visualizer, video_path, output_path
         scores = res["scores"].cpu().numpy()
 
         detections = [
-            Detection(bbox=tuple(b.tolist()), score=float(s), cls_id=int(c))
-            for b, c, s in zip(boxes, labels, scores)
+            Detection(bbox=tuple(b.tolist()), score=float(s), cls_id=int(c)) for b, c, s in zip(boxes, labels, scores)
         ]
         tracked = tracker.update(detections, frame_shape=(height, width))
 
@@ -272,9 +262,7 @@ def _run_video_tracked(torch_model, tracker, visualizer, video_path, output_path
 
 def run_videos_tracked(torch_model, folder_path, output_path, label_to_name, tracker_cfg):
     video_files = sorted(
-        f
-        for f in folder_path.iterdir()
-        if f.suffix.lower() in VIDEO_EXTS and not f.name.startswith(".")
+        f for f in folder_path.iterdir() if f.suffix.lower() in VIDEO_EXTS and not f.name.startswith(".")
     )
     if not video_files:
         logger.error(f"No video files found in {folder_path}")
@@ -349,9 +337,7 @@ def main(cfg: DictConfig):
     )
 
     if data_type == "video" and cfg.train.in_channels != 3:
-        raise ValueError(
-            f"Video inference only supports 3-channel input, got in_channels={cfg.train.in_channels}"
-        )
+        raise ValueError(f"Video inference only supports 3-channel input, got in_channels={cfg.train.in_channels}")
 
     output_path = Path(cfg.train.infer_path)
     if output_path.exists():
