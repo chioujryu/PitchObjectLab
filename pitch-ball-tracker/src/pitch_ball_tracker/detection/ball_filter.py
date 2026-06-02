@@ -15,19 +15,17 @@ _DEBUG_FRAME = -1  # set to frame index to dump all detections for that frame
 @dataclass
 class BallCandidate:
     """A single detection that has passed ball-shape filtering."""
-    box: np.ndarray       # (4,) xyxy float32
-    mask: np.ndarray      # (H, W) bool
+
+    box: np.ndarray  # (4,) xyxy float32
+    mask: np.ndarray  # (H, W) bool
     score: float
     circularity: float
     area: float
 
 
 class BallFilter:
-    """
-    Geometric filter that accepts SAM3 segments that look like a ball:
-      - Circularity close to 1 (round shape)
-      - Area within configured bounds
-      - Aspect ratio not too elongated
+    """Geometric filter that accepts SAM3 segments that look like a ball: - Circularity close to 1 (round shape) - Area
+    within configured bounds - Aspect ratio not too elongated.
     """
 
     def __init__(self, cfg: DictConfig) -> None:
@@ -47,23 +45,27 @@ class BallFilter:
             accepted = self._accept(box, circ, area)
             if frame_idx < 10:
                 reason = (
-                    "OK" if accepted else
-                    f"circ={circ:.2f}<{self._min_circ}" if circ < self._min_circ else
-                    f"area={area:.0f} out of [{self._min_area},{self._max_area}]" if not (self._min_area <= area <= self._max_area) else
-                    f"ar={ar:.2f}>{self._max_ar}"
+                    "OK"
+                    if accepted
+                    else f"circ={circ:.2f}<{self._min_circ}"
+                    if circ < self._min_circ
+                    else f"area={area:.0f} out of [{self._min_area},{self._max_area}]"
+                    if not (self._min_area <= area <= self._max_area)
+                    else f"ar={ar:.2f}>{self._max_ar}"
                 )
                 logger.debug(
-                    f"  [frame {frame_idx}] score={score:.3f} circ={circ:.2f} "
-                    f"area={area:.0f} ar={ar:.2f} → {reason}"
+                    f"  [frame {frame_idx}] score={score:.3f} circ={circ:.2f} area={area:.0f} ar={ar:.2f} → {reason}"
                 )
             if accepted:
-                candidates.append(BallCandidate(
-                    box=box.astype(np.float32),
-                    mask=mask,
-                    score=float(score),
-                    circularity=circ,
-                    area=area,
-                ))
+                candidates.append(
+                    BallCandidate(
+                        box=box.astype(np.float32),
+                        mask=mask,
+                        score=float(score),
+                        circularity=circ,
+                        area=area,
+                    )
+                )
         return candidates
 
     def _accept(self, box: np.ndarray, circ: float, area: float) -> bool:
@@ -83,6 +85,7 @@ class BallFilter:
 # Helpers
 # ------------------------------------------------------------------
 
+
 def _mask_circularity_area(mask: np.ndarray) -> tuple[float, float]:
     """Return (circularity, area_px) for a boolean mask."""
     uint8 = mask.astype(np.uint8) * 255
@@ -94,5 +97,5 @@ def _mask_circularity_area(mask: np.ndarray) -> tuple[float, float]:
     perimeter = cv2.arcLength(c, closed=True)
     if perimeter < 1e-3:
         return 0.0, float(area)
-    circularity = 4 * np.pi * area / (perimeter ** 2)
+    circularity = 4 * np.pi * area / (perimeter**2)
     return float(np.clip(circularity, 0.0, 1.0)), float(area)

@@ -6,11 +6,10 @@ import hydra
 import numpy as np
 import pandas as pd
 from omegaconf import DictConfig
-from tabulate import tabulate
-from tqdm import tqdm
-
 from src.dl.utils import get_latest_experiment_name
 from src.infer.torch_model import Torch_model
+from tabulate import tabulate
+from tqdm import tqdm
 
 
 @hydra.main(version_base=None, config_path="../../", config_name="config")

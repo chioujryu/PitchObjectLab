@@ -1,6 +1,6 @@
 """
 This script takes a path to labels and label id to remove.
-It delets all objects with that label id and if there are no other labels on the image - removes image too
+It deletes all objects with that label id and if there are no other labels on the image - removes image too.
 
 """
 

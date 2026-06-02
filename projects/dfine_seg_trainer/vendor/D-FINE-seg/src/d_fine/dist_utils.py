@@ -11,11 +11,9 @@ def is_dist_available_and_initialized() -> bool:
 
 
 def init_distributed_mode() -> None:
-    """
-    Single-node torchrun-friendly DDP init.
+    """Single-node torchrun-friendly DDP init.
 
-    torchrun sets: RANK, WORLD_SIZE, LOCAL_RANK.
-    We:
+    torchrun sets: RANK, WORLD_SIZE, LOCAL_RANK. We:
     - read LOCAL_RANK
     - set CUDA device
     - init the default process group
@@ -112,11 +110,7 @@ def broadcast_scalar(value, src: int = 0):
     if world_size == 1:
         return value
 
-    device = (
-        torch.device("cuda", torch.cuda.current_device())
-        if torch.cuda.is_available()
-        else torch.device("cpu")
-    )
+    device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
     tensor = torch.tensor([float(value)], device=device)
     if get_rank() == src:
         tensor.fill_(float(value))
@@ -125,9 +119,8 @@ def broadcast_scalar(value, src: int = 0):
 
 
 def _preds_to_serializable(preds_list):
-    """
-    Convert prediction/gt dicts with tensors to serializable format (numpy arrays).
-    This avoids CUDA memory issues during all_gather_object.
+    """Convert prediction/gt dicts with tensors to serializable format (numpy arrays). This avoids CUDA memory issues
+    during all_gather_object.
     """
     serializable = []
     for item in preds_list:
@@ -142,9 +135,7 @@ def _preds_to_serializable(preds_list):
 
 
 def _serializable_to_preds(serializable_list):
-    """
-    Convert serializable format back to tensors.
-    """
+    """Convert serializable format back to tensors."""
     preds = []
     for item in serializable_list:
         new_item = {}
@@ -158,8 +149,7 @@ def _serializable_to_preds(serializable_list):
 
 
 def gather_predictions(local_preds, local_gt):
-    """
-    Gather predictions and ground truth from all ranks to rank 0.
+    """Gather predictions and ground truth from all ranks to rank 0.
 
     Args:
         local_preds: List of prediction dicts from this rank
@@ -194,9 +184,7 @@ def gather_predictions(local_preds, local_gt):
 
 
 def synchronize():
-    """
-    Synchronize all processes. Use as a barrier.
-    """
+    """Synchronize all processes. Use as a barrier."""
     if not is_dist_available_and_initialized():
         return
     world_size = get_world_size()
