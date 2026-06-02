@@ -2,19 +2,13 @@ import platform
 import time
 from pathlib import Path
 from shutil import rmtree
-from typing import Dict, Tuple
 
-import cv2
 import hydra
 import numpy as np
 import pandas as pd
 import torch
 from loguru import logger
 from omegaconf import DictConfig
-from tabulate import tabulate
-from torch.utils.data import DataLoader
-from tqdm import tqdm
-
 from src.dl.dataset import CustomDataset, Loader, read_image_hwc
 from src.dl.utils import (
     get_latest_experiment_name,
@@ -23,12 +17,15 @@ from src.dl.utils import (
     visualize,
 )
 from src.dl.validator import Validator
+from tabulate import tabulate
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 IS_MACOS = platform.system() == "Darwin"
 
 
 class BenchLoader(Loader):
-    def build_dataloaders(self) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    def build_dataloaders(self) -> tuple[DataLoader, DataLoader, DataLoader]:
         val_ds = CustomDataset(
             self.img_size,
             self.root_path,
@@ -63,10 +60,10 @@ def test_model(
     conf_thresh: float,
     iou_thresh: float,
     to_visualize: bool,
-    processed_size: Tuple[int, int],
+    processed_size: tuple[int, int],
     keep_ratio: bool,
     device: str,
-    label_to_name: Dict[int, str],
+    label_to_name: dict[int, str],
     compute_maps: bool,
     to_draw_gt: bool,
 ):
@@ -95,7 +92,7 @@ def test_model(
             img = read_image_hwc(data_path / "images" / img_path)
             is_npy = Path(img_path).suffix.lower() == ".npy"
 
-            # laod GT
+            # load GT
             gt_boxes = process_boxes(
                 target["boxes"][None],
                 processed_size,

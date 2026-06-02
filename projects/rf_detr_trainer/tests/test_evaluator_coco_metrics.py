@@ -1,10 +1,9 @@
-from pathlib import Path
-from types import SimpleNamespace
 import sys
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
-
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 REPO_ROOT = PROJECT_DIR.parents[1]

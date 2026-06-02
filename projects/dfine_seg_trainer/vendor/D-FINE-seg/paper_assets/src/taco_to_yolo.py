@@ -25,9 +25,7 @@ def parse_args():
         required=True,
         help="Directory containing TACO JSON annotation files",
     )
-    parser.add_argument(
-        "--output_dir", type=str, required=True, help="Output directory for YOLO format labels"
-    )
+    parser.add_argument("--output_dir", type=str, required=True, help="Output directory for YOLO format labels")
     parser.add_argument(
         "--classes_file",
         type=str,
@@ -47,7 +45,7 @@ def load_class_mapping(classes_file: str) -> dict:
     """Load existing class mapping from classes.txt file."""
     class_to_idx = {}
     if os.path.exists(classes_file):
-        with open(classes_file, "r") as f:
+        with open(classes_file) as f:
             for idx, line in enumerate(f):
                 class_name = line.strip()
                 if class_name:
@@ -74,7 +72,7 @@ def discover_classes(input_dir: str) -> dict:
     print("Discovering classes from annotations...")
     for json_file in tqdm(json_files):
         try:
-            with open(json_file, "r") as f:
+            with open(json_file) as f:
                 data = json.load(f)
             for obj in data.get("objects", []):
                 class_title = obj.get("classTitle", "")
@@ -121,7 +119,7 @@ def convert_annotation(json_file: str, output_dir: str, class_to_idx: dict) -> d
     """Convert a single TACO annotation file to YOLO format."""
     stats = {"polygons": 0, "rectangles": 0, "skipped": 0}
 
-    with open(json_file, "r") as f:
+    with open(json_file) as f:
         data = json.load(f)
 
     # Get image dimensions
