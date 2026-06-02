@@ -132,6 +132,8 @@ venv.bak/
 # VSCode project settings
 .vscode/
 .devcontainer/
+.git.backup-*/
+.git.backup-*
 
 # Rope project settings
 .ropeproject
@@ -150,13 +152,19 @@ dmypy.json
 # datasets and projects (ignore /datasets dir at root only to allow for docs/en/datasets dir)
 /datasets
 runs/
+dataset_cache/
+**/dataset_cache/
 wandb/
 .DS_Store
+.ruff_cache/
 
 # Neural Network weights -----------------------------------------------------------------------------------------------
 weights/
 *.weights
 *.pt
+*.pth
+*.ckpt
+*.tmp
 *.ts
 *.pb
 *.onnx

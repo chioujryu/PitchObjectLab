@@ -22,7 +22,7 @@ model:
   # Optional class count override. Options: null to auto-detect from dataset, or a positive integer.
   num_classes: 3
   # Model construction device. Options: auto, cpu, cuda, cuda:0. Training device is controlled by train.device.
-  device: auto
+  device: cuda:7
   # Automatic mixed precision behavior in RF-DETR model config. Options: true, false.
   amp: true
   # Prediction confidence threshold used by wrapper final/periodic tests. Options: 0.0-1.0.
@@ -97,7 +97,7 @@ train:
   # Dataset file type. Options: roboflow, coco, yolo, o365. roboflow auto-detects Roboflow COCO/YOLO layouts.
   dataset_file: roboflow
   # CUDA/CPU selector. Options: auto, cpu, cuda, 0, 1, 0,1, cuda:0, mps, -1.
-  device: 0
+  device: 7
   # Number of training epochs. Options: any positive integer.
   epochs: 50
   # Micro batch size per optimizer step. Options: positive integer, or auto for RF-DETR auto-batch probing.
