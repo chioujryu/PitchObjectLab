@@ -26,7 +26,7 @@ src/
 - Python 3.11–3.13, PyTorch 2.9, CUDA 12.x. Dependencies live in [pyproject.toml](pyproject.toml); [uv.lock](uv.lock) is the source of truth for versions.
 - Install with `uv sync` (creates `.venv/`). All Makefile targets shell out via `uv run`, so no manual activation is needed for `make train` / `make bench` / etc. For ad-hoc commands either prefix with `uv run` or activate the venv (`source .venv/bin/activate`).
 - Platform-specific deps are gated by markers in `pyproject.toml`: `tensorrt` installs on Linux only. `coremltools` ships wheels for both platforms (Linux can run the converter for `make export`, even though the CoreML runtime itself is macOS-only). `uv.lock` covers both so the same lockfile works on the dev mac and the lab box.
-- Pretrained weights auto-download from Hugging Face (`ArgoSA/D-FINE-seg`) into `pretrained/` on first use via `ensure_pretrained` in [src/d_fine/utils.py](src/d_fine/utils.py). Triggered from `build_model` in [src/d_fine/dfine.py](src/d_fine/dfine.py) only when the filename matches `dfine_<size>_<dataset>.pt`; custom checkpoint paths still raise `FileNotFoundError` if missing.
+- Pretrained weights auto-download from Hugging Face (`ArgoSA/D-FINE-seg`) into `pretrained/` on first use via `ensure_pretrained` in [src/d_fine/utils.py](src/d_fine/utils.py). Triggered from `build_model` in [src/d_fine/define.py](src/d_fine/define.py) only when the filename matches `dfine_<size>_<dataset>.pt`; custom checkpoint paths still raise `FileNotFoundError` if missing.
 
 ## 4. Configuration model
 
@@ -38,22 +38,22 @@ python -m src.dl.train exp_name=my_exp model_name=s train.batch_size=12 train.ep
 
 Key top-level fields in [config.yaml](config.yaml):
 
-| Field | Meaning |
-|---|---|
-| `project_name` | WandB project name |
-| `exp_name` | Experiment name (outputs nest under `<exp_name>_<date>`) |
-| `model_name` | `n` / `s` / `m` / `l` / `x` |
-| `task` | `detect` or `segment` |
-| `train.root` | Absolute project root (dataset + outputs live here) |
-| `train.data_path` | Dataset dir — `${train.root}/data/dataset` by default |
-| `train.coco_dataset` | `False` → YOLO-style; `True` → COCO JSON |
-| `train.pretrained_dataset` | `coco` or `obj2coco` |
-| `train.pretrained_model_path` | Path to init weights (swap this to fine-tune from a custom checkpoint) |
-| `train.path_to_save` | Where `model.pt`, `last.pt`, logs, and configs land |
-| `train.path_to_test_data` | Folder of images/videos for `infer.py` |
-| `train.label_to_name` | 0-indexed, contiguous class map |
-| `train.ddp.enabled` / `train.ddp.n_gpus` | Multi-GPU switch |
-| `train.conf_thresh` / `train.iou_thresh` | Detection thresholds |
+| Field                                    | Meaning                                                                |
+| ---------------------------------------- | ---------------------------------------------------------------------- |
+| `project_name`                           | WandB project name                                                     |
+| `exp_name`                               | Experiment name (outputs nest under `<exp_name>_<date>`)               |
+| `model_name`                             | `n` / `s` / `m` / `l` / `x`                                            |
+| `task`                                   | `detect` or `segment`                                                  |
+| `train.root`                             | Absolute project root (dataset + outputs live here)                    |
+| `train.data_path`                        | Dataset dir — `${train.root}/data/dataset` by default                  |
+| `train.coco_dataset`                     | `False` → YOLO-style; `True` → COCO JSON                               |
+| `train.pretrained_dataset`               | `coco` or `obj2coco`                                                   |
+| `train.pretrained_model_path`            | Path to init weights (swap this to fine-tune from a custom checkpoint) |
+| `train.path_to_save`                     | Where `model.pt`, `last.pt`, logs, and configs land                    |
+| `train.path_to_test_data`                | Folder of images/videos for `infer.py`                                 |
+| `train.label_to_name`                    | 0-indexed, contiguous class map                                        |
+| `train.ddp.enabled` / `train.ddp.n_gpus` | Multi-GPU switch                                                       |
+| `train.conf_thresh` / `train.iou_thresh` | Detection thresholds                                                   |
 
 LRs are indexed by model size under `train.lrs.<size>.{backbone_lr, base_lr}`.
 
@@ -70,6 +70,7 @@ Preset dataset configs in [configs/](configs/) can be used as templates — copy
 ```
 
 Label format:
+
 - **detect**: `class_id xc yc w h` (normalized, cxcywh)
 - **segment**: `class_id x1 y1 x2 y2 … xN yN` (normalized polygon)
 
@@ -78,7 +79,7 @@ Supported input types: 3-channel `.jpg`/`.png` (BGR, `cv2.imread`), 3-channel `.
 Generate splits:
 
 ```bash
-make split        # == python -m src.etl.split
+make split # == python -m src.etl.split
 ```
 
 Produces `train.csv`, `val.csv` (and `test.csv` if `split.val_split < 1 - split.train_split`) inside `train.data_path`. Ratios live under the top-level `split:` section in `config.yaml`.
@@ -125,6 +126,7 @@ make train
 ### 6.4 Outputs
 
 Under `${train.path_to_save}` (= `${train.root}/output/models/<exp>`):
+
 - `model.pt` — **best** checkpoint by `train.decision_metrics` (use this for inference/export)
 - `last.pt` — last-epoch checkpoint, used only for NaN recovery
 - `config.yaml` — frozen snapshot of the run's config
@@ -165,6 +167,7 @@ python -m src.dl.infer train.path_to_test_data=/abs/path/to/folder infer.to_crop
 Supported inputs: `.jpg`, `.png`, `.jpeg`, `.mp4`, `.avi`, `.mov`, `.mkv`.
 
 Outputs land under `${train.infer_path}`:
+
 - `images/` — annotated frames (boxes + masks + labels)
 - `labels/` — YOLO-format predictions per frame
 - `crops/` — per-object crops (when `infer.to_crop: True`, padded by `infer.paddings.{w,h}`)
@@ -180,22 +183,24 @@ Important to note: inference wrappers under /infer are standalone scripts that a
 ## 9. Benchmarking
 
 ```bash
-make bench        # == python -m src.dl.bench
+make bench # == python -m src.dl.bench
 ```
 
 Runs the val/test set through each backend listed in `formats_to_bench` inside [src/dl/bench.py](src/dl/bench.py) and reports per-backend latency (ms/image, CUDA-synced, warmup skipped) and F1 / mAP vs GT. Edit `formats_to_bench` to include/exclude `"torch"`, `"onnx"`, `"openvino"`, `"tensorrt"`, `"coreml"`, `"litert"`. The exported artifact for each backend must already exist (run `make export` first).
 
 Related:
+
 - `python -m src.dl.test_batching` — sweeps batch sizes, writes `batched_infer.csv`
 - `python -m src.dl.check_errors` — dumps FP/FN mismatches against GT
 
 ## 10. Export / conversion
 
 ```bash
-make export       # == python -m src.dl.export
+make export # == python -m src.dl.export
 ```
 
 Produces, under `${train.path_to_save}`:
+
 - `model.onnx` (always)
 - `model.engine` — TensorRT (skipped on macOS; engine is GPU-specific, rebuild on target hardware)
 - `model.xml` + `model.bin` — OpenVINO
@@ -209,8 +214,8 @@ ONNX has the D-FINE postprocessor fused into the graph; OpenVINO exports the raw
 ### 10.1 INT8 quantization
 
 ```bash
-make ov_int8      # OpenVINO INT8 via NNCF, accuracy-aware (can take hours)
-make trt_int8     # TensorRT INT8 calibration
+make ov_int8  # OpenVINO INT8 via NNCF, accuracy-aware (can take hours)
+make trt_int8 # TensorRT INT8 calibration
 ```
 
 OpenVINO path respects `ov_int8_max_drop` (default 0.02 F1 drop allowed).
@@ -220,11 +225,12 @@ OpenVINO path respects `ov_int8_max_drop` (default 0.02 F1 drop allowed).
 Pytest suite under [tests/](tests/), zero training data required.
 
 ```bash
-make test-fast   # ~5s on Mac, all unit tests + CPU forward smoke
-make test        # full suite incl. the ~5s CPU pretrained accuracy regression
+make test-fast # ~5s on Mac, all unit tests + CPU forward smoke
+make test      # full suite incl. the ~5s CPU pretrained accuracy regression
 ```
 
 Layout:
+
 - `tests/unit/` — pin pure helpers (box conversions, IoU, RLE, letterbox, NMS, matcher, losses, Validator, ETL). No model or weights loaded.
 - `tests/integration/test_cpu_forward.py` — shapes + a loose CPU forward latency ceiling. GPU variant is marked `@pytest.mark.gpu` and auto-skips when CUDA isn't present.
 - `tests/integration/test_pretrained_accuracy.py` (marked `slow`) — loads `dfine_s_coco.pt` on CPU, runs through `Torch_model` on the source images in `tests/assets/`, asserts `mAP_50 ≥ baseline_min` from `tests/assets/baseline.json`. Catches any silent drift in the model arch / weights loader / postprocess / letterbox / NMS / Validator math.
@@ -275,23 +281,23 @@ uv run python -m tests.generate_fixtures
 
 ## 13. Quick reference
 
-| Task | Command |
-|---|---|
-| Prepare YOLO splits | `make split` |
-| Train (single GPU) | `python -m src.dl.train exp_name=<name> model_name=<size>` |
-| Train (multi-GPU) | set `train.ddp.enabled=True`, `train.ddp.n_gpus=N`, then `make train` |
-| Fine-tune from checkpoint | `python -m src.dl.train train.pretrained_model_path=/abs/path/model.pt exp_name=<new>` |
-| Infer on folder (images or video) | `python -m src.dl.infer train.path_to_test_data=/abs/path` |
-| Export all formats | `make export` |
-| Benchmark exports | `make bench` |
-| Full pipeline | `make` (train → export → bench) |
-| Find best batch size | `python -m src.dl.test_batching` |
-| Inspect FP/FN | `python -m src.dl.check_errors` |
-| OpenVINO INT8 | `make ov_int8` |
-| TensorRT INT8 | `make trt_int8` |
-| Run unit + smoke tests | `make test-fast` |
-| Run full test suite | `make test` |
-| Regenerate accuracy baseline | `uv run python -m tests.generate_fixtures` |
+| Task                              | Command                                                                                |
+| --------------------------------- | -------------------------------------------------------------------------------------- |
+| Prepare YOLO splits               | `make split`                                                                           |
+| Train (single GPU)                | `python -m src.dl.train exp_name=<name> model_name=<size>`                             |
+| Train (multi-GPU)                 | set `train.ddp.enabled=True`, `train.ddp.n_gpus=N`, then `make train`                  |
+| Fine-tune from checkpoint         | `python -m src.dl.train train.pretrained_model_path=/abs/path/model.pt exp_name=<new>` |
+| Infer on folder (images or video) | `python -m src.dl.infer train.path_to_test_data=/abs/path`                             |
+| Export all formats                | `make export`                                                                          |
+| Benchmark exports                 | `make bench`                                                                           |
+| Full pipeline                     | `make` (train → export → bench)                                                        |
+| Find best batch size              | `python -m src.dl.test_batching`                                                       |
+| Inspect FP/FN                     | `python -m src.dl.check_errors`                                                        |
+| OpenVINO INT8                     | `make ov_int8`                                                                         |
+| TensorRT INT8                     | `make trt_int8`                                                                        |
+| Run unit + smoke tests            | `make test-fast`                                                                       |
+| Run full test suite               | `make test`                                                                            |
+| Regenerate accuracy baseline      | `uv run python -m tests.generate_fixtures`                                             |
 
 ## 14. Code style
 

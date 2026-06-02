@@ -31,9 +31,7 @@ def split(
                 img_paths.remove(img_path)
 
     indices = np.arange(len(img_paths))
-    train_idxs, temp_idxs = train_test_split(
-        indices, test_size=(1 - train_split), random_state=seed, shuffle=shuffle
-    )
+    train_idxs, temp_idxs = train_test_split(indices, test_size=(1 - train_split), random_state=seed, shuffle=shuffle)
 
     if test_split:
         test_idxs, val_idxs = train_test_split(
