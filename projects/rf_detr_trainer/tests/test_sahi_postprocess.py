@@ -1,7 +1,6 @@
-from pathlib import Path
 import sys
 import unittest
-
+from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 REPO_ROOT = PROJECT_DIR.parents[1]
