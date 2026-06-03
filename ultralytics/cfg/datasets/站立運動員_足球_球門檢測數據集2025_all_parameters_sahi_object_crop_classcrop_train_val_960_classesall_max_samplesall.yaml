@@ -3,7 +3,6 @@ path: /home/new_users/zhiyu/cosmo/datasets/soccer/spatial_perception/Xbotgo/ç«™ç
 train: images/train # train images (relative to 'path') 4 images
 val: images/val # val images (relative to 'path') 4 images
 test: images/test
-test-original: images/test-original
 
 # Classes
 names:
