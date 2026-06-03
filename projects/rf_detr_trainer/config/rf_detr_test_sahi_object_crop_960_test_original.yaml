@@ -12,6 +12,19 @@ runtime:
   yes: false
   # Seed for deterministic sampling. Options: integer.
   seed: 0
+  time_estimate:
+    # Print rough HH:MM:SS runtime estimates before execution. Options: true, false.
+    enabled: true
+    # Prefer latest sibling run_timing.json throughput when available. Options: true, false.
+    use_history: true
+    # Fallback train speed retained for shared schema. Options: positive seconds per training batch.
+    default_train_seconds_per_batch: 0.7
+    # Fallback standalone test speed for first runs. Options: positive seconds per image.
+    default_test_seconds_per_image: 0.25
+    # Fallback inference speed retained for shared schema. Options: positive seconds per image/frame.
+    default_inference_seconds_per_image: 0.25
+    # Fallback video render speed retained for shared schema. Options: positive seconds per frame.
+    default_video_render_seconds_per_frame: 0.005
 
 model:
   # RF-DETR model size. Options: base, nano, small, medium, large, seg-preview, seg-nano, seg-small, seg-medium, seg-large, seg-xlarge, seg-2xlarge.
@@ -27,7 +40,7 @@ model:
   # Automatic mixed precision. Options: true, false.
   amp: true
   # Prediction confidence threshold. Options: 0.0-1.0.
-  confidence_threshold: 0.7
+  confidence_threshold: 0.25
   # Optional model label to dataset category-id mapping. Options: {}, false, or {model_label: dataset_category_id}.
   category_remapping: {}
   # Extra RF-DETR ModelConfig keys. Options: any supported model config key.
@@ -70,6 +83,8 @@ output:
 test:
   # Dataset split. Options: test-original, test, val, valid, train.
   split: test-original
+  # Maximum images to evaluate. Options: all/null for the full split, or a positive integer for first N images.
+  max_images: 1000
   test_mode:
     # Test mode. Options: full_image, class_crop, sahi.
     mode: sahi
@@ -110,6 +125,28 @@ test:
     postprocess_class_agnostic: false
     # SAHI batch size. Options: positive integer.
     batch_size: 1
+    recheck:
+      # Run a second centered B*B verification pass for selected SAHI target-class boxes. Options: true, false.
+      enabled: true
+      # Target category IDs for SAHI recheck. Empty means use target_class_names; if both empty and enabled, default is football.
+      target_class_ids: []
+      # Target category names for SAHI recheck. Empty with enabled defaults to football. Options: category names such as [football].
+      target_class_names:
+        - football
+      # B*B centered crop size for the second pass. Options: positive integer pixels.
+      crop_size: 640
+      # Confidence threshold for the second pass. Options: 0.0-1.0.
+      second_confidence_threshold: 0.25
+      # Weight applied to the first-stage confidence. Options: non-negative float.
+      first_weight: 0.5
+      # Weight applied to the best second-stage confidence. Options: non-negative float.
+      second_weight: 0.5
+      # Minimum fused confidence to keep the first-stage box. Options: 0.0-1.0.
+      fused_confidence_threshold: 0.5
+      # Extra relative padding around the first-stage box for center-hit matching. Options: non-negative float.
+      center_padding_ratio: 0.0
+      # Maximum target boxes rechecked per image. Options: 0 disables rechecking; positive integer caps by score.
+      max_rechecks_per_image: 50
   visual_samples:
     # Save sampled GT/prediction images. Options: true, false.
     enabled: true
@@ -139,8 +176,8 @@ test:
     min_predictions: 0
     # Minimum score for candidate filtering. Options: null or 0.0-1.0.
     filter_min_score: 0.7
-    # Minimum score drawn. Options: null or 0.0-1.0.
-    draw_min_score: 0.7
+    # Minimum score drawn. Options: null to use model.confidence_threshold, or 0.0-1.0.
+    draw_min_score: null
   # Write per-class metrics. Options: true, false.
   classwise: true
   # Show progress bars. Options: true, false.

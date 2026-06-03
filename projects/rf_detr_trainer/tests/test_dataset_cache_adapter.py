@@ -128,6 +128,72 @@ class DatasetCacheAdapterTest(unittest.TestCase):
             self.assertEqual(metadata["split_counts"]["test-original"], 1)
             self.assertEqual(split_count(cache_dir, "test-original"), 1)
 
+    def test_source_conversion_respects_dataset_split_limits(self):
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as temp:
+            root = Path(temp) / "yolo_limited"
+            cache_root = Path(temp) / "cache"
+            for split, count in (("train", 3), ("val", 2), ("test", 2)):
+                for index in range(count):
+                    image = root / "images" / split / f"{split}_{index}.jpg"
+                    make_image(image)
+                    label_dir = root / "labels" / split
+                    label_dir.mkdir(parents=True, exist_ok=True)
+                    (label_dir / f"{split}_{index}.txt").write_text("0 0.5 0.5 0.2 0.4\n", encoding="utf-8")
+            (root / "data.yaml").write_text(
+                "path: .\ntrain: images/train\nval: images/val\ntest: images/test\nnames: [ball]\n",
+                encoding="utf-8",
+            )
+            config = base_config(root, cache_root, source_format="ultralytics_yolo")
+            config["dataset"].update(
+                {
+                    "data_yaml": str(root / "data.yaml"),
+                    "max_train_images": 2,
+                    "max_val_images": 1,
+                    "max_test_images": 1,
+                }
+            )
+
+            metadata, cache_dir = materialize(config, Path(temp))
+
+            self.assertEqual(metadata["split_counts"], {"train": 2, "valid": 1, "test": 1})
+            self.assertEqual([split_count(cache_dir, split) for split in ("train", "valid", "test")], [2, 1, 1])
+
+    def test_rfdetr_coco_split_limits_build_limited_cache(self):
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as temp:
+            root = Path(temp) / "rfdetr_coco"
+            cache_root = Path(temp) / "cache"
+            for split, count in (("train", 3), ("valid", 2), ("test", 2)):
+                split_dir = root / split
+                images = []
+                annotations = []
+                for index in range(count):
+                    name = f"{split}_{index}.jpg"
+                    make_image(split_dir / name)
+                    image_id = index + 1
+                    images.append({"id": image_id, "file_name": name, "width": 100, "height": 80})
+                    annotations.append({"id": image_id, "image_id": image_id, "category_id": 1, "bbox": [10, 12, 20, 30]})
+                (split_dir / "_annotations.coco.json").write_text(
+                    json.dumps(
+                        {
+                            "images": images,
+                            "annotations": annotations,
+                            "categories": [{"id": 1, "name": "ball"}],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            config = base_config(root, cache_root, source_format="rfdetr")
+            config["dataset"].update({"max_train_images": 2, "max_val_images": 1, "max_test_images": 1})
+
+            plan = trainer.build_dataset_plan(config, Path(temp) / "run", None)
+            metadata = trainer.materialize_dataset_plan(plan, config, Path(temp) / "run", verbose=False)
+            cache_dir = Path(config["train"]["dataset_dir"])
+
+            self.assertEqual(plan["action"], "prepare_cache")
+            self.assertEqual(metadata["source_format"], "rfdetr")
+            self.assertIn("rfdetr_limited", cache_dir.name)
+            self.assertEqual([split_count(cache_dir, split) for split in ("train", "valid", "test")], [2, 1, 1])
+
     def test_coco_json_unsplit_uses_8_1_1_and_reuses_cache(self):
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as temp:
             root = Path(temp) / "coco"

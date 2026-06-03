@@ -1,6 +1,11 @@
 from pathlib import Path
 import sys
+import tempfile
 import unittest
+from types import SimpleNamespace
+
+import numpy as np
+from PIL import Image
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -9,6 +14,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from projects.object_detection_common import test_modes  # noqa: E402
+from projects.object_detection_dataset_evaluator import object_detection_dataset_evaluator as evaluator  # noqa: E402
 
 
 class SahiPostprocessTest(unittest.TestCase):
@@ -116,6 +122,91 @@ class SahiPostprocessTest(unittest.TestCase):
         self.assertEqual(len(merged), 1)
         self.assertNotIn("merged_prediction_count", merged[0])
         self.assertEqual(merged[0]["bbox"], [10, 10, 100, 100])
+
+    def test_sahi_recheck_fuses_score_and_keeps_first_stage_geometry(self):
+        class FakeModel:
+            def predict(self, *_args, **_kwargs):
+                return SimpleNamespace(
+                    xyxy=np.array([[4, 4, 8, 8]], dtype=np.float32),
+                    confidence=np.array([0.8], dtype=np.float32),
+                    class_id=np.array([1], dtype=np.int64),
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "image.jpg"
+            Image.new("RGB", (100, 100), color=(255, 255, 255)).save(image_path)
+            image = evaluator.ImageRecord(image_id=1, file_name=image_path.name, path=str(image_path), width=100, height=100)
+            config = {
+                "model": {"type": "rfdetr", "confidence_threshold": 0.25},
+                "dataset_categories": [{"id": 1, "name": "football"}],
+                "sahi": {
+                    "slice_width": 20,
+                    "slice_height": 20,
+                    "recheck": {
+                        "enabled": True,
+                        "target_class_names": ["football"],
+                        "crop_size": 20,
+                        "second_confidence_threshold": 0.25,
+                        "first_weight": 0.5,
+                        "second_weight": 0.5,
+                        "fused_confidence_threshold": 0.6,
+                        "center_padding_ratio": 0.0,
+                        "max_rechecks_per_image": 5,
+                    },
+                },
+            }
+            predictions = [{"image_id": 1, "category_id": 1, "bbox": [40, 40, 10, 10], "score": 0.6}]
+
+            with Image.open(image_path) as source:
+                output, stats = evaluator.apply_sahi_recheck(image, FakeModel(), config, source.convert("RGB"), predictions)
+
+            self.assertEqual(len(output), 1)
+            self.assertEqual(output[0]["bbox"], [40, 40, 10, 10])
+            self.assertAlmostEqual(output[0]["score"], 0.7)
+            self.assertEqual(stats["passed"], 1)
+
+    def test_sahi_recheck_filters_target_without_center_hit(self):
+        class FakeModel:
+            def predict(self, *_args, **_kwargs):
+                return SimpleNamespace(
+                    xyxy=np.array([[0, 0, 2, 2]], dtype=np.float32),
+                    confidence=np.array([0.9], dtype=np.float32),
+                    class_id=np.array([1], dtype=np.int64),
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "image.jpg"
+            Image.new("RGB", (100, 100), color=(255, 255, 255)).save(image_path)
+            image = evaluator.ImageRecord(image_id=1, file_name=image_path.name, path=str(image_path), width=100, height=100)
+            config = {
+                "model": {"type": "rfdetr", "confidence_threshold": 0.25},
+                "dataset_categories": [{"id": 0, "name": "player"}, {"id": 1, "name": "football"}],
+                "sahi": {
+                    "slice_width": 20,
+                    "slice_height": 20,
+                    "recheck": {
+                        "enabled": True,
+                        "target_class_names": ["football"],
+                        "crop_size": 20,
+                        "second_confidence_threshold": 0.25,
+                        "first_weight": 0.5,
+                        "second_weight": 0.5,
+                        "fused_confidence_threshold": 0.25,
+                        "center_padding_ratio": 0.0,
+                        "max_rechecks_per_image": 5,
+                    },
+                },
+            }
+            predictions = [
+                {"image_id": 1, "category_id": 1, "bbox": [40, 40, 10, 10], "score": 0.6},
+                {"image_id": 1, "category_id": 0, "bbox": [0, 0, 10, 10], "score": 0.6},
+            ]
+
+            with Image.open(image_path) as source:
+                output, stats = evaluator.apply_sahi_recheck(image, FakeModel(), config, source.convert("RGB"), predictions)
+
+            self.assertEqual([row["category_id"] for row in output], [0])
+            self.assertEqual(stats["filtered"], 1)
 
 
 if __name__ == "__main__":

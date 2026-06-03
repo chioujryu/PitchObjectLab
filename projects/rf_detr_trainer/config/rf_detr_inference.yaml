@@ -1,0 +1,167 @@
+# Standalone config for inference_rf_detr_model.py.
+# Parameters are grouped by runtime, model, dataset, output, inference, and evaluation.
+
+runtime:
+  # Print wrapper status text. Options: true, false.
+  verbose: true
+  # Estimate outputs and exit before model loading/inference. Options: true, false.
+  dry_run: false
+  # Ask before writing rendered images/videos, predictions, configs, or URL caches. Options: true, false.
+  confirm_before_run: true
+  # Skip confirmation after reviewing the estimate. Options: true, false.
+  yes: false
+  # Seed reserved for deterministic future sampling. Options: integer.
+  seed: 0
+  time_estimate:
+    # Print rough HH:MM:SS runtime estimates before execution. Options: true, false.
+    enabled: true
+    # Prefer latest sibling run_timing.json throughput when available. Options: true, false.
+    use_history: true
+    # Fallback train speed retained for shared schema. Options: positive seconds per training batch.
+    default_train_seconds_per_batch: 0.7
+    # Fallback test speed retained for shared schema. Options: positive seconds per image.
+    default_test_seconds_per_image: 0.25
+    # Fallback inference speed for image sources and video detection frames. Options: positive seconds per image/frame.
+    default_inference_seconds_per_image: 0.25
+    # Fallback cost for drawing/writing output video frames. Options: positive seconds per frame.
+    default_video_render_seconds_per_frame: 0.005
+
+model:
+  # RF-DETR model size. Detection: base, nano, small, medium, large. Segmentation sizes are not used by this bbox renderer.
+  size: large
+  # RF-DETR checkpoint to load. Options: default, null/false, hosted key, or local .pth/.pt/.ckpt path.
+  pretrain_weights: default
+  # Input resolution override. Options: null for model default, or positive integer.
+  resolution: null
+  # Class count override. Options: null to infer from checkpoint/config, or positive integer.
+  num_classes: null
+  # Device selector. Options: auto, cpu, cuda, cuda:0, 0, 1, mps, -1.
+  device: 0
+  # Automatic mixed precision in RF-DETR. Options: true, false.
+  amp: true
+  # Prediction confidence threshold used for rendered boxes. Options: 0.0-1.0.
+  confidence_threshold: 0.25
+  # Optional model label to output category-id mapping. Options: empty mapping, false to disable, or {model_label: category_id}.
+  category_remapping: {}
+  # Extra RF-DETR ModelConfig keys. Options: any supported model config key.
+  extra_model_args: {}
+
+dataset:
+  # Class names for labels/colors. Options: list like [standing_player, football], mapping like {0: football}, or [] to label by ID.
+  class_names:
+    - standing_player
+    - football
+    - goal
+  # Optional dataset YAML used only to read names when class_names is empty. Options: empty string or path to YAML with names.
+  data_yaml: ""
+
+output:
+  # Exact output directory. Options: empty string to use root/name, absolute path, or relative path.
+  output_dir: ""
+  # Output root when output_dir is empty. Options: pure string path.
+  root: runs/rf_detr/inference
+  # Run folder name when output_dir is empty. Supports {timestamp}. Options: string.
+  name: "rfdetr_inference_{timestamp}"
+  # Allow writing into an existing output directory. Options: true, false.
+  exist_ok: false
+
+inference:
+  # Input sources. Options: image path, video path, folder path, HTTP(S) image/video URL; folders may mix images and videos.
+  sources: []
+  # Recurse into folders. Options: true, false.
+  recursive: true
+  # Maximum discovered sources to infer after image/video caps. Options: all/null for every source, or a positive integer.
+  max_sources: all
+  # Maximum image sources to infer. Options: all/null for every image, or a positive integer for first N images.
+  max_images: all
+  # Maximum video sources to infer. Options: all/null for every video, or a positive integer for first N videos.
+  max_videos: all
+  # Inference mode. Options: full_image, sahi, class_crop.
+  mode: full_image
+  # Image extensions included from folders. Options: list of extensions.
+  image_extensions: [.bmp, .jpeg, .jpg, .png, .tif, .tiff, .webp]
+  # Video extensions included from folders. Options: list of extensions.
+  video_extensions: [.avi, .m4v, .mkv, .mov, .mp4, .mpeg, .mpg, .webm]
+  # Category IDs to render. Empty means draw all predicted classes. Options: list of category IDs.
+  render_class_ids: []
+  # Category names to render. Empty means draw all predicted classes. Options: list of names.
+  render_class_names: []
+  # Save line-delimited prediction records. Options: true, false.
+  save_predictions_jsonl: true
+  video:
+    # Detection FPS for videos. Options: null to detect every frame, or positive float such as 5.
+    detection_fps: null
+    # Start time for each video segment. Options: seconds, MM:SS, or HH:MM:SS.
+    start_time: 0
+    # End time for each video segment. Options: all/null for video end, seconds, MM:SS, or HH:MM:SS.
+    end_time: all
+    # Maximum selected duration to infer per video. Options: all/null for the full start/end range, seconds, MM:SS, or HH:MM:SS.
+    max_seconds: all
+    # Output video FPS. Options: null to preserve input FPS, or positive float.
+    output_fps: null
+    # Draw latest detections on skipped frames when detection_fps is lower than video FPS. Options: true, false.
+    render_skipped_frames: true
+
+crop:
+  # Class IDs used to find class_crop windows from model predictions. Empty means all predicted classes are eligible.
+  class_ids: []
+  # Class names used to find class_crop windows from model predictions. Empty means all predicted classes are eligible.
+  class_names: []
+  # Crop source. Options: prediction.
+  source: prediction
+  # Confidence threshold for the first pass that finds the crop window. Options: 0.0-1.0.
+  source_conf: 0.25
+  # Fixed crop padding in pixels. Options: non-negative integer.
+  padding_pixels: 0
+  # Relative crop padding around the union box. Options: non-negative float.
+  padding_ratio: 0.05
+  # Behavior when no crop class is predicted. Options: full_image.
+  fallback: full_image
+
+sahi:
+  # Slice height for sahi mode. Options: positive integer.
+  slice_height: 640
+  # Slice width for sahi mode. Options: positive integer.
+  slice_width: 640
+  # Height overlap between adjacent slices. Options: 0.0-0.9.
+  overlap_height_ratio: 0.2
+  # Width overlap between adjacent slices. Options: 0.0-0.9.
+  overlap_width_ratio: 0.2
+  # Also run full-image prediction and merge with slices. Options: true, false.
+  standard_prediction: true
+  # SAHI postprocess type. Options: GREEDYNMM, NMM, NMS, LSNMS. GREEDYNMM is recommended for small slices.
+  postprocess_type: GREEDYNMM
+  # SAHI match metric. Options: IOS, IOU. IOS is recommended when small slice boxes cover parts of the same object.
+  postprocess_match_metric: IOS
+  # Slice merge/NMS threshold. Options: 0.0-1.0.
+  postprocess_match_threshold: 0.5
+  # Class-agnostic slice merge. Options: true, false.
+  postprocess_class_agnostic: false
+  # SAHI model input batch size. Options: positive integer.
+  batch_size: 1
+  recheck:
+    # Run a second centered B*B verification pass for selected SAHI target-class boxes. Options: true, false.
+    enabled: false
+    # Target category IDs for SAHI recheck. Empty means use target_class_names; if both empty and enabled, default is football.
+    target_class_ids: []
+    # Target category names for SAHI recheck. Empty with enabled defaults to football. Options: category names such as [football].
+    target_class_names:
+      - football
+    # B*B centered crop size for the second pass. Options: positive integer pixels.
+    crop_size: 960
+    # Confidence threshold for the second pass. Options: 0.0-1.0.
+    second_confidence_threshold: 0.25
+    # Weight applied to the first-stage confidence. Options: non-negative float.
+    first_weight: 0.5
+    # Weight applied to the best second-stage confidence. Options: non-negative float.
+    second_weight: 0.5
+    # Minimum fused confidence to keep the first-stage box. Options: 0.0-1.0.
+    fused_confidence_threshold: 0.25
+    # Extra relative padding around the first-stage box for center-hit matching. Options: non-negative float.
+    center_padding_ratio: 0.0
+    # Maximum target boxes rechecked per image. Options: 0 disables rechecking; positive integer caps by score.
+    max_rechecks_per_image: 50
+
+evaluation:
+  # Reserved for consistency with train/test configs. Options: bbox.
+  type: bbox

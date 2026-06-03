@@ -2198,6 +2198,137 @@ def predict_image_direct(
     return predict_image_ultralytics(image, model, config, source=source, width=width, height=height, confidence=confidence)
 
 
+def coco_bbox_center(bbox: Sequence[float]) -> Tuple[float, float]:
+    """Return the center point of a COCO xywh box."""
+    x, y, width, height = [float(value) for value in bbox[:4]]
+    return x + width / 2.0, y + height / 2.0
+
+
+def center_in_coco_bbox(center: Tuple[float, float], bbox: Sequence[float], padding_ratio: float = 0.0) -> bool:
+    """Return True when a center point falls inside a COCO xywh box plus optional relative padding."""
+    x, y, width, height = [float(value) for value in bbox[:4]]
+    pad_x = max(0.0, float(width) * float(padding_ratio))
+    pad_y = max(0.0, float(height) * float(padding_ratio))
+    cx, cy = center
+    return (x - pad_x) <= cx <= (x + width + pad_x) and (y - pad_y) <= cy <= (y + height + pad_y)
+
+
+def centered_square_window(
+    center: Tuple[float, float],
+    crop_size: int,
+    image_width: int,
+    image_height: int,
+) -> Tuple[int, int, int, int]:
+    """Build a clamped square crop window centered on an object."""
+    size = max(1, int(crop_size))
+    size = min(size, max(1, int(image_width)), max(1, int(image_height)))
+    cx, cy = center
+    x = int(round(float(cx) - size / 2.0))
+    y = int(round(float(cy) - size / 2.0))
+    x = max(0, min(max(0, int(image_width) - size), x))
+    y = max(0, min(max(0, int(image_height) - size), y))
+    return x, y, size, size
+
+
+def resolve_recheck_target_class_ids(config: Mapping[str, Any], recheck_cfg: Mapping[str, Any]) -> List[int]:
+    """Resolve SAHI recheck target class IDs, defaulting to football aliases."""
+    return resolve_category_class_ids(
+        config.get("dataset_categories", []),
+        recheck_cfg.get("target_class_ids"),
+        recheck_cfg.get("target_class_names"),
+        "SAHI recheck",
+        default_names=["football"],
+    )
+
+
+def apply_sahi_recheck(
+    image: ImageRecord,
+    model: Any,
+    config: Mapping[str, Any],
+    source_rgb: Image.Image,
+    predictions: Sequence[Mapping[str, Any]],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Verify target-class SAHI boxes with a centered second pass and fused confidence."""
+    sahi_cfg = config["sahi"]
+    recheck_cfg = dict(sahi_cfg.get("recheck", {}) or {})
+    if not bool(recheck_cfg.get("enabled", False)):
+        return [dict(prediction) for prediction in predictions], {"enabled": False}
+
+    target_ids = set(resolve_recheck_target_class_ids(config, recheck_cfg))
+    if not target_ids:
+        return [dict(prediction) for prediction in predictions], {"enabled": True, "target_class_ids": []}
+
+    crop_size = int(recheck_cfg.get("crop_size", max(int(sahi_cfg.get("slice_width", image.width)), int(sahi_cfg.get("slice_height", image.height)))))
+    second_conf = float(recheck_cfg.get("second_confidence_threshold", config["model"].get("confidence_threshold", 0.25)))
+    first_weight = float(recheck_cfg.get("first_weight", 0.5))
+    second_weight = float(recheck_cfg.get("second_weight", 0.5))
+    fused_threshold = float(recheck_cfg.get("fused_confidence_threshold", config["model"].get("confidence_threshold", 0.25)))
+    center_padding_ratio = float(recheck_cfg.get("center_padding_ratio", 0.0))
+    max_rechecks = int(recheck_cfg.get("max_rechecks_per_image", 50) or 0)
+
+    output_predictions: List[Dict[str, Any]] = []
+    target_predictions = [
+        prediction
+        for prediction in sorted(predictions, key=lambda item: float(item.get("score", 0.0)), reverse=True)
+        if int(prediction.get("category_id", -1)) in target_ids
+    ]
+    rechecked_ids = {id(prediction) for prediction in target_predictions[:max_rechecks]} if max_rechecks > 0 else set()
+    stats = {
+        "enabled": True,
+        "target_class_ids": sorted(target_ids),
+        "requested": len(target_predictions),
+        "rechecked": len(rechecked_ids),
+        "passed": 0,
+        "filtered": 0,
+    }
+
+    for prediction in predictions:
+        category_id = int(prediction.get("category_id", -1))
+        if category_id not in target_ids:
+            output_predictions.append(dict(prediction))
+            continue
+        if id(prediction) not in rechecked_ids:
+            output_predictions.append(dict(prediction))
+            continue
+
+        center = coco_bbox_center(prediction.get("bbox", [0, 0, 0, 0]))
+        x, y, width, height = centered_square_window(center, crop_size, image.width, image.height)
+        crop = source_rgb.crop((x, y, x + width, y + height))
+        second_predictions, _, _ = predict_image_direct(
+            image=image,
+            model=model,
+            config=config,
+            source=crop,
+            width=width,
+            height=height,
+            confidence=second_conf,
+        )
+        projected = shared_modes.project_predictions_to_original(second_predictions, x, y, image.width, image.height)
+        matching = [
+            item
+            for item in projected
+            if int(item.get("category_id", -1)) == category_id
+            and center_in_coco_bbox(coco_bbox_center(item.get("bbox", [0, 0, 0, 0])), prediction.get("bbox", [0, 0, 0, 0]), center_padding_ratio)
+        ]
+        if not matching:
+            stats["filtered"] += 1
+            continue
+        best_second = max(matching, key=lambda item: float(item.get("score", 0.0)))
+        fused_score = first_weight * float(prediction.get("score", 0.0)) + second_weight * float(best_second.get("score", 0.0))
+        if fused_score < fused_threshold:
+            stats["filtered"] += 1
+            continue
+        row = dict(prediction)
+        row["score"] = float(fused_score)
+        row["first_stage_score"] = float(prediction.get("score", 0.0))
+        row["second_stage_score"] = float(best_second.get("score", 0.0))
+        row["recheck_crop"] = [int(x), int(y), int(width), int(height)]
+        row["recheck_passed"] = True
+        output_predictions.append(row)
+        stats["passed"] += 1
+    return output_predictions, stats
+
+
 def predict_image_sliced_direct(
     image: ImageRecord,
     model: Any,
@@ -2240,6 +2371,11 @@ def predict_image_sliced_direct(
         match_threshold=float(sahi_cfg.get("postprocess_match_threshold", 0.5)),
         class_agnostic=bool(sahi_cfg.get("postprocess_class_agnostic", False)),
     )
+    recheck_stats: Dict[str, Any] = {"enabled": False}
+    if bool(dict(sahi_cfg.get("recheck", {}) or {}).get("enabled", False)):
+        with Image.open(image.path) as source_image:
+            source_rgb = source_image.convert("RGB")
+            predictions, recheck_stats = apply_sahi_recheck(image, model, config, source_rgb, predictions)
     elapsed = time.perf_counter() - start
     stat = {
         "image_id": image.image_id,
@@ -2250,6 +2386,7 @@ def predict_image_sliced_direct(
         "elapsed_seconds": elapsed,
         "inference_engine": "direct_sahi",
         "slice_count": len(windows),
+        "sahi_recheck": recheck_stats,
     }
     return predictions, stat, None
 
@@ -2451,6 +2588,19 @@ def xywh_to_xyxy(box: Sequence[float]) -> np.ndarray:
     return np.array([x, y, x + width, y + height], dtype=np.float32)
 
 
+def area_bucket_from_area(area: float, area_ranges: Sequence[float]) -> str:
+    """Return the COCO-style small/medium/large area bucket for an object."""
+    small, medium, large = [float(value) for value in list(area_ranges)[:3]]
+    value = float(area)
+    if value < small:
+        return "small"
+    if value < medium:
+        return "medium"
+    if value < large:
+        return "large"
+    return "large"
+
+
 def bbox_iou_one_to_many(box: np.ndarray, boxes: np.ndarray) -> np.ndarray:
     """Vectorized IoU between one xyxy box and many xyxy boxes."""
     if boxes.size == 0:
@@ -2593,6 +2743,102 @@ def match_predictions_at_threshold(
         "per_class": per_class,
         "per_image": list(per_image.values()),
     }
+
+
+def match_predictions_by_area_at_threshold(
+    predictions: Sequence[Mapping[str, Any]],
+    annotations: Sequence[Mapping[str, Any]],
+    category_ids: Sequence[int],
+    area_ranges: Sequence[float],
+    iou_threshold: float,
+    confidence_threshold: float,
+) -> List[Dict[str, Any]]:
+    """Compute operating-point metrics by category and small/medium/large area bucket."""
+    gt_boxes, _, _, _ = build_gt_indexes(annotations)
+    matched = {key: np.zeros(len(boxes), dtype=bool) for key, boxes in gt_boxes.items()}
+    gt_meta: Dict[Tuple[int, int], List[Mapping[str, Any]]] = {}
+    counts: Dict[Tuple[int, str], Dict[str, int]] = {
+        (int(category_id), bucket): {"tp": 0, "fp": 0, "fn": 0, "instances": 0}
+        for category_id in category_ids
+        for bucket in ("small", "medium", "large")
+    }
+
+    for annotation in annotations:
+        image_id = int(annotation["image_id"])
+        category_id = int(annotation["category_id"])
+        bucket = area_bucket_from_area(float(annotation.get("area", 0.0)), area_ranges)
+        counts.setdefault((category_id, bucket), {"tp": 0, "fp": 0, "fn": 0, "instances": 0})
+        counts[(category_id, bucket)]["instances"] += 1
+        gt_meta.setdefault((image_id, category_id), []).append(annotation)
+
+    rows = sorted(
+        (prediction for prediction in predictions if float(prediction.get("score", 0.0)) >= confidence_threshold),
+        key=lambda item: float(item.get("score", 0.0)),
+        reverse=True,
+    )
+    for prediction in rows:
+        image_id = int(prediction["image_id"])
+        category_id = int(prediction["category_id"])
+        key = (image_id, category_id)
+        boxes = gt_boxes.get(key)
+        best_index = -1
+        is_tp = False
+        if boxes is not None and len(boxes):
+            ious = bbox_iou_one_to_many(xywh_to_xyxy(prediction["bbox"]), boxes)
+            ious[matched[key]] = -1.0
+            best_index = int(np.argmax(ious)) if len(ious) else -1
+            if best_index >= 0 and float(ious[best_index]) >= iou_threshold:
+                matched[key][best_index] = True
+                is_tp = True
+        if is_tp:
+            annotation = gt_meta.get(key, [])[best_index]
+            bucket = area_bucket_from_area(float(annotation.get("area", 0.0)), area_ranges)
+            counts.setdefault((category_id, bucket), {"tp": 0, "fp": 0, "fn": 0, "instances": 0})
+            counts[(category_id, bucket)]["tp"] += 1
+        else:
+            pred_area = float(prediction.get("area", 0.0))
+            if pred_area <= 0.0:
+                bbox = prediction.get("bbox", [0, 0, 0, 0])
+                pred_area = float(bbox[2]) * float(bbox[3]) if len(bbox) >= 4 else 0.0
+            bucket = area_bucket_from_area(pred_area, area_ranges)
+            counts.setdefault((category_id, bucket), {"tp": 0, "fp": 0, "fn": 0, "instances": 0})
+            counts[(category_id, bucket)]["fp"] += 1
+
+    for key in gt_boxes:
+        image_id, category_id = key
+        annotations_for_key = gt_meta.get((image_id, category_id), [])
+        for index, is_matched in enumerate(matched[key]):
+            if bool(is_matched):
+                continue
+            annotation = annotations_for_key[index] if index < len(annotations_for_key) else {}
+            bucket = area_bucket_from_area(float(annotation.get("area", 0.0)), area_ranges)
+            counts.setdefault((category_id, bucket), {"tp": 0, "fp": 0, "fn": 0, "instances": 0})
+            counts[(category_id, bucket)]["fn"] += 1
+
+    output_rows: List[Dict[str, Any]] = []
+    for category_id in category_ids:
+        for bucket in ("small", "medium", "large"):
+            row = counts.get((int(category_id), bucket), {"tp": 0, "fp": 0, "fn": 0, "instances": 0})
+            tp = int(row["tp"])
+            fp = int(row["fp"])
+            fn = int(row["fn"])
+            precision = tp / (tp + fp) if (tp + fp) else 0.0
+            recall = tp / (tp + fn) if (tp + fn) else 0.0
+            f1 = (2.0 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
+            output_rows.append(
+                {
+                    "category_id": int(category_id),
+                    "area": bucket,
+                    "tp": tp,
+                    "fp": fp,
+                    "fn": fn,
+                    "precision": precision,
+                    "recall": recall,
+                    "f1": f1,
+                    "instances": int(row.get("instances", 0)),
+                }
+            )
+    return output_rows
 
 
 def threshold_sweep(
@@ -2878,8 +3124,40 @@ def coco_per_class_metrics(coco_eval: Any, categories: Sequence[Mapping[str, Any
                 "AP50": mean_coco_precision(coco_eval, category_index=index, iou_threshold=0.5, max_det=max_det),
                 "AP75": mean_coco_precision(coco_eval, category_index=index, iou_threshold=0.75, max_det=max_det),
                 f"AR@{max_det}": mean_coco_recall(coco_eval, category_index=index, max_det=max_det),
+                "mAP50-95": mean_coco_precision(coco_eval, category_index=index, max_det=max_det),
+                "mAP50": mean_coco_precision(coco_eval, category_index=index, iou_threshold=0.5, max_det=max_det),
+                "mAP50-95_small": mean_coco_precision(coco_eval, category_index=index, area_label="small", max_det=max_det),
+                "mAP50-95_medium": mean_coco_precision(coco_eval, category_index=index, area_label="medium", max_det=max_det),
+                "mAP50-95_large": mean_coco_precision(coco_eval, category_index=index, area_label="large", max_det=max_det),
+                "mAP50_small": mean_coco_precision(coco_eval, category_index=index, iou_threshold=0.5, area_label="small", max_det=max_det),
+                "mAP50_medium": mean_coco_precision(coco_eval, category_index=index, iou_threshold=0.5, area_label="medium", max_det=max_det),
+                "mAP50_large": mean_coco_precision(coco_eval, category_index=index, iou_threshold=0.5, area_label="large", max_det=max_det),
+                f"AR@{max_det}_small": mean_coco_recall(coco_eval, category_index=index, area_label="small", max_det=max_det),
+                f"AR@{max_det}_medium": mean_coco_recall(coco_eval, category_index=index, area_label="medium", max_det=max_det),
+                f"AR@{max_det}_large": mean_coco_recall(coco_eval, category_index=index, area_label="large", max_det=max_det),
             }
         )
+    return rows
+
+
+def coco_per_class_size_metrics(coco_eval: Any, categories: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    """Collect per-class COCO metrics as one row per small/medium/large bucket."""
+    cat_ids = list(coco_eval.params.catIds)
+    cat_id_to_name = {int(category["id"]): str(category.get("name", category["id"])) for category in categories}
+    max_det = int(coco_eval.params.maxDets[-1])
+    rows: List[Dict[str, Any]] = []
+    for index, category_id in enumerate(cat_ids):
+        for area_label in ("small", "medium", "large"):
+            rows.append(
+                {
+                    "category_id": int(category_id),
+                    "class": cat_id_to_name.get(int(category_id), str(category_id)),
+                    "area": area_label,
+                    "mAP50-95": mean_coco_precision(coco_eval, category_index=index, area_label=area_label, max_det=max_det),
+                    "mAP50": mean_coco_precision(coco_eval, category_index=index, iou_threshold=0.5, area_label=area_label, max_det=max_det),
+                    f"AR@{max_det}": mean_coco_recall(coco_eval, category_index=index, area_label=area_label, max_det=max_det),
+                }
+            )
     return rows
 
 
@@ -3514,6 +3792,8 @@ def normalize_config(config: MutableMapping[str, Any], source_config: Path) -> T
     output_cfg.setdefault("draw_predictions", True)
     output_cfg.setdefault("gt_color", "green")
     output_cfg.setdefault("pred_color", "red")
+    if output_cfg.get("visual_draw_min_score") is None:
+        output_cfg["visual_draw_min_score"] = float(model_cfg.get("confidence_threshold", 0.25))
     output_cfg.setdefault("visual_jpeg_quality", 92)
     output_cfg.setdefault("error_cases", {})
     if not isinstance(output_cfg["error_cases"], MutableMapping):
@@ -3536,6 +3816,19 @@ def normalize_config(config: MutableMapping[str, Any], source_config: Path) -> T
         output_cfg["visual_random_seed"] = int(runtime.get("seed", 0))
     if output_cfg.get("dataset_case_random_seed") is None:
         output_cfg["dataset_case_random_seed"] = int(runtime.get("seed", 0))
+    sahi_cfg.setdefault("recheck", {})
+    if not isinstance(sahi_cfg["recheck"], MutableMapping):
+        sahi_cfg["recheck"] = {}
+    sahi_cfg["recheck"].setdefault("enabled", False)
+    sahi_cfg["recheck"].setdefault("target_class_ids", [])
+    sahi_cfg["recheck"].setdefault("target_class_names", [])
+    sahi_cfg["recheck"].setdefault("crop_size", max(int(sahi_cfg.get("slice_width", 640)), int(sahi_cfg.get("slice_height", 640))))
+    sahi_cfg["recheck"].setdefault("second_confidence_threshold", float(model_cfg.get("confidence_threshold", 0.25)))
+    sahi_cfg["recheck"].setdefault("first_weight", 0.5)
+    sahi_cfg["recheck"].setdefault("second_weight", 0.5)
+    sahi_cfg["recheck"].setdefault("fused_confidence_threshold", float(model_cfg.get("confidence_threshold", 0.25)))
+    sahi_cfg["recheck"].setdefault("center_padding_ratio", 0.0)
+    sahi_cfg["recheck"].setdefault("max_rechecks_per_image", 50)
 
     if bool(demo_cfg.get("enabled", False)):
         demo_max_images = int(demo_cfg.get("max_images", 8))
@@ -3729,8 +4022,34 @@ def run_evaluation(
 
     cat_name = {int(category["id"]): str(category.get("name", category["id"])) for category in dataset.categories}
     per_class_rows: List[Dict[str, Any]] = []
+    per_class_size_rows: List[Dict[str, Any]] = []
     if bool(eval_cfg.get("classwise", True)):
         coco_per_class = {row["category_id"]: row for row in coco_per_class_metrics(coco_eval, dataset.categories)}
+        area_ranges = [float(value) for value in eval_cfg.get("area_ranges", [1024, 9216, 10000000000])]
+        coco_size = {
+            (int(row["category_id"]), str(row["area"])): row
+            for row in coco_per_class_size_metrics(coco_eval, dataset.categories)
+        }
+        operating_size = match_predictions_by_area_at_threshold(
+            predictions=predictions,
+            annotations=dataset.annotations,
+            category_ids=category_ids,
+            area_ranges=area_ranges,
+            iou_threshold=match_iou,
+            confidence_threshold=operating_conf,
+        )
+        class_names = {int(category["id"]): str(category.get("name", category["id"])) for category in dataset.categories}
+        for row in operating_size:
+            category_id = int(row["category_id"])
+            area_label = str(row["area"])
+            per_class_size_rows.append(
+                {
+                    "category_id": category_id,
+                    "class": class_names.get(category_id, str(category_id)),
+                    **{key: value for key, value in coco_size.get((category_id, area_label), {}).items() if key not in {"category_id", "class", "area"}},
+                    **row,
+                }
+            )
         for row in operating["per_class"]:
             category_id = int(row["category_id"])
             per_class_rows.append(
@@ -3750,6 +4069,14 @@ def run_evaluation(
 
     if bool(config["output"].get("save_metrics", True)):
         write_metrics_tables(output_dir, summary, per_class_rows, per_image_rows, sweep_rows, stats_rows, visual_rows, output_info, manifest)
+        if per_class_size_rows:
+            metadata = {"run_id": output_info["run_id"], "config_hash": output_info["config_hash"]}
+            per_class_size_path = output_dir / "per_class_size_metrics.csv"
+            write_table(per_class_size_path, per_class_size_rows, metadata)
+            manifest.append({"path": str(per_class_size_path), "kind": "metrics", "description": "Per-class small/medium/large AP/P/R/F1 metrics."})
+            per_class_size_json_path = output_dir / "per_class_size_metrics.json"
+            write_json(per_class_size_json_path, {"metadata": output_info, "metrics": per_class_size_rows})
+            manifest.append({"path": str(per_class_size_json_path), "kind": "metrics", "description": "Per-class small/medium/large metrics JSON."})
     elif visual_rows:
         path = output_dir / "visuals_manifest.csv"
         write_table(path, visual_rows, {"run_id": output_info["run_id"], "config_hash": output_info["config_hash"]})
@@ -3794,6 +4121,7 @@ def run_evaluation(
         "output_info": output_info,
         "summary": summary,
         "per_class": per_class_rows,
+        "per_class_size": per_class_size_rows,
         "per_image": per_image_rows,
         "stats": stats_rows,
         "predictions": predictions,

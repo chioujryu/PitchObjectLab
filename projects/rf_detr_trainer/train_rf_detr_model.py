@@ -204,6 +204,29 @@ def parse_scalar(value: str) -> Any:
         return value
 
 
+def parse_limit_value(value: Any, field_name: str = "limit") -> Optional[int]:
+    """Parse a positive count limit; null/all/empty means no limit."""
+    if value is None:
+        return None
+    parsed = parse_scalar(value) if isinstance(value, str) else value
+    if isinstance(parsed, str):
+        text = parsed.strip().lower()
+        if text in {"", "all", "none", "null"}:
+            return None
+        parsed = text
+    if isinstance(parsed, bool):
+        raise ValueError(f"{field_name} must be 'all', null, or a positive integer.")
+    if isinstance(parsed, float) and not parsed.is_integer():
+        raise ValueError(f"{field_name} must be an integer count when set, got {value!r}.")
+    try:
+        limit = int(parsed)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be 'all', null, or a positive integer, got {value!r}.") from exc
+    if limit <= 0:
+        raise ValueError(f"{field_name} must be positive when set, got {value!r}.")
+    return limit
+
+
 def parse_extra_args(values: Optional[Sequence[str]]) -> Dict[str, Any]:
     """Parse repeated key=value CLI entries."""
     parsed: Dict[str, Any] = {}
@@ -481,6 +504,179 @@ def format_bytes(num_bytes: Optional[float]) -> str:
             return f"{value:.1f} {unit}"
         value /= 1024.0
     return f"{value:.1f} TiB"
+
+
+RUNTIME_TIME_ESTIMATE_DEFAULTS = {
+    "enabled": True,
+    "use_history": True,
+    "default_train_seconds_per_batch": 0.7,
+    "default_test_seconds_per_image": 0.25,
+    "default_inference_seconds_per_image": 0.25,
+    "default_video_render_seconds_per_frame": 0.005,
+}
+
+
+def format_duration_hms(seconds: Optional[float]) -> str:
+    """Format seconds as HH:MM:SS for estimates and elapsed runtime."""
+    if seconds is None:
+        return "unknown"
+    try:
+        value = float(seconds)
+    except (TypeError, ValueError):
+        return "unknown"
+    if not math.isfinite(value):
+        return "unknown"
+    total = int(math.ceil(max(0.0, value)))
+    if 0.0 < value < 1.0:
+        total = 1
+    hours, remainder = divmod(total, 3600)
+    minutes, sec = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{sec:02d}"
+
+
+def runtime_time_estimate_settings(config: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return merged runtime.time_estimate settings with stable defaults."""
+    settings = dict(RUNTIME_TIME_ESTIMATE_DEFAULTS)
+    runtime = config.get("runtime", {}) if isinstance(config.get("runtime", {}), Mapping) else {}
+    configured = runtime.get("time_estimate", {}) if isinstance(runtime.get("time_estimate", {}), Mapping) else {}
+    settings.update(configured)
+    return settings
+
+
+def positive_float_setting(settings: Mapping[str, Any], key: str) -> float:
+    """Read a positive float timing setting."""
+    value = settings.get(key, RUNTIME_TIME_ESTIMATE_DEFAULTS[key])
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"runtime.time_estimate.{key} must be a positive number, got {value!r}.") from exc
+    if parsed <= 0 or not math.isfinite(parsed):
+        raise ValueError(f"runtime.time_estimate.{key} must be a positive finite number, got {value!r}.")
+    return parsed
+
+
+def load_latest_timing_history(output_root: Path, task: str) -> Optional[Dict[str, Any]]:
+    """Load the newest sibling run_timing.json for a task."""
+    if not output_root.exists():
+        return None
+    candidates = sorted(
+        output_root.glob("*/run_timing.json"),
+        key=lambda path: path.stat().st_mtime if path.exists() else 0.0,
+        reverse=True,
+    )
+    for path in candidates:
+        with contextlib.suppress(Exception):
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if data.get("task") == task and data.get("success") is True:
+                return data
+    return None
+
+
+def add_runtime_estimate(
+    estimate: MutableMapping[str, Any],
+    config: Mapping[str, Any],
+    output_dir: Path,
+    task: str,
+    runtime_units: float,
+    default_rate_key: str,
+    basis: Mapping[str, Any],
+    extra_seconds: float = 0.0,
+) -> MutableMapping[str, Any]:
+    """Attach a rough HH:MM:SS runtime estimate to an output estimate."""
+    settings = runtime_time_estimate_settings(config)
+    units = max(0.0, float(runtime_units or 0.0))
+    estimate["runtime_units"] = units
+    estimate["runtime_estimate_basis"] = dict(basis)
+    if not bool(settings.get("enabled", True)):
+        estimate.update(
+            {
+                "estimated_runtime_seconds": None,
+                "estimated_runtime_hms": "unknown",
+                "estimated_runtime_source": "disabled",
+                "estimated_runtime_confidence": "unknown",
+            }
+        )
+        return estimate
+
+    rate = positive_float_setting(settings, default_rate_key)
+    source = "default-rate"
+    if bool(settings.get("use_history", True)):
+        history = load_latest_timing_history(output_dir.parent, task)
+        throughput = history.get("throughput", {}) if isinstance(history, Mapping) else {}
+        history_rate = throughput.get("seconds_per_runtime_unit") if isinstance(throughput, Mapping) else None
+        with contextlib.suppress(TypeError, ValueError):
+            parsed_history_rate = float(history_rate)
+            if parsed_history_rate > 0 and math.isfinite(parsed_history_rate):
+                rate = parsed_history_rate
+                source = "history"
+
+    seconds = units * rate + max(0.0, float(extra_seconds or 0.0))
+    estimate.update(
+        {
+            "estimated_runtime_seconds": round(seconds, 3),
+            "estimated_runtime_hms": format_duration_hms(seconds),
+            "estimated_runtime_source": source,
+            "estimated_runtime_confidence": "rough",
+        }
+    )
+    return estimate
+
+
+def start_run_timing(task: str, verbose: bool = True) -> Dict[str, Any]:
+    """Create a mutable timing context for an entrypoint run."""
+    return {
+        "task": task,
+        "verbose": verbose,
+        "started_at_monotonic": time.monotonic(),
+        "started_at": datetime.now().isoformat(timespec="seconds"),
+        "dry_run": False,
+        "outputs_created": False,
+        "success": False,
+    }
+
+
+def finish_run_timing(context: MutableMapping[str, Any]) -> None:
+    """Print elapsed time and write run_timing.json when an output dir exists."""
+    ended_at_monotonic = time.monotonic()
+    elapsed_seconds = max(0.0, ended_at_monotonic - float(context.get("started_at_monotonic", ended_at_monotonic)))
+    elapsed_hms = format_duration_hms(elapsed_seconds)
+    verbose = bool(context.get("verbose", True))
+    if verbose:
+        blue(f"Elapsed time: {elapsed_hms}", verbose=True, force=True)
+    else:
+        print(f"Elapsed time: {elapsed_hms}")
+
+    output_dir = context.get("output_dir")
+    dry_run = bool(context.get("dry_run", False))
+    if output_dir is None or dry_run or not bool(context.get("outputs_created", False)):
+        return
+    output_path = Path(str(output_dir))
+    if not output_path.exists():
+        return
+
+    estimate = dict(context.get("estimate", {}) or {})
+    units = float(estimate.get("runtime_units") or 0.0)
+    throughput: Dict[str, Any] = {"runtime_units": units}
+    if units > 0:
+        throughput["seconds_per_runtime_unit"] = elapsed_seconds / units
+
+    payload = {
+        "task": context.get("task"),
+        "success": bool(context.get("success", False)),
+        "started_at": context.get("started_at"),
+        "ended_at": datetime.now().isoformat(timespec="seconds"),
+        "elapsed_seconds": round(elapsed_seconds, 3),
+        "elapsed_hms": elapsed_hms,
+        "estimated_runtime_seconds": estimate.get("estimated_runtime_seconds"),
+        "estimated_runtime_hms": estimate.get("estimated_runtime_hms"),
+        "estimated_runtime_source": estimate.get("estimated_runtime_source"),
+        "estimated_runtime_confidence": estimate.get("estimated_runtime_confidence"),
+        "runtime_estimate_basis": estimate.get("runtime_estimate_basis", {}),
+        "throughput": throughput,
+    }
+    if context.get("error"):
+        payload["error"] = context["error"]
+    write_json(output_path / "run_timing.json", payload)
 
 
 def maybe_count_images(path: Optional[Path]) -> Optional[int]:
@@ -1000,6 +1196,48 @@ def ensure_split_records(
     result = deterministic_unsplit(all_records, ratio, seed)
     result.update({split: records for split, records in extra.items() if records})
     return result
+
+
+def dataset_limit_config(config: Mapping[str, Any]) -> Dict[str, Optional[int]]:
+    """Return per-split dataset image limits from dataset.* max fields."""
+    dataset = config.get("dataset", {})
+    default_limit = parse_limit_value(dataset.get("max_images"), "dataset.max_images")
+
+    def split_limit(key: str, field_name: str) -> Optional[int]:
+        if key not in dataset or dataset.get(key) is None:
+            return default_limit
+        return parse_limit_value(dataset.get(key), field_name)
+
+    train_limit = split_limit("max_train_images", "dataset.max_train_images")
+    valid_limit = split_limit("max_val_images", "dataset.max_val_images")
+    test_limit = split_limit("max_test_images", "dataset.max_test_images")
+    return {
+        "train": train_limit,
+        "valid": valid_limit,
+        "val": valid_limit,
+        "test": test_limit,
+        "test-original": test_limit,
+        "test_original": test_limit,
+    }
+
+
+def has_dataset_limits(config: Mapping[str, Any]) -> bool:
+    """Return True when dataset config limits at least one split."""
+    return any(limit is not None for limit in dataset_limit_config(config).values())
+
+
+def limit_records_by_split(
+    records_by_split: Mapping[str, List[Dict[str, Any]]],
+    config: Mapping[str, Any],
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Apply dataset first-N image limits after split assignment."""
+    limits = dataset_limit_config(config)
+    limited: Dict[str, List[Dict[str, Any]]] = {}
+    for split, records in records_by_split.items():
+        normalized = normalize_split_name(split)
+        limit = limits.get(normalized)
+        limited[split] = list(records[:limit] if limit is not None else records)
+    return limited
 
 
 def assign_cache_file_names(records_by_split: Mapping[str, List[Dict[str, Any]]]) -> None:
@@ -1638,6 +1876,7 @@ def build_source_fingerprint(
         "source_name": source.get("source_name"),
         "split_ratio": list(split_ratio),
         "split_seed": config.get("dataset", {}).get("split_seed", 0),
+        "dataset_limits": dataset_limit_config(config),
         "categories": list(categories),
         "files_digest": files_digest,
         "file_count": file_count,
@@ -1670,6 +1909,7 @@ def build_cache_dataset_plan(
         split_ratio,
         seed=dataset.get("split_seed", 0),
     )
+    records_by_split = limit_records_by_split(records_by_split, config)
     assign_cache_file_names(records_by_split)
     categories = finalize_categories(records_by_split, source.get("class_names", []))
     fingerprint = build_source_fingerprint(source_format, source, records_by_split, categories, split_ratio, config)
@@ -1682,6 +1922,138 @@ def build_cache_dataset_plan(
     return {
         "source_format": source_format,
         "action": "prepare_cache",
+        "cache_root": cache_root,
+        "cache_dir": cache_dir,
+        "fingerprint": fingerprint,
+        "records_by_split": records_by_split,
+        "categories": categories,
+        "split_counts": {split: len(records) for split, records in records_by_split.items()},
+        "class_names": [category["name"] for category in categories],
+        "link_mode": link_mode,
+        "copy_file_count": len(images) if link_mode == "copy" else 0,
+        "copy_bytes": copy_bytes,
+        "cache_file_count": len(images) + len(records_by_split) + 2,
+        "refresh_cache": bool(dataset.get("refresh_cache", False)),
+        "warnings": list(source.get("warnings", [])),
+    }
+
+
+def find_rfdetr_coco_split_files(dataset_dir: Path) -> Dict[str, Path]:
+    """Find RF-DETR/Roboflow COCO split annotation files."""
+    candidates = [
+        ("train", "train"),
+        ("valid", "valid"),
+        ("val", "valid"),
+        ("test", "test"),
+        ("test-original", "test-original"),
+        ("test_original", "test-original"),
+    ]
+    found: Dict[str, Path] = {}
+    for folder_name, split in candidates:
+        if split in found:
+            continue
+        annotation_file = dataset_dir / folder_name / "_annotations.coco.json"
+        if annotation_file.exists():
+            found[split] = annotation_file.resolve()
+    return found
+
+
+def build_rfdetr_coco_split_source(dataset_dir: Path) -> Dict[str, Any]:
+    """Read an existing RF-DETR COCO split dataset into cache records."""
+    annotation_files = find_rfdetr_coco_split_files(dataset_dir)
+    if not annotation_files:
+        raise ValueError(
+            "Limiting an existing RF-DETR dataset requires split _annotations.coco.json files "
+            "or a Roboflow/RF-DETR YOLO layout with data.yaml."
+        )
+
+    records_by_split: Dict[str, List[Dict[str, Any]]] = {}
+    class_names: List[str] = []
+    class_seen: set[str] = set()
+    source_files: List[Path] = list(annotation_files.values())
+
+    for split, annotation_file in annotation_files.items():
+        split_dir = annotation_file.parent
+        with annotation_file.open("r", encoding="utf-8") as file:
+            coco = json.load(file)
+        source_categories = {int(category["id"]): str(category["name"]) for category in coco.get("categories", [])}
+        for _, name in sorted(source_categories.items()):
+            if name not in class_seen:
+                class_names.append(name)
+                class_seen.add(name)
+
+        annotations_by_image: Dict[int, List[Mapping[str, Any]]] = {}
+        for annotation in coco.get("annotations", []):
+            annotations_by_image.setdefault(int(annotation["image_id"]), []).append(annotation)
+
+        images = sorted(coco.get("images", []), key=lambda image: str(image.get("file_name", "")))
+        for image in images:
+            image_id = int(image["id"])
+            source_image = resolve_coco_image_path(str(image["file_name"]), dataset_dir, split_dir, annotation_file, split)
+            width = int(image.get("width") or 0)
+            height = int(image.get("height") or 0)
+            if width <= 0 or height <= 0:
+                width, height = read_image_size(source_image)
+            annotations: List[Dict[str, Any]] = []
+            for annotation in annotations_by_image.get(image_id, []):
+                bbox_raw = annotation.get("bbox")
+                if not bbox_raw or len(bbox_raw) != 4:
+                    continue
+                bbox = clamp_coco_bbox(float(bbox_raw[0]), float(bbox_raw[1]), float(bbox_raw[2]), float(bbox_raw[3]), width, height)
+                if bbox is None:
+                    continue
+                category_id = int(annotation.get("category_id", 0))
+                converted = {
+                    "category_name": source_categories.get(category_id, str(category_id)),
+                    "bbox": bbox,
+                    "iscrowd": int(annotation.get("iscrowd", 0) or 0),
+                    "source": f"{annotation_file}:annotation:{annotation.get('id')}",
+                }
+                if annotation.get("segmentation"):
+                    converted["segmentation"] = annotation["segmentation"]
+                annotations.append(converted)
+            add_record(
+                records_by_split,
+                split,
+                {"source_image": source_image, "width": width, "height": height, "annotations": annotations},
+            )
+            source_files.append(source_image)
+
+    return {
+        "source_format": "rfdetr_coco",
+        "source_name": dataset_dir.name,
+        "records_by_split": records_by_split,
+        "class_names": class_names,
+        "annotation_files": source_files,
+        "warnings": [],
+    }
+
+
+def build_rfdetr_limited_dataset_plan(
+    config: Mapping[str, Any],
+    dataset_dir: Optional[Path],
+    source_config: Optional[Path],
+) -> Dict[str, Any]:
+    """Build a cache plan that limits an existing RF-DETR-readable dataset."""
+    if dataset_dir is None:
+        raise ValueError("dataset.dataset_dir/train.dataset_dir is required when dataset limits are enabled.")
+    dataset = config.get("dataset", {})
+    source = build_ultralytics_yolo_source(config, source_config) if is_rfdetr_yolo_layout(dataset_dir) else build_rfdetr_coco_split_source(dataset_dir)
+    records_by_split = limit_records_by_split(source["records_by_split"], config)
+    assign_cache_file_names(records_by_split)
+    categories = finalize_categories(records_by_split, source.get("class_names", []))
+    split_ratio = parse_split_ratio(dataset.get("split_ratio", [8, 1, 1]))
+    fingerprint = build_source_fingerprint("rfdetr_limited", source, records_by_split, categories, split_ratio, config)
+    cache_root = resolve_cache_root(dataset.get("cache_root", "dataset_cache"), source_config)
+    source_name = sanitize_name(str(source.get("source_name") or dataset_dir.name))
+    cache_dir = cache_root / f"rfdetr_limited_{source_name}_{fingerprint['hash'][:16]}"
+    link_mode = normalize_link_mode(dataset.get("link_mode", "auto"))
+    images = unique_source_images(records_by_split)
+    copy_bytes = image_bytes(images) if link_mode == "copy" else 0
+    return {
+        "source_format": "rfdetr",
+        "action": "prepare_cache",
+        "dataset_dir": dataset_dir,
         "cache_root": cache_root,
         "cache_dir": cache_dir,
         "fingerprint": fingerprint,
@@ -1717,6 +2089,8 @@ def build_dataset_plan(
     source_format = resolve_dataset_source_format(config, dataset_dir, data_yaml, source_config)
     if source_format != "rfdetr":
         return build_cache_dataset_plan(config, source_format, dataset_dir, data_yaml, source_config)
+    if has_dataset_limits(config):
+        return build_rfdetr_limited_dataset_plan(config, dataset_dir, source_config)
     split_counts: Dict[str, Optional[int]] = {}
     if dataset_dir is not None:
         split_counts = {
@@ -1983,6 +2357,7 @@ def materialize_cache_dataset_plan(
         "link_mode_requested": link_mode,
         "link_mode_used": image_modes,
         "split_counts": dict(plan.get("split_counts", {})),
+        "dataset_limits": plan.get("fingerprint", {}).get("dataset_limits", {}),
         "class_names": list(plan.get("class_names", [])),
         "warnings": list(plan.get("warnings", [])),
     }
@@ -2075,7 +2450,16 @@ def estimate_outputs(
         total_known += dataset_cache_files
         approx_bytes += dataset_cache_bytes
 
-    return {
+    train_images = split_counts.get("train") or 0
+    try:
+        batch_size = int(train.get("batch_size") if train.get("batch_size") != "auto" else train.get("auto_batch_target_effective", 1))
+    except (TypeError, ValueError):
+        batch_size = int(train.get("auto_batch_target_effective", 1) or 1)
+    batch_size = max(1, batch_size)
+    train_batches = max(1, int(math.ceil(float(train_images or 0) / batch_size))) if train_images else 1
+    runtime_units = float(epochs * train_batches)
+
+    estimate = {
         "output_dir": str(output_dir),
         "dataset_source_format": dataset_source_format,
         "dataset_link_mode": dataset_link_mode,
@@ -2092,6 +2476,21 @@ def estimate_outputs(
         "estimated_disk_usage": format_bytes(approx_bytes),
         "note": "Estimates are conservative approximations. Metrics/json/log files depend on dataset size and enabled loggers.",
     }
+    add_runtime_estimate(
+        estimate=estimate,
+        config=config,
+        output_dir=output_dir,
+        task="train",
+        runtime_units=runtime_units,
+        default_rate_key="default_train_seconds_per_batch",
+        basis={
+            "epochs": epochs,
+            "train_images": train_images,
+            "batch_size": batch_size,
+            "train_batches_per_epoch": train_batches,
+        },
+    )
+    return estimate
 
 
 def confirm_or_exit(estimate: Mapping[str, Any], verbose: bool, assume_yes: bool) -> None:
@@ -2224,7 +2623,111 @@ def build_train_kwargs(config: Mapping[str, Any], output_dir: Path) -> Dict[str,
     return train_kwargs
 
 
-def save_dataset_grids_if_enabled(datamodule: Any, train_config: Any, output_dir: Path, verbose: bool) -> List[Path]:
+def _save_val_prediction_grids_if_possible(
+    datamodule: Any,
+    pl_module: Any,
+    output_dir: Path,
+    max_batches: int,
+    verbose: bool,
+) -> List[Path]:
+    """Render early validation prediction grids from the current model when RF-DETR internals allow it."""
+    if pl_module is None:
+        return []
+    try:
+        import numpy as np
+        import torch
+        from PIL import Image, ImageDraw, ImageFont
+    except Exception as exc:
+        blue(f"Warning: validation prediction grids could not be initialized; training will continue. {exc}", force=True)
+        return []
+
+    def tensor_to_image(tensor: Any) -> Image.Image:
+        array = tensor.detach().cpu().float().numpy()
+        mean = np.asarray([0.485, 0.456, 0.406], dtype=np.float32)[:, None, None]
+        std = np.asarray([0.229, 0.224, 0.225], dtype=np.float32)[:, None, None]
+        array = np.clip(array * std + mean, 0.0, 1.0)
+        return Image.fromarray((array.transpose(1, 2, 0) * 255).astype(np.uint8)).convert("RGB")
+
+    def draw_predictions_on_tile(image: Image.Image, result: Mapping[str, Any]) -> Image.Image:
+        tile_size = 320
+        scale = min(tile_size / max(1, image.width), tile_size / max(1, image.height))
+        resized = image.resize((max(1, int(image.width * scale)), max(1, int(image.height * scale))))
+        tile = Image.new("RGB", (tile_size, tile_size), color=(20, 20, 20))
+        paste_x = (tile_size - resized.width) // 2
+        paste_y = (tile_size - resized.height) // 2
+        tile.paste(resized, (paste_x, paste_y))
+        draw = ImageDraw.Draw(tile)
+        try:
+            font = ImageFont.truetype("arial.ttf", 12)
+        except Exception:
+            font = ImageFont.load_default()
+        boxes = flatten_tensor(result.get("boxes", []))
+        scores = flatten_tensor(result.get("scores", []))
+        labels = flatten_tensor(result.get("labels", []))
+        if boxes and not isinstance(boxes[0], list):
+            boxes = [boxes[index : index + 4] for index in range(0, len(boxes), 4)]
+        for index, box in enumerate(boxes[:100]):
+            if len(box) < 4:
+                continue
+            score = float(scores[index]) if index < len(scores) else 0.0
+            label = int(labels[index]) if index < len(labels) else 0
+            x1, y1, x2, y2 = [float(value) * scale for value in box[:4]]
+            x1 += paste_x
+            x2 += paste_x
+            y1 += paste_y
+            y2 += paste_y
+            draw.rectangle([x1, y1, x2, y2], outline=(239, 68, 68), width=2)
+            text = f"{label} {score:.2f}"
+            text_bbox = draw.textbbox((x1 + 2, y1 + 2), text, font=font)
+            draw.rectangle(text_bbox, fill=(239, 68, 68))
+            draw.text((x1 + 2, y1 + 2), text, fill=(255, 255, 255), font=font)
+        return tile
+
+    saved: List[Path] = []
+    was_training = bool(getattr(pl_module, "training", False))
+    try:
+        loader = datamodule.val_dataloader()
+        pl_module.eval()
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(loader):
+                if batch_idx >= max_batches:
+                    break
+                device = getattr(pl_module, "device", None)
+                model_batch = batch
+                if device is not None and hasattr(datamodule, "transfer_batch_to_device"):
+                    model_batch = datamodule.transfer_batch_to_device(batch, device, 0)
+                samples, targets = model_batch
+                outputs = pl_module.model(samples)
+                target_sizes = torch.stack([target.get("size", target.get("orig_size")) for target in targets])
+                results = pl_module.postprocess(outputs, target_sizes)
+                tensors = getattr(samples, "tensors", samples)
+                canvas = Image.new("RGB", (3 * 320, 3 * 348), color=(245, 245, 245))
+                draw = ImageDraw.Draw(canvas)
+                for sample_index, (single_image, result) in enumerate(zip(tensors[:9], results[:9])):
+                    col = sample_index % 3
+                    row = sample_index // 3
+                    x0 = col * 320
+                    y0 = row * 348
+                    tile = draw_predictions_on_tile(tensor_to_image(single_image), result)
+                    canvas.paste(tile, (x0, y0))
+                    draw.text((x0 + 6, y0 + 326), f"val pred batch={batch_idx} item={sample_index}", fill=(20, 20, 20))
+                path = output_dir / f"val_batch{batch_idx}_pred.jpg"
+                canvas.save(path, quality=92)
+                saved.append(path)
+    except Exception as exc:
+        blue(f"Warning: validation prediction grids could not be saved; training will continue. {exc}", force=True)
+    finally:
+        if was_training:
+            try:
+                pl_module.train()
+            except Exception:
+                pass
+    if saved:
+        blue(f"Saved {len(saved)} validation prediction grid image(s).", verbose=verbose, force=True)
+    return saved
+
+
+def save_dataset_grids_if_enabled(datamodule: Any, train_config: Any, output_dir: Path, verbose: bool, pl_module: Optional[Any] = None) -> List[Path]:
     """Save augmented train/validation sample grids from the RF-DETR dataloaders."""
     if not bool(getattr(train_config, "save_dataset_grids", False)):
         return []
@@ -2269,9 +2772,7 @@ def save_dataset_grids_if_enabled(datamodule: Any, train_config: Any, output_dir
             val_grid = grids_output_dir / f"val_batch{index}_grid.jpg"
             if val_grid.exists():
                 shutil.copy2(val_grid, output_dir / f"val_batch{index}_labels.jpg")
-                pred_alias = output_dir / f"val_batch{index}_pred.jpg"
-                if not pred_alias.exists():
-                    shutil.copy2(val_grid, pred_alias)
+        saved_files.extend(_save_val_prediction_grids_if_possible(datamodule, pl_module, output_dir, DATASET_GRID_MAX_BATCHES, verbose))
         blue(
             f"Saved {len(saved_files)} model-input dataset sample grid image(s): {grids_output_dir}",
             verbose=verbose,
@@ -2462,9 +2963,11 @@ def normalize_rfdetr_test_settings(merged_config: Mapping[str, Any], section: st
             max_dets = max_values[-1]
         elif max_values is not None:
             max_dets = max_values
+    max_images = parse_limit_value(source.get("max_images"), f"{section}.max_images")
     return {
         **source,
         "split": split,
+        "max_images": max_images,
         "test_mode": {"mode": mode},
         "crop": dict(source.get("crop", {}) or {}),
         "sahi": dict(source.get("sahi", {}) or {}),
@@ -3290,7 +3793,7 @@ Example usage:
     return parser
 
 
-def main() -> int:
+def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int:
     """
     Main entry point for RF-DETR training.
 
@@ -3338,6 +3841,8 @@ def main() -> int:
         config = load_yaml(source_config)
         apply_cli_overrides(config, args)
         verbose = bool(config.get("runtime", {}).get("verbose", True))
+        if timing_context is not None:
+            timing_context["verbose"] = verbose
         apply_demo_mode(config, timestamp, verbose)
         bar.update(1)
 
@@ -3347,6 +3852,8 @@ def main() -> int:
             config.setdefault("train", {})["dataset_dir"] = config["dataset"]["dataset_dir"]
 
         output_dir = build_output_dir(config, timestamp)
+        if timing_context is not None:
+            timing_context["output_dir"] = str(output_dir)
         dataset_plan = build_dataset_plan(config, output_dir, source_config)
         warnings = validate_requirements(config, output_dir, dataset_plan)
         for warning in warnings:
@@ -3361,6 +3868,9 @@ def main() -> int:
         estimate["periodic_test_count"] = periodic_count if periodic_count is not None else periodic_note
         estimate["model_size"] = config.get("model", {}).get("size")
         estimate["eval_interval"] = config.get("train", {}).get("eval_interval")
+        if timing_context is not None:
+            timing_context["estimate"] = estimate
+            timing_context["dry_run"] = bool(config.get("runtime", {}).get("dry_run", False))
         confirm = bool(config.get("runtime", {}).get("confirm_before_run", True))
         assume_yes = bool(args.yes or not confirm)
         confirm_or_exit(estimate, verbose=verbose, assume_yes=assume_yes)
@@ -3373,6 +3883,8 @@ def main() -> int:
             return 0
 
         output_dir.mkdir(parents=True, exist_ok=True)
+        if timing_context is not None:
+            timing_context["outputs_created"] = True
         bar.set_description("Dataset")
         dataset_metadata = materialize_dataset_plan(dataset_plan, config, output_dir, verbose)
         bar.update(1)
@@ -3428,7 +3940,7 @@ def main() -> int:
         datamodule = RFDETRDataModule(rf_model.model_config, train_config)
 
         bar.set_description("Sample grids")
-        dataset_grid_files = save_dataset_grids_if_enabled(datamodule, train_config, output_dir, verbose)
+        dataset_grid_files = save_dataset_grids_if_enabled(datamodule, train_config, output_dir, verbose, pl_module=module)
         bar.update(1)
 
         trainer = build_trainer(train_config, rf_model.model_config, **trainer_kwargs)
@@ -3507,6 +4019,21 @@ def main() -> int:
     blue(f"Training output directory: {output_dir}", verbose=verbose, force=True)
     blue("Done.", verbose=verbose, force=True)
     return 0
+
+
+def main() -> int:
+    """Run training with elapsed-time reporting."""
+    timing_context = start_run_timing("train")
+    try:
+        result = _main_impl(timing_context)
+        timing_context["success"] = True
+        return result
+    except Exception as exc:
+        timing_context["success"] = False
+        timing_context["error"] = {"type": exc.__class__.__name__, "message": str(exc)}
+        raise
+    finally:
+        finish_run_timing(timing_context)
 
 
 if __name__ == "__main__":

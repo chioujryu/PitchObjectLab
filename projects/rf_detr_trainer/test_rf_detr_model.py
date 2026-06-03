@@ -36,7 +36,7 @@ import yaml
 from colorama import Fore, Style
 from tqdm import tqdm
 
-import train_rf_detr_model as trainer
+import rf_detr_runtime as trainer
 from projects.object_detection_dataset_evaluator.object_detection_dataset_evaluator import run_evaluation
 
 colorama.init(autoreset=True)
@@ -76,6 +76,8 @@ def apply_cli_overrides(config: MutableMapping[str, Any], args: argparse.Namespa
     if args.test_mode:
         config.setdefault("test_mode", {})["mode"] = args.test_mode
         test.setdefault("test_mode", {})["mode"] = args.test_mode
+    if args.max_images is not None:
+        test["max_images"] = args.max_images
 
 
 def _last_max_det(evaluation: Mapping[str, Any], default: int = 500) -> int:
@@ -172,6 +174,8 @@ def print_inference_timing_summary(result: Mapping[str, Any], output_dir: Path) 
 def _non_negative_int_or_none(value: Any) -> Optional[int]:
     if value is None:
         return None
+    if isinstance(value, str) and value.strip().lower() in {"", "all", "none", "null"}:
+        return None
     return max(0, int(value))
 
 
@@ -209,6 +213,9 @@ def estimate_standalone_test_outputs(
     image_count = split_counts.get(split)
     if image_count is None and split == "test-original":
         image_count = split_counts.get("test-original") or split_counts.get("test_original") or split_counts.get("test")
+    test_limit = trainer.parse_limit_value(test_settings.get("max_images"), "test.max_images")
+    if test_limit is not None:
+        image_count = min(int(image_count), test_limit) if image_count is not None else test_limit
 
     config_files = 6
     metric_files = 8 if bool(evaluation.get("classwise", True)) else 6
@@ -244,7 +251,7 @@ def estimate_standalone_test_outputs(
     )
     image_outputs = model_input_files + max(0, visual_files - 2 if visual_files else 0) + max(0, error_case_files - 3 if error_case_files else 0) + dataset_case_files
     approx_bytes = dataset_cache_bytes + metric_files * 200_000 + image_outputs * 500_000 + plot_files * 350_000 + config_files * 50_000
-    return {
+    estimate = {
         "output_dir": str(output_dir),
         "dataset_source_format": dataset_plan.get("source_format"),
         "dataset_plan_action": dataset_plan.get("action"),
@@ -262,6 +269,16 @@ def estimate_standalone_test_outputs(
         "estimated_disk_usage": trainer.format_bytes(approx_bytes),
         "note": "Test output estimates are conservative. Prediction-filtered visuals and error cases are known exactly after inference.",
     }
+    trainer.add_runtime_estimate(
+        estimate=estimate,
+        config=config,
+        output_dir=output_dir,
+        task="test",
+        runtime_units=float(image_count or 0),
+        default_rate_key="default_test_seconds_per_image",
+        basis={"test_images": image_count, "split": split},
+    )
+    return estimate
 
 
 def confirm_test_or_exit(estimate: Mapping[str, Any], verbose: bool, assume_yes: bool) -> None:
@@ -303,13 +320,17 @@ def build_internal_test_config(config: Mapping[str, Any]) -> Dict[str, Any]:
         else None
     ) or test_mode_value or test.get("mode") or periodic_mode or "full_image"
     split = str(test.get("split") or periodic_source.get("split") or dataset.get("split", "test") or "test")
+    max_images = trainer.parse_limit_value(test.get("max_images", periodic_source.get("max_images")), "test.max_images")
     crop = test.get("crop") or internal.get("crop") or periodic_source.get("crop") or {}
     sahi = test.get("sahi") or internal.get("sahi") or periodic_source.get("sahi") or {}
     error_cases = test.get("error_cases") or periodic_source.get("error_cases") or {}
     visual_samples = dict(test.get("visual_samples") or periodic_source.get("visual_samples") or {})
-    if visual_samples.get("max_images") is not None and isinstance(error_cases, Mapping):
+    visual_sample_cap = _non_negative_int_or_none(visual_samples.get("max_images"))
+    if visual_samples.get("max_images") is not None:
+        visual_samples["max_images"] = visual_sample_cap
+    if visual_sample_cap is not None and isinstance(error_cases, Mapping):
         error_cases = dict(error_cases)
-        error_cases.setdefault("max_images", int(visual_samples["max_images"]))
+        error_cases.setdefault("max_images", visual_sample_cap)
 
     internal["test_mode"] = {"mode": mode}
     internal["crop"] = dict(crop)
@@ -320,6 +341,7 @@ def build_internal_test_config(config: Mapping[str, Any]) -> Dict[str, Any]:
     test_settings = {
         **test,
         "split": split,
+        "max_images": max_images,
         "test_mode": {"mode": mode},
         "crop": internal["crop"],
         "sahi": internal["sahi"],
@@ -357,7 +379,7 @@ def build_internal_test_config(config: Mapping[str, Any]) -> Dict[str, Any]:
     return internal
 
 
-def main() -> int:
+def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int:
     parser = argparse.ArgumentParser(description="RF-DETR standalone test runner.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="Path to rf_detr_test.yaml.")
     parser.add_argument("--model-size", help="RF-DETR size override, e.g. medium, large, seg-small, seg-2xlarge.")
@@ -366,6 +388,7 @@ def main() -> int:
     parser.add_argument("--num-classes", type=int, help="Optional class count override.")
     parser.add_argument("--output-dir", help="Exact output directory override.")
     parser.add_argument("--test-mode", choices=["full_image", "sahi", "class_crop"], help="Test mode override.")
+    parser.add_argument("--max-images", type=trainer.parse_scalar, help="Maximum test images to evaluate. Use all/null for all.")
     parser.add_argument("--dry-run", action="store_true", help="Validate and print planned output without inference.")
     parser.add_argument("--yes", action="store_true", help="Skip confirmation.")
     args = parser.parse_args()
@@ -377,16 +400,23 @@ def main() -> int:
         config = load_yaml(source_config)
         apply_cli_overrides(config, args)
         internal_config = build_internal_test_config(config)
+        if timing_context is not None:
+            timing_context["verbose"] = bool(internal_config.get("runtime", {}).get("verbose", True))
         bar.update(1)
 
         timestamp = datetime.now().strftime(TIMESTAMP_FORMAT)
         output_dir = trainer.build_output_dir(internal_config, timestamp)
+        if timing_context is not None:
+            timing_context["output_dir"] = str(output_dir)
         dataset_plan = trainer.build_dataset_plan(internal_config, output_dir, source_config)
         bar.update(1)
 
         if output_dir.exists() and not bool(internal_config.get("output", {}).get("exist_ok", False)):
             raise FileExistsError(f"Output directory already exists and output.exist_ok=false: {output_dir}")
         estimate = estimate_standalone_test_outputs(internal_config, output_dir, dataset_plan)
+        if timing_context is not None:
+            timing_context["estimate"] = estimate
+            timing_context["dry_run"] = bool(internal_config.get("runtime", {}).get("dry_run", False))
         confirm = bool(internal_config.get("runtime", {}).get("confirm_before_run", True))
         assume_yes = bool(internal_config.get("runtime", {}).get("yes", False) or not confirm)
         confirm_test_or_exit(estimate, bool(internal_config.get("runtime", {}).get("verbose", True)), assume_yes)
@@ -412,6 +442,8 @@ def main() -> int:
             metadata={"event": "standalone_test_start", "dataset": dataset_metadata},
             source_config=source_config,
         )
+        if timing_context is not None:
+            timing_context["outputs_created"] = True
         bar.update(1)
 
         model_cls = trainer.get_model_class(str(internal_config.get("model", {}).get("size", "medium")))
@@ -466,6 +498,21 @@ def main() -> int:
     print_inference_timing_summary(result if isinstance(result, Mapping) else {}, output_dir)
     print(f"RF-DETR test output directory: {output_dir}")
     return 0
+
+
+def main() -> int:
+    """Run standalone test with elapsed-time reporting."""
+    timing_context = trainer.start_run_timing("test")
+    try:
+        result = _main_impl(timing_context)
+        timing_context["success"] = True
+        return result
+    except Exception as exc:
+        timing_context["success"] = False
+        timing_context["error"] = {"type": exc.__class__.__name__, "message": str(exc)}
+        raise
+    finally:
+        trainer.finish_run_timing(timing_context)
 
 
 if __name__ == "__main__":

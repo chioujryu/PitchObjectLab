@@ -34,6 +34,19 @@ class RfDetrTestDiagnosticsTest(unittest.TestCase):
         self.assertEqual(internal["test"]["visual_samples"]["max_images"], 7)
         self.assertEqual(internal["test"]["error_cases"]["max_images"], 7)
 
+    def test_test_max_images_all_and_integer_normalize(self):
+        base = {
+            "model": {"confidence_threshold": 0.25},
+            "dataset": {},
+            "evaluation": {"max_detections": [1, 10, 500], "match_iou_threshold": 0.5},
+        }
+
+        all_config = {**base, "test": {"max_images": "all"}}
+        limited_config = {**base, "test": {"max_images": 5}}
+
+        self.assertIsNone(test_runner.build_internal_test_config(all_config)["test"]["max_images"])
+        self.assertEqual(test_runner.build_internal_test_config(limited_config)["test"]["max_images"], 5)
+
     def test_render_football_error_cases_outputs_images_and_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

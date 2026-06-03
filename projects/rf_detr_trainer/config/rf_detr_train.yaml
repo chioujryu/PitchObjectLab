@@ -8,6 +8,19 @@ runtime:
   dry_run: false
   # Ask before creating checkpoints, logs, metrics, plots, or dataset grids. Options: true, false.
   confirm_before_run: true
+  time_estimate:
+    # Print rough HH:MM:SS runtime estimates before execution. Options: true, false.
+    enabled: true
+    # Prefer latest sibling run_timing.json throughput when available. Options: true, false.
+    use_history: true
+    # Fallback train speed for first runs. Options: positive seconds per training batch.
+    default_train_seconds_per_batch: 0.7
+    # Fallback test speed for scheduled/final tests. Options: positive seconds per image.
+    default_test_seconds_per_image: 0.25
+    # Fallback inference speed retained for shared schema. Options: positive seconds per image/frame.
+    default_inference_seconds_per_image: 0.25
+    # Fallback video render speed retained for shared schema. Options: positive seconds per frame.
+    default_video_render_seconds_per_frame: 0.005
 
 model:
   # RF-DETR model size. Detection: base, nano, small, medium, large. Segmentation: seg-preview, seg-nano, seg-small, seg-medium, seg-large, seg-xlarge, seg-2xlarge.
@@ -43,6 +56,14 @@ dataset:
   coco_json: ""
   # Image directory used with coco_json when image file names are relative. Options: empty string to infer from dataset_dir.
   image_dir: ""
+  # Default maximum images per split prepared for training/eval. Options: all/null for all images, or a positive integer for first N images.
+  max_images: all
+  # Maximum train split images. Options: null to inherit max_images, all for all train images, or a positive integer.
+  max_train_images: null
+  # Maximum validation split images. Options: null to inherit max_images, all for all validation images, or a positive integer.
+  max_val_images: null
+  # Maximum test/test-original split images. Options: null to inherit max_images, all for all test images, or a positive integer.
+  max_test_images: null
   # RF-DETR-readable converted dataset cache root. Relative paths resolve under projects/rf_detr_trainer.
   cache_root: dataset_cache
   # Rebuild a matching cache even when source_fingerprint.json says it can be reused. Options: true, false.
@@ -256,6 +277,28 @@ periodic_test:
     postprocess_class_agnostic: false
     # SAHI model input batch size. Options: positive integer.
     batch_size: 1
+    recheck:
+      # Run a second centered B*B verification pass for selected SAHI target-class boxes. Options: true, false.
+      enabled: false
+      # Target category IDs for SAHI recheck. Empty means use target_class_names; if both empty and enabled, default is football.
+      target_class_ids: []
+      # Target category names for SAHI recheck. Empty with enabled defaults to football. Options: category names such as [football].
+      target_class_names:
+        - football
+      # B*B centered crop size for the second pass. Options: positive integer pixels.
+      crop_size: 960
+      # Confidence threshold for the second pass. Options: 0.0-1.0.
+      second_confidence_threshold: 0.25
+      # Weight applied to the first-stage confidence. Options: non-negative float.
+      first_weight: 0.5
+      # Weight applied to the best second-stage confidence. Options: non-negative float.
+      second_weight: 0.5
+      # Minimum fused confidence to keep the first-stage box. Options: 0.0-1.0.
+      fused_confidence_threshold: 0.25
+      # Extra relative padding around the first-stage box for center-hit matching. Options: non-negative float.
+      center_padding_ratio: 0.0
+      # Maximum target boxes rechecked per image. Options: 0 disables rechecking; positive integer caps by score.
+      max_rechecks_per_image: 50
   visual_samples:
     # Save sampled prediction test images with GT and predictions during periodic/final tests. Options: true, false.
     enabled: false
@@ -285,12 +328,14 @@ periodic_test:
     min_predictions: 0
     # Minimum prediction score used only for candidate filtering. Options: null or 0.0-1.0.
     filter_min_score: 0.25
-    # Minimum prediction score drawn in visual images. Options: null or 0.0-1.0.
-    draw_min_score: 0.25
+    # Minimum prediction score drawn in visual images. Options: null to use model.confidence_threshold, or 0.0-1.0.
+    draw_min_score: null
   # Number of model input cases per saved test_batch grid. Options: positive integer.
   model_input_batch_size: 9
   # Split used for scheduled and final wrapper tests. Options: test-original, test, val, valid, train.
   split: test-original
+  # Maximum images evaluated in each scheduled/final test. Options: all/null for full split, or a positive integer for first N images.
+  max_images: all
   # Run test every N epochs. Options: 0 disables epoch interval, positive integer enables.
   test_interval_epochs: 10
   # Run test every N minutes. Options: 0 disables time interval, positive float enables.
