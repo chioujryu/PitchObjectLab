@@ -1,4 +1,4 @@
-"""
+r"""
 Run RF-DETR inference on images, videos, folders, and HTTP(S) media URLs.
 
 Usage:
@@ -25,19 +25,20 @@ import contextlib
 import json
 import math
 import shutil
+from collections.abc import Iterable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+from typing import Any
 from urllib.parse import urlparse
 
 import colorama
+import rf_detr_runtime as trainer
 import yaml
 from colorama import Fore, Style
 from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
 
-import rf_detr_runtime as trainer
 from projects.object_detection_dataset_evaluator import object_detection_dataset_evaluator as evaluator
 
 colorama.init(autoreset=True)
@@ -66,21 +67,21 @@ class SourceItem:
     source: str
     kind: str
     is_url: bool = False
-    local_path: Optional[Path] = None
+    local_path: Path | None = None
 
 
 @dataclass(frozen=True)
 class VideoFrameWindow:
     start_seconds: float
-    end_seconds: Optional[float]
-    max_seconds: Optional[float]
-    effective_end_seconds: Optional[float]
+    end_seconds: float | None
+    max_seconds: float | None
+    effective_end_seconds: float | None
     start_frame: int
-    end_frame: Optional[int]
-    output_frames: Optional[int]
+    end_frame: int | None
+    output_frames: int | None
 
 
-def load_yaml(path: Path) -> Dict[str, Any]:
+def load_yaml(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as file:
         data = yaml.safe_load(file) or {}
     if not isinstance(data, dict):
@@ -122,7 +123,7 @@ def apply_cli_overrides(config: MutableMapping[str, Any], args: argparse.Namespa
         inference.setdefault("video", {})["end_time"] = args.video_end_time
 
 
-def config_list(value: Any) -> List[Any]:
+def config_list(value: Any) -> list[Any]:
     if value is None or value == "":
         return []
     if isinstance(value, str):
@@ -137,9 +138,9 @@ def parse_video_time_seconds(
     field_name: str,
     *,
     allow_all: bool = False,
-    default: Optional[float] = None,
+    default: float | None = None,
     positive: bool = False,
-) -> Optional[float]:
+) -> float | None:
     """Parse seconds, MM:SS, or HH:MM:SS values."""
     if value is None:
         return default
@@ -160,7 +161,9 @@ def parse_video_time_seconds(
             try:
                 numbers = [float(part) for part in parts]
             except ValueError as exc:
-                raise ValueError(f"{field_name} must use numeric SS, MM:SS, or HH:MM:SS format, got {value!r}.") from exc
+                raise ValueError(
+                    f"{field_name} must use numeric SS, MM:SS, or HH:MM:SS format, got {value!r}."
+                ) from exc
             if any(number < 0 for number in numbers):
                 raise ValueError(f"{field_name} must be non-negative, got {value!r}.")
             if len(numbers) == 2:
@@ -188,14 +191,16 @@ def parse_video_time_seconds(
     try:
         seconds = float(parsed)
     except (TypeError, ValueError) as exc:
-        raise ValueError(f"{field_name} must be SS, MM:SS, HH:MM:SS, or a numeric seconds value, got {value!r}.") from exc
+        raise ValueError(
+            f"{field_name} must be SS, MM:SS, HH:MM:SS, or a numeric seconds value, got {value!r}."
+        ) from exc
     if seconds < 0 or (positive and seconds <= 0):
         comparator = "positive" if positive else "non-negative"
         raise ValueError(f"{field_name} must be {comparator}, got {value!r}.")
     return seconds
 
 
-def parse_seconds_limit(value: Any, field_name: str = "inference.video.max_seconds") -> Optional[float]:
+def parse_seconds_limit(value: Any, field_name: str = "inference.video.max_seconds") -> float | None:
     """Parse a positive duration limit; null/all/empty means the whole selected video range."""
     try:
         return parse_video_time_seconds(value, field_name, allow_all=True, default=None, positive=True)
@@ -209,8 +214,12 @@ def video_frame_window(frame_count: int, input_fps: float, video_cfg: Mapping[st
     """Resolve configured video start/end/max_seconds into frame bounds."""
     fps = max(0.001, float(input_fps or 0.0))
     total_frames = max(0, int(frame_count or 0))
-    start_seconds = parse_video_time_seconds(video_cfg.get("start_time", 0), "inference.video.start_time", default=0.0) or 0.0
-    end_seconds = parse_video_time_seconds(video_cfg.get("end_time", "all"), "inference.video.end_time", allow_all=True, default=None)
+    start_seconds = (
+        parse_video_time_seconds(video_cfg.get("start_time", 0), "inference.video.start_time", default=0.0) or 0.0
+    )
+    end_seconds = parse_video_time_seconds(
+        video_cfg.get("end_time", "all"), "inference.video.end_time", allow_all=True, default=None
+    )
     max_seconds = parse_seconds_limit(video_cfg.get("max_seconds"))
     if end_seconds is not None and end_seconds <= start_seconds:
         raise ValueError("inference.video.end_time must be greater than inference.video.start_time.")
@@ -218,17 +227,19 @@ def video_frame_window(frame_count: int, input_fps: float, video_cfg: Mapping[st
     effective_end_seconds = end_seconds
     if max_seconds is not None:
         max_end_seconds = start_seconds + max_seconds
-        effective_end_seconds = min(effective_end_seconds, max_end_seconds) if effective_end_seconds is not None else max_end_seconds
+        effective_end_seconds = (
+            min(effective_end_seconds, max_end_seconds) if effective_end_seconds is not None else max_end_seconds
+        )
 
-    start_frame = max(0, int(math.floor(start_seconds * fps)))
+    start_frame = max(0, math.floor(start_seconds * fps))
     if total_frames > 0:
         start_frame = min(start_frame, total_frames)
 
-    end_frame: Optional[int]
+    end_frame: int | None
     if effective_end_seconds is None:
         end_frame = total_frames if total_frames > 0 else None
     else:
-        end_frame = max(0, int(math.ceil(effective_end_seconds * fps)))
+        end_frame = max(0, math.ceil(effective_end_seconds * fps))
         if total_frames > 0:
             end_frame = min(end_frame, total_frames)
         end_frame = max(start_frame, end_frame)
@@ -244,12 +255,12 @@ def video_frame_window(frame_count: int, input_fps: float, video_cfg: Mapping[st
     )
 
 
-def limited_video_frame_total(frame_count: int, input_fps: float, max_seconds: Optional[float]) -> Optional[int]:
+def limited_video_frame_total(frame_count: int, input_fps: float, max_seconds: float | None) -> int | None:
     """Return the maximum number of frames to process for a video."""
     if max_seconds is None:
         return frame_count if frame_count > 0 else None
     fps = max(0.001, float(input_fps or 0.0))
-    seconds_frames = max(1, int(math.ceil(max_seconds * fps)))
+    seconds_frames = max(1, math.ceil(max_seconds * fps))
     return min(frame_count, seconds_frames) if frame_count > 0 else seconds_frames
 
 
@@ -259,11 +270,11 @@ def video_detection_frame_count(output_frames: int, input_fps: float, detection_
         return 0
     if detection_fps is None:
         return output_frames
-    frame_interval = max(1, int(round(max(0.001, float(input_fps or 0.0)) / max(0.001, float(detection_fps)))))
-    return int(math.ceil(output_frames / frame_interval))
+    frame_interval = max(1, round(max(0.001, float(input_fps or 0.0)) / max(0.001, float(detection_fps))))
+    return math.ceil(output_frames / frame_interval)
 
 
-def estimate_video_work(item: SourceItem, video_cfg: Mapping[str, Any]) -> Dict[str, Any]:
+def estimate_video_work(item: SourceItem, video_cfg: Mapping[str, Any]) -> dict[str, Any]:
     """Estimate processed/output video frames without running inference."""
     input_fps = 30.0
     frame_count = 0
@@ -285,7 +296,7 @@ def estimate_video_work(item: SourceItem, video_cfg: Mapping[str, Any]) -> Dict[
             fallback_seconds = max(0.0, window.effective_end_seconds - window.start_seconds)
         else:
             fallback_seconds = window.max_seconds if window.max_seconds is not None else 60.0
-        output_frames = max(1, int(math.ceil(fallback_seconds * input_fps)))
+        output_frames = max(1, math.ceil(fallback_seconds * input_fps))
     detection_frames = video_detection_frame_count(output_frames, input_fps, video_cfg.get("detection_fps"))
     return {
         "start_seconds": window.start_seconds,
@@ -301,7 +312,7 @@ def estimate_video_work(item: SourceItem, video_cfg: Mapping[str, Any]) -> Dict[
     }
 
 
-def media_kind_from_suffix(suffix: str, image_exts: Sequence[str], video_exts: Sequence[str]) -> Optional[str]:
+def media_kind_from_suffix(suffix: str, image_exts: Sequence[str], video_exts: Sequence[str]) -> str | None:
     normalized = suffix.lower()
     if normalized in {ext.lower() for ext in image_exts}:
         return "image"
@@ -314,12 +325,12 @@ def is_url(value: str) -> bool:
     return trainer.is_url_like(value)
 
 
-def discover_sources(config: Mapping[str, Any]) -> List[SourceItem]:
+def discover_sources(config: Mapping[str, Any]) -> list[SourceItem]:
     inference = config.get("inference", {})
     image_exts = [str(ext).lower() for ext in (inference.get("image_extensions") or sorted(IMAGE_EXTENSIONS))]
     video_exts = [str(ext).lower() for ext in (inference.get("video_extensions") or sorted(VIDEO_EXTENSIONS))]
     recursive = bool(inference.get("recursive", True))
-    items: List[SourceItem] = []
+    items: list[SourceItem] = []
     for raw in config_list(inference.get("sources")):
         source = str(raw).strip()
         if not source:
@@ -347,7 +358,7 @@ def discover_sources(config: Mapping[str, Any]) -> List[SourceItem]:
     return items
 
 
-def apply_source_limits(items: Sequence[SourceItem], config: Mapping[str, Any]) -> List[SourceItem]:
+def apply_source_limits(items: Sequence[SourceItem], config: Mapping[str, Any]) -> list[SourceItem]:
     """Apply first-N source limits from inference config."""
     inference = config.get("inference", {})
     max_images = trainer.parse_limit_value(inference.get("max_images"), "inference.max_images")
@@ -355,7 +366,7 @@ def apply_source_limits(items: Sequence[SourceItem], config: Mapping[str, Any]) 
     max_sources = trainer.parse_limit_value(inference.get("max_sources"), "inference.max_sources")
     image_count = 0
     video_count = 0
-    per_type_limited: List[SourceItem] = []
+    per_type_limited: list[SourceItem] = []
     for item in items:
         if item.kind == "image":
             if max_images is not None and image_count >= max_images:
@@ -379,15 +390,19 @@ def build_output_dir(config: Mapping[str, Any], timestamp: str) -> Path:
     return trainer.resolve_path_for_output(str(Path(str(root)) / str(name)), [Path.cwd(), PROJECT_DIR])
 
 
-def estimate_outputs(items: Sequence[SourceItem], output_dir: Path, config: Mapping[str, Any]) -> Dict[str, Any]:
+def estimate_outputs(items: Sequence[SourceItem], output_dir: Path, config: Mapping[str, Any]) -> dict[str, Any]:
     image_count = sum(1 for item in items if item.kind == "image")
     video_count = sum(1 for item in items if item.kind == "video")
-    video_cfg = dict((config.get("inference", {}).get("video", {}) or {}))
+    video_cfg = dict(config.get("inference", {}).get("video", {}) or {})
     video_work = [estimate_video_work(item, video_cfg) for item in items if item.kind == "video"]
     detection_frames = sum(int(work["detection_frames"]) for work in video_work)
     output_frames = sum(int(work["output_frames"]) for work in video_work)
-    start_seconds = parse_video_time_seconds(video_cfg.get("start_time", 0), "inference.video.start_time", default=0.0) or 0.0
-    end_seconds = parse_video_time_seconds(video_cfg.get("end_time", "all"), "inference.video.end_time", allow_all=True, default=None)
+    start_seconds = (
+        parse_video_time_seconds(video_cfg.get("start_time", 0), "inference.video.start_time", default=0.0) or 0.0
+    )
+    end_seconds = parse_video_time_seconds(
+        video_cfg.get("end_time", "all"), "inference.video.end_time", allow_all=True, default=None
+    )
     max_seconds = parse_seconds_limit(video_cfg.get("max_seconds"))
     local_bytes = 0
     for item in items:
@@ -438,14 +453,16 @@ def confirm_or_exit(estimate: Mapping[str, Any], verbose: bool, assume_yes: bool
     print(json.dumps(dict(estimate), indent=2, ensure_ascii=False))
     if assume_yes:
         if verbose:
-            print(Fore.BLUE + Style.BRIGHT + "Confirmation skipped because --yes or confirm_before_run=false is enabled.")
+            print(
+                Fore.BLUE + Style.BRIGHT + "Confirmation skipped because --yes or confirm_before_run=false is enabled."
+            )
         return
     answer = input(Fore.BLUE + Style.BRIGHT + "Continue and start inference? [y/N]: " + Style.RESET_ALL).strip().lower()
     if answer not in {"y", "yes"}:
         raise SystemExit("Aborted before inference output was produced.")
 
 
-def class_names_from_config(config: Mapping[str, Any]) -> Dict[int, str]:
+def class_names_from_config(config: Mapping[str, Any]) -> dict[int, str]:
     dataset = config.get("dataset", {})
     names = dataset.get("class_names", dataset.get("names", []))
     if not names and dataset.get("data_yaml"):
@@ -462,7 +479,7 @@ def class_names_from_config(config: Mapping[str, Any]) -> Dict[int, str]:
     return {}
 
 
-def build_categories(config: Mapping[str, Any]) -> List[Dict[str, Any]]:
+def build_categories(config: Mapping[str, Any]) -> list[dict[str, Any]]:
     names = class_names_from_config(config)
     num_classes = config.get("model", {}).get("num_classes")
     if num_classes is not None:
@@ -471,20 +488,22 @@ def build_categories(config: Mapping[str, Any]) -> List[Dict[str, Any]]:
     return [{"id": int(index), "name": name} for index, name in sorted(names.items())]
 
 
-def class_color(category_id: int) -> Tuple[int, int, int]:
+def class_color(category_id: int) -> tuple[int, int, int]:
     if category_id < len(COLOR_PALETTE):
         return COLOR_PALETTE[category_id]
     value = (int(category_id) * 2654435761) & 0xFFFFFF
     return 64 + value % 160, 64 + (value >> 8) % 160, 64 + (value >> 16) % 160
 
 
-def color_map(categories: Sequence[Mapping[str, Any]], predictions: Sequence[Mapping[str, Any]]) -> Dict[int, Tuple[int, int, int]]:
+def color_map(
+    categories: Sequence[Mapping[str, Any]], predictions: Sequence[Mapping[str, Any]]
+) -> dict[int, tuple[int, int, int]]:
     ids = {int(category["id"]) for category in categories}
     ids.update(int(prediction.get("category_id", 0)) for prediction in predictions)
     return {category_id: class_color(category_id) for category_id in sorted(ids)}
 
 
-def resolve_render_ids(config: Mapping[str, Any], categories: Sequence[Mapping[str, Any]]) -> List[int]:
+def resolve_render_ids(config: Mapping[str, Any], categories: Sequence[Mapping[str, Any]]) -> list[int]:
     inference = config.get("inference", {})
     ids = [int(value) for value in config_list(inference.get("render_class_ids"))]
     if ids:
@@ -526,7 +545,7 @@ def draw_predictions(
     return canvas
 
 
-def build_prediction_config(config: Mapping[str, Any], categories: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+def build_prediction_config(config: Mapping[str, Any], categories: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     model = config.get("model", {})
     inference = config.get("inference", {})
     mode = str(inference.get("mode", "full_image")).strip().lower()
@@ -575,11 +594,13 @@ def predict_image_file(
     categories: Sequence[Mapping[str, Any]],
     output_dir: Path,
     render_ids: Sequence[int],
-) -> Tuple[List[Dict[str, Any]], Path]:
+) -> tuple[list[dict[str, Any]], Path]:
     assert item.local_path is not None
     with Image.open(item.local_path) as image:
         width, height = image.size
-    record = evaluator.ImageRecord(image_id=image_id, file_name=item.local_path.name, path=str(item.local_path), width=width, height=height)
+    record = evaluator.ImageRecord(
+        image_id=image_id, file_name=item.local_path.name, path=str(item.local_path), width=width, height=height
+    )
     predictions, _, _ = evaluator.predict_image(record, model, prediction_config, output_dir, save_visual=False)
     with Image.open(item.local_path) as image:
         rendered = draw_predictions(image, predictions, categories, render_ids)
@@ -599,7 +620,7 @@ def predict_video_file(
     output_dir: Path,
     render_ids: Sequence[int],
     video_cfg: Mapping[str, Any],
-) -> Tuple[List[Dict[str, Any]], Path, int]:
+) -> tuple[list[dict[str, Any]], Path, int]:
     import cv2
 
     assert item.local_path is not None
@@ -611,7 +632,7 @@ def predict_video_file(
     detection_fps = video_cfg.get("detection_fps")
     frame_interval = 1
     if detection_fps is not None:
-        frame_interval = max(1, int(round(input_fps / max(0.001, float(detection_fps)))))
+        frame_interval = max(1, round(input_fps / max(0.001, float(detection_fps))))
     width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
     frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
@@ -626,8 +647,8 @@ def predict_video_file(
     if not writer.isOpened():
         raise RuntimeError(f"Could not create video writer: {target}")
 
-    all_predictions: List[Dict[str, Any]] = []
-    last_predictions: List[Dict[str, Any]] = []
+    all_predictions: list[dict[str, Any]] = []
+    last_predictions: list[dict[str, Any]] = []
     frame_cache_dir = output_dir / "_frame_cache"
     frame_cache_dir.mkdir(parents=True, exist_ok=True)
     render_skipped = bool(video_cfg.get("render_skipped_frames", True))
@@ -655,7 +676,9 @@ def predict_video_file(
                     width=width,
                     height=height,
                 )
-                frame_predictions, _, _ = evaluator.predict_image(record, model, prediction_config, output_dir, save_visual=False)
+                frame_predictions, _, _ = evaluator.predict_image(
+                    record, model, prediction_config, output_dir, save_visual=False
+                )
                 for prediction in frame_predictions:
                     row = dict(prediction)
                     row["source"] = item.source
@@ -671,7 +694,9 @@ def predict_video_file(
                 image_id += 1
             if should_detect or render_skipped:
                 pil_frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                frame = cv2.cvtColor(np_image(draw_predictions(pil_frame, frame_predictions, categories, render_ids)), cv2.COLOR_RGB2BGR)
+                frame = cv2.cvtColor(
+                    np_image(draw_predictions(pil_frame, frame_predictions, categories, render_ids)), cv2.COLOR_RGB2BGR
+                )
             writer.write(frame)
             segment_frame_index += 1
             absolute_frame_index += 1
@@ -697,7 +722,7 @@ def write_predictions_jsonl(path: Path, rows: Sequence[Mapping[str, Any]]) -> No
             file.write(json.dumps(row, ensure_ascii=False, default=trainer.json_safe_value) + "\n")
 
 
-def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int:
+def _main_impl(timing_context: MutableMapping[str, Any] | None = None) -> int:
     parser = argparse.ArgumentParser(description="RF-DETR image/video inference runner.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="Path to rf_detr_inference.yaml.")
     parser.add_argument("--source", action="append", help="Image/video file, folder, or URL. Can be repeated.")
@@ -705,12 +730,24 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
     parser.add_argument("--checkpoint", help="RF-DETR checkpoint/pretrain_weights override.")
     parser.add_argument("--device", help="Device override: auto, cpu, cuda, cuda:0, 0, 1.")
     parser.add_argument("--confidence-threshold", type=float, help="Model confidence threshold override.")
-    parser.add_argument("--max-sources", type=trainer.parse_scalar, help="Maximum discovered sources to run. Use all/null for all.")
-    parser.add_argument("--max-images", type=trainer.parse_scalar, help="Maximum image sources to run. Use all/null for all.")
-    parser.add_argument("--max-videos", type=trainer.parse_scalar, help="Maximum video sources to run. Use all/null for all.")
-    parser.add_argument("--max-seconds", type=trainer.parse_scalar, help="Maximum seconds per video to infer. Use all/null for the whole video.")
+    parser.add_argument(
+        "--max-sources", type=trainer.parse_scalar, help="Maximum discovered sources to run. Use all/null for all."
+    )
+    parser.add_argument(
+        "--max-images", type=trainer.parse_scalar, help="Maximum image sources to run. Use all/null for all."
+    )
+    parser.add_argument(
+        "--max-videos", type=trainer.parse_scalar, help="Maximum video sources to run. Use all/null for all."
+    )
+    parser.add_argument(
+        "--max-seconds",
+        type=trainer.parse_scalar,
+        help="Maximum seconds per video to infer. Use all/null for the whole video.",
+    )
     parser.add_argument("--video-start-time", help="Video segment start time. Options: seconds, MM:SS, or HH:MM:SS.")
-    parser.add_argument("--video-end-time", help="Video segment end time. Options: all/null, seconds, MM:SS, or HH:MM:SS.")
+    parser.add_argument(
+        "--video-end-time", help="Video segment end time. Options: all/null, seconds, MM:SS, or HH:MM:SS."
+    )
     parser.add_argument("--dry-run", action="store_true", help="Validate and estimate outputs without inference.")
     parser.add_argument("--yes", action="store_true", help="Skip confirmation.")
     args = parser.parse_args()
@@ -751,25 +788,33 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
     prediction_config = build_prediction_config(config, categories)
     model = load_rfdetr_model(config)
     render_ids = resolve_render_ids(config, categories)
-    all_predictions: List[Dict[str, Any]] = []
-    outputs: List[Dict[str, Any]] = []
+    all_predictions: list[dict[str, Any]] = []
+    outputs: list[dict[str, Any]] = []
     image_id = 1
     video_cfg = dict(config.get("inference", {}).get("video", {}) or {})
 
     iterator = tqdm(resolved_items, desc="RF-DETR inference", unit="source")
     for item in iterator:
         if item.kind == "image":
-            predictions, path = predict_image_file(item, image_id, model, prediction_config, categories, output_dir, render_ids)
+            predictions, path = predict_image_file(
+                item, image_id, model, prediction_config, categories, output_dir, render_ids
+            )
             for prediction in predictions:
                 row = dict(prediction)
                 row["source"] = item.source
                 all_predictions.append(row)
-            outputs.append({"source": item.source, "kind": "image", "output": str(path), "predictions": len(predictions)})
+            outputs.append(
+                {"source": item.source, "kind": "image", "output": str(path), "predictions": len(predictions)}
+            )
             image_id += 1
         elif item.kind == "video":
-            predictions, path, image_id = predict_video_file(item, image_id, model, prediction_config, categories, output_dir, render_ids, video_cfg)
+            predictions, path, image_id = predict_video_file(
+                item, image_id, model, prediction_config, categories, output_dir, render_ids, video_cfg
+            )
             all_predictions.extend(predictions)
-            outputs.append({"source": item.source, "kind": "video", "output": str(path), "predictions": len(predictions)})
+            outputs.append(
+                {"source": item.source, "kind": "video", "output": str(path), "predictions": len(predictions)}
+            )
 
     colors = {
         str(category_id): {"rgb": list(color), "hex": "#{:02x}{:02x}{:02x}".format(*color)}
@@ -778,7 +823,9 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
     trainer.write_json(output_dir / "class_colors.json", {"categories": categories, "colors": colors})
     if bool(config.get("inference", {}).get("save_predictions_jsonl", True)):
         write_predictions_jsonl(output_dir / "predictions.jsonl", all_predictions)
-    trainer.write_json(output_dir / "inference_summary.json", {"outputs": outputs, "prediction_count": len(all_predictions)})
+    trainer.write_json(
+        output_dir / "inference_summary.json", {"outputs": outputs, "prediction_count": len(all_predictions)}
+    )
     trainer.dump_config_snapshot(
         output_dir=output_dir,
         merged_config=config,

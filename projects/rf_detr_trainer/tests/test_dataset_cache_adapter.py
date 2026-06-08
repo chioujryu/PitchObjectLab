@@ -171,7 +171,9 @@ class DatasetCacheAdapterTest(unittest.TestCase):
                     make_image(split_dir / name)
                     image_id = index + 1
                     images.append({"id": image_id, "file_name": name, "width": 100, "height": 80})
-                    annotations.append({"id": image_id, "image_id": image_id, "category_id": 1, "bbox": [10, 12, 20, 30]})
+                    annotations.append(
+                        {"id": image_id, "image_id": image_id, "category_id": 1, "bbox": [10, 12, 20, 30]}
+                    )
                 (split_dir / "_annotations.coco.json").write_text(
                     json.dumps(
                         {

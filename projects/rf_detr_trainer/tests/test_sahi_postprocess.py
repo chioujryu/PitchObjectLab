@@ -1,12 +1,11 @@
-from pathlib import Path
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 from PIL import Image
-
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 REPO_ROOT = PROJECT_DIR.parents[1]
@@ -135,7 +134,9 @@ class SahiPostprocessTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             image_path = Path(tmp) / "image.jpg"
             Image.new("RGB", (100, 100), color=(255, 255, 255)).save(image_path)
-            image = evaluator.ImageRecord(image_id=1, file_name=image_path.name, path=str(image_path), width=100, height=100)
+            image = evaluator.ImageRecord(
+                image_id=1, file_name=image_path.name, path=str(image_path), width=100, height=100
+            )
             config = {
                 "model": {"type": "rfdetr", "confidence_threshold": 0.25},
                 "dataset_categories": [{"id": 1, "name": "football"}],
@@ -158,7 +159,9 @@ class SahiPostprocessTest(unittest.TestCase):
             predictions = [{"image_id": 1, "category_id": 1, "bbox": [40, 40, 10, 10], "score": 0.6}]
 
             with Image.open(image_path) as source:
-                output, stats = evaluator.apply_sahi_recheck(image, FakeModel(), config, source.convert("RGB"), predictions)
+                output, stats = evaluator.apply_sahi_recheck(
+                    image, FakeModel(), config, source.convert("RGB"), predictions
+                )
 
             self.assertEqual(len(output), 1)
             self.assertEqual(output[0]["bbox"], [40, 40, 10, 10])
@@ -177,7 +180,9 @@ class SahiPostprocessTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             image_path = Path(tmp) / "image.jpg"
             Image.new("RGB", (100, 100), color=(255, 255, 255)).save(image_path)
-            image = evaluator.ImageRecord(image_id=1, file_name=image_path.name, path=str(image_path), width=100, height=100)
+            image = evaluator.ImageRecord(
+                image_id=1, file_name=image_path.name, path=str(image_path), width=100, height=100
+            )
             config = {
                 "model": {"type": "rfdetr", "confidence_threshold": 0.25},
                 "dataset_categories": [{"id": 0, "name": "player"}, {"id": 1, "name": "football"}],
@@ -203,7 +208,9 @@ class SahiPostprocessTest(unittest.TestCase):
             ]
 
             with Image.open(image_path) as source:
-                output, stats = evaluator.apply_sahi_recheck(image, FakeModel(), config, source.convert("RGB"), predictions)
+                output, stats = evaluator.apply_sahi_recheck(
+                    image, FakeModel(), config, source.convert("RGB"), predictions
+                )
 
             self.assertEqual([row["category_id"] for row in output], [0])
             self.assertEqual(stats["filtered"], 1)

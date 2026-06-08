@@ -3,9 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from PIL import Image
-
 from dfine_seg_trainer.dataset_adapter import build_dataset_plan, materialize_dataset
+from PIL import Image
 
 
 def write_image(path: Path, size: tuple[int, int] = (80, 60)) -> None:

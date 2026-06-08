@@ -1,11 +1,10 @@
-from pathlib import Path
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from PIL import Image
-
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 REPO_ROOT = PROJECT_DIR.parents[1]
@@ -13,6 +12,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import test_rf_detr_model as test_runner  # noqa: E402
+
 from projects.object_detection_dataset_evaluator import object_detection_dataset_evaluator as evaluator  # noqa: E402
 
 
@@ -106,7 +106,9 @@ class RfDetrTestDiagnosticsTest(unittest.TestCase):
             output_info = {"run_id": "test", "config_hash": "hash"}
             manifest = []
 
-            rows = evaluator.render_error_case_outputs(dataset, predictions, config, root / "out", output_info, True, manifest)
+            rows = evaluator.render_error_case_outputs(
+                dataset, predictions, config, root / "out", output_info, True, manifest
+            )
             events, info = evaluator.build_error_case_events(dataset, predictions, config)
 
             self.assertEqual(len(rows), 3)
@@ -125,7 +127,9 @@ class RfDetrTestDiagnosticsTest(unittest.TestCase):
             root = Path(tmp)
             image_path = root / "image.jpg"
             Image.new("RGB", (100, 100), color=(255, 255, 255)).save(image_path)
-            image = evaluator.ImageRecord(image_id=1, file_name=image_path.name, path=str(image_path), width=100, height=100)
+            image = evaluator.ImageRecord(
+                image_id=1, file_name=image_path.name, path=str(image_path), width=100, height=100
+            )
             config = {
                 "output": {
                     "draw_ground_truth": True,
@@ -164,7 +168,9 @@ class RfDetrTestDiagnosticsTest(unittest.TestCase):
         categories = [{"id": 0, "name": "standing_player"}, {"id": 1, "name": "football"}]
 
         target_ids = evaluator.resolve_error_case_class_ids(categories, {})
-        render_ids = evaluator.resolve_error_case_render_class_ids(categories, {"render_class_names": ["standing_player"]})
+        render_ids = evaluator.resolve_error_case_render_class_ids(
+            categories, {"render_class_names": ["standing_player"]}
+        )
 
         self.assertEqual(target_ids, [1])
         self.assertEqual(render_ids, [0])
