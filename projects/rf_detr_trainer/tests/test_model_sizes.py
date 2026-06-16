@@ -123,6 +123,27 @@ class RFDETRModelSizeTest(unittest.TestCase):
         self.assertEqual(internal["train"]["device"], "auto")
         self.assertNotIn("device", trainer.build_model_kwargs(internal))
 
+    def test_model_constructor_device_shortcuts_are_normalized(self):
+        cases = [
+            (0, "cuda:0"),
+            ("0", "cuda:0"),
+            (1, "cuda:1"),
+            ("cuda:0", "cuda:0"),
+            ("cpu", "cpu"),
+            (-1, "cpu"),
+            ("-1", "cpu"),
+            ("0,1", "cuda:0"),
+        ]
+        for raw_device, expected in cases:
+            with self.subTest(raw_device=raw_device):
+                kwargs = trainer.build_model_kwargs({"model": {"device": raw_device}})
+                self.assertEqual(kwargs["device"], expected)
+
+        for raw_device in (None, "", "auto"):
+            with self.subTest(raw_device=raw_device):
+                kwargs = trainer.build_model_kwargs({"model": {"device": raw_device}})
+                self.assertNotIn("device", kwargs)
+
     def test_standalone_test_average_inference_seconds_prefers_result_summary(self):
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as temp:
             output_dir = Path(temp)
@@ -155,6 +176,8 @@ class RFDETRModelSizeTest(unittest.TestCase):
                 "test": {
                     "split": "valid",
                     "test_mode": {"mode": "class_crop"},
+                    "batch_size": 6,
+                    "sahi": {"batch_size": 5},
                     "crop": {"class_names": ["ball"], "source_conf": 0.2},
                     "visual_samples": {
                         "enabled": True,
@@ -180,6 +203,8 @@ class RFDETRModelSizeTest(unittest.TestCase):
             )
 
             self.assertEqual(evaluator_config["test_mode"]["mode"], "class_crop")
+            self.assertEqual(evaluator_config["inference"]["batch_size"], 6)
+            self.assertEqual(evaluator_config["sahi"]["batch_size"], 5)
             self.assertEqual(evaluator_config["crop"]["class_names"], ["ball"])
             self.assertFalse(evaluator_config["evaluation"]["classwise"])
             self.assertEqual(evaluator_config["evaluation"]["max_detections"], [1, 10, 777])

@@ -2593,8 +2593,9 @@ def build_model_kwargs(config: Mapping[str, Any]) -> Dict[str, Any]:
         kwargs["resolution"] = int(model_cfg["resolution"])
     if model_cfg.get("num_classes") is not None:
         kwargs["num_classes"] = int(model_cfg["num_classes"])
-    if model_cfg.get("device") not in (None, "", "auto"):
-        kwargs["device"] = str(model_cfg["device"])
+    device = normalize_model_constructor_device(model_cfg.get("device"))
+    if device is not None:
+        kwargs["device"] = device
     if model_cfg.get("amp") is not None:
         kwargs["amp"] = bool(model_cfg["amp"])
     should_pass, pretrain = normalize_pretrain_weights(model_cfg.get("pretrain_weights", "default"))
@@ -2604,6 +2605,35 @@ def build_model_kwargs(config: Mapping[str, Any]) -> Dict[str, Any]:
         else:
             kwargs["pretrain_weights"] = pretrain
     return kwargs
+
+
+def normalize_model_constructor_device(value: Any) -> Optional[str]:
+    """Normalize config/CLI shortcuts into RF-DETR model constructor device strings."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return "cpu" if value < 0 else f"cuda:{value}"
+    text = str(value).strip()
+    if not text:
+        return None
+    lower = text.lower()
+    if lower == "auto":
+        return None
+    if lower == "-1":
+        return "cpu"
+    if lower.isdecimal():
+        return f"cuda:{int(lower)}"
+    if "," in lower:
+        first = lower.split(",", 1)[0].strip()
+        if first.isdecimal():
+            return f"cuda:{int(first)}"
+    if lower in {"cpu", "cuda", "mps"}:
+        return lower
+    if lower.startswith("cuda:") and lower.split(":", 1)[1].isdecimal():
+        return lower
+    return text
 
 
 def build_train_kwargs(config: Mapping[str, Any], output_dir: Path) -> Dict[str, Any]:
@@ -2977,6 +3007,7 @@ def normalize_rfdetr_test_settings(merged_config: Mapping[str, Any], section: st
         "save_dataset_cases": bool(source.get("save_dataset_cases", False)),
         "visual_samples": dict(source.get("visual_samples", {}) or {}),
         "model_input_batch_size": int(source.get("model_input_batch_size", 9) or 9),
+        "batch_size": int(source.get("batch_size", 4) or 4),
         "error_cases": dict(source.get("error_cases", {}) or {}),
         "conf": source.get("conf", model.get("confidence_threshold", 0.25)),
         "match_iou_threshold": source.get("match_iou_threshold", evaluation.get("match_iou_threshold", 0.5)),
@@ -3059,7 +3090,7 @@ def build_rfdetr_evaluator_config(
         "postprocess_match_metric": str(test_settings.get("postprocess_match_metric", "IOS")),
         "postprocess_match_threshold": float(test_settings.get("postprocess_match_threshold", 0.5)),
         "postprocess_class_agnostic": bool(test_settings.get("postprocess_class_agnostic", False)),
-        "batch_size": int(test_settings.get("batch", 1) or 1),
+        "batch_size": int(test_settings.get("batch", test_settings.get("batch_size", 4)) or 4),
     }
     sahi_cfg.update(test_settings.get("sahi", {}) or {})
     dataset_cfg = resolve_eval_dataset_config(train_config, split)
@@ -3081,7 +3112,7 @@ def build_rfdetr_evaluator_config(
             "banner": "RF-DETR TEST EVALUATION",
             "seed": int(merged_config.get("runtime", {}).get("seed", 0) or 0),
         },
-        "inference": {"mode": mode, "use_sahi": mode == shared_modes.SAHI_MODE},
+        "inference": {"mode": mode, "use_sahi": mode == shared_modes.SAHI_MODE, "batch_size": int(test_settings.get("batch_size", 4) or 4)},
         "test_mode": {"mode": mode},
         "dataset": dataset_cfg,
         "model": {

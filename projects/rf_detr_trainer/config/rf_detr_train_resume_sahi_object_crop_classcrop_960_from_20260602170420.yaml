@@ -1,4 +1,5 @@
-# Main config for train_rf_detr_model.py.
+# Train config for train_rf_detr_model.py.
+# Dataset YAML files stay in their framework-native Ultralytics format.
 # Every path can be absolute or relative. Relative paths are resolved from the repo root when possible.
 
 runtime:
@@ -6,21 +7,10 @@ runtime:
   verbose: true
   # Validate config and estimate output files without starting training. Options: true, false.
   dry_run: false
-  # Ask before creating checkpoints, logs, metrics, plots, or dataset grids. Options: true, false.
+  # Ask before creating checkpoints, logs, metrics, plots, caches, or dataset grids. Options: true, false.
   confirm_before_run: true
-  time_estimate:
-    # Print rough HH:MM:SS runtime estimates before execution. Options: true, false.
-    enabled: true
-    # Prefer latest sibling run_timing.json throughput when available. Options: true, false.
-    use_history: true
-    # Fallback train speed for first runs. Options: positive seconds per training batch.
-    default_train_seconds_per_batch: 0.7
-    # Fallback test speed for scheduled/final tests. Options: positive seconds per image.
-    default_test_seconds_per_image: 0.25
-    # Fallback inference speed retained for shared schema. Options: positive seconds per image/frame.
-    default_inference_seconds_per_image: 0.25
-    # Fallback video render speed retained for shared schema. Options: positive seconds per frame.
-    default_video_render_seconds_per_frame: 0.005
+  # Seed used for deterministic visual sampling during final/periodic tests. Options: integer.
+  seed: 0
 
 model:
   # RF-DETR model size. Detection: base, nano, small, medium, large. Segmentation: seg-preview, seg-nano, seg-small, seg-medium, seg-large, seg-xlarge, seg-2xlarge.
@@ -30,11 +20,15 @@ model:
   # Pretrained weights. Options: default, null/false to disable, hosted key like rf-detr-medium.pth, or a local .pth path.
   pretrain_weights: default
   # Optional class count override. Options: null to auto-detect from dataset, or a positive integer.
-  num_classes: null
+  num_classes: 3
   # Model construction device. Options: auto, cpu, cuda, cuda:0. Training device is controlled by train.device.
-  device: auto
+  device: cuda:7
   # Automatic mixed precision behavior in RF-DETR model config. Options: true, false.
   amp: true
+  # Prediction confidence threshold used by wrapper final/periodic tests. Options: 0.0-1.0.
+  confidence_threshold: 0.25
+  # Optional model label to dataset category-id mapping for evaluation. Options: empty mapping, false to disable, or {model_label: dataset_category_id}.
+  category_remapping: {}
   # Extra RF-DETR ModelConfig keys. Options: any supported model key such as freeze_encoder, gradient_checkpointing, compile, num_queries.
   extra_model_args: {}
 
@@ -47,23 +41,15 @@ dataset:
   # pascal_voc        - Pascal VOC XML annotations.
   # dota              - Native DOTA labelTxt/labels with oriented boxes converted to axis-aligned boxes.
   # labelme_json      - LabelMe JSON annotations.
-  source_format: rfdetr
+  source_format: ultralytics_yolo
   # Source dataset root. Options: RF-DETR/Roboflow root, YOLO root, VOC root, DOTA root, LabelMe root, or COCO root.
-  dataset_dir: /home/new_users/zhiyu/datasets/soccer/spatial_perception/Xbotgo/站立运动员、足球、球门检测数据集V1/outputs/YoloFormat/all_parameters_sahi_object_crop_classcrop_train_val_960_classesall_max_samplesall
+  dataset_dir: "/home/new_users/zhiyu/datasets/soccer/spatial_perception/Xbotgo/站立运动员、足球、球门检测数据集V1/outputs/YoloFormat/all_parameters_sahi_object_crop_classcrop_train_val_960_classesall_max_samplesall"
   # Ultralytics YOLO dataset YAML. Options: empty string to auto-find data.yaml/data.yml/dataset.yaml in dataset_dir, or a YAML path.
-  data_yaml: "/home/new_users/zhiyu/projects/PitchObjectLab/ultralytics/cfg/datasets/站立運動員_足球_球門檢測數據集2025_all_parameters_sahi_object_crop_classcrop_train_val_960_classesall_max_samplesall.yaml"
+  data_yaml: "/home/new_users/zhiyu/datasets/soccer/spatial_perception/Xbotgo/站立运动员、足球、球门检测数据集V1/outputs/YoloFormat/all_parameters_sahi_object_crop_classcrop_train_val_960_classesall_max_samplesall/dataset.yaml"
   # COCO annotation file for single-file COCO datasets. Options: empty string to auto-find common annotations/*.json files.
   coco_json: ""
   # Image directory used with coco_json when image file names are relative. Options: empty string to infer from dataset_dir.
   image_dir: ""
-  # Default maximum images per split prepared for training/eval. Options: all/null for all images, or a positive integer for first N images.
-  max_images: all
-  # Maximum train split images. Options: null to inherit max_images, all for all train images, or a positive integer.
-  max_train_images: null
-  # Maximum validation split images. Options: null to inherit max_images, all for all validation images, or a positive integer.
-  max_val_images: null
-  # Maximum test/test-original split images. Options: null to inherit max_images, all for all test images, or a positive integer.
-  max_test_images: null
   # RF-DETR-readable converted dataset cache root. Relative paths resolve under projects/rf_detr_trainer.
   cache_root: dataset_cache
   # Rebuild a matching cache even when source_fingerprint.json says it can be reused. Options: true, false.
@@ -95,25 +81,25 @@ output:
   # {eval_interval}, {test_interval_epochs}, {test_interval_minutes}, {test_split},
   # {logger_project}, {logger_run}.
   # Example: "D:/runs/rf_detr/{dataset_name}/{model_size}_e{epochs}_b{batch_size}_{timestamp}"
-  output_dir: ""
+  output_dir: "/home/new_users/zhiyu/projects/PitchObjectLab/runs/detect/站立運動員_足球_球門檢測數據集2025/train/sahi_object_crop_classcrop_960_rfdetr_large_e50_b16_val1_test10_20260602170420"
   # Output root when output_dir is empty. Options: runs/rf_detr, D:/runs/{dataset_name}, /mnt/runs/rf_detr.
   # Supports the same placeholders as output_dir.
-  root: /home/new_users/zhiyu/projects/PitchObjectLab/runs/detect/站立運動員_足球_球門檢測數據集2025/train
+  root: "/home/new_users/zhiyu/projects/PitchObjectLab/runs/detect/站立運動員_足球_球門檢測數據集2025/train"
   # Run folder name when output_dir is empty. Options: pure string or placeholder template.
   # Supports the same placeholders as output_dir.
-  name: "rfdetr_{model_size}_e{epochs}_b{batch_size}_val{eval_interval}_test{test_interval_epochs}_{timestamp}"
+  name: "resume_from_20260602170420_sahi_object_crop_classcrop_960_rfdetr_{model_size}_e{epochs}_b{batch_size}_val{eval_interval}_test{test_interval_epochs}_{timestamp}"
   # Allow using an existing output directory. Options: true, false.
-  exist_ok: false
+  exist_ok: true
 
 train:
-  # RF-DETR dataset root forwarded into TrainConfig. Options: empty to copy dataset.dataset_dir, or explicit path.
-  dataset_dir: /home/new_users/zhiyu/datasets/soccer/spatial_perception/Xbotgo/站立运动员、足球、球门检测数据集V1/outputs/YoloFormat/all_parameters_sahi_object_crop_classcrop_train_val_960_classesall_max_samplesall
+  # RF-DETR dataset root forwarded into TrainConfig. Options: empty to copy dataset.dataset_dir, or explicit path. For ultralytics_yolo sources this is replaced with the converted cache before training.
+  dataset_dir: "/home/new_users/zhiyu/datasets/soccer/spatial_perception/Xbotgo/站立运动员、足球、球门检测数据集V1/outputs/YoloFormat/all_parameters_sahi_object_crop_classcrop_train_val_960_classesall_max_samplesall"
   # Dataset file type. Options: roboflow, coco, yolo, o365. roboflow auto-detects Roboflow COCO/YOLO layouts.
   dataset_file: roboflow
   # CUDA/CPU selector. Options: auto, cpu, cuda, 0, 1, 0,1, cuda:0, mps, -1.
-  device: 0
+  device: 7
   # Number of training epochs. Options: any positive integer.
-  epochs: 50
+  epochs: 30
   # Micro batch size per optimizer step. Options: positive integer, or auto for RF-DETR auto-batch probing.
   batch_size: 16
   # Gradient accumulation steps. Effective per-device batch = batch_size * grad_accum_steps. Options: positive integer.
@@ -147,7 +133,7 @@ train:
   # Save archive checkpoint every N epochs. Options: positive integer.
   checkpoint_interval: 10
   # Resume checkpoint path. Options: null, or path to RF-DETR .pth/.ckpt checkpoint.
-  resume: null
+  resume: "/home/new_users/zhiyu/projects/PitchObjectLab/runs/detect/站立運動員_足球_球門檢測數據集2025/train/sahi_object_crop_classcrop_960_rfdetr_large_e50_b16_val1_test10_20260602170420/last.ckpt"
   # Use exponential moving average weights. Options: true, false.
   use_ema: true
   # EMA decay. Options: float in 0.0-1.0.
@@ -235,6 +221,16 @@ train:
   # Extra RF-DETR TrainConfig keys not listed above. Example: {freeze_encoder: true}
   extra_train_args: {}
 
+evaluation:
+  # Evaluation type for wrapper final/periodic tests. Options: auto, bbox, segm, segmentation, mask, masks.
+  type: auto
+  # Write per-class metrics JSON/CSV. Options: true, false.
+  classwise: true
+  # COCO max detections list. Options: one, two, or three positive integers.
+  max_detections: [1, 10, 500]
+  # Operating-point and error-case IoU threshold. Options: 0.0-1.0.
+  match_iou_threshold: 0.5
+
 periodic_test:
   # Enable scheduled test-set evaluation during training. Options: true, false.
   enabled: false
@@ -275,30 +271,8 @@ periodic_test:
     postprocess_match_threshold: 0.5
     # Merge/NMS class-agnostic behavior. Options: true, false.
     postprocess_class_agnostic: false
-    # RF-DETR SAHI slice/recheck batch size for scheduled/final tests. Options: positive integer.
-    batch_size: 4
-    recheck:
-      # Run a second centered B*B verification pass for selected SAHI target-class boxes. Options: true, false.
-      enabled: false
-      # Target category IDs for SAHI recheck. Empty means use target_class_names; if both empty and enabled, default is football.
-      target_class_ids: []
-      # Target category names for SAHI recheck. Empty with enabled defaults to football. Options: category names such as [football].
-      target_class_names:
-        - football
-      # B*B centered crop size for the second pass. Options: positive integer pixels.
-      crop_size: 960
-      # Confidence threshold for the second pass. Options: 0.0-1.0.
-      second_confidence_threshold: 0.25
-      # Weight applied to the first-stage confidence. Options: non-negative float.
-      first_weight: 0.5
-      # Weight applied to the best second-stage confidence. Options: non-negative float.
-      second_weight: 0.5
-      # Minimum fused confidence to keep the first-stage box. Options: 0.0-1.0.
-      fused_confidence_threshold: 0.25
-      # Extra relative padding around the first-stage box for center-hit matching. Options: non-negative float.
-      center_padding_ratio: 0.0
-      # Maximum target boxes rechecked per image. Options: 0 disables rechecking; positive integer caps by score.
-      max_rechecks_per_image: 50
+    # SAHI model input batch size. Options: positive integer.
+    batch_size: 1
   visual_samples:
     # Save sampled prediction test images with GT and predictions during periodic/final tests. Options: true, false.
     enabled: false
@@ -328,14 +302,12 @@ periodic_test:
     min_predictions: 0
     # Minimum prediction score used only for candidate filtering. Options: null or 0.0-1.0.
     filter_min_score: 0.25
-    # Minimum prediction score drawn in visual images. Options: null to use model.confidence_threshold, or 0.0-1.0.
-    draw_min_score: null
+    # Minimum prediction score drawn in visual images. Options: null or 0.0-1.0.
+    draw_min_score: 0.25
   # Number of model input cases per saved test_batch grid. Options: positive integer.
   model_input_batch_size: 9
   # Split used for scheduled and final wrapper tests. Options: test-original, test, val, valid, train.
-  split: test-original
-  # Maximum images evaluated in each scheduled/final test. Options: all/null for full split, or a positive integer for first N images.
-  max_images: all
+  split: test
   # Run test every N epochs. Options: 0 disables epoch interval, positive integer enables.
   test_interval_epochs: 10
   # Run test every N minutes. Options: 0 disables time interval, positive float enables.
@@ -350,8 +322,20 @@ periodic_test:
   final_output_dir_name: final_test
   # Write per-class test metrics JSON/CSV. Options: true, false. true is recommended.
   classwise: true
-  # RF-DETR full-image/class-crop evaluator batch size for scheduled/final tests. Options: positive integer.
-  batch_size: 4
+  # Save PR/confusion/curve plots during wrapper tests. Options: true, false.
+  plots: false
+  # Save raw evaluated dataset case images during wrapper tests. Options: true, false.
+  save_dataset_cases: false
+  # Prediction confidence threshold override for wrapper tests. Options: null to use model.confidence_threshold, or 0.0-1.0.
+  conf: null
+  # Max detections used in wrapper test metrics. Options: null to use evaluation.max_detections/eval_max_dets, or positive integer.
+  max_dets: null
+  # IoU threshold for wrapper TP/FP/FN and error-case matching. Options: null to use evaluation.match_iou_threshold, or 0.0-1.0.
+  match_iou_threshold: null
+  # Adapter batch size for standalone-style evaluation. Options: positive integer.
+  batch_size: 1
+  # Adapter dataloader workers for standalone-style evaluation. Options: 0 for Windows compatibility, or positive integer.
+  num_workers: 0
   error_cases:
     # Save target-class missed/misclassified/false-positive examples after scheduled/final tests. Options: true, false.
     enabled: true

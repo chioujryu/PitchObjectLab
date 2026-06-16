@@ -114,6 +114,10 @@ def apply_cli_overrides(config: MutableMapping[str, Any], args: argparse.Namespa
         inference["max_images"] = args.max_images
     if args.max_videos is not None:
         inference["max_videos"] = args.max_videos
+    if args.batch_size is not None:
+        inference["batch_size"] = args.batch_size
+    if args.video_batch_size is not None:
+        inference.setdefault("video", {})["batch_size"] = args.video_batch_size
     if args.max_seconds is not None:
         inference.setdefault("video", {})["max_seconds"] = args.max_seconds
     if args.video_start_time is not None:
@@ -130,6 +134,38 @@ def config_list(value: Any) -> List[Any]:
     if isinstance(value, (list, tuple, set)):
         return [item for item in value if item is not None and item != ""]
     return [value]
+
+
+def positive_batch_size(value: Any, field_name: str, default: int) -> int:
+    """Parse a positive batch size; all/null/empty inherit the provided default."""
+    if value is None:
+        return max(1, int(default))
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"", "all", "none", "null"}:
+            return max(1, int(default))
+        value = trainer.parse_scalar(value)
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a positive integer, got {value!r}.")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be a positive integer, got {value!r}.") from exc
+    if parsed <= 0:
+        raise ValueError(f"{field_name} must be a positive integer, got {value!r}.")
+    return parsed
+
+
+def inference_batch_size(config: Mapping[str, Any]) -> int:
+    """Return image/source inference batch size."""
+    return positive_batch_size(config.get("inference", {}).get("batch_size"), "inference.batch_size", 8)
+
+
+def video_batch_size(config: Mapping[str, Any]) -> int:
+    """Return video detection-frame batch size."""
+    inference = config.get("inference", {})
+    video_cfg = dict(inference.get("video", {}) or {})
+    return positive_batch_size(video_cfg.get("batch_size"), "inference.video.batch_size", inference_batch_size(config))
 
 
 def parse_video_time_seconds(
@@ -537,7 +573,7 @@ def build_prediction_config(config: Mapping[str, Any], categories: Sequence[Mapp
             "image_size": model.get("resolution"),
             "category_remapping": model.get("category_remapping", {}),
         },
-        "inference": {"mode": mode, "use_sahi": mode == "sahi"},
+        "inference": {"mode": mode, "use_sahi": mode == "sahi", "batch_size": inference_batch_size(config)},
         "test_mode": {"mode": mode},
         "sahi": dict(config.get("sahi", {}) or {}),
         "crop": dict(config.get("crop", {}) or {}),
@@ -590,7 +626,62 @@ def predict_image_file(
     return predictions, target
 
 
-def predict_video_file(
+def prediction_config_with_batch(prediction_config: Mapping[str, Any], batch_size: int) -> Dict[str, Any]:
+    """Return a shallow prediction config copy with an RF-DETR batch size."""
+    configured = dict(prediction_config)
+    configured["inference"] = dict(configured.get("inference", {}) or {})
+    configured["inference"]["batch_size"] = max(1, int(batch_size))
+    configured["sahi"] = dict(configured.get("sahi", {}) or {})
+    configured["sahi"]["batch_size"] = max(1, int(configured["sahi"].get("batch_size", batch_size) or batch_size))
+    return configured
+
+
+def predict_image_files_batch(
+    items: Sequence[SourceItem],
+    start_image_id: int,
+    model: Any,
+    prediction_config: Mapping[str, Any],
+    categories: Sequence[Mapping[str, Any]],
+    output_dir: Path,
+    render_ids: Sequence[int],
+    batch_size: int,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], int]:
+    """Predict and render image sources in RF-DETR batches."""
+    records: List[evaluator.ImageRecord] = []
+    for offset, item in enumerate(items):
+        assert item.local_path is not None
+        with Image.open(item.local_path) as image:
+            width, height = image.size
+        records.append(
+            evaluator.ImageRecord(
+                image_id=start_image_id + offset,
+                file_name=item.local_path.name,
+                path=str(item.local_path),
+                width=width,
+                height=height,
+            )
+        )
+    batch_config = prediction_config_with_batch(prediction_config, batch_size)
+    predictions_by_image, _, _ = evaluator.predict_images_rfdetr(records, model, batch_config, output_dir)
+    image_dir = output_dir / "images"
+    image_dir.mkdir(parents=True, exist_ok=True)
+    all_rows: List[Dict[str, Any]] = []
+    outputs: List[Dict[str, Any]] = []
+    for item, predictions in zip(items, predictions_by_image):
+        assert item.local_path is not None
+        with Image.open(item.local_path) as image:
+            rendered = draw_predictions(image, predictions, categories, render_ids)
+        target = image_dir / f"{trainer.sanitize_name(item.local_path.stem)}_pred.jpg"
+        rendered.save(target, quality=92)
+        for prediction in predictions:
+            row = dict(prediction)
+            row["source"] = item.source
+            all_rows.append(row)
+        outputs.append({"source": item.source, "kind": "image", "output": str(target), "predictions": len(predictions)})
+    return all_rows, outputs, start_image_id + len(items)
+
+
+def predict_video_file_one_pass(
     item: SourceItem,
     start_image_id: int,
     model: Any,
@@ -684,6 +775,187 @@ def predict_video_file(
     return all_predictions, target, image_id
 
 
+def predict_video_file_batched(
+    item: SourceItem,
+    start_image_id: int,
+    model: Any,
+    prediction_config: Mapping[str, Any],
+    categories: Sequence[Mapping[str, Any]],
+    output_dir: Path,
+    render_ids: Sequence[int],
+    video_cfg: Mapping[str, Any],
+    batch_size: int,
+) -> Tuple[List[Dict[str, Any]], Path, int]:
+    """Batch RF-DETR detection frames, then render the selected video range."""
+    import cv2
+
+    assert item.local_path is not None
+    capture = cv2.VideoCapture(str(item.local_path))
+    if not capture.isOpened():
+        raise RuntimeError(f"Could not open video for batched detection: {item.local_path}")
+    input_fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0) or 30.0
+    output_fps = float(video_cfg.get("output_fps") or input_fps)
+    detection_fps = video_cfg.get("detection_fps")
+    frame_interval = 1
+    if detection_fps is not None:
+        frame_interval = max(1, int(round(input_fps / max(0.001, float(detection_fps)))))
+    width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    frame_window = video_frame_window(frame_count, input_fps, video_cfg)
+    frame_limit = frame_window.output_frames
+    if frame_window.start_frame > 0 and not capture.set(cv2.CAP_PROP_POS_FRAMES, frame_window.start_frame):
+        capture.release()
+        raise RuntimeError(f"Could not seek video for batched detection: {item.local_path}")
+
+    frame_cache_dir = output_dir / "_frame_cache"
+    frame_cache_dir.mkdir(parents=True, exist_ok=True)
+    batch_config = prediction_config_with_batch(prediction_config, batch_size)
+    all_predictions: List[Dict[str, Any]] = []
+    predictions_by_segment: Dict[int, List[Dict[str, Any]]] = {}
+    pending_records: List[evaluator.ImageRecord] = []
+    pending_meta: List[Dict[str, Any]] = []
+    image_id = start_image_id
+
+    def flush_pending() -> None:
+        nonlocal pending_records, pending_meta
+        if not pending_records:
+            return
+        predictions_by_frame, _, _ = evaluator.predict_images_rfdetr(pending_records, model, batch_config, output_dir)
+        for record, meta, frame_predictions in zip(pending_records, pending_meta, predictions_by_frame):
+            segment_frame_index = int(meta["segment_frame_index"])
+            absolute_frame_index = int(meta["absolute_frame_index"])
+            predictions_by_segment[segment_frame_index] = frame_predictions
+            for prediction in frame_predictions:
+                row = dict(prediction)
+                row["source"] = item.source
+                row["frame_index"] = absolute_frame_index
+                row["segment_frame_index"] = segment_frame_index
+                row["timestamp_seconds"] = absolute_frame_index / input_fps
+                row["segment_timestamp_seconds"] = segment_frame_index / input_fps
+                row["video_start_seconds"] = frame_window.start_seconds
+                row["video_end_seconds"] = frame_window.end_seconds
+                row["video_effective_end_seconds"] = frame_window.effective_end_seconds
+                all_predictions.append(row)
+            Path(record.path).unlink(missing_ok=True)
+        pending_records = []
+        pending_meta = []
+
+    segment_frame_index = 0
+    absolute_frame_index = frame_window.start_frame
+    detect_iterator = tqdm(total=frame_limit, desc=f"Detect video {item.local_path.name}", unit="frame")
+    try:
+        while True:
+            if frame_limit is not None and segment_frame_index >= frame_limit:
+                break
+            ok, frame = capture.read()
+            if not ok:
+                break
+            if segment_frame_index % frame_interval == 0:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame_path = frame_cache_dir / f"frame_{absolute_frame_index:010d}.jpg"
+                Image.fromarray(rgb).save(frame_path, quality=92)
+                pending_records.append(
+                    evaluator.ImageRecord(
+                        image_id=image_id,
+                        file_name=f"{item.local_path.stem}_frame_{absolute_frame_index:06d}.jpg",
+                        path=str(frame_path),
+                        width=width,
+                        height=height,
+                    )
+                )
+                pending_meta.append({"segment_frame_index": segment_frame_index, "absolute_frame_index": absolute_frame_index})
+                image_id += 1
+                if len(pending_records) >= batch_size:
+                    flush_pending()
+            segment_frame_index += 1
+            absolute_frame_index += 1
+            detect_iterator.update(1)
+        flush_pending()
+    finally:
+        detect_iterator.close()
+        capture.release()
+
+    render_capture = cv2.VideoCapture(str(item.local_path))
+    if not render_capture.isOpened():
+        shutil.rmtree(frame_cache_dir, ignore_errors=True)
+        raise RuntimeError(f"Could not reopen video for batched render: {item.local_path}")
+    if frame_window.start_frame > 0 and not render_capture.set(cv2.CAP_PROP_POS_FRAMES, frame_window.start_frame):
+        render_capture.release()
+        shutil.rmtree(frame_cache_dir, ignore_errors=True)
+        raise RuntimeError(f"Could not seek video for batched render: {item.local_path}")
+    video_dir = output_dir / "videos"
+    video_dir.mkdir(parents=True, exist_ok=True)
+    target = video_dir / f"{trainer.sanitize_name(item.local_path.stem)}_pred.mp4"
+    writer = cv2.VideoWriter(str(target), cv2.VideoWriter_fourcc(*"mp4v"), output_fps, (width, height))
+    if not writer.isOpened():
+        render_capture.release()
+        shutil.rmtree(frame_cache_dir, ignore_errors=True)
+        raise RuntimeError(f"Could not create video writer: {target}")
+
+    render_skipped = bool(video_cfg.get("render_skipped_frames", True))
+    last_predictions: List[Dict[str, Any]] = []
+    segment_frame_index = 0
+    render_iterator = tqdm(total=frame_limit, desc=f"Render video {item.local_path.name}", unit="frame")
+    try:
+        while True:
+            if frame_limit is not None and segment_frame_index >= frame_limit:
+                break
+            ok, frame = render_capture.read()
+            if not ok:
+                break
+            should_detect = segment_frame_index % frame_interval == 0
+            frame_predictions = last_predictions
+            if should_detect:
+                frame_predictions = predictions_by_segment.get(segment_frame_index, [])
+                last_predictions = frame_predictions
+            if should_detect or render_skipped:
+                pil_frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                frame = cv2.cvtColor(np_image(draw_predictions(pil_frame, frame_predictions, categories, render_ids)), cv2.COLOR_RGB2BGR)
+            writer.write(frame)
+            segment_frame_index += 1
+            render_iterator.update(1)
+    finally:
+        render_iterator.close()
+        render_capture.release()
+        writer.release()
+        shutil.rmtree(frame_cache_dir, ignore_errors=True)
+    return all_predictions, target, image_id
+
+
+def predict_video_file(
+    item: SourceItem,
+    start_image_id: int,
+    model: Any,
+    prediction_config: Mapping[str, Any],
+    categories: Sequence[Mapping[str, Any]],
+    output_dir: Path,
+    render_ids: Sequence[int],
+    video_cfg: Mapping[str, Any],
+) -> Tuple[List[Dict[str, Any]], Path, int]:
+    """Predict one video with batched detection frames when configured."""
+    configured_batch = positive_batch_size(video_cfg.get("batch_size"), "inference.video.batch_size", 1)
+    if configured_batch <= 1:
+        return predict_video_file_one_pass(item, start_image_id, model, prediction_config, categories, output_dir, render_ids, video_cfg)
+    try:
+        return predict_video_file_batched(
+            item,
+            start_image_id,
+            model,
+            prediction_config,
+            categories,
+            output_dir,
+            render_ids,
+            video_cfg,
+            configured_batch,
+        )
+    except RuntimeError as exc:
+        if "batched" in str(exc).lower() or "reopen video" in str(exc).lower() or "seek video" in str(exc).lower():
+            print(Fore.BLUE + Style.BRIGHT + f"Warning: batched video inference fell back to one-pass mode. {exc}")
+            return predict_video_file_one_pass(item, start_image_id, model, prediction_config, categories, output_dir, render_ids, video_cfg)
+        raise
+
+
 def np_image(image: Image.Image) -> Any:
     import numpy as np
 
@@ -708,6 +980,8 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
     parser.add_argument("--max-sources", type=trainer.parse_scalar, help="Maximum discovered sources to run. Use all/null for all.")
     parser.add_argument("--max-images", type=trainer.parse_scalar, help="Maximum image sources to run. Use all/null for all.")
     parser.add_argument("--max-videos", type=trainer.parse_scalar, help="Maximum video sources to run. Use all/null for all.")
+    parser.add_argument("--batch-size", type=int, help="RF-DETR image-source inference batch size.")
+    parser.add_argument("--video-batch-size", type=trainer.parse_scalar, help="RF-DETR video detection-frame batch size. all/null inherits --batch-size.")
     parser.add_argument("--max-seconds", type=trainer.parse_scalar, help="Maximum seconds per video to infer. Use all/null for the whole video.")
     parser.add_argument("--video-start-time", help="Video segment start time. Options: seconds, MM:SS, or HH:MM:SS.")
     parser.add_argument("--video-end-time", help="Video segment end time. Options: all/null, seconds, MM:SS, or HH:MM:SS.")
@@ -755,21 +1029,40 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
     outputs: List[Dict[str, Any]] = []
     image_id = 1
     video_cfg = dict(config.get("inference", {}).get("video", {}) or {})
+    video_cfg["batch_size"] = video_batch_size(config)
+    image_batch_size = inference_batch_size(config)
+    pending_images: List[SourceItem] = []
+
+    def flush_pending_images() -> None:
+        nonlocal image_id
+        if not pending_images:
+            return
+        rows, image_outputs, image_id = predict_image_files_batch(
+            pending_images,
+            image_id,
+            model,
+            prediction_config,
+            categories,
+            output_dir,
+            render_ids,
+            image_batch_size,
+        )
+        all_predictions.extend(rows)
+        outputs.extend(image_outputs)
+        pending_images.clear()
 
     iterator = tqdm(resolved_items, desc="RF-DETR inference", unit="source")
     for item in iterator:
         if item.kind == "image":
-            predictions, path = predict_image_file(item, image_id, model, prediction_config, categories, output_dir, render_ids)
-            for prediction in predictions:
-                row = dict(prediction)
-                row["source"] = item.source
-                all_predictions.append(row)
-            outputs.append({"source": item.source, "kind": "image", "output": str(path), "predictions": len(predictions)})
-            image_id += 1
+            pending_images.append(item)
+            if len(pending_images) >= image_batch_size:
+                flush_pending_images()
         elif item.kind == "video":
+            flush_pending_images()
             predictions, path, image_id = predict_video_file(item, image_id, model, prediction_config, categories, output_dir, render_ids, video_cfg)
             all_predictions.extend(predictions)
             outputs.append({"source": item.source, "kind": "video", "output": str(path), "predictions": len(predictions)})
+    flush_pending_images()
 
     colors = {
         str(category_id): {"rgb": list(color), "hex": "#{:02x}{:02x}{:02x}".format(*color)}

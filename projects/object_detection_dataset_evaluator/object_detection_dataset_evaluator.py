@@ -1979,6 +1979,240 @@ def to_numpy_array(value: Any) -> np.ndarray:
     return np.asarray(value)
 
 
+RFDETR_MODEL_TYPES = {"rfdetr", "rf-detr", "rf_detr"}
+
+
+def is_rfdetr_model_type(model_cfg: Mapping[str, Any]) -> bool:
+    """Return True when the configured direct model is RF-DETR."""
+    return str(model_cfg.get("type", "ultralytics")).strip().lower() in RFDETR_MODEL_TYPES
+
+
+def positive_int_setting(value: Any, default: int, field_name: str) -> int:
+    """Parse a positive integer setting with all/null inheriting the default."""
+    if value is None:
+        return max(1, int(default))
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"", "all", "none", "null"}:
+            return max(1, int(default))
+        value = parse_scalar(value)
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a positive integer, got {value!r}.")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be a positive integer, got {value!r}.") from exc
+    if parsed <= 0:
+        raise ValueError(f"{field_name} must be a positive integer, got {value!r}.")
+    return parsed
+
+
+def rfdetr_image_batch_size(config: Mapping[str, Any]) -> int:
+    """Return the image-level RF-DETR batch size."""
+    inference_cfg = config.get("inference", {})
+    model_cfg = config.get("model", {})
+    default = positive_int_setting(model_cfg.get("batch_size", 1), 1, "model.batch_size")
+    return positive_int_setting(inference_cfg.get("batch_size"), default, "inference.batch_size")
+
+
+def rfdetr_sahi_batch_size(config: Mapping[str, Any]) -> int:
+    """Return the RF-DETR SAHI slice/recheck batch size."""
+    return positive_int_setting(config.get("sahi", {}).get("batch_size"), rfdetr_image_batch_size(config), "sahi.batch_size")
+
+
+def batched_sequence(values: Sequence[Any], batch_size: int) -> Iterable[Sequence[Any]]:
+    """Yield non-empty batches from a sequence."""
+    size = max(1, int(batch_size))
+    for index in range(0, len(values), size):
+        yield values[index : index + size]
+
+
+def is_cuda_oom_error(exc: BaseException) -> bool:
+    """Detect CUDA OOM errors without requiring torch at import time."""
+    text = str(exc).lower()
+    if "out of memory" not in text and "cuda error: out of memory" not in text:
+        return False
+    with contextlib.suppress(Exception):
+        import torch
+
+        if isinstance(exc, torch.cuda.OutOfMemoryError):
+            return True
+    return "cuda" in text or "cudnn" in text or "out of memory" in text
+
+
+def clear_cuda_cache_if_available() -> None:
+    """Release cached CUDA blocks after an OOM retry."""
+    with contextlib.suppress(Exception):
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+@contextlib.contextmanager
+def torch_inference_context() -> Iterable[None]:
+    """Use torch.inference_mode when torch is available."""
+    try:
+        import torch
+    except Exception:
+        yield
+        return
+    with torch.inference_mode():
+        yield
+
+
+def normalize_detection_list(result: Any, expected: int) -> List[Any]:
+    """Normalize RF-DETR model.predict output to one detections object per input."""
+    if isinstance(result, tuple):
+        result = list(result)
+    if isinstance(result, list):
+        if len(result) != expected:
+            raise ValueError(f"RF-DETR returned {len(result)} prediction result(s) for {expected} input image(s).")
+        return result
+    if expected == 1:
+        return [result]
+    raise ValueError(f"RF-DETR returned a single prediction result for {expected} input image(s).")
+
+
+def rfdetr_predict_batches(
+    model: Any,
+    inputs: Sequence[Any],
+    *,
+    threshold: float,
+    shape: Optional[Tuple[int, int]],
+    batch_size: int,
+) -> Tuple[List[Any], List[Dict[str, Any]]]:
+    """Run RF-DETR model.predict on input batches with CUDA OOM downshift."""
+    detections: List[Any] = []
+    timing_rows: List[Dict[str, Any]] = []
+    active_batch_size = max(1, int(batch_size))
+    index = 0
+    while index < len(inputs):
+        current_size = min(active_batch_size, len(inputs) - index)
+        current_inputs = list(inputs[index : index + current_size])
+        start = time.perf_counter()
+        try:
+            with torch_inference_context():
+                result = call_with_supported_kwargs(
+                    model.predict,
+                    current_inputs,
+                    threshold=threshold,
+                    shape=shape,
+                )
+        except Exception as exc:
+            if current_size > 1 and is_cuda_oom_error(exc):
+                clear_cuda_cache_if_available()
+                active_batch_size = max(1, current_size // 2)
+                blue(
+                    f"RF-DETR CUDA OOM at batch_size={current_size}; retrying with batch_size={active_batch_size}.",
+                    verbose=True,
+                    force=True,
+                )
+                continue
+            raise
+        elapsed = time.perf_counter() - start
+        result_list = normalize_detection_list(result, len(current_inputs))
+        per_image_elapsed = elapsed / max(1, len(current_inputs))
+        detections.extend(result_list)
+        timing_rows.extend(
+            {
+                "elapsed_seconds": per_image_elapsed,
+                "batch_elapsed_seconds": elapsed,
+                "batch_size": len(current_inputs),
+            }
+            for _ in current_inputs
+        )
+        index += len(current_inputs)
+    return detections, timing_rows
+
+
+def rfdetr_detections_to_predictions(
+    detections: Any,
+    image: ImageRecord,
+    model_cfg: Mapping[str, Any],
+    infer_width: int,
+    infer_height: int,
+) -> List[Dict[str, Any]]:
+    """Convert one RF-DETR Detections object to COCO prediction rows."""
+    predictions: List[Dict[str, Any]] = []
+    xyxy = to_numpy_array(getattr(detections, "xyxy", []))
+    conf = to_numpy_array(getattr(detections, "confidence", []))
+    cls = to_numpy_array(getattr(detections, "class_id", []))
+    if cls.size == 0 and len(xyxy):
+        cls = np.zeros((len(xyxy),), dtype=np.int64)
+    if conf.size == 0 and len(xyxy):
+        conf = np.ones((len(xyxy),), dtype=np.float32)
+    for box, score, category in zip(xyxy, conf, cls):
+        converted = xyxy_to_coco_bbox(box, infer_width, infer_height)
+        if converted is None:
+            continue
+        bbox, area = converted
+        predictions.append(
+            {
+                "image_id": int(image.image_id),
+                "category_id": remap_model_category_id(int(category), model_cfg),
+                "bbox": [float(value) for value in bbox],
+                "score": float(score),
+                "area": float(area),
+            }
+        )
+    return predictions
+
+
+def predict_rfdetr_direct_batch(
+    images: Sequence[ImageRecord],
+    model: Any,
+    config: Mapping[str, Any],
+    *,
+    sources: Optional[Sequence[Any]] = None,
+    widths: Optional[Sequence[int]] = None,
+    heights: Optional[Sequence[int]] = None,
+    confidence: Optional[float] = None,
+    batch_size: Optional[int] = None,
+    engine: str = "rfdetr",
+) -> Tuple[List[List[Dict[str, Any]]], List[Dict[str, Any]]]:
+    """Run direct RF-DETR prediction for multiple images/crops."""
+    if not images:
+        return [], []
+    model_cfg = config["model"]
+    threshold = float(model_cfg.get("confidence_threshold", 0.25) if confidence is None else confidence)
+    shape = None
+    if model_cfg.get("image_size") is not None:
+        image_size_value = int(model_cfg.get("image_size"))
+        shape = (image_size_value, image_size_value)
+    inputs = list(sources) if sources is not None else [image.path for image in images]
+    infer_widths = [int(value) for value in widths] if widths is not None else [int(image.width) for image in images]
+    infer_heights = [int(value) for value in heights] if heights is not None else [int(image.height) for image in images]
+    if len(inputs) != len(images) or len(infer_widths) != len(images) or len(infer_heights) != len(images):
+        raise ValueError("RF-DETR batch inputs, images, widths, and heights must have the same length.")
+    detections, timings = rfdetr_predict_batches(
+        model,
+        inputs,
+        threshold=threshold,
+        shape=shape,
+        batch_size=batch_size or rfdetr_image_batch_size(config),
+    )
+    predictions_by_image: List[List[Dict[str, Any]]] = []
+    stats: List[Dict[str, Any]] = []
+    for image, detection, infer_width, infer_height, timing in zip(images, detections, infer_widths, infer_heights, timings):
+        predictions = rfdetr_detections_to_predictions(detection, image, model_cfg, infer_width, infer_height)
+        predictions_by_image.append(predictions)
+        stats.append(
+            {
+                "image_id": image.image_id,
+                "file_name": image.file_name,
+                "width": infer_width,
+                "height": infer_height,
+                "predictions": len(predictions),
+                "elapsed_seconds": timing["elapsed_seconds"],
+                "batch_elapsed_seconds": timing["batch_elapsed_seconds"],
+                "batch_size": timing["batch_size"],
+                "inference_engine": engine,
+            }
+        )
+    return predictions_by_image, stats
+
+
 def predict_image_sahi(
     image: ImageRecord,
     detection_model: Any,
@@ -2131,55 +2365,18 @@ def predict_image_rfdetr(
     confidence: Optional[float] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], None]:
     """Run direct RF-DETR prediction for one image or crop."""
-    model_cfg = config["model"]
-    infer_width = int(width or image.width)
-    infer_height = int(height or image.height)
-    threshold = float(model_cfg.get("confidence_threshold", 0.25) if confidence is None else confidence)
-    shape = None
-    if model_cfg.get("image_size") is not None:
-        image_size_value = int(model_cfg.get("image_size"))
-        shape = (image_size_value, image_size_value)
-    start = time.perf_counter()
-    detections = call_with_supported_kwargs(
-        model.predict,
-        source if source is not None else image.path,
-        threshold=threshold,
-        shape=shape,
+    predictions_by_image, stats = predict_rfdetr_direct_batch(
+        [image],
+        model,
+        config,
+        sources=[source] if source is not None else None,
+        widths=[int(width or image.width)],
+        heights=[int(height or image.height)],
+        confidence=confidence,
+        batch_size=1,
+        engine="rfdetr",
     )
-    elapsed = time.perf_counter() - start
-
-    predictions: List[Dict[str, Any]] = []
-    xyxy = to_numpy_array(getattr(detections, "xyxy", []))
-    conf = to_numpy_array(getattr(detections, "confidence", []))
-    cls = to_numpy_array(getattr(detections, "class_id", []))
-    if cls.size == 0 and len(xyxy):
-        cls = np.zeros((len(xyxy),), dtype=np.int64)
-    if conf.size == 0 and len(xyxy):
-        conf = np.ones((len(xyxy),), dtype=np.float32)
-    for box, score, category in zip(xyxy, conf, cls):
-        converted = xyxy_to_coco_bbox(box, infer_width, infer_height)
-        if converted is None:
-            continue
-        bbox, area = converted
-        predictions.append(
-            {
-                "image_id": int(image.image_id),
-                "category_id": remap_model_category_id(int(category), model_cfg),
-                "bbox": [float(value) for value in bbox],
-                "score": float(score),
-                "area": float(area),
-            }
-        )
-    stat = {
-        "image_id": image.image_id,
-        "file_name": image.file_name,
-        "width": infer_width,
-        "height": infer_height,
-        "predictions": len(predictions),
-        "elapsed_seconds": elapsed,
-        "inference_engine": "rfdetr",
-    }
-    return predictions, stat, None
+    return predictions_by_image[0], stats[0], None
 
 
 def predict_image_direct(
@@ -2241,6 +2438,148 @@ def resolve_recheck_target_class_ids(config: Mapping[str, Any], recheck_cfg: Map
     )
 
 
+def apply_sahi_recheck_batch(
+    images: Sequence[ImageRecord],
+    model: Any,
+    config: Mapping[str, Any],
+    source_rgbs: Sequence[Image.Image],
+    predictions_by_image: Sequence[Sequence[Mapping[str, Any]]],
+) -> Tuple[List[List[Dict[str, Any]]], List[Dict[str, Any]]]:
+    """Verify target-class SAHI boxes in batches with centered second-pass crops."""
+    sahi_cfg = config["sahi"]
+    recheck_cfg = dict(sahi_cfg.get("recheck", {}) or {})
+    if not bool(recheck_cfg.get("enabled", False)):
+        return [[dict(prediction) for prediction in predictions] for predictions in predictions_by_image], [
+            {"enabled": False} for _ in predictions_by_image
+        ]
+
+    target_ids = set(resolve_recheck_target_class_ids(config, recheck_cfg))
+    if not target_ids:
+        return [[dict(prediction) for prediction in predictions] for predictions in predictions_by_image], [
+            {"enabled": True, "target_class_ids": []} for _ in predictions_by_image
+        ]
+
+    crop_size = int(recheck_cfg.get("crop_size", max(int(sahi_cfg.get("slice_width", 640)), int(sahi_cfg.get("slice_height", 640)))))
+    second_conf = float(recheck_cfg.get("second_confidence_threshold", config["model"].get("confidence_threshold", 0.25)))
+    first_weight = float(recheck_cfg.get("first_weight", 0.5))
+    second_weight = float(recheck_cfg.get("second_weight", 0.5))
+    fused_threshold = float(recheck_cfg.get("fused_confidence_threshold", config["model"].get("confidence_threshold", 0.25)))
+    center_padding_ratio = float(recheck_cfg.get("center_padding_ratio", 0.0))
+    max_rechecks = int(recheck_cfg.get("max_rechecks_per_image", 50) or 0)
+
+    stats = [
+        {
+            "enabled": True,
+            "target_class_ids": sorted(target_ids),
+            "requested": 0,
+            "rechecked": 0,
+            "passed": 0,
+            "filtered": 0,
+        }
+        for _ in predictions_by_image
+    ]
+    task_records: List[ImageRecord] = []
+    task_sources: List[Image.Image] = []
+    task_widths: List[int] = []
+    task_heights: List[int] = []
+    task_meta: List[Dict[str, Any]] = []
+    rechecked_keys: set = set()
+
+    for image_index, (image, source_rgb, predictions) in enumerate(zip(images, source_rgbs, predictions_by_image)):
+        indexed_targets = [
+            (prediction_index, prediction)
+            for prediction_index, prediction in enumerate(predictions)
+            if int(prediction.get("category_id", -1)) in target_ids
+        ]
+        selected_indices = {
+            prediction_index
+            for prediction_index, _ in sorted(indexed_targets, key=lambda item: float(item[1].get("score", 0.0)), reverse=True)[:max_rechecks]
+        } if max_rechecks > 0 else set()
+        stats[image_index]["requested"] = len(indexed_targets)
+        stats[image_index]["rechecked"] = len(selected_indices)
+
+        for prediction_index, prediction in indexed_targets:
+            if prediction_index not in selected_indices:
+                continue
+            center = coco_bbox_center(prediction.get("bbox", [0, 0, 0, 0]))
+            x, y, width, height = centered_square_window(center, crop_size, image.width, image.height)
+            crop = source_rgb.crop((x, y, x + width, y + height))
+            task_records.append(image)
+            task_sources.append(crop)
+            task_widths.append(width)
+            task_heights.append(height)
+            task_meta.append(
+                {
+                    "image_index": image_index,
+                    "prediction_index": prediction_index,
+                    "category_id": int(prediction.get("category_id", -1)),
+                    "first_prediction": prediction,
+                    "crop": [int(x), int(y), int(width), int(height)],
+                }
+            )
+            rechecked_keys.add((image_index, prediction_index))
+
+    passed_rows: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    if task_records:
+        second_predictions_by_task, _ = predict_rfdetr_direct_batch(
+            task_records,
+            model,
+            config,
+            sources=task_sources,
+            widths=task_widths,
+            heights=task_heights,
+            confidence=second_conf,
+            batch_size=rfdetr_sahi_batch_size(config),
+            engine="rfdetr_recheck",
+        )
+        for meta, second_predictions in zip(task_meta, second_predictions_by_task):
+            image_index = int(meta["image_index"])
+            prediction_index = int(meta["prediction_index"])
+            image = images[image_index]
+            first_prediction = meta["first_prediction"]
+            x, y, width, height = meta["crop"]
+            projected = shared_modes.project_predictions_to_original(second_predictions, x, y, image.width, image.height)
+            matching = [
+                item
+                for item in projected
+                if int(item.get("category_id", -1)) == int(meta["category_id"])
+                and center_in_coco_bbox(
+                    coco_bbox_center(item.get("bbox", [0, 0, 0, 0])),
+                    first_prediction.get("bbox", [0, 0, 0, 0]),
+                    center_padding_ratio,
+                )
+            ]
+            if not matching:
+                stats[image_index]["filtered"] += 1
+                continue
+            best_second = max(matching, key=lambda item: float(item.get("score", 0.0)))
+            fused_score = first_weight * float(first_prediction.get("score", 0.0)) + second_weight * float(best_second.get("score", 0.0))
+            if fused_score < fused_threshold:
+                stats[image_index]["filtered"] += 1
+                continue
+            row = dict(first_prediction)
+            row["score"] = float(fused_score)
+            row["first_stage_score"] = float(first_prediction.get("score", 0.0))
+            row["second_stage_score"] = float(best_second.get("score", 0.0))
+            row["recheck_crop"] = [int(x), int(y), int(width), int(height)]
+            row["recheck_passed"] = True
+            passed_rows[(image_index, prediction_index)] = row
+            stats[image_index]["passed"] += 1
+
+    output_by_image: List[List[Dict[str, Any]]] = []
+    for image_index, predictions in enumerate(predictions_by_image):
+        output_predictions: List[Dict[str, Any]] = []
+        for prediction_index, prediction in enumerate(predictions):
+            key = (image_index, prediction_index)
+            if key in rechecked_keys:
+                if key in passed_rows:
+                    output_predictions.append(passed_rows[key])
+                continue
+            output_predictions.append(dict(prediction))
+        output_by_image.append(output_predictions)
+    return output_by_image, stats
+
+
 def apply_sahi_recheck(
     image: ImageRecord,
     model: Any,
@@ -2249,84 +2588,285 @@ def apply_sahi_recheck(
     predictions: Sequence[Mapping[str, Any]],
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Verify target-class SAHI boxes with a centered second pass and fused confidence."""
+    output, stats = apply_sahi_recheck_batch([image], model, config, [source_rgb], [predictions])
+    return output[0], stats[0]
+
+
+def predict_images_rfdetr_full(
+    images: Sequence[ImageRecord],
+    model: Any,
+    config: Mapping[str, Any],
+    *,
+    batch_size: Optional[int] = None,
+) -> Tuple[List[List[Dict[str, Any]]], List[Dict[str, Any]]]:
+    """Run batched RF-DETR full-image inference."""
+    return predict_rfdetr_direct_batch(
+        images,
+        model,
+        config,
+        batch_size=batch_size or rfdetr_image_batch_size(config),
+        engine="rfdetr",
+    )
+
+
+def predict_images_rfdetr_sahi(
+    images: Sequence[ImageRecord],
+    model: Any,
+    config: Mapping[str, Any],
+) -> Tuple[List[List[Dict[str, Any]]], List[Dict[str, Any]]]:
+    """Run batched direct RF-DETR SAHI-style sliced prediction."""
+    if not images:
+        return [], []
     sahi_cfg = config["sahi"]
-    recheck_cfg = dict(sahi_cfg.get("recheck", {}) or {})
-    if not bool(recheck_cfg.get("enabled", False)):
-        return [dict(prediction) for prediction in predictions], {"enabled": False}
+    slice_batch_size = rfdetr_sahi_batch_size(config)
+    windows_by_image: List[List[Tuple[int, int, int, int]]] = []
+    source_rgbs: List[Image.Image] = []
+    task_records: List[ImageRecord] = []
+    task_sources: List[Image.Image] = []
+    task_widths: List[int] = []
+    task_heights: List[int] = []
+    task_meta: List[Tuple[int, int, int, int, int]] = []
 
-    target_ids = set(resolve_recheck_target_class_ids(config, recheck_cfg))
-    if not target_ids:
-        return [dict(prediction) for prediction in predictions], {"enabled": True, "target_class_ids": []}
-
-    crop_size = int(recheck_cfg.get("crop_size", max(int(sahi_cfg.get("slice_width", image.width)), int(sahi_cfg.get("slice_height", image.height)))))
-    second_conf = float(recheck_cfg.get("second_confidence_threshold", config["model"].get("confidence_threshold", 0.25)))
-    first_weight = float(recheck_cfg.get("first_weight", 0.5))
-    second_weight = float(recheck_cfg.get("second_weight", 0.5))
-    fused_threshold = float(recheck_cfg.get("fused_confidence_threshold", config["model"].get("confidence_threshold", 0.25)))
-    center_padding_ratio = float(recheck_cfg.get("center_padding_ratio", 0.0))
-    max_rechecks = int(recheck_cfg.get("max_rechecks_per_image", 50) or 0)
-
-    output_predictions: List[Dict[str, Any]] = []
-    target_predictions = [
-        prediction
-        for prediction in sorted(predictions, key=lambda item: float(item.get("score", 0.0)), reverse=True)
-        if int(prediction.get("category_id", -1)) in target_ids
-    ]
-    rechecked_ids = {id(prediction) for prediction in target_predictions[:max_rechecks]} if max_rechecks > 0 else set()
-    stats = {
-        "enabled": True,
-        "target_class_ids": sorted(target_ids),
-        "requested": len(target_predictions),
-        "rechecked": len(rechecked_ids),
-        "passed": 0,
-        "filtered": 0,
-    }
-
-    for prediction in predictions:
-        category_id = int(prediction.get("category_id", -1))
-        if category_id not in target_ids:
-            output_predictions.append(dict(prediction))
-            continue
-        if id(prediction) not in rechecked_ids:
-            output_predictions.append(dict(prediction))
-            continue
-
-        center = coco_bbox_center(prediction.get("bbox", [0, 0, 0, 0]))
-        x, y, width, height = centered_square_window(center, crop_size, image.width, image.height)
-        crop = source_rgb.crop((x, y, x + width, y + height))
-        second_predictions, _, _ = predict_image_direct(
-            image=image,
-            model=model,
-            config=config,
-            source=crop,
-            width=width,
-            height=height,
-            confidence=second_conf,
+    for image_index, image in enumerate(images):
+        windows = shared_modes.generate_slice_windows_for_size(
+            width=image.width,
+            height=image.height,
+            slice_width=int(sahi_cfg.get("slice_width", image.width)),
+            slice_height=int(sahi_cfg.get("slice_height", image.height)),
+            overlap_width_ratio=float(sahi_cfg.get("overlap_width_ratio", 0.2)),
+            overlap_height_ratio=float(sahi_cfg.get("overlap_height_ratio", 0.2)),
         )
-        projected = shared_modes.project_predictions_to_original(second_predictions, x, y, image.width, image.height)
-        matching = [
-            item
-            for item in projected
-            if int(item.get("category_id", -1)) == category_id
-            and center_in_coco_bbox(coco_bbox_center(item.get("bbox", [0, 0, 0, 0])), prediction.get("bbox", [0, 0, 0, 0]), center_padding_ratio)
-        ]
-        if not matching:
-            stats["filtered"] += 1
+        windows_by_image.append(windows)
+        with Image.open(image.path) as source_image:
+            source_rgb = source_image.convert("RGB")
+        source_rgbs.append(source_rgb)
+        for x, y, width, height in windows:
+            task_records.append(image)
+            task_sources.append(source_rgb.crop((x, y, x + width, y + height)))
+            task_widths.append(width)
+            task_heights.append(height)
+            task_meta.append((image_index, x, y, width, height))
+
+    elapsed_by_image = [0.0 for _ in images]
+    all_predictions: List[List[Dict[str, Any]]] = [[] for _ in images]
+    if task_records:
+        slice_predictions_by_task, slice_stats = predict_rfdetr_direct_batch(
+            task_records,
+            model,
+            config,
+            sources=task_sources,
+            widths=task_widths,
+            heights=task_heights,
+            batch_size=slice_batch_size,
+            engine="rfdetr_slice",
+        )
+        for meta, crop_predictions, stat in zip(task_meta, slice_predictions_by_task, slice_stats):
+            image_index, x, y, _, _ = meta
+            image = images[image_index]
+            all_predictions[image_index].extend(
+                shared_modes.project_predictions_to_original(crop_predictions, x, y, image.width, image.height)
+            )
+            elapsed_by_image[image_index] += float(stat.get("elapsed_seconds", 0.0))
+
+    if bool(sahi_cfg.get("standard_prediction", True)):
+        full_predictions_by_image, full_stats = predict_rfdetr_direct_batch(
+            images,
+            model,
+            config,
+            batch_size=slice_batch_size,
+            engine="rfdetr_standard",
+        )
+        for image_index, (full_predictions, stat) in enumerate(zip(full_predictions_by_image, full_stats)):
+            all_predictions[image_index].extend(full_predictions)
+            elapsed_by_image[image_index] += float(stat.get("elapsed_seconds", 0.0))
+
+    postprocess_start = time.perf_counter()
+    postprocessed: List[List[Dict[str, Any]]] = []
+    for predictions in all_predictions:
+        postprocessed.append(
+            shared_modes.postprocess_sahi_coco_predictions(
+                predictions,
+                postprocess_type=str(sahi_cfg.get("postprocess_type", "GREEDYNMM")),
+                match_metric=str(sahi_cfg.get("postprocess_match_metric", "IOS")),
+                match_threshold=float(sahi_cfg.get("postprocess_match_threshold", 0.5)),
+                class_agnostic=bool(sahi_cfg.get("postprocess_class_agnostic", False)),
+            )
+        )
+    postprocess_elapsed = (time.perf_counter() - postprocess_start) / max(1, len(images))
+    recheck_stats: List[Dict[str, Any]] = [{"enabled": False} for _ in images]
+    if bool(dict(sahi_cfg.get("recheck", {}) or {}).get("enabled", False)):
+        postprocessed, recheck_stats = apply_sahi_recheck_batch(images, model, config, source_rgbs, postprocessed)
+
+    stats: List[Dict[str, Any]] = []
+    for image_index, image in enumerate(images):
+        stats.append(
+            {
+                "image_id": image.image_id,
+                "file_name": image.file_name,
+                "width": image.width,
+                "height": image.height,
+                "predictions": len(postprocessed[image_index]),
+                "elapsed_seconds": elapsed_by_image[image_index] + postprocess_elapsed,
+                "inference_engine": "direct_sahi",
+                "slice_count": len(windows_by_image[image_index]),
+                "slice_batch_size": slice_batch_size,
+                "sahi_recheck": recheck_stats[image_index],
+            }
+        )
+    return postprocessed, stats
+
+
+def predict_images_rfdetr_class_crop(
+    images: Sequence[ImageRecord],
+    model: Any,
+    config: Mapping[str, Any],
+) -> Tuple[List[List[Dict[str, Any]]], List[Dict[str, Any]]]:
+    """Run batched RF-DETR class-crop inference."""
+    if not images:
+        return [], []
+    crop_cfg = shared_modes.default_crop_config(config)
+    source_predictions_by_image, source_stats = predict_rfdetr_direct_batch(
+        images,
+        model,
+        config,
+        confidence=float(crop_cfg.get("source_conf", config["model"].get("confidence_threshold", 0.25))),
+        batch_size=rfdetr_image_batch_size(config),
+        engine="rfdetr_class_crop_source",
+    )
+    output_predictions: List[Optional[List[Dict[str, Any]]]] = [None for _ in images]
+    output_stats: List[Optional[Dict[str, Any]]] = [None for _ in images]
+    fallback_indices: List[int] = []
+    crop_records: List[ImageRecord] = []
+    crop_sources: List[Image.Image] = []
+    crop_widths: List[int] = []
+    crop_heights: List[int] = []
+    crop_meta: List[Dict[str, Any]] = []
+
+    for image_index, (image, source_predictions) in enumerate(zip(images, source_predictions_by_image)):
+        window = shared_modes.select_crop_window_from_predictions(
+            source_predictions,
+            crop_cfg,
+            config.get("dataset_categories", []),
+            image.width,
+            image.height,
+        )
+        if window is None:
+            fallback_indices.append(image_index)
             continue
-        best_second = max(matching, key=lambda item: float(item.get("score", 0.0)))
-        fused_score = first_weight * float(prediction.get("score", 0.0)) + second_weight * float(best_second.get("score", 0.0))
-        if fused_score < fused_threshold:
-            stats["filtered"] += 1
-            continue
-        row = dict(prediction)
-        row["score"] = float(fused_score)
-        row["first_stage_score"] = float(prediction.get("score", 0.0))
-        row["second_stage_score"] = float(best_second.get("score", 0.0))
-        row["recheck_crop"] = [int(x), int(y), int(width), int(height)]
-        row["recheck_passed"] = True
-        output_predictions.append(row)
-        stats["passed"] += 1
-    return output_predictions, stats
+        crop_x, crop_y, crop_w, crop_h, matches = window
+        with Image.open(image.path) as source_image:
+            crop_image = source_image.convert("RGB").crop((crop_x, crop_y, crop_x + crop_w, crop_y + crop_h))
+        crop_records.append(image)
+        crop_sources.append(crop_image)
+        crop_widths.append(crop_w)
+        crop_heights.append(crop_h)
+        crop_meta.append(
+            {
+                "image_index": image_index,
+                "crop_x": crop_x,
+                "crop_y": crop_y,
+                "crop_width": crop_w,
+                "crop_height": crop_h,
+                "matches": matches,
+            }
+        )
+
+    if fallback_indices:
+        fallback_images = [images[index] for index in fallback_indices]
+        fallback_predictions_by_image, fallback_stats = predict_rfdetr_direct_batch(
+            fallback_images,
+            model,
+            config,
+            batch_size=rfdetr_image_batch_size(config),
+            engine="rfdetr",
+        )
+        for image_index, predictions, stat in zip(fallback_indices, fallback_predictions_by_image, fallback_stats):
+            image = images[image_index]
+            stat.update(
+                {
+                    "elapsed_seconds": float(source_stats[image_index].get("elapsed_seconds", 0.0)) + float(stat.get("elapsed_seconds", 0.0)),
+                    "test_mode": "class_crop",
+                    "model_input_type": "full_image",
+                    "crop_fallback": True,
+                    "crop_x": 0,
+                    "crop_y": 0,
+                    "crop_width": image.width,
+                    "crop_height": image.height,
+                    "crop_source_matches": 0,
+                }
+            )
+            output_predictions[image_index] = predictions
+            output_stats[image_index] = stat
+
+    if crop_records:
+        crop_predictions_by_task, crop_stats = predict_rfdetr_direct_batch(
+            crop_records,
+            model,
+            config,
+            sources=crop_sources,
+            widths=crop_widths,
+            heights=crop_heights,
+            batch_size=rfdetr_image_batch_size(config),
+            engine="rfdetr_class_crop",
+        )
+        for meta, crop_predictions, stat in zip(crop_meta, crop_predictions_by_task, crop_stats):
+            image_index = int(meta["image_index"])
+            image = images[image_index]
+            crop_x = int(meta["crop_x"])
+            crop_y = int(meta["crop_y"])
+            projected = shared_modes.project_predictions_to_original(crop_predictions, crop_x, crop_y, image.width, image.height)
+            stat.update(
+                {
+                    "width": image.width,
+                    "height": image.height,
+                    "predictions": len(projected),
+                    "elapsed_seconds": float(source_stats[image_index].get("elapsed_seconds", 0.0)) + float(stat.get("elapsed_seconds", 0.0)),
+                    "test_mode": "class_crop",
+                    "model_input_type": "class_crop",
+                    "crop_fallback": False,
+                    "crop_x": crop_x,
+                    "crop_y": crop_y,
+                    "crop_width": int(meta["crop_width"]),
+                    "crop_height": int(meta["crop_height"]),
+                    "crop_source_matches": int(meta["matches"]),
+                }
+            )
+            output_predictions[image_index] = projected
+            output_stats[image_index] = stat
+
+    return [predictions or [] for predictions in output_predictions], [
+        stat or {
+            "image_id": image.image_id,
+            "file_name": image.file_name,
+            "width": image.width,
+            "height": image.height,
+            "predictions": 0,
+            "elapsed_seconds": float(source_stats[index].get("elapsed_seconds", 0.0)),
+            "inference_engine": "rfdetr_class_crop",
+            "test_mode": "class_crop",
+        }
+        for index, (image, stat) in enumerate(zip(images, output_stats))
+    ]
+
+
+def predict_images_rfdetr(
+    images: Sequence[ImageRecord],
+    inference_model: Any,
+    config: Mapping[str, Any],
+    output_dir: Path,
+    visual_image_ids: Optional[Sequence[int]] = None,
+) -> Tuple[List[List[Dict[str, Any]]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Run batched RF-DETR inference for the configured test mode."""
+    _ = output_dir
+    _ = visual_image_ids
+    mode = shared_modes.canonical_test_mode(config)
+    if mode == shared_modes.SAHI_MODE:
+        predictions, stats = predict_images_rfdetr_sahi(images, inference_model, config)
+    elif mode == shared_modes.CLASS_CROP_MODE:
+        predictions, stats = predict_images_rfdetr_class_crop(images, inference_model, config)
+    else:
+        predictions, stats = predict_images_rfdetr_full(images, inference_model, config)
+    return predictions, stats, []
 
 
 def predict_image_sliced_direct(
@@ -2335,60 +2875,8 @@ def predict_image_sliced_direct(
     config: Mapping[str, Any],
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], None]:
     """Run SAHI-style sliced prediction using the direct model adapter."""
-    sahi_cfg = config["sahi"]
-    start = time.perf_counter()
-    all_predictions: List[Dict[str, Any]] = []
-    windows = shared_modes.generate_slice_windows_for_size(
-        width=image.width,
-        height=image.height,
-        slice_width=int(sahi_cfg.get("slice_width", image.width)),
-        slice_height=int(sahi_cfg.get("slice_height", image.height)),
-        overlap_width_ratio=float(sahi_cfg.get("overlap_width_ratio", 0.2)),
-        overlap_height_ratio=float(sahi_cfg.get("overlap_height_ratio", 0.2)),
-    )
-    with Image.open(image.path) as source_image:
-        source_rgb = source_image.convert("RGB")
-        for x, y, width, height in windows:
-            crop = source_rgb.crop((x, y, x + width, y + height))
-            crop_predictions, _, _ = predict_image_direct(
-                image=image,
-                model=model,
-                config=config,
-                source=crop,
-                width=width,
-                height=height,
-            )
-            all_predictions.extend(
-                shared_modes.project_predictions_to_original(crop_predictions, x, y, image.width, image.height)
-            )
-    if bool(sahi_cfg.get("standard_prediction", True)):
-        full_predictions, _, _ = predict_image_direct(image, model, config)
-        all_predictions.extend(full_predictions)
-    predictions = shared_modes.postprocess_sahi_coco_predictions(
-        all_predictions,
-        postprocess_type=str(sahi_cfg.get("postprocess_type", "GREEDYNMM")),
-        match_metric=str(sahi_cfg.get("postprocess_match_metric", "IOS")),
-        match_threshold=float(sahi_cfg.get("postprocess_match_threshold", 0.5)),
-        class_agnostic=bool(sahi_cfg.get("postprocess_class_agnostic", False)),
-    )
-    recheck_stats: Dict[str, Any] = {"enabled": False}
-    if bool(dict(sahi_cfg.get("recheck", {}) or {}).get("enabled", False)):
-        with Image.open(image.path) as source_image:
-            source_rgb = source_image.convert("RGB")
-            predictions, recheck_stats = apply_sahi_recheck(image, model, config, source_rgb, predictions)
-    elapsed = time.perf_counter() - start
-    stat = {
-        "image_id": image.image_id,
-        "file_name": image.file_name,
-        "width": image.width,
-        "height": image.height,
-        "predictions": len(predictions),
-        "elapsed_seconds": elapsed,
-        "inference_engine": "direct_sahi",
-        "slice_count": len(windows),
-        "sahi_recheck": recheck_stats,
-    }
-    return predictions, stat, None
+    predictions_by_image, stats = predict_images_rfdetr_sahi([image], model, config)
+    return predictions_by_image[0], stats[0], None
 
 
 def predict_image_class_crop(
@@ -2495,9 +2983,19 @@ def inference_worker(
     all_predictions: List[Dict[str, Any]] = []
     all_stats: List[Dict[str, Any]] = []
     visual_rows: List[Dict[str, Any]] = []
+    image_records = [ImageRecord(**record) for record in records]
 
-    for record in records:
-        image = ImageRecord(**record)
+    if is_rfdetr_model_type(config.get("model", {})):
+        predictions, stats, visuals = run_batched_rfdetr_records(
+            image_records,
+            inference_model,
+            config,
+            output_dir,
+            list(visual_ids),
+        )
+        return {"predictions": predictions, "stats": stats, "visuals": visuals, "device": device}
+
+    for image in image_records:
         predictions, stat, visual_row = predict_image(
             image=image,
             inference_model=inference_model,
@@ -2522,6 +3020,35 @@ def chunk_records(records: Sequence[ImageRecord], chunks: int) -> List[List[Dict
     return [bucket for bucket in buckets if bucket]
 
 
+def run_batched_rfdetr_records(
+    records: Sequence[ImageRecord],
+    inference_model: Any,
+    config: Mapping[str, Any],
+    output_dir: Path,
+    visual_image_ids: Sequence[int],
+    progress_bar: Optional[Any] = None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Run RF-DETR records in image batches and flatten evaluator outputs."""
+    all_predictions: List[Dict[str, Any]] = []
+    all_stats: List[Dict[str, Any]] = []
+    visual_rows: List[Dict[str, Any]] = []
+    for batch in batched_sequence(list(records), rfdetr_image_batch_size(config)):
+        predictions_by_image, stats, batch_visual_rows = predict_images_rfdetr(
+            images=batch,
+            inference_model=inference_model,
+            config=config,
+            output_dir=output_dir,
+            visual_image_ids=visual_image_ids,
+        )
+        for predictions in predictions_by_image:
+            all_predictions.extend(predictions)
+        all_stats.extend(stats)
+        visual_rows.extend(batch_visual_rows)
+        if progress_bar is not None:
+            progress_bar.update(len(batch))
+    return all_predictions, all_stats, visual_rows
+
+
 def run_inference(
     dataset: DatasetBundle,
     config: Mapping[str, Any],
@@ -2540,6 +3067,20 @@ def run_inference(
 
     if len(devices) == 1:
         inference_model = build_inference_model(config, devices[0], prebuilt_model=prebuilt_model)
+        if is_rfdetr_model_type(config.get("model", {})):
+            progress_bar = tqdm(total=len(dataset.images), desc=f"{engine} inference", unit="image") if progress_enabled else None
+            try:
+                return run_batched_rfdetr_records(
+                    dataset.images,
+                    inference_model,
+                    config,
+                    output_dir,
+                    list(visual_image_ids),
+                    progress_bar=progress_bar,
+                )
+            finally:
+                if progress_bar is not None:
+                    progress_bar.close()
         all_predictions: List[Dict[str, Any]] = []
         all_stats: List[Dict[str, Any]] = []
         visual_rows: List[Dict[str, Any]] = []
@@ -3563,7 +4104,7 @@ def build_arg_parser(usage_text: str) -> argparse.ArgumentParser:
     parser.add_argument("--slice-width", type=int, help="SAHI slice/window width.")
     parser.add_argument("--overlap-height-ratio", type=float, help="SAHI height overlap ratio.")
     parser.add_argument("--overlap-width-ratio", type=float, help="SAHI width overlap ratio.")
-    parser.add_argument("--batch-size", type=int, help="SAHI slice batch size.")
+    parser.add_argument("--batch-size", type=int, help="RF-DETR image and SAHI slice batch size.")
     parser.add_argument("--crop-class-names", type=str, help="Comma-separated class names used to find class_crop windows.")
     parser.add_argument("--crop-class-ids", type=str, help="Comma-separated class IDs used to find class_crop windows.")
     parser.add_argument("--crop-source-conf", type=float, help="Confidence threshold for crop-window source predictions.")
@@ -3644,6 +4185,7 @@ def cli_overrides(args: argparse.Namespace) -> Dict[str, Any]:
         "model.type": args.model_type,
         "model.device": args.device,
         "model.confidence_threshold": args.conf,
+        "inference.batch_size": args.batch_size,
         "sahi.slice_height": args.slice_height,
         "sahi.slice_width": args.slice_width,
         "sahi.overlap_height_ratio": args.overlap_height_ratio,
@@ -3744,6 +4286,8 @@ def normalize_config(config: MutableMapping[str, Any], source_config: Path) -> T
     sahi_cfg["enabled"] = mode == shared_modes.SAHI_MODE
     engine = inference_engine_name(config)
     inference_cfg["engine"] = engine
+    inference_cfg["batch_size"] = positive_int_setting(inference_cfg.get("batch_size"), 1, "inference.batch_size")
+    sahi_cfg["batch_size"] = positive_int_setting(sahi_cfg.get("batch_size"), inference_cfg["batch_size"], "sahi.batch_size")
     model_type = str(model_cfg.get("type", "ultralytics")).strip().lower()
     if mode != shared_modes.SAHI_MODE and model_type not in {"ultralytics", "rfdetr", "rf-detr", "rf_detr"}:
         raise ValueError("Direct full_image/class_crop inference supports model.type: ultralytics or rfdetr.")

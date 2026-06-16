@@ -18,6 +18,14 @@ from projects.object_detection_dataset_evaluator import object_detection_dataset
 
 
 class SahiPostprocessTest(unittest.TestCase):
+    @staticmethod
+    def fake_detection(category_id: int = 0, score: float = 0.9):
+        return SimpleNamespace(
+            xyxy=np.array([[1, 1, 6, 6]], dtype=np.float32),
+            confidence=np.array([score], dtype=np.float32),
+            class_id=np.array([category_id], dtype=np.int64),
+        )
+
     def test_greedynmm_ios_merges_partial_slice_box_into_same_object(self):
         predictions = [
             {"image_id": 1, "category_id": 1, "bbox": [10, 10, 100, 100], "score": 0.9},
@@ -207,6 +215,80 @@ class SahiPostprocessTest(unittest.TestCase):
 
             self.assertEqual([row["category_id"] for row in output], [0])
             self.assertEqual(stats["filtered"], 1)
+
+    def test_rfdetr_full_image_uses_list_input_batches(self):
+        class FakeBatchModel:
+            def __init__(self):
+                self.calls = []
+
+            def predict(self, images, **_kwargs):
+                batch = images if isinstance(images, list) else [images]
+                self.calls.append(len(batch))
+                return [SahiPostprocessTest.fake_detection(category_id=0, score=0.9) for _ in batch]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            records = []
+            for image_id in range(1, 4):
+                image_path = root / f"image_{image_id}.jpg"
+                Image.new("RGB", (32, 32), color=(255, 255, 255)).save(image_path)
+                records.append(evaluator.ImageRecord(image_id=image_id, file_name=image_path.name, path=str(image_path), width=32, height=32))
+            config = {
+                "model": {"type": "rfdetr", "confidence_threshold": 0.25},
+                "inference": {"mode": "full_image", "batch_size": 2},
+                "test_mode": {"mode": "full_image"},
+                "sahi": {"batch_size": 2},
+            }
+
+            model = FakeBatchModel()
+            predictions, stats, _ = evaluator.predict_images_rfdetr(records, model, config, root)
+
+            self.assertEqual(model.calls, [2, 1])
+            self.assertEqual([len(row) for row in predictions], [1, 1, 1])
+            self.assertEqual([row[0]["image_id"] for row in predictions], [1, 2, 3])
+            self.assertEqual([stat["batch_size"] for stat in stats], [2, 2, 1])
+
+    def test_rfdetr_direct_sahi_uses_slice_batches(self):
+        class FakeBatchModel:
+            def __init__(self):
+                self.calls = []
+
+            def predict(self, images, **_kwargs):
+                batch = images if isinstance(images, list) else [images]
+                self.calls.append(len(batch))
+                return [SahiPostprocessTest.fake_detection(category_id=1, score=0.9) for _ in batch]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "image.jpg"
+            Image.new("RGB", (100, 100), color=(255, 255, 255)).save(image_path)
+            image = evaluator.ImageRecord(image_id=1, file_name=image_path.name, path=str(image_path), width=100, height=100)
+            model = FakeBatchModel()
+            config = {
+                "model": {"type": "rfdetr", "confidence_threshold": 0.25},
+                "dataset_categories": [{"id": 1, "name": "football"}],
+                "inference": {"mode": "sahi", "batch_size": 1},
+                "test_mode": {"mode": "sahi"},
+                "sahi": {
+                    "slice_width": 50,
+                    "slice_height": 50,
+                    "overlap_width_ratio": 0.0,
+                    "overlap_height_ratio": 0.0,
+                    "standard_prediction": False,
+                    "postprocess_type": "GREEDYNMM",
+                    "postprocess_match_metric": "IOS",
+                    "postprocess_match_threshold": 0.5,
+                    "postprocess_class_agnostic": False,
+                    "batch_size": 3,
+                    "recheck": {"enabled": False},
+                },
+            }
+
+            predictions, stats = evaluator.predict_images_rfdetr_sahi([image], model, config)
+
+            self.assertEqual(model.calls, [3, 1])
+            self.assertEqual(len(predictions[0]), 4)
+            self.assertEqual(stats[0]["slice_batch_size"], 3)
 
 
 if __name__ == "__main__":

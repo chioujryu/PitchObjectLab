@@ -78,6 +78,10 @@ def apply_cli_overrides(config: MutableMapping[str, Any], args: argparse.Namespa
         test.setdefault("test_mode", {})["mode"] = args.test_mode
     if args.max_images is not None:
         test["max_images"] = args.max_images
+    if args.batch_size is not None:
+        test["batch_size"] = args.batch_size
+    if args.sahi_batch_size is not None:
+        test.setdefault("sahi", {})["batch_size"] = args.sahi_batch_size
 
 
 def _last_max_det(evaluation: Mapping[str, Any], default: int = 500) -> int:
@@ -351,6 +355,7 @@ def build_internal_test_config(config: Mapping[str, Any]) -> Dict[str, Any]:
         "save_dataset_cases": bool(test.get("save_dataset_cases", periodic_source.get("save_dataset_cases", False))),
         "visual_samples": dict(visual_samples),
         "model_input_batch_size": int(test.get("model_input_batch_size", periodic_source.get("model_input_batch_size", 9)) or 9),
+        "batch_size": int(test.get("batch_size", periodic_source.get("batch_size", 4)) or 4),
         "error_cases": dict(error_cases),
         "conf": model.get("confidence_threshold", 0.25),
         "match_iou_threshold": evaluation.get("match_iou_threshold", 0.5),
@@ -368,7 +373,7 @@ def build_internal_test_config(config: Mapping[str, Any]) -> Dict[str, Any]:
     internal["train"] = {
         "dataset_dir": dataset_dir,
         "dataset_file": "roboflow",
-        "batch_size": int(test.get("batch_size", 1) or 1),
+        "batch_size": int(test_settings.get("batch_size", 4) or 4),
         "grad_accum_steps": 1,
         "num_workers": int(test.get("num_workers", 0) or 0),
         "device": device,
@@ -389,6 +394,8 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
     parser.add_argument("--output-dir", help="Exact output directory override.")
     parser.add_argument("--test-mode", choices=["full_image", "sahi", "class_crop"], help="Test mode override.")
     parser.add_argument("--max-images", type=trainer.parse_scalar, help="Maximum test images to evaluate. Use all/null for all.")
+    parser.add_argument("--batch-size", type=int, help="RF-DETR full-image/class-crop evaluator batch size.")
+    parser.add_argument("--sahi-batch-size", type=int, help="RF-DETR SAHI slice/recheck batch size.")
     parser.add_argument("--dry-run", action="store_true", help="Validate and print planned output without inference.")
     parser.add_argument("--yes", action="store_true", help="Skip confirmation.")
     args = parser.parse_args()

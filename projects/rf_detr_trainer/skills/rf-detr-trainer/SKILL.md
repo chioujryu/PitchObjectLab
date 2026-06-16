@@ -29,6 +29,7 @@ Use this skill when editing `projects/rf_detr_trainer` or related object-detecti
 
 - `test_rf_detr_model.py` supports `full_image`, `sahi`, and `class_crop`.
 - Use `test.max_images` for the number of test images evaluated. `all`/`null` means the full split; a positive integer means first N images.
+- Use real RF-DETR list-input batching for test speedups. `test.batch_size` controls full-image/class-crop image batches, and `test.sahi.batch_size` controls SAHI slice/recheck batches. Balanced defaults are 4; downshift on CUDA OOM before failing.
 - Use `test.visual_samples.max_images` to limit saved prediction images.
 - Use `test.visual_samples.class_ids/class_names` only to choose visual candidate images; use `test.visual_samples.render_class_ids/render_class_names` to limit which GT/prediction classes are drawn.
 - Football diagnostics default to `test.error_cases.target_class_names: [football]`.
@@ -44,6 +45,7 @@ Use this skill when editing `projects/rf_detr_trainer` or related object-detecti
 
 - `inference_rf_detr_model.py` is RF-DETR only and supports image files, video files, folders, mixed image/video folders, and HTTP(S) media URLs.
 - Use `inference.max_sources`, `inference.max_images`, and `inference.max_videos` to limit first-N inference sources. `all`/`null` means no limit.
+- Use `inference.batch_size` for batched image-source inference and `inference.video.batch_size` for video detection-frame batches. Default image/video detection batch is 8, and `inference.video.batch_size: null` inherits `inference.batch_size`.
 - Use `inference.video.start_time`/`end_time` for video segment inference and `inference.video.max_seconds` to cap selected duration. Time values accept seconds, `MM:SS`, and `HH:MM:SS`; `all`/`null` end/max means no cap.
 - Inference should save rendered media, prediction records, class color metadata, and config snapshots inside the output folder.
 - Class colors must be stable within a run: the same class ID uses the same bounding-box color across every image and every video frame.
