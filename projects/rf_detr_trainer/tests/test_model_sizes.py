@@ -1,12 +1,11 @@
-from pathlib import Path
 import json
 import sys
 import tempfile
-from types import SimpleNamespace
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 
 import yaml
-
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 if str(PROJECT_DIR) not in sys.path:
@@ -155,9 +154,7 @@ class RFDETRModelSizeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as temp:
             output_dir = Path(temp)
             (output_dir / "inference_stats.csv").write_text(
-                "image_id,file_name,elapsed_seconds\n"
-                "1,a.jpg,0.10\n"
-                "2,b.jpg,0.30\n",
+                "image_id,file_name,elapsed_seconds\n1,a.jpg,0.10\n2,b.jpg,0.30\n",
                 encoding="utf-8",
             )
 

@@ -1,8 +1,7 @@
-from pathlib import Path
 import sys
 import tempfile
 import unittest
-
+from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 REPO_ROOT = PROJECT_DIR.parents[1]
@@ -97,7 +96,9 @@ class RfDetrInferenceTest(unittest.TestCase):
 
         self.assertEqual(inference_runner.inference_batch_size(config), 8)
         self.assertEqual(inference_runner.video_batch_size(config), 8)
-        self.assertEqual(inference_runner.video_batch_size({"inference": {"batch_size": 8, "video": {"batch_size": 3}}}), 3)
+        self.assertEqual(
+            inference_runner.video_batch_size({"inference": {"batch_size": 8, "video": {"batch_size": 3}}}), 3
+        )
 
     def test_prediction_config_includes_batch_size(self):
         config = {"model": {"confidence_threshold": 0.3}, "inference": {"mode": "full_image", "batch_size": 7}}

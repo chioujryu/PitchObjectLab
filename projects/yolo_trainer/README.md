@@ -141,7 +141,7 @@ Run the `test` split on a schedule during training:
 periodic_test:
   enabled: true
   test_mode:
-    mode: full_image   # full_image, sahi, class_crop
+    mode: full_image # full_image, sahi, class_crop
   test_interval_epochs: 10
   test_interval_minutes: 0
   run_final_test: true

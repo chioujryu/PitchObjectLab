@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 import argparse
 from pathlib import Path
-from typing import List, Tuple
 
 import cv2
 import numpy as np
 
 
-def find_contours(binary: np.ndarray) -> List[np.ndarray]:
+def find_contours(binary: np.ndarray) -> list[np.ndarray]:
     # External contours only (ignore holes)
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     return contours
@@ -15,7 +16,7 @@ def find_contours(binary: np.ndarray) -> List[np.ndarray]:
 
 def to_yolo_poly(
     contour: np.ndarray, w: int, h: int, epsilon_ratio: float, n_points_max: int | None
-) -> List[Tuple[float, float]]:
+) -> list[tuple[float, float]]:
     # Simplify contour with Douglas-Peucker
     peri = cv2.arcLength(contour, True)
     epsilon = max(1.0, epsilon_ratio * peri)  # at least 1px to avoid degenerate approximations
@@ -41,7 +42,7 @@ def mask_to_yolo_lines(
     min_area_px: int,
     epsilon_ratio: float,
     n_points_max: int | None,
-) -> List[str]:
+) -> list[str]:
     # Ensure grayscale
     if img.ndim == 3:
         img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -53,7 +54,7 @@ def mask_to_yolo_lines(
     contours = find_contours(binary)
     h, w = img.shape[:2]
 
-    lines: List[str] = []
+    lines: list[str] = []
     for cnt in contours:
         area = cv2.contourArea(cnt)
         if area < min_area_px:
@@ -75,15 +76,9 @@ def mask_to_yolo_lines(
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Convert mask images to YOLO polygon labels (one row per object)."
-    )
-    parser.add_argument(
-        "masks_dir", type=Path, help="Path to the folder containing binary mask images (png/jpg)."
-    )
-    parser.add_argument(
-        "--class-id", type=int, default=0, help="Class id to write as the first value (default: 0)."
-    )
+    parser = argparse.ArgumentParser(description="Convert mask images to YOLO polygon labels (one row per object).")
+    parser.add_argument("masks_dir", type=Path, help="Path to the folder containing binary mask images (png/jpg).")
+    parser.add_argument("--class-id", type=int, default=0, help="Class id to write as the first value (default: 0).")
     parser.add_argument(
         "--invert",
         action="store_true",
