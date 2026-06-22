@@ -144,6 +144,22 @@ class RFDETRModelSizeTest(unittest.TestCase):
                 kwargs = trainer.build_model_kwargs({"model": {"device": raw_device}})
                 self.assertNotIn("device", kwargs)
 
+    def test_multigpu_training_uses_find_unused_ddp_strategy(self):
+        trainer_kwargs = trainer.parse_device_to_trainer_kwargs("4,5")
+        trainer.apply_multigpu_ddp_strategy({"train": {"strategy": "auto"}}, trainer_kwargs, verbose=False)
+        self.assertEqual(trainer_kwargs["strategy"], "ddp_find_unused_parameters_true")
+
+    def test_multigpu_training_keeps_explicit_non_ddp_strategy(self):
+        trainer_kwargs = trainer.parse_device_to_trainer_kwargs("4,5")
+        trainer_kwargs["strategy"] = "deepspeed"
+        trainer.apply_multigpu_ddp_strategy({"train": {"strategy": "auto"}}, trainer_kwargs, verbose=False)
+        self.assertEqual(trainer_kwargs["strategy"], "deepspeed")
+
+    def test_single_gpu_training_does_not_force_ddp_strategy(self):
+        trainer_kwargs = trainer.parse_device_to_trainer_kwargs("4")
+        trainer.apply_multigpu_ddp_strategy({"train": {"strategy": "auto"}}, trainer_kwargs, verbose=False)
+        self.assertNotIn("strategy", trainer_kwargs)
+
     def test_standalone_test_average_inference_seconds_prefers_result_summary(self):
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as temp:
             output_dir = Path(temp)

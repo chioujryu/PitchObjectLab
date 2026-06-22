@@ -4,6 +4,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -14,6 +15,43 @@ import train_rf_detr_model as trainer  # noqa: E402
 
 
 class RuntimeTimingTest(unittest.TestCase):
+    def test_nonzero_distributed_process_detection(self):
+        self.assertFalse(trainer.is_nonzero_distributed_process({}))
+        self.assertFalse(trainer.is_nonzero_distributed_process({"LOCAL_RANK": "0", "RANK": "0"}))
+        self.assertTrue(trainer.is_nonzero_distributed_process({"LOCAL_RANK": "2", "RANK": "2"}))
+        self.assertTrue(trainer.is_nonzero_distributed_process({"GLOBAL_RANK": "1", "LOCAL_RANK": "0"}))
+
+    def test_distributed_child_overrides_use_parent_runtime_paths(self):
+        config = {
+            "dataset": {
+                "source_format": "ultralytics_yolo",
+                "dataset_dir": "/source/yolo",
+                "data_yaml": "/source/yolo/dataset.yaml",
+            },
+            "train": {"dataset_dir": "/source/yolo", "dataset_file": "roboflow"},
+            "output": {"name": "run_{timestamp}", "exist_ok": False},
+        }
+        with patch.dict(
+            "os.environ",
+            {
+                trainer.DDP_OUTPUT_DIR_ENV: "/runs/shared",
+                trainer.DDP_DATASET_DIR_ENV: "/cache/rfdetr",
+                trainer.DDP_DATASET_FILE_ENV: "roboflow",
+                "LOCAL_RANK": "1",
+            },
+            clear=True,
+        ):
+            metadata = trainer.apply_distributed_child_runtime_overrides(config)
+
+        self.assertTrue(metadata["distributed_child"])
+        self.assertEqual(config["output"]["output_dir"], "/runs/shared")
+        self.assertTrue(config["output"]["exist_ok"])
+        self.assertEqual(config["dataset"]["source_format"], "rfdetr")
+        self.assertEqual(config["dataset"]["data_yaml"], "")
+        self.assertEqual(config["dataset"]["dataset_dir"], "/cache/rfdetr")
+        self.assertEqual(config["train"]["dataset_dir"], "/cache/rfdetr")
+        self.assertEqual(config["train"]["dataset_file"], "roboflow")
+
     def test_format_duration_hms(self):
         self.assertEqual(trainer.format_duration_hms(0), "00:00:00")
         self.assertEqual(trainer.format_duration_hms(0.2), "00:00:01")

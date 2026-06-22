@@ -79,6 +79,10 @@ from projects.object_detection_common import test_modes as shared_modes  # noqa:
 
 DEFAULT_CONFIG = PROJECT_DIR / "config" / "rf_detr_train.yaml"
 TIMESTAMP_FORMAT = "%Y%m%d%H%M%S"
+DDP_TIMESTAMP_ENV = "RF_DETR_TRAIN_TIMESTAMP"
+DDP_OUTPUT_DIR_ENV = "RF_DETR_TRAIN_OUTPUT_DIR"
+DDP_DATASET_DIR_ENV = "RF_DETR_TRAIN_DATASET_DIR"
+DDP_DATASET_FILE_ENV = "RF_DETR_TRAIN_DATASET_FILE"
 IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 DATASET_SOURCE_FORMATS = {
     "auto",
@@ -265,6 +269,71 @@ def save_yaml(path: Path, data: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as file:
         yaml.safe_dump(dict(data), file, sort_keys=False, allow_unicode=True)
+
+
+def parse_rank_value(value: Any) -> Optional[int]:
+    """Parse a distributed rank environment value."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    with contextlib.suppress(ValueError):
+        return int(text)
+    return None
+
+
+def is_nonzero_distributed_process(env: Optional[Mapping[str, str]] = None) -> bool:
+    """Return True for Lightning/DDP child processes that should not run parent-only setup."""
+    source = os.environ if env is None else env
+    for key in ("RANK", "GLOBAL_RANK", "LOCAL_RANK"):
+        rank = parse_rank_value(source.get(key))
+        if rank is not None and rank > 0:
+            return True
+    return False
+
+
+def apply_distributed_child_runtime_overrides(config: MutableMapping[str, Any]) -> Dict[str, Any]:
+    """Use parent-exported runtime paths in a re-launched non-zero DDP rank."""
+    output_dir = os.environ.get(DDP_OUTPUT_DIR_ENV)
+    if output_dir:
+        output = config.setdefault("output", {})
+        output["output_dir"] = output_dir
+        output["exist_ok"] = True
+
+    dataset_dir = os.environ.get(DDP_DATASET_DIR_ENV)
+    dataset_file = os.environ.get(DDP_DATASET_FILE_ENV, "roboflow")
+    if dataset_dir:
+        dataset = config.setdefault("dataset", {})
+        train = config.setdefault("train", {})
+        dataset["source_format"] = "rfdetr"
+        dataset["dataset_dir"] = dataset_dir
+        dataset["data_yaml"] = ""
+        dataset["dataset_file"] = dataset_file
+        train["dataset_dir"] = dataset_dir
+        train["dataset_file"] = dataset_file
+
+    return {
+        "distributed_child": True,
+        "output_dir": output_dir,
+        "dataset_dir": dataset_dir,
+        "dataset_file": dataset_file,
+        "rank": os.environ.get("RANK") or os.environ.get("GLOBAL_RANK") or os.environ.get("LOCAL_RANK"),
+        "local_rank": os.environ.get("LOCAL_RANK"),
+    }
+
+
+def export_distributed_child_runtime(config: Mapping[str, Any], output_dir: Path, timestamp: str) -> None:
+    """Export resolved parent paths so Lightning DDP child ranks do not redo setup."""
+    os.environ[DDP_TIMESTAMP_ENV] = timestamp
+    os.environ[DDP_OUTPUT_DIR_ENV] = str(output_dir)
+    dataset = config.get("dataset", {})
+    train = config.get("train", {})
+    dataset_dir = train.get("dataset_dir") or dataset.get("dataset_dir")
+    if dataset_dir:
+        os.environ[DDP_DATASET_DIR_ENV] = str(dataset_dir)
+    dataset_file = train.get("dataset_file") or dataset.get("dataset_file") or "roboflow"
+    os.environ[DDP_DATASET_FILE_ENV] = str(dataset_file)
 
 
 def is_abs_any_os(value: str) -> bool:
@@ -2836,6 +2905,52 @@ def parse_device_to_trainer_kwargs(device: Optional[str]) -> Dict[str, Any]:
     return {"accelerator": text}
 
 
+def uses_multiple_gpu_devices(trainer_kwargs: Mapping[str, Any]) -> bool:
+    """Return True when resolved Trainer kwargs request more than one CUDA device."""
+    accelerator = str(trainer_kwargs.get("accelerator", "")).strip().lower()
+    if accelerator != "gpu":
+        return False
+    devices = trainer_kwargs.get("devices")
+    if isinstance(devices, int):
+        return devices > 1
+    if isinstance(devices, str):
+        text = devices.strip().lower()
+        if text in {"", "auto"}:
+            return False
+        if "," in text:
+            return len([item for item in text.split(",") if item.strip()]) > 1
+        with contextlib.suppress(ValueError):
+            return int(text) > 1
+        return False
+    if isinstance(devices, Sequence) and not isinstance(devices, (str, bytes, bytearray)):
+        return len(devices) > 1
+    return False
+
+
+def strategy_allows_find_unused_override(value: Any) -> bool:
+    """Return True for strategy settings where the wrapper may select RF-DETR-safe DDP."""
+    if value is None:
+        return True
+    if not isinstance(value, str):
+        return False
+    return value.strip().lower() in {"", "auto", "ddp"}
+
+
+def apply_multigpu_ddp_strategy(config: Mapping[str, Any], trainer_kwargs: MutableMapping[str, Any], verbose: bool) -> None:
+    """Use DDP unused-parameter detection for RF-DETR multi-GPU training unless explicitly overridden."""
+    explicit_trainer_strategy = trainer_kwargs.get("strategy")
+    train_strategy = config.get("train", {}).get("strategy", "auto")
+    if explicit_trainer_strategy is not None:
+        if not strategy_allows_find_unused_override(explicit_trainer_strategy):
+            return
+    elif not strategy_allows_find_unused_override(train_strategy):
+        return
+    if not uses_multiple_gpu_devices(trainer_kwargs):
+        return
+    trainer_kwargs["strategy"] = "ddp_find_unused_parameters_true"
+    blue("Multi-GPU RF-DETR training uses strategy=ddp_find_unused_parameters_true.", verbose)
+
+
 def flatten_tensor(value: Any) -> List[Any]:
     """Return a 1-D Python list from a scalar/list/tensor-like value."""
     safe = json_safe_value(value)
@@ -3867,14 +3982,25 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
     if not source_config.exists():
         raise FileNotFoundError(f"Config file not found: {source_config}")
 
-    timestamp = datetime.now().strftime(TIMESTAMP_FORMAT)
-    with tqdm(total=9, desc="Preparing") as bar:
+    distributed_child = is_nonzero_distributed_process()
+    timestamp = (
+        os.environ.get(DDP_TIMESTAMP_ENV, "").strip()
+        if distributed_child and os.environ.get(DDP_TIMESTAMP_ENV)
+        else datetime.now().strftime(TIMESTAMP_FORMAT)
+    )
+    if not distributed_child:
+        os.environ[DDP_TIMESTAMP_ENV] = timestamp
+
+    with tqdm(total=9, desc="Preparing", disable=distributed_child) as bar:
         config = load_yaml(source_config)
         apply_cli_overrides(config, args)
         verbose = bool(config.get("runtime", {}).get("verbose", True))
         if timing_context is not None:
-            timing_context["verbose"] = verbose
+            timing_context["verbose"] = verbose and not distributed_child
         apply_demo_mode(config, timestamp, verbose)
+        child_metadata: Dict[str, Any] = {}
+        if distributed_child:
+            child_metadata = apply_distributed_child_runtime_overrides(config)
         bar.update(1)
 
         if config.get("train", {}).get("progress_bar") == "none":
@@ -3885,54 +4011,65 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
         output_dir = build_output_dir(config, timestamp)
         if timing_context is not None:
             timing_context["output_dir"] = str(output_dir)
-        dataset_plan = build_dataset_plan(config, output_dir, source_config)
-        warnings = validate_requirements(config, output_dir, dataset_plan)
-        for warning in warnings:
-            blue(f"Requirement check warning: {warning}", verbose=verbose, force=True)
-        if output_dir.exists() and not bool(config.get("output", {}).get("exist_ok", False)):
-            raise FileExistsError(f"Output directory already exists and output.exist_ok=false: {output_dir}")
-        bar.set_description("Estimating")
-        bar.update(1)
+        if not distributed_child:
+            export_distributed_child_runtime(config, output_dir, timestamp)
 
-        periodic_count, periodic_note = estimate_periodic_tests(config)
-        estimate = estimate_outputs(config, output_dir, periodic_count, dataset_plan)
-        estimate["periodic_test_count"] = periodic_count if periodic_count is not None else periodic_note
-        estimate["model_size"] = config.get("model", {}).get("size")
-        estimate["eval_interval"] = config.get("train", {}).get("eval_interval")
-        if timing_context is not None:
-            timing_context["estimate"] = estimate
-            timing_context["dry_run"] = bool(config.get("runtime", {}).get("dry_run", False))
-        confirm = bool(config.get("runtime", {}).get("confirm_before_run", True))
-        assume_yes = bool(args.yes or not confirm)
-        confirm_or_exit(estimate, verbose=verbose, assume_yes=assume_yes)
-        bar.set_description("Confirmed")
-        bar.update(1)
+        if distributed_child:
+            dataset_metadata = child_metadata
+            bar.set_description("Estimating")
+            bar.update(2)
+            bar.set_description("Dataset")
+            bar.update(1)
+        else:
+            dataset_plan = build_dataset_plan(config, output_dir, source_config)
+            warnings = validate_requirements(config, output_dir, dataset_plan)
+            for warning in warnings:
+                blue(f"Requirement check warning: {warning}", verbose=verbose, force=True)
+            if output_dir.exists() and not bool(config.get("output", {}).get("exist_ok", False)):
+                raise FileExistsError(f"Output directory already exists and output.exist_ok=false: {output_dir}")
+            bar.set_description("Estimating")
+            bar.update(1)
 
-        if bool(config.get("runtime", {}).get("dry_run", False)):
-            blue("Dry run complete. Training was not started.", verbose=verbose, force=True)
-            bar.update(bar.total - bar.n)
-            return 0
+            periodic_count, periodic_note = estimate_periodic_tests(config)
+            estimate = estimate_outputs(config, output_dir, periodic_count, dataset_plan)
+            estimate["periodic_test_count"] = periodic_count if periodic_count is not None else periodic_note
+            estimate["model_size"] = config.get("model", {}).get("size")
+            estimate["eval_interval"] = config.get("train", {}).get("eval_interval")
+            if timing_context is not None:
+                timing_context["estimate"] = estimate
+                timing_context["dry_run"] = bool(config.get("runtime", {}).get("dry_run", False))
+            confirm = bool(config.get("runtime", {}).get("confirm_before_run", True))
+            assume_yes = bool(args.yes or not confirm)
+            confirm_or_exit(estimate, verbose=verbose, assume_yes=assume_yes)
+            bar.set_description("Confirmed")
+            bar.update(1)
 
-        output_dir.mkdir(parents=True, exist_ok=True)
-        if timing_context is not None:
-            timing_context["outputs_created"] = True
-        bar.set_description("Dataset")
-        dataset_metadata = materialize_dataset_plan(dataset_plan, config, output_dir, verbose)
-        bar.update(1)
+            if bool(config.get("runtime", {}).get("dry_run", False)):
+                blue("Dry run complete. Training was not started.", verbose=verbose, force=True)
+                bar.update(bar.total - bar.n)
+                return 0
 
-        dump_config_snapshot(
-            output_dir=output_dir,
-            merged_config=config,
-            metadata={
-                "event": "pre_import",
-                "created_at": datetime.now().isoformat(timespec="seconds"),
-                "argv": sys.argv,
-                "cwd": str(Path.cwd()),
-                "output_dir": str(output_dir),
-                "dataset_metadata": dataset_metadata,
-            },
-            source_config=source_config,
-        )
+            output_dir.mkdir(parents=True, exist_ok=True)
+            if timing_context is not None:
+                timing_context["outputs_created"] = True
+            bar.set_description("Dataset")
+            dataset_metadata = materialize_dataset_plan(dataset_plan, config, output_dir, verbose)
+            export_distributed_child_runtime(config, output_dir, timestamp)
+            bar.update(1)
+
+            dump_config_snapshot(
+                output_dir=output_dir,
+                merged_config=config,
+                metadata={
+                    "event": "pre_import",
+                    "created_at": datetime.now().isoformat(timespec="seconds"),
+                    "argv": sys.argv,
+                    "cwd": str(Path.cwd()),
+                    "output_dir": str(output_dir),
+                    "dataset_metadata": dataset_metadata,
+                },
+                source_config=source_config,
+            )
         bar.set_description("Importing")
         bar.update(1)
 
@@ -3946,6 +4083,7 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
         device_value = train_kwargs.pop("_device", None)
         trainer_kwargs = parse_device_to_trainer_kwargs(device_value)
         trainer_kwargs.update(config.get("trainer", {}).get("extra_trainer_args", {}) or {})
+        apply_multigpu_ddp_strategy(config, trainer_kwargs, verbose)
 
         blue(f"Creating RF-DETR model: {model_cls.__name__}.", verbose)
         rf_model = model_cls(**model_kwargs)
@@ -3986,22 +4124,23 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
                 verbose=verbose,
             )
         )
-        dump_config_snapshot(
-            output_dir=output_dir,
-            merged_config=config,
-            metadata={
-                "event": "train_start",
-                "created_at": datetime.now().isoformat(timespec="seconds"),
-                "argv": sys.argv,
-                "cwd": str(Path.cwd()),
-                "output_dir": str(output_dir),
-                "device": device_value or "auto",
-                "dataset_grid_files": [str(path) for path in dataset_grid_files],
-            },
-            source_config=source_config,
-            train_config=train_config,
-            model_config=rf_model.model_config,
-        )
+        if not distributed_child:
+            dump_config_snapshot(
+                output_dir=output_dir,
+                merged_config=config,
+                metadata={
+                    "event": "train_start",
+                    "created_at": datetime.now().isoformat(timespec="seconds"),
+                    "argv": sys.argv,
+                    "cwd": str(Path.cwd()),
+                    "output_dir": str(output_dir),
+                    "device": device_value or "auto",
+                    "dataset_grid_files": [str(path) for path in dataset_grid_files],
+                },
+                source_config=source_config,
+                train_config=train_config,
+                model_config=rf_model.model_config,
+            )
         bar.set_description("Training")
         bar.update(1)
 
@@ -4014,7 +4153,8 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
         bar.update(1)
 
         periodic = config.get("periodic_test", {})
-        if bool(periodic.get("run_final_test", True)):
+        is_global_zero = bool(getattr(trainer, "is_global_zero", not distributed_child))
+        if bool(periodic.get("run_final_test", True)) and is_global_zero:
             best_checkpoint = load_best_checkpoint_if_available(module, output_dir, verbose)
             final_output_name = render_output_template(
                 str(periodic.get("final_output_dir_name", "final_test")),
@@ -4041,20 +4181,21 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
                 verbose=verbose,
                 progress_bar=bool(periodic.get("progress_bar", True)),
             )
-        else:
+        elif is_global_zero:
             blue("Final test skipped by config.", verbose)
 
         bar.set_description("Done")
         bar.update(1)
 
-    blue(f"Training output directory: {output_dir}", verbose=verbose, force=True)
-    blue("Done.", verbose=verbose, force=True)
+    if not distributed_child:
+        blue(f"Training output directory: {output_dir}", verbose=verbose, force=True)
+        blue("Done.", verbose=verbose, force=True)
     return 0
 
 
 def main() -> int:
     """Run training with elapsed-time reporting."""
-    timing_context = start_run_timing("train")
+    timing_context = start_run_timing("train", verbose=not is_nonzero_distributed_process())
     try:
         result = _main_impl(timing_context)
         timing_context["success"] = True
