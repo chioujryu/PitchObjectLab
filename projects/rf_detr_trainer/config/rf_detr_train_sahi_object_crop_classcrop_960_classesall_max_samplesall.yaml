@@ -122,7 +122,7 @@ train:
   # Number of training epochs. Options: any positive integer.
   epochs: 20
   # Micro batch size per optimizer step. Options: positive integer, or auto for RF-DETR auto-batch probing.
-  batch_size: 32
+  batch_size: 16
   # Gradient accumulation steps. Effective per-device batch = batch_size * grad_accum_steps. Options: positive integer.
   grad_accum_steps: 8
   # Per-device effective batch target when batch_size=auto. Options: positive integer.
@@ -413,8 +413,10 @@ periodic_test:
   progress_bar: true
 
 trainer:
-  # Extra PyTorch Lightning Trainer kwargs. Options: any Trainer key such as precision, fast_dev_run, limit_train_batches.
-  extra_trainer_args: {}
+  # Extra PyTorch Lightning Trainer kwargs. Options: any Trainer key such as precision, fast_dev_run, limit_train_batches, num_sanity_val_steps.
+  extra_trainer_args:
+    # Initial validation sanity batches before training. Options: 0 disables; positive integer enables. Use 0 for multi-GPU RF-DETR to avoid distributed mAP sync timeout before epoch 1.
+    num_sanity_val_steps: 0
 
 demo:
   # Enable small demo output mode. Options: true, false.

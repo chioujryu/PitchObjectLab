@@ -47,6 +47,11 @@ def split_count(cache_dir: Path, split: str) -> int:
     return len(data["images"])
 
 
+def annotation_count(cache_dir: Path, split: str) -> int:
+    data = json.loads((cache_dir / split / "_annotations.coco.json").read_text(encoding="utf-8"))
+    return len(data["annotations"])
+
+
 class DatasetCacheAdapterTest(unittest.TestCase):
     def test_ultralytics_yolo_auto_detects_and_caches(self):
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as temp:
@@ -73,6 +78,36 @@ class DatasetCacheAdapterTest(unittest.TestCase):
             self.assertEqual(train_json["categories"][0]["name"], "ball")
             self.assertEqual(train_json["annotations"][0]["bbox"], [40.0, 24.0, 20.0, 32.0])
             self.assertEqual(config["train"]["dataset_file"], "roboflow")
+
+    def test_ultralytics_yolo_symlink_images_preserve_label_lookup(self):
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as temp:
+            temp_path = Path(temp)
+            source_root = temp_path / "source_images"
+            root = temp_path / "yolo_symlink_export"
+            cache_root = temp_path / "cache"
+            for split in ("train", "val", "test"):
+                source_image = source_root / split / "images" / f"{split}.jpg"
+                make_image(source_image)
+                image_dir = root / "images" / split
+                image_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    os.symlink(source_image, image_dir / f"{split}.jpg")
+                except (OSError, NotImplementedError) as exc:
+                    self.skipTest(f"Symlinks are not available: {exc}")
+                label_dir = root / "labels" / split
+                label_dir.mkdir(parents=True, exist_ok=True)
+                (label_dir / f"{split}.txt").write_text("0 0.5 0.5 0.2 0.4\n", encoding="utf-8")
+            (root / "data.yaml").write_text(
+                "path: .\ntrain: images/train\nval: images/val\ntest: images/test\nnames: [ball]\n",
+                encoding="utf-8",
+            )
+            config = base_config(root, cache_root, source_format="ultralytics_yolo")
+            config["dataset"]["data_yaml"] = str(root / "data.yaml")
+
+            _, cache_dir = materialize(config, temp_path)
+
+            self.assertEqual([split_count(cache_dir, split) for split in ("train", "valid", "test")], [1, 1, 1])
+            self.assertEqual([annotation_count(cache_dir, split) for split in ("train", "valid", "test")], [1, 1, 1])
 
     def test_yolo_yaml_missing_host_path_falls_back_to_dataset_dir(self):
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as temp:

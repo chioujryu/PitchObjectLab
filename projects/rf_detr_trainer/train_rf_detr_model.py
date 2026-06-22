@@ -1120,10 +1120,10 @@ def split_from_path_or_name(path: Path) -> Optional[str]:
 def iter_image_files(path: Path) -> List[Path]:
     """Return image files under a file or directory path."""
     if path.is_file():
-        return [path.resolve()] if path.suffix.lower() in IMAGE_EXTENSIONS else []
+        return [path.absolute()] if path.suffix.lower() in IMAGE_EXTENSIONS else []
     if not path.exists():
         return []
-    return sorted(file.resolve() for file in path.rglob("*") if file.is_file() and file.suffix.lower() in IMAGE_EXTENSIONS)
+    return sorted(file.absolute() for file in path.rglob("*") if file.is_file() and file.suffix.lower() in IMAGE_EXTENSIONS)
 
 
 def read_image_size(path: Path) -> Tuple[int, int]:
@@ -2951,6 +2951,20 @@ def apply_multigpu_ddp_strategy(config: Mapping[str, Any], trainer_kwargs: Mutab
     blue("Multi-GPU RF-DETR training uses strategy=ddp_find_unused_parameters_true.", verbose)
 
 
+def apply_multigpu_validation_safety(trainer_kwargs: MutableMapping[str, Any], verbose: bool) -> None:
+    """Avoid RF-DETR DDP hangs in Lightning's initial validation sanity check."""
+    if not uses_multiple_gpu_devices(trainer_kwargs):
+        return
+    if "num_sanity_val_steps" in trainer_kwargs:
+        return
+    trainer_kwargs["num_sanity_val_steps"] = 0
+    blue(
+        "Multi-GPU RF-DETR training disables Lightning sanity validation "
+        "(num_sanity_val_steps=0) to avoid distributed mAP sync timeouts before training.",
+        verbose,
+    )
+
+
 def flatten_tensor(value: Any) -> List[Any]:
     """Return a 1-D Python list from a scalar/list/tensor-like value."""
     safe = json_safe_value(value)
@@ -4084,6 +4098,7 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
         trainer_kwargs = parse_device_to_trainer_kwargs(device_value)
         trainer_kwargs.update(config.get("trainer", {}).get("extra_trainer_args", {}) or {})
         apply_multigpu_ddp_strategy(config, trainer_kwargs, verbose)
+        apply_multigpu_validation_safety(trainer_kwargs, verbose)
 
         blue(f"Creating RF-DETR model: {model_cls.__name__}.", verbose)
         rf_model = model_cls(**model_kwargs)

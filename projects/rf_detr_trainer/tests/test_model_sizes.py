@@ -149,6 +149,17 @@ class RFDETRModelSizeTest(unittest.TestCase):
         trainer.apply_multigpu_ddp_strategy({"train": {"strategy": "auto"}}, trainer_kwargs, verbose=False)
         self.assertEqual(trainer_kwargs["strategy"], "ddp_find_unused_parameters_true")
 
+    def test_multigpu_training_disables_sanity_validation_by_default(self):
+        trainer_kwargs = trainer.parse_device_to_trainer_kwargs("4,5")
+        trainer.apply_multigpu_validation_safety(trainer_kwargs, verbose=False)
+        self.assertEqual(trainer_kwargs["num_sanity_val_steps"], 0)
+
+    def test_multigpu_training_keeps_explicit_sanity_validation_setting(self):
+        trainer_kwargs = trainer.parse_device_to_trainer_kwargs("4,5")
+        trainer_kwargs["num_sanity_val_steps"] = 2
+        trainer.apply_multigpu_validation_safety(trainer_kwargs, verbose=False)
+        self.assertEqual(trainer_kwargs["num_sanity_val_steps"], 2)
+
     def test_multigpu_training_keeps_explicit_non_ddp_strategy(self):
         trainer_kwargs = trainer.parse_device_to_trainer_kwargs("4,5")
         trainer_kwargs["strategy"] = "deepspeed"
@@ -159,6 +170,11 @@ class RFDETRModelSizeTest(unittest.TestCase):
         trainer_kwargs = trainer.parse_device_to_trainer_kwargs("4")
         trainer.apply_multigpu_ddp_strategy({"train": {"strategy": "auto"}}, trainer_kwargs, verbose=False)
         self.assertNotIn("strategy", trainer_kwargs)
+
+    def test_single_gpu_training_does_not_force_sanity_validation_setting(self):
+        trainer_kwargs = trainer.parse_device_to_trainer_kwargs("4")
+        trainer.apply_multigpu_validation_safety(trainer_kwargs, verbose=False)
+        self.assertNotIn("num_sanity_val_steps", trainer_kwargs)
 
     def test_standalone_test_average_inference_seconds_prefers_result_summary(self):
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as temp:

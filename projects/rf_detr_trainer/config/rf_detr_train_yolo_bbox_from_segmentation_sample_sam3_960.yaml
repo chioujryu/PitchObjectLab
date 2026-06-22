@@ -118,7 +118,7 @@ train:
   # Dataset file type. Options: roboflow, coco, yolo, o365. roboflow auto-detects Roboflow COCO/YOLO layouts.
   dataset_file: roboflow
   # CUDA/CPU selector. Options: auto, cpu, cuda, 0, 1, 0,1, cuda:0, mps, -1.
-  device: 3,4
+  device: 1,2
   # Number of training epochs. Options: any positive integer.
   epochs: 20
   # Micro batch size per optimizer step. Options: positive integer, or auto for RF-DETR auto-batch probing.
