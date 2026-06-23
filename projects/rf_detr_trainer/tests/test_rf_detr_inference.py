@@ -106,6 +106,63 @@ class RfDetrInferenceTest(unittest.TestCase):
 
         self.assertEqual(prediction_config["inference"]["batch_size"], 7)
 
+    def test_draw_predictions_without_tracks_is_unchanged(self):
+        from PIL import Image
+
+        image = Image.new("RGB", (40, 40), (10, 20, 30))
+        predictions = [{"category_id": 1, "bbox": [5, 5, 10, 10], "score": 0.9}]
+        categories = [{"id": 1, "name": "football"}]
+
+        baseline = inference_runner.draw_predictions(image, predictions, categories, [])
+        with_defaults = inference_runner.draw_predictions(image, predictions, categories, [], None, None)
+
+        self.assertEqual(baseline.tobytes(), with_defaults.tobytes())
+
+    def test_build_video_row_has_expected_keys(self):
+        from types import SimpleNamespace
+
+        window = SimpleNamespace(start_seconds=0.0, end_seconds=2.0, effective_end_seconds=2.0)
+        row = inference_runner.build_video_row(
+            {"category_id": 1, "bbox": [0, 0, 1, 1], "score": 0.5}, "v.mp4", 3, 3, 30.0, window
+        )
+
+        self.assertEqual(row["source"], "v.mp4")
+        self.assertEqual(row["frame_index"], 3)
+        self.assertAlmostEqual(row["timestamp_seconds"], 0.1)
+        for key in ("segment_frame_index", "segment_timestamp_seconds", "video_start_seconds", "video_end_seconds", "video_effective_end_seconds"):
+            self.assertIn(key, row)
+
+    @staticmethod
+    def _cli_args(**overrides):
+        from types import SimpleNamespace
+
+        base = dict(
+            yes=False, dry_run=False, source=None, output_dir=None, checkpoint=None, device=None,
+            confidence_threshold=None, max_sources=None, max_images=None, max_videos=None,
+            batch_size=None, video_batch_size=None, max_seconds=None, video_start_time=None, video_end_time=None,
+            track=False, no_track=False, track_radius=None, track_velocity=False,
+        )
+        base.update(overrides)
+        return SimpleNamespace(**base)
+
+    def test_cli_track_overrides_enable_and_tune(self):
+        config = {}
+        inference_runner.apply_cli_overrides(config, self._cli_args(track=True, track_radius=120.0, track_velocity=True))
+        tracking = config["inference"]["tracking"]
+        self.assertTrue(tracking["enabled"])
+        self.assertEqual(tracking["radius_pixels"], 120.0)
+        self.assertTrue(tracking["use_velocity_prediction"])
+
+    def test_cli_no_track_disables_and_wins(self):
+        config = {}
+        inference_runner.apply_cli_overrides(config, self._cli_args(track=True, no_track=True))
+        self.assertFalse(config["inference"]["tracking"]["enabled"])
+
+    def test_cli_without_track_flags_adds_no_tracking_key(self):
+        config = {}
+        inference_runner.apply_cli_overrides(config, self._cli_args())
+        self.assertNotIn("tracking", config.get("inference", {}))
+
 
 if __name__ == "__main__":
     unittest.main()

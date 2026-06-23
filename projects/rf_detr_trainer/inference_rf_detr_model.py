@@ -38,6 +38,7 @@ from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
 
 import rf_detr_runtime as trainer
+import rf_detr_video_tracking as video_tracking
 from projects.object_detection_dataset_evaluator import object_detection_dataset_evaluator as evaluator
 
 colorama.init(autoreset=True)
@@ -124,6 +125,17 @@ def apply_cli_overrides(config: MutableMapping[str, Any], args: argparse.Namespa
         inference.setdefault("video", {})["start_time"] = args.video_start_time
     if args.video_end_time is not None:
         inference.setdefault("video", {})["end_time"] = args.video_end_time
+    if getattr(args, "no_track", False) or getattr(args, "track", False) \
+            or getattr(args, "track_radius", None) is not None or getattr(args, "track_velocity", False):
+        tracking = inference.setdefault("tracking", {})
+        if getattr(args, "no_track", False):
+            tracking["enabled"] = False
+        elif getattr(args, "track", False):
+            tracking["enabled"] = True
+        if getattr(args, "track_radius", None) is not None:
+            tracking["radius_pixels"] = args.track_radius
+        if getattr(args, "track_velocity", False):
+            tracking["use_velocity_prediction"] = True
 
 
 def config_list(value: Any) -> List[Any]:
@@ -432,6 +444,8 @@ def estimate_outputs(items: Sequence[SourceItem], output_dir: Path, config: Mapp
     output_files = 5 + image_count + video_count
     if bool(config.get("inference", {}).get("save_predictions_jsonl", True)):
         output_files += 1
+    if bool((config.get("inference", {}).get("tracking", {}) or {}).get("enabled", False)):
+        output_files += 1  # tracking_summary.json
     estimate = {
         "output_dir": str(output_dir),
         "sources": len(items),
@@ -514,6 +528,12 @@ def class_color(category_id: int) -> Tuple[int, int, int]:
     return 64 + value % 160, 64 + (value >> 8) % 160, 64 + (value >> 16) % 160
 
 
+def track_color(track_id: int) -> Tuple[int, int, int]:
+    """Stable, distinct color per track id for trajectory overlays."""
+    value = ((int(track_id) + 1) * 2246822519) & 0xFFFFFF
+    return 48 + value % 180, 48 + (value >> 8) % 180, 48 + (value >> 16) % 180
+
+
 def color_map(categories: Sequence[Mapping[str, Any]], predictions: Sequence[Mapping[str, Any]]) -> Dict[int, Tuple[int, int, int]]:
     ids = {int(category["id"]) for category in categories}
     ids.update(int(prediction.get("category_id", 0)) for prediction in predictions)
@@ -532,11 +552,50 @@ def resolve_render_ids(config: Mapping[str, Any], categories: Sequence[Mapping[s
     return [name_to_id[name] for name in names if name in name_to_id]
 
 
+def draw_track_overlays(
+    draw: Any,
+    tracks: Sequence[Any],
+    tracking_cfg: Any,
+    target_ids: Sequence[int],
+    current_frame_index: Optional[int] = None,
+) -> None:
+    """Draw trajectory trails, optional search circles, and current-center dots for visible tracks."""
+    base_color = class_color(int(target_ids[0])) if target_ids else class_color(1)
+    width = max(1, int(tracking_cfg.trajectory_width))
+    for track in tracks:
+        if not video_tracking.is_track_visible(track, current_frame_index, tracking_cfg):
+            continue
+        color = track_color(track.track_id) if tracking_cfg.trajectory_per_track_color else base_color
+        # Live position: velocity-extrapolated through detection gaps so the ball keeps moving smoothly.
+        live_x, live_y = video_tracking.live_center(track, current_frame_index, tracking_cfg)
+        # Historical points (age-filtered, already linearly bridged) plus the live head.
+        xy = video_tracking.trail_points(track, current_frame_index, tracking_cfg)
+        if not xy or xy[-1] != (live_x, live_y):
+            xy = xy + [(live_x, live_y)]
+        if tracking_cfg.draw_trajectory and len(xy) >= 2:
+            if tracking_cfg.trajectory_taper:
+                count = len(xy)
+                for index in range(1, count):
+                    segment_width = max(1, int(round(width * (index + 1) / count)))
+                    draw.line([xy[index - 1], xy[index]], fill=color, width=segment_width)
+            else:
+                draw.line(xy, fill=color, width=width)
+        if tracking_cfg.draw_search_circle:
+            radius = video_tracking.effective_radius(track, tracking_cfg)
+            draw.ellipse([live_x - radius, live_y - radius, live_x + radius, live_y + radius], outline=color, width=1)
+        if tracking_cfg.draw_current_center:
+            dot = max(2, width + 1)
+            draw.ellipse([live_x - dot, live_y - dot, live_x + dot, live_y + dot], fill=color)
+
+
 def draw_predictions(
     image: Image.Image,
     predictions: Sequence[Mapping[str, Any]],
     categories: Sequence[Mapping[str, Any]],
     render_ids: Sequence[int],
+    tracks: Optional[Sequence[Any]] = None,
+    tracking_cfg: Optional[Any] = None,
+    current_frame_index: Optional[int] = None,
 ) -> Image.Image:
     canvas = image.convert("RGB")
     draw = ImageDraw.Draw(canvas)
@@ -546,6 +605,9 @@ def draw_predictions(
         font = ImageFont.truetype("arial.ttf", 14)
     except Exception:
         font = ImageFont.load_default()
+    tracking_active = bool(tracks) and tracking_cfg is not None and getattr(tracking_cfg, "enabled", False)
+    if tracking_active:
+        draw_track_overlays(draw, tracks, tracking_cfg, sorted(tracking_cfg.target_class_ids), current_frame_index)
     for prediction in predictions:
         category_id = int(prediction.get("category_id", 0))
         if render_set and category_id not in render_set:
@@ -554,6 +616,13 @@ def draw_predictions(
         color = class_color(category_id)
         draw.rectangle([x, y, x + width, y + height], outline=color, width=2)
         label = f"{id_to_name.get(category_id, category_id)} {float(prediction.get('score', 0.0)):.2f}"
+        if (
+            tracking_active
+            and tracking_cfg.label_track_id
+            and prediction.get("track_id") is not None
+            and prediction.get("track_confirmed")
+        ):
+            label = f"{id_to_name.get(category_id, category_id)} #{int(prediction['track_id'])} {float(prediction.get('score', 0.0)):.2f}"
         text_bbox = draw.textbbox((x + 2, y + 2), label, font=font)
         draw.rectangle(text_bbox, fill=color)
         luminance = 0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2]
@@ -681,6 +750,27 @@ def predict_image_files_batch(
     return all_rows, outputs, start_image_id + len(items)
 
 
+def build_video_row(
+    prediction: Mapping[str, Any],
+    source: str,
+    absolute_frame_index: int,
+    segment_frame_index: int,
+    input_fps: float,
+    frame_window: Any,
+) -> Dict[str, Any]:
+    """Attach source, frame index, and timestamp metadata to a video prediction row."""
+    row = dict(prediction)
+    row["source"] = source
+    row["frame_index"] = absolute_frame_index
+    row["segment_frame_index"] = segment_frame_index
+    row["timestamp_seconds"] = absolute_frame_index / input_fps
+    row["segment_timestamp_seconds"] = segment_frame_index / input_fps
+    row["video_start_seconds"] = frame_window.start_seconds
+    row["video_end_seconds"] = frame_window.end_seconds
+    row["video_effective_end_seconds"] = frame_window.effective_end_seconds
+    return row
+
+
 def predict_video_file_one_pass(
     item: SourceItem,
     start_image_id: int,
@@ -690,6 +780,7 @@ def predict_video_file_one_pass(
     output_dir: Path,
     render_ids: Sequence[int],
     video_cfg: Mapping[str, Any],
+    tracking_config: Optional[Any] = None,
 ) -> Tuple[List[Dict[str, Any]], Path, int]:
     import cv2
 
@@ -722,6 +813,11 @@ def predict_video_file_one_pass(
     frame_cache_dir = output_dir / "_frame_cache"
     frame_cache_dir.mkdir(parents=True, exist_ok=True)
     render_skipped = bool(video_cfg.get("render_skipped_frames", True))
+    tracker = (
+        video_tracking.FootballTracker(tracking_config)
+        if tracking_config is not None and tracking_config.enabled
+        else None
+    )
     iterator = tqdm(total=frame_limit, desc=f"Inference video {item.local_path.name}", unit="frame")
     segment_frame_index = 0
     absolute_frame_index = frame_window.start_frame
@@ -747,22 +843,30 @@ def predict_video_file_one_pass(
                     height=height,
                 )
                 frame_predictions, _, _ = evaluator.predict_image(record, model, prediction_config, output_dir, save_visual=False)
+                if tracker is not None:
+                    frame_predictions = tracker.update(absolute_frame_index, frame_predictions)
                 for prediction in frame_predictions:
-                    row = dict(prediction)
-                    row["source"] = item.source
-                    row["frame_index"] = absolute_frame_index
-                    row["segment_frame_index"] = segment_frame_index
-                    row["timestamp_seconds"] = absolute_frame_index / input_fps
-                    row["segment_timestamp_seconds"] = segment_frame_index / input_fps
-                    row["video_start_seconds"] = frame_window.start_seconds
-                    row["video_end_seconds"] = frame_window.end_seconds
-                    row["video_effective_end_seconds"] = frame_window.effective_end_seconds
-                    all_predictions.append(row)
+                    all_predictions.append(
+                        build_video_row(prediction, item.source, absolute_frame_index, segment_frame_index, input_fps, frame_window)
+                    )
                 last_predictions = frame_predictions
                 image_id += 1
             if should_detect or render_skipped:
                 pil_frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                frame = cv2.cvtColor(np_image(draw_predictions(pil_frame, frame_predictions, categories, render_ids)), cv2.COLOR_RGB2BGR)
+                frame = cv2.cvtColor(
+                    np_image(
+                        draw_predictions(
+                            pil_frame,
+                            frame_predictions,
+                            categories,
+                            render_ids,
+                            tracker.tracks if tracker is not None else None,
+                            tracking_config,
+                            absolute_frame_index,
+                        )
+                    ),
+                    cv2.COLOR_RGB2BGR,
+                )
             writer.write(frame)
             segment_frame_index += 1
             absolute_frame_index += 1
@@ -785,6 +889,7 @@ def predict_video_file_batched(
     render_ids: Sequence[int],
     video_cfg: Mapping[str, Any],
     batch_size: int,
+    tracking_config: Optional[Any] = None,
 ) -> Tuple[List[Dict[str, Any]], Path, int]:
     """Batch RF-DETR detection frames, then render the selected video range."""
     import cv2
@@ -823,20 +928,7 @@ def predict_video_file_batched(
             return
         predictions_by_frame, _, _ = evaluator.predict_images_rfdetr(pending_records, model, batch_config, output_dir)
         for record, meta, frame_predictions in zip(pending_records, pending_meta, predictions_by_frame):
-            segment_frame_index = int(meta["segment_frame_index"])
-            absolute_frame_index = int(meta["absolute_frame_index"])
-            predictions_by_segment[segment_frame_index] = frame_predictions
-            for prediction in frame_predictions:
-                row = dict(prediction)
-                row["source"] = item.source
-                row["frame_index"] = absolute_frame_index
-                row["segment_frame_index"] = segment_frame_index
-                row["timestamp_seconds"] = absolute_frame_index / input_fps
-                row["segment_timestamp_seconds"] = segment_frame_index / input_fps
-                row["video_start_seconds"] = frame_window.start_seconds
-                row["video_end_seconds"] = frame_window.end_seconds
-                row["video_effective_end_seconds"] = frame_window.effective_end_seconds
-                all_predictions.append(row)
+            predictions_by_segment[int(meta["segment_frame_index"])] = frame_predictions
             Path(record.path).unlink(missing_ok=True)
         pending_records = []
         pending_meta = []
@@ -894,6 +986,11 @@ def predict_video_file_batched(
         raise RuntimeError(f"Could not create video writer: {target}")
 
     render_skipped = bool(video_cfg.get("render_skipped_frames", True))
+    tracker = (
+        video_tracking.FootballTracker(tracking_config)
+        if tracking_config is not None and tracking_config.enabled
+        else None
+    )
     last_predictions: List[Dict[str, Any]] = []
     segment_frame_index = 0
     render_iterator = tqdm(total=frame_limit, desc=f"Render video {item.local_path.name}", unit="frame")
@@ -904,14 +1001,34 @@ def predict_video_file_batched(
             ok, frame = render_capture.read()
             if not ok:
                 break
+            absolute_frame_index = frame_window.start_frame + segment_frame_index
             should_detect = segment_frame_index % frame_interval == 0
             frame_predictions = last_predictions
             if should_detect:
                 frame_predictions = predictions_by_segment.get(segment_frame_index, [])
+                if tracker is not None:
+                    frame_predictions = tracker.update(absolute_frame_index, frame_predictions)
+                for prediction in frame_predictions:
+                    all_predictions.append(
+                        build_video_row(prediction, item.source, absolute_frame_index, segment_frame_index, input_fps, frame_window)
+                    )
                 last_predictions = frame_predictions
             if should_detect or render_skipped:
                 pil_frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                frame = cv2.cvtColor(np_image(draw_predictions(pil_frame, frame_predictions, categories, render_ids)), cv2.COLOR_RGB2BGR)
+                frame = cv2.cvtColor(
+                    np_image(
+                        draw_predictions(
+                            pil_frame,
+                            frame_predictions,
+                            categories,
+                            render_ids,
+                            tracker.tracks if tracker is not None else None,
+                            tracking_config,
+                            absolute_frame_index,
+                        )
+                    ),
+                    cv2.COLOR_RGB2BGR,
+                )
             writer.write(frame)
             segment_frame_index += 1
             render_iterator.update(1)
@@ -932,11 +1049,14 @@ def predict_video_file(
     output_dir: Path,
     render_ids: Sequence[int],
     video_cfg: Mapping[str, Any],
+    tracking_config: Optional[Any] = None,
 ) -> Tuple[List[Dict[str, Any]], Path, int]:
     """Predict one video with batched detection frames when configured."""
     configured_batch = positive_batch_size(video_cfg.get("batch_size"), "inference.video.batch_size", 1)
     if configured_batch <= 1:
-        return predict_video_file_one_pass(item, start_image_id, model, prediction_config, categories, output_dir, render_ids, video_cfg)
+        return predict_video_file_one_pass(
+            item, start_image_id, model, prediction_config, categories, output_dir, render_ids, video_cfg, tracking_config
+        )
     try:
         return predict_video_file_batched(
             item,
@@ -948,11 +1068,14 @@ def predict_video_file(
             render_ids,
             video_cfg,
             configured_batch,
+            tracking_config,
         )
     except RuntimeError as exc:
         if "batched" in str(exc).lower() or "reopen video" in str(exc).lower() or "seek video" in str(exc).lower():
             print(Fore.BLUE + Style.BRIGHT + f"Warning: batched video inference fell back to one-pass mode. {exc}")
-            return predict_video_file_one_pass(item, start_image_id, model, prediction_config, categories, output_dir, render_ids, video_cfg)
+            return predict_video_file_one_pass(
+                item, start_image_id, model, prediction_config, categories, output_dir, render_ids, video_cfg, tracking_config
+            )
         raise
 
 
@@ -985,6 +1108,10 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
     parser.add_argument("--max-seconds", type=trainer.parse_scalar, help="Maximum seconds per video to infer. Use all/null for the whole video.")
     parser.add_argument("--video-start-time", help="Video segment start time. Options: seconds, MM:SS, or HH:MM:SS.")
     parser.add_argument("--video-end-time", help="Video segment end time. Options: all/null, seconds, MM:SS, or HH:MM:SS.")
+    parser.add_argument("--track", action="store_true", help="Enable football tracking for video inference.")
+    parser.add_argument("--no-track", dest="no_track", action="store_true", help="Disable football tracking (overrides config and --track).")
+    parser.add_argument("--track-radius", dest="track_radius", type=float, help="Override inference.tracking.radius_pixels (search radius in pixels).")
+    parser.add_argument("--track-velocity", dest="track_velocity", action="store_true", help="Enable the velocity-predicted gate for tracking.")
     parser.add_argument("--dry-run", action="store_true", help="Validate and estimate outputs without inference.")
     parser.add_argument("--yes", action="store_true", help="Skip confirmation.")
     args = parser.parse_args()
@@ -1025,6 +1152,7 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
     prediction_config = build_prediction_config(config, categories)
     model = load_rfdetr_model(config)
     render_ids = resolve_render_ids(config, categories)
+    tracking_config = video_tracking.parse_tracking_config(config, categories)
     all_predictions: List[Dict[str, Any]] = []
     outputs: List[Dict[str, Any]] = []
     image_id = 1
@@ -1059,7 +1187,7 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
                 flush_pending_images()
         elif item.kind == "video":
             flush_pending_images()
-            predictions, path, image_id = predict_video_file(item, image_id, model, prediction_config, categories, output_dir, render_ids, video_cfg)
+            predictions, path, image_id = predict_video_file(item, image_id, model, prediction_config, categories, output_dir, render_ids, video_cfg, tracking_config)
             all_predictions.extend(predictions)
             outputs.append({"source": item.source, "kind": "video", "output": str(path), "predictions": len(predictions)})
     flush_pending_images()
@@ -1072,6 +1200,8 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
     if bool(config.get("inference", {}).get("save_predictions_jsonl", True)):
         write_predictions_jsonl(output_dir / "predictions.jsonl", all_predictions)
     trainer.write_json(output_dir / "inference_summary.json", {"outputs": outputs, "prediction_count": len(all_predictions)})
+    if tracking_config.enabled:
+        trainer.write_json(output_dir / "tracking_summary.json", video_tracking.build_tracking_summary(all_predictions))
     trainer.dump_config_snapshot(
         output_dir=output_dir,
         merged_config=config,
