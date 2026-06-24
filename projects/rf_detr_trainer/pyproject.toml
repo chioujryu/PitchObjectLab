@@ -5,6 +5,7 @@ description = "Config-first RF-DETR trainer with Ultralytics-style outputs, sche
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "boxmot==13.0.0",
     "colorama>=0.4.6",
     "pyyaml>=6.0.0",
     "rfdetr[loggers,train]>=1.6.5",

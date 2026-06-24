@@ -256,6 +256,89 @@ Output folder fields can be pure strings or placeholder templates. Supported pla
 The same placeholders also work in `periodic_test.output_dir_name`,
 `periodic_test.final_output_dir_name`, and `demo.output_dir`.
 
+## Inference
+
+`inference_rf_detr_model.py` runs RF-DETR over image files, video files, folders,
+mixed image/video folders, and HTTP(S) media URLs. Edit `config/rf_detr_inference.yaml`
+and run:
+
+```bash
+uv run python inference_rf_detr_model.py --config config/rf_detr_inference.yaml --dry-run --yes
+uv run python inference_rf_detr_model.py --config config/rf_detr_inference.yaml --source D:/clips/match.mp4 --yes
+```
+
+Each run writes rendered media, `predictions.jsonl`, `class_colors.json`, an
+`inference_summary.json`, and a config snapshot into the output folder.
+
+### Video tracking
+
+Video inference can attach a multi-object tracker that adds stable `track_id`s, draws
+trajectory trails, and writes a `tracking_summary.json`. The tracker is selected by
+`inference.tracking.algorithm`:
+
+```yaml
+inference:
+  tracking:
+    enabled: true
+    algorithm: circle     # default; or ocsort / deepocsort / botsort / bytetrack (via boxmot)
+    target_class_names: [football]   # which class(es) to track (default football)
+```
+
+- `circle` (**default**) — the built-in, dependency-free centroid/search-circle ball tracker
+  (`rf_detr_video_tracking.py`). Best for a single fast tiny ball where bounding boxes
+  barely overlap between frames.
+- `ocsort`, `deepocsort`, `botsort`, `bytetrack` — provided by
+  [`boxmot`](https://github.com/mikel-brostrom/boxmot). OC-SORT and ByteTrack are
+  motion-only and need no extra weights; Deep OC-SORT and BoT-SORT add appearance ReID.
+
+Each boxmot tracker's parameters live in its **own nested block** under `inference.tracking`
+(`ocsort:`, `deepocsort:`, `botsort:`, `bytetrack:`); the shared ReID/camera-motion keys
+(`reid_weights`, `reid_device`, `reid_half`, `cmc_method`, `per_class`) and the `circle` /
+rendering keys sit at the `tracking` top level:
+
+```yaml
+inference:
+  tracking:
+    algorithm: ocsort
+    ocsort:
+      det_thresh: 0.2
+      max_age: 30
+      asso_threshold: 0.3
+    bytetrack:
+      track_thresh: 0.45
+```
+
+The tracked class is configurable for every algorithm via
+`inference.tracking.target_class_ids` / `target_class_names`; with both empty it defaults
+to `football`. The `predictions.jsonl` track fields and `tracking_summary.json` are the
+same regardless of algorithm, so downstream tooling does not change when you switch.
+
+The boxmot trackers require the dependency (already pinned in `pyproject.toml`):
+
+```bash
+uv add 'boxmot==13.0.0'
+```
+
+ReID notes for `deepocsort` / `botsort`: appearance weights (default
+`osnet_x0_25_msmt17.pt`) auto-download from Google Drive on first use, which is
+unreliable in China/HK/MO/TW. Set a local file to skip the download, disable appearance,
+or use a motion-only tracker:
+
+```yaml
+inference:
+  tracking:
+    reid_weights: D:/weights/osnet_x0_25_msmt17.pt   # local file => no download
+    # or: algorithm: ocsort        # motion-only, no ReID
+    botsort:
+      with_reid: false             # BoT-SORT without appearance (no download)
+```
+
+The ReID device follows `model.device` (override with `inference.tracking.reid_device`);
+FP16 ReID (`reid_half`) is GPU-only and is forced off on CPU/MPS. CLI overrides:
+`--tracker {circle,ocsort,deepocsort,botsort,bytetrack}` and `--reid-weights PATH`, plus
+the existing `--track` / `--no-track`. Every `inference.tracking.*` key is documented inline
+in `config/rf_detr_inference.yaml`.
+
 ## Dataset Layout
 
 RF-DETR `dataset_file: roboflow` auto-detects Roboflow COCO and YOLO layouts.

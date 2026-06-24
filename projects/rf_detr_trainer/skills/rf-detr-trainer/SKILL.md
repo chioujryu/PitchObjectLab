@@ -49,6 +49,10 @@ Use this skill when editing `projects/rf_detr_trainer` or related object-detecti
 - Use `inference.video.start_time`/`end_time` for video segment inference and `inference.video.max_seconds` to cap selected duration. Time values accept seconds, `MM:SS`, and `HH:MM:SS`; `all`/`null` end/max means no cap.
 - Inference should save rendered media, prediction records, class color metadata, and config snapshots inside the output folder.
 - Class colors must be stable within a run: the same class ID uses the same bounding-box color across every image and every video frame.
+- Video tracking is selected by `inference.tracking.algorithm`: `circle` (built-in stdlib tracker in `rf_detr_video_tracking.py`, the default) or `ocsort`/`deepocsort`/`botsort`/`bytetrack` from `boxmot` (pinned `boxmot==13.0.0`). The adapter lives in `rf_detr_boxmot_tracker.py` and imports boxmot lazily; `algorithm: circle` must stay byte-compatible.
+- Each boxmot tracker's params live in its own nested sub-block (`inference.tracking.ocsort`/`deepocsort`/`botsort`/`bytetrack`); shared ReID/CMC and circle/rendering keys stay at the `tracking` top level. The parser maps the nested blocks onto flat `TrackingConfig` fields, so the adapter is unaffected.
+- The tracked class is configurable for all algorithms via `inference.tracking.target_class_ids`/`target_class_names` (default football). `predictions.jsonl` track fields and `tracking_summary.json` are identical across algorithms.
+- For `deepocsort`/`botsort`, prefer a local `inference.tracking.reid_weights` path; the default ReID weights auto-download from Google Drive (unreliable in CN/HK/MO/TW, rule 8). `ocsort`/`bytetrack` need no weights, and `botsort.with_reid: false` disables BoT-SORT appearance. ReID device follows `model.device`; `reid_half` is GPU-only.
 
 ## Dataset Limits
 

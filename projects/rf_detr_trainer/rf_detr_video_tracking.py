@@ -96,6 +96,45 @@ def _as_int(value: Any, default: int, field_name: str) -> int:
         raise ValueError(f"inference.tracking.{field_name} must be an integer, got {value!r}") from exc
 
 
+def _as_str(value: Any, default: str, field_name: str) -> str:
+    """Parse a non-empty string with a fallback default (used for enum-like keys)."""
+    if value is None:
+        return default
+    text = str(value).strip()
+    return text or default
+
+
+def _as_optional_str(value: Any) -> Optional[str]:
+    """Return a stripped string, or None for null/none/empty sentinels."""
+    if _is_null_token(value):
+        return None
+    return str(value).strip()
+
+
+def _as_unit_float(value: Any, default: float, field_name: str) -> float:
+    """Parse a float constrained to the inclusive 0.0-1.0 range."""
+    parsed = _as_float(value, default, field_name)
+    if not 0.0 <= parsed <= 1.0:
+        raise ValueError(f"inference.tracking.{field_name} must be between 0 and 1, got {parsed!r}")
+    return parsed
+
+
+def _as_positive_int(value: Any, default: int, field_name: str) -> int:
+    """Parse a strictly positive integer."""
+    parsed = _as_int(value, default, field_name)
+    if parsed <= 0:
+        raise ValueError(f"inference.tracking.{field_name} must be a positive integer, got {parsed!r}")
+    return parsed
+
+
+# Tracking algorithms: "circle" is the built-in stdlib tracker in this module; the rest are
+# provided by the boxmot adapter (rf_detr_boxmot_tracker.BoxmotTracker).
+ALLOWED_ALGORITHMS: Tuple[str, ...] = ("circle", "ocsort", "deepocsort", "botsort", "bytetrack")
+# boxmot trackers that consume an appearance ReID model (need reid_weights / device).
+APPEARANCE_ALGORITHMS: Tuple[str, ...] = ("deepocsort", "botsort")
+_ALLOWED_CMC_METHODS = {"ecc", "orb", "sof", "sparseoptflow", "file", "files"}
+
+
 @dataclass
 class TrackingConfig:
     """Parsed and validated `inference.tracking` settings."""
@@ -119,6 +158,50 @@ class TrackingConfig:
     draw_current_center: bool = True
     draw_search_circle: bool = False
     label_track_id: bool = True
+    # Algorithm selector: "circle" (this module) or boxmot-backed trackers.
+    algorithm: str = "circle"
+    # Shared boxmot ReID / camera-motion settings (only used by boxmot algorithms).
+    reid_weights: Optional[str] = None
+    reid_device: Optional[str] = None
+    reid_half: bool = False
+    cmc_method: Optional[str] = "ecc"
+    per_class: bool = False
+    # OC-SORT parameters.
+    ocsort_det_thresh: float = 0.2
+    ocsort_max_age: int = 30
+    ocsort_min_hits: int = 3
+    ocsort_asso_threshold: float = 0.3
+    ocsort_delta_t: int = 3
+    ocsort_asso_func: str = "iou"
+    ocsort_inertia: float = 0.2
+    ocsort_use_byte: bool = False
+    # Deep OC-SORT parameters.
+    deepocsort_det_thresh: float = 0.3
+    deepocsort_max_age: int = 30
+    deepocsort_min_hits: int = 3
+    deepocsort_iou_threshold: float = 0.3
+    deepocsort_delta_t: int = 3
+    deepocsort_asso_func: str = "iou"
+    deepocsort_inertia: float = 0.2
+    deepocsort_w_association_emb: float = 0.5
+    deepocsort_alpha_fixed_emb: float = 0.95
+    deepocsort_embedding_off: bool = False
+    deepocsort_cmc_off: bool = False
+    # BoT-SORT parameters.
+    botsort_track_high_thresh: float = 0.5
+    botsort_track_low_thresh: float = 0.1
+    botsort_new_track_thresh: float = 0.6
+    botsort_track_buffer: int = 30
+    botsort_match_thresh: float = 0.8
+    botsort_proximity_thresh: float = 0.5
+    botsort_appearance_thresh: float = 0.25
+    botsort_with_reid: bool = True
+    botsort_fuse_first_associate: bool = False
+    # ByteTrack parameters.
+    bytetrack_track_thresh: float = 0.45
+    bytetrack_match_thresh: float = 0.8
+    bytetrack_track_buffer: int = 25
+    bytetrack_frame_rate: int = 30
 
 
 @dataclass
@@ -246,6 +329,22 @@ def parse_tracking_config(
     if trajectory_max_age_frames is not None and trajectory_max_age_frames <= 0:
         raise ValueError("inference.tracking.trajectory_max_age_frames must be all/null or a positive integer")
 
+    algorithm = _as_str(raw.get("algorithm"), "circle", "algorithm").casefold()
+    if algorithm not in ALLOWED_ALGORITHMS:
+        raise ValueError(
+            f"inference.tracking.algorithm must be one of {list(ALLOWED_ALGORITHMS)}, got {algorithm!r}"
+        )
+    cmc_method = _as_optional_str(raw.get("cmc_method", "ecc"))
+    if cmc_method is not None and cmc_method.casefold() not in _ALLOWED_CMC_METHODS:
+        raise ValueError(
+            f"inference.tracking.cmc_method must be null or one of {sorted(_ALLOWED_CMC_METHODS)}, got {cmc_method!r}"
+        )
+    # Per-algorithm boxmot params live in nested sub-blocks; map them to flat dataclass fields.
+    ocsort = dict(raw.get("ocsort", {}) or {})
+    deepocsort = dict(raw.get("deepocsort", {}) or {})
+    botsort = dict(raw.get("botsort", {}) or {})
+    bytetrack = dict(raw.get("bytetrack", {}) or {})
+
     return TrackingConfig(
         enabled=_as_bool(raw.get("enabled"), False),
         target_class_ids=target_ids,
@@ -266,6 +365,48 @@ def parse_tracking_config(
         draw_current_center=_as_bool(raw.get("draw_current_center"), True),
         draw_search_circle=_as_bool(raw.get("draw_search_circle"), False),
         label_track_id=_as_bool(raw.get("label_track_id"), True),
+        algorithm=algorithm,
+        reid_weights=_as_optional_str(raw.get("reid_weights")),
+        reid_device=_as_optional_str(raw.get("reid_device")),
+        reid_half=_as_bool(raw.get("reid_half"), False),
+        cmc_method=cmc_method,
+        per_class=_as_bool(raw.get("per_class"), False),
+        ocsort_det_thresh=_as_unit_float(ocsort.get("det_thresh"), 0.2, "ocsort.det_thresh"),
+        ocsort_max_age=_as_positive_int(ocsort.get("max_age"), 30, "ocsort.max_age"),
+        ocsort_min_hits=_as_positive_int(ocsort.get("min_hits"), 3, "ocsort.min_hits"),
+        ocsort_asso_threshold=_as_unit_float(ocsort.get("asso_threshold"), 0.3, "ocsort.asso_threshold"),
+        ocsort_delta_t=_as_positive_int(ocsort.get("delta_t"), 3, "ocsort.delta_t"),
+        ocsort_asso_func=_as_str(ocsort.get("asso_func"), "iou", "ocsort.asso_func"),
+        ocsort_inertia=_as_unit_float(ocsort.get("inertia"), 0.2, "ocsort.inertia"),
+        ocsort_use_byte=_as_bool(ocsort.get("use_byte"), False),
+        deepocsort_det_thresh=_as_unit_float(deepocsort.get("det_thresh"), 0.3, "deepocsort.det_thresh"),
+        deepocsort_max_age=_as_positive_int(deepocsort.get("max_age"), 30, "deepocsort.max_age"),
+        deepocsort_min_hits=_as_positive_int(deepocsort.get("min_hits"), 3, "deepocsort.min_hits"),
+        deepocsort_iou_threshold=_as_unit_float(deepocsort.get("iou_threshold"), 0.3, "deepocsort.iou_threshold"),
+        deepocsort_delta_t=_as_positive_int(deepocsort.get("delta_t"), 3, "deepocsort.delta_t"),
+        deepocsort_asso_func=_as_str(deepocsort.get("asso_func"), "iou", "deepocsort.asso_func"),
+        deepocsort_inertia=_as_unit_float(deepocsort.get("inertia"), 0.2, "deepocsort.inertia"),
+        deepocsort_w_association_emb=_as_unit_float(
+            deepocsort.get("w_association_emb"), 0.5, "deepocsort.w_association_emb"
+        ),
+        deepocsort_alpha_fixed_emb=_as_unit_float(
+            deepocsort.get("alpha_fixed_emb"), 0.95, "deepocsort.alpha_fixed_emb"
+        ),
+        deepocsort_embedding_off=_as_bool(deepocsort.get("embedding_off"), False),
+        deepocsort_cmc_off=_as_bool(deepocsort.get("cmc_off"), False),
+        botsort_track_high_thresh=_as_unit_float(botsort.get("track_high_thresh"), 0.5, "botsort.track_high_thresh"),
+        botsort_track_low_thresh=_as_unit_float(botsort.get("track_low_thresh"), 0.1, "botsort.track_low_thresh"),
+        botsort_new_track_thresh=_as_unit_float(botsort.get("new_track_thresh"), 0.6, "botsort.new_track_thresh"),
+        botsort_track_buffer=_as_positive_int(botsort.get("track_buffer"), 30, "botsort.track_buffer"),
+        botsort_match_thresh=_as_unit_float(botsort.get("match_thresh"), 0.8, "botsort.match_thresh"),
+        botsort_proximity_thresh=_as_unit_float(botsort.get("proximity_thresh"), 0.5, "botsort.proximity_thresh"),
+        botsort_appearance_thresh=_as_unit_float(botsort.get("appearance_thresh"), 0.25, "botsort.appearance_thresh"),
+        botsort_with_reid=_as_bool(botsort.get("with_reid"), True),
+        botsort_fuse_first_associate=_as_bool(botsort.get("fuse_first_associate"), False),
+        bytetrack_track_thresh=_as_unit_float(bytetrack.get("track_thresh"), 0.45, "bytetrack.track_thresh"),
+        bytetrack_match_thresh=_as_unit_float(bytetrack.get("match_thresh"), 0.8, "bytetrack.match_thresh"),
+        bytetrack_track_buffer=_as_positive_int(bytetrack.get("track_buffer"), 25, "bytetrack.track_buffer"),
+        bytetrack_frame_rate=_as_positive_int(bytetrack.get("frame_rate"), 30, "bytetrack.frame_rate"),
     )
 
 
@@ -320,8 +461,14 @@ class FootballTracker:
         track.last_seen_frame_index = frame_index
         track.points.append((frame_index, center_x, center_y))
 
-    def update(self, frame_index: int, predictions: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
-        """Associate this frame's detections, returning rows (input order) with tracking fields."""
+    def update(
+        self, frame_index: int, predictions: Sequence[Mapping[str, Any]], frame: Any = None
+    ) -> List[Dict[str, Any]]:
+        """Associate this frame's detections, returning rows (input order) with tracking fields.
+
+        `frame` is accepted for interface parity with the boxmot adapter and ignored here
+        (the circle tracker is motion/position only).
+        """
         cfg = self.cfg
         # Score-desc order breaks distance ties and orders new-track creation.
         ordered_targets = sorted(

@@ -176,6 +176,82 @@ class TrackingConfigTest(unittest.TestCase):
             vt.parse_tracking_config({"inference": {"tracking": {"min_hits": 0}}}, CATEGORIES)
 
 
+class BoxmotConfigTest(unittest.TestCase):
+    def test_default_algorithm_is_circle(self):
+        cfg = vt.parse_tracking_config({"inference": {"tracking": {"enabled": True}}}, CATEGORIES)
+        self.assertEqual(cfg.algorithm, "circle")
+
+    def test_algorithm_is_casefolded(self):
+        cfg = vt.parse_tracking_config({"inference": {"tracking": {"algorithm": "DeepOcSort"}}}, CATEGORIES)
+        self.assertEqual(cfg.algorithm, "deepocsort")
+
+    def test_unknown_algorithm_raises(self):
+        with self.assertRaises(ValueError) as ctx:
+            vt.parse_tracking_config({"inference": {"tracking": {"algorithm": "magic"}}}, CATEGORIES)
+        self.assertIn("algorithm", str(ctx.exception))
+
+    def test_circle_algorithm_allowed(self):
+        cfg = vt.parse_tracking_config({"inference": {"tracking": {"algorithm": "circle"}}}, CATEGORIES)
+        self.assertEqual(cfg.algorithm, "circle")
+
+    def test_nested_boxmot_blocks_map_to_flat_fields(self):
+        raw = {
+            "inference": {
+                "tracking": {
+                    "algorithm": "ocsort",
+                    "per_class": True,
+                    "reid_weights": "weights/osnet_x0_25_msmt17.pt",
+                    "ocsort": {"max_age": 50, "asso_threshold": 0.4, "use_byte": True},
+                    "bytetrack": {"track_buffer": 40},
+                    "botsort": {"with_reid": False},
+                    "deepocsort": {"iou_threshold": 0.2},
+                }
+            }
+        }
+        cfg = vt.parse_tracking_config(raw, CATEGORIES)
+        self.assertEqual(cfg.ocsort_max_age, 50)
+        self.assertAlmostEqual(cfg.ocsort_asso_threshold, 0.4)
+        self.assertIs(cfg.ocsort_use_byte, True)
+        self.assertEqual(cfg.bytetrack_track_buffer, 40)
+        self.assertIs(cfg.botsort_with_reid, False)
+        self.assertAlmostEqual(cfg.deepocsort_iou_threshold, 0.2)
+        self.assertIs(cfg.per_class, True)
+        self.assertEqual(cfg.reid_weights, "weights/osnet_x0_25_msmt17.pt")
+
+    def test_missing_boxmot_blocks_use_defaults(self):
+        cfg = vt.parse_tracking_config({"inference": {"tracking": {"algorithm": "ocsort"}}}, CATEGORIES)
+        self.assertAlmostEqual(cfg.ocsort_det_thresh, 0.2)
+        self.assertEqual(cfg.ocsort_max_age, 30)
+        self.assertAlmostEqual(cfg.bytetrack_track_thresh, 0.45)
+
+    def test_reid_weights_null_is_none(self):
+        cfg = vt.parse_tracking_config({"inference": {"tracking": {"reid_weights": "null"}}}, CATEGORIES)
+        self.assertIsNone(cfg.reid_weights)
+
+    def test_unit_float_out_of_range_raises(self):
+        with self.assertRaises(ValueError) as ctx:
+            vt.parse_tracking_config({"inference": {"tracking": {"bytetrack": {"track_thresh": 1.5}}}}, CATEGORIES)
+        self.assertIn("bytetrack.track_thresh", str(ctx.exception))
+
+    def test_positive_int_rejects_zero(self):
+        with self.assertRaises(ValueError) as ctx:
+            vt.parse_tracking_config({"inference": {"tracking": {"botsort": {"track_buffer": 0}}}}, CATEGORIES)
+        self.assertIn("botsort.track_buffer", str(ctx.exception))
+
+    def test_cmc_method_null_disables(self):
+        cfg = vt.parse_tracking_config({"inference": {"tracking": {"cmc_method": "null"}}}, CATEGORIES)
+        self.assertIsNone(cfg.cmc_method)
+
+    def test_invalid_cmc_method_raises(self):
+        with self.assertRaises(ValueError):
+            vt.parse_tracking_config({"inference": {"tracking": {"cmc_method": "magic"}}}, CATEGORIES)
+
+    def test_target_class_override_still_works(self):
+        raw = {"inference": {"tracking": {"algorithm": "ocsort", "target_class_names": ["goal"]}}}
+        cfg = vt.parse_tracking_config(raw, CATEGORIES)
+        self.assertEqual(cfg.target_class_ids, {2})
+
+
 class TrackingSummaryTest(unittest.TestCase):
     def test_build_tracking_summary_groups_by_track(self):
         rows = [
@@ -302,7 +378,7 @@ class SyntheticVideoTrackingTest(unittest.TestCase):
             "render_skipped_frames": True,
         }
         tracking_config = inference_runner.video_tracking.parse_tracking_config(
-            {"inference": {"tracking": {"enabled": True, "radius_pixels": 80}}}, CATEGORIES
+            {"inference": {"tracking": {"enabled": True, "algorithm": "circle", "radius_pixels": 80}}}, CATEGORIES
         )
         with mock.patch.object(inference_runner.evaluator, "predict_image", _fake_predict_image), mock.patch.object(
             inference_runner.evaluator, "predict_images_rfdetr", _fake_predict_images_rfdetr

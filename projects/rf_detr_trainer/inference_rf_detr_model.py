@@ -126,16 +126,21 @@ def apply_cli_overrides(config: MutableMapping[str, Any], args: argparse.Namespa
     if args.video_end_time is not None:
         inference.setdefault("video", {})["end_time"] = args.video_end_time
     if getattr(args, "no_track", False) or getattr(args, "track", False) \
-            or getattr(args, "track_radius", None) is not None or getattr(args, "track_velocity", False):
+            or getattr(args, "track_radius", None) is not None or getattr(args, "track_velocity", False) \
+            or getattr(args, "tracker", None) is not None or getattr(args, "reid_weights", None) is not None:
         tracking = inference.setdefault("tracking", {})
         if getattr(args, "no_track", False):
             tracking["enabled"] = False
         elif getattr(args, "track", False):
             tracking["enabled"] = True
+        if getattr(args, "tracker", None) is not None:
+            tracking["algorithm"] = args.tracker
         if getattr(args, "track_radius", None) is not None:
             tracking["radius_pixels"] = args.track_radius
         if getattr(args, "track_velocity", False):
             tracking["use_velocity_prediction"] = True
+        if getattr(args, "reid_weights", None) is not None:
+            tracking["reid_weights"] = args.reid_weights
 
 
 def config_list(value: Any) -> List[Any]:
@@ -657,6 +662,85 @@ def load_rfdetr_model(config: Mapping[str, Any]) -> Any:
     return model_cls(**trainer.build_model_kwargs(config))
 
 
+def resolved_tracker_device(config: Mapping[str, Any], tracking_config: Any) -> str:
+    """Resolve a concrete boxmot/ReID device string from tracking.reid_device or model.device."""
+    raw = getattr(tracking_config, "reid_device", None) or config.get("model", {}).get("device")
+    normalized = trainer.normalize_model_constructor_device(raw)
+    if normalized:
+        return normalized
+    # auto/None: pick the best available device.
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return "cuda:0"
+        mps = getattr(torch.backends, "mps", None)
+        if mps is not None and mps.is_available():
+            return "mps"
+    except Exception:
+        pass
+    return "cpu"
+
+
+def warn_reid_in_restricted_region(tracking_config: Any) -> None:
+    """Best-effort warning before boxmot ReID auto-download in CN/HK/MO/TW (AGENTS rule 8).
+
+    Only triggers for appearance trackers (deepocsort, or botsort with ReID on) that have no
+    local reid_weights, since those are the cases that download from Google Drive via gdown.
+    """
+    algorithm = getattr(tracking_config, "algorithm", "circle")
+    needs_reid = algorithm == "deepocsort" or (
+        algorithm == "botsort" and getattr(tracking_config, "botsort_with_reid", True)
+    )
+    if not needs_reid or getattr(tracking_config, "reid_weights", None):
+        return
+    try:
+        import importlib.util
+
+        script_path = PROJECT_DIR / "scripts" / "setup_pytorch_uv.py"
+        spec = importlib.util.spec_from_file_location("rf_detr_setup_pytorch_uv", script_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        region, _provider = module.detect_region()
+        greater_china = getattr(module, "GREATER_CHINA_REGIONS", {"CN", "HK", "MO", "TW"})
+    except Exception:
+        return
+    if region in greater_china:
+        print(
+            Fore.YELLOW
+            + Style.BRIGHT
+            + f"Warning: tracking.algorithm={algorithm} downloads ReID weights from Google Drive (gdown), "
+            + f"which is unreliable in your region ({region}). Set inference.tracking.reid_weights to a local "
+            + "osnet_x0_25_msmt17.pt path, or use algorithm: ocsort (or botsort_with_reid: false) to avoid it."
+        )
+
+
+def create_tracker(
+    tracking_config: Optional[Any],
+    tracker_device: str = "cpu",
+    frame_size: Optional[Tuple[int, int]] = None,
+) -> Optional[Any]:
+    """Build the configured tracker, or None when tracking is disabled.
+
+    algorithm 'circle' -> built-in FootballTracker; 'ocsort'/'deepocsort'/'botsort'/'bytetrack'
+    -> the boxmot adapter. boxmot is imported lazily so it is only required when a boxmot
+    algorithm is actually selected.
+    """
+    if tracking_config is None or not tracking_config.enabled:
+        return None
+    if getattr(tracking_config, "algorithm", "circle") == "circle":
+        return video_tracking.FootballTracker(tracking_config)
+    import rf_detr_boxmot_tracker as boxmot_tracking
+
+    if getattr(tracking_config, "reid_half", False) and not boxmot_tracking.effective_reid_half(tracking_config, tracker_device):
+        print(
+            Fore.YELLOW
+            + Style.BRIGHT
+            + f"Warning: reid_half disabled on non-CUDA device ({tracker_device}); FP16 ReID is GPU-only."
+        )
+    return boxmot_tracking.BoxmotTracker(tracking_config, device=tracker_device, frame_size=frame_size)
+
+
 def download_url(item: SourceItem, cache_dir: Path) -> SourceItem:
     import requests
 
@@ -781,6 +865,7 @@ def predict_video_file_one_pass(
     render_ids: Sequence[int],
     video_cfg: Mapping[str, Any],
     tracking_config: Optional[Any] = None,
+    tracker_device: str = "cpu",
 ) -> Tuple[List[Dict[str, Any]], Path, int]:
     import cv2
 
@@ -813,11 +898,7 @@ def predict_video_file_one_pass(
     frame_cache_dir = output_dir / "_frame_cache"
     frame_cache_dir.mkdir(parents=True, exist_ok=True)
     render_skipped = bool(video_cfg.get("render_skipped_frames", True))
-    tracker = (
-        video_tracking.FootballTracker(tracking_config)
-        if tracking_config is not None and tracking_config.enabled
-        else None
-    )
+    tracker = create_tracker(tracking_config, tracker_device, (width, height))
     iterator = tqdm(total=frame_limit, desc=f"Inference video {item.local_path.name}", unit="frame")
     segment_frame_index = 0
     absolute_frame_index = frame_window.start_frame
@@ -844,7 +925,7 @@ def predict_video_file_one_pass(
                 )
                 frame_predictions, _, _ = evaluator.predict_image(record, model, prediction_config, output_dir, save_visual=False)
                 if tracker is not None:
-                    frame_predictions = tracker.update(absolute_frame_index, frame_predictions)
+                    frame_predictions = tracker.update(absolute_frame_index, frame_predictions, frame=frame)
                 for prediction in frame_predictions:
                     all_predictions.append(
                         build_video_row(prediction, item.source, absolute_frame_index, segment_frame_index, input_fps, frame_window)
@@ -890,6 +971,7 @@ def predict_video_file_batched(
     video_cfg: Mapping[str, Any],
     batch_size: int,
     tracking_config: Optional[Any] = None,
+    tracker_device: str = "cpu",
 ) -> Tuple[List[Dict[str, Any]], Path, int]:
     """Batch RF-DETR detection frames, then render the selected video range."""
     import cv2
@@ -986,11 +1068,7 @@ def predict_video_file_batched(
         raise RuntimeError(f"Could not create video writer: {target}")
 
     render_skipped = bool(video_cfg.get("render_skipped_frames", True))
-    tracker = (
-        video_tracking.FootballTracker(tracking_config)
-        if tracking_config is not None and tracking_config.enabled
-        else None
-    )
+    tracker = create_tracker(tracking_config, tracker_device, (width, height))
     last_predictions: List[Dict[str, Any]] = []
     segment_frame_index = 0
     render_iterator = tqdm(total=frame_limit, desc=f"Render video {item.local_path.name}", unit="frame")
@@ -1007,7 +1085,7 @@ def predict_video_file_batched(
             if should_detect:
                 frame_predictions = predictions_by_segment.get(segment_frame_index, [])
                 if tracker is not None:
-                    frame_predictions = tracker.update(absolute_frame_index, frame_predictions)
+                    frame_predictions = tracker.update(absolute_frame_index, frame_predictions, frame=frame)
                 for prediction in frame_predictions:
                     all_predictions.append(
                         build_video_row(prediction, item.source, absolute_frame_index, segment_frame_index, input_fps, frame_window)
@@ -1050,12 +1128,14 @@ def predict_video_file(
     render_ids: Sequence[int],
     video_cfg: Mapping[str, Any],
     tracking_config: Optional[Any] = None,
+    tracker_device: str = "cpu",
 ) -> Tuple[List[Dict[str, Any]], Path, int]:
     """Predict one video with batched detection frames when configured."""
     configured_batch = positive_batch_size(video_cfg.get("batch_size"), "inference.video.batch_size", 1)
     if configured_batch <= 1:
         return predict_video_file_one_pass(
-            item, start_image_id, model, prediction_config, categories, output_dir, render_ids, video_cfg, tracking_config
+            item, start_image_id, model, prediction_config, categories, output_dir, render_ids, video_cfg,
+            tracking_config, tracker_device,
         )
     try:
         return predict_video_file_batched(
@@ -1069,12 +1149,14 @@ def predict_video_file(
             video_cfg,
             configured_batch,
             tracking_config,
+            tracker_device,
         )
     except RuntimeError as exc:
         if "batched" in str(exc).lower() or "reopen video" in str(exc).lower() or "seek video" in str(exc).lower():
             print(Fore.BLUE + Style.BRIGHT + f"Warning: batched video inference fell back to one-pass mode. {exc}")
             return predict_video_file_one_pass(
-                item, start_image_id, model, prediction_config, categories, output_dir, render_ids, video_cfg, tracking_config
+                item, start_image_id, model, prediction_config, categories, output_dir, render_ids, video_cfg,
+                tracking_config, tracker_device,
             )
         raise
 
@@ -1111,7 +1193,9 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
     parser.add_argument("--track", action="store_true", help="Enable football tracking for video inference.")
     parser.add_argument("--no-track", dest="no_track", action="store_true", help="Disable football tracking (overrides config and --track).")
     parser.add_argument("--track-radius", dest="track_radius", type=float, help="Override inference.tracking.radius_pixels (search radius in pixels).")
-    parser.add_argument("--track-velocity", dest="track_velocity", action="store_true", help="Enable the velocity-predicted gate for tracking.")
+    parser.add_argument("--track-velocity", dest="track_velocity", action="store_true", help="Enable the velocity-predicted gate for the circle tracker.")
+    parser.add_argument("--tracker", dest="tracker", choices=["circle", "ocsort", "deepocsort", "botsort", "bytetrack"], help="Override inference.tracking.algorithm.")
+    parser.add_argument("--reid-weights", dest="reid_weights", help="Override inference.tracking.reid_weights (local ReID .pt path for deepocsort/botsort).")
     parser.add_argument("--dry-run", action="store_true", help="Validate and estimate outputs without inference.")
     parser.add_argument("--yes", action="store_true", help="Skip confirmation.")
     args = parser.parse_args()
@@ -1153,6 +1237,9 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
     model = load_rfdetr_model(config)
     render_ids = resolve_render_ids(config, categories)
     tracking_config = video_tracking.parse_tracking_config(config, categories)
+    tracker_device = resolved_tracker_device(config, tracking_config)
+    if tracking_config.enabled:
+        warn_reid_in_restricted_region(tracking_config)
     all_predictions: List[Dict[str, Any]] = []
     outputs: List[Dict[str, Any]] = []
     image_id = 1
@@ -1187,7 +1274,7 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
                 flush_pending_images()
         elif item.kind == "video":
             flush_pending_images()
-            predictions, path, image_id = predict_video_file(item, image_id, model, prediction_config, categories, output_dir, render_ids, video_cfg, tracking_config)
+            predictions, path, image_id = predict_video_file(item, image_id, model, prediction_config, categories, output_dir, render_ids, video_cfg, tracking_config, tracker_device)
             all_predictions.extend(predictions)
             outputs.append({"source": item.source, "kind": "video", "output": str(path), "predictions": len(predictions)})
     flush_pending_images()

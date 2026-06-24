@@ -106,8 +106,10 @@ inference:
     # Draw latest detections on skipped frames when detection_fps is lower than video FPS. Options: true, false.
     render_skipped_frames: true
   tracking:
-    # Enable circle-based football tracking for video inference. Options: true, false.
+    # Enable tracking for video inference. Options: true, false.
     enabled: false
+    # Tracking algorithm. Options: circle (built-in stdlib motion-only ball tracker), ocsort, deepocsort, botsort, bytetrack (via boxmot). ocsort/bytetrack need no ReID download; deepocsort/botsort use appearance ReID.
+    algorithm: circle
     # Category IDs to track. Empty means use target_class_names. Options: list of category IDs.
     target_class_ids: []
     # Category names to track. Empty with no target_class_ids defaults to football. Options: names such as [football].
@@ -147,6 +149,89 @@ inference:
     draw_search_circle: false
     # Include the track ID in rendered football labels, e.g. "football #3 0.91". Options: true, false.
     label_track_id: true
+    # --- shared boxmot ReID / camera-motion (used by deepocsort/botsort; ignored when algorithm: circle) ---
+    # Local ReID .pt weights for deepocsort/botsort appearance. Options: null to auto-download (gdown/Google Drive, unreliable in CN/HK/MO/TW), or a local path such as weights/osnet_x0_25_msmt17.pt.
+    reid_weights: null
+    # Device for the ReID appearance model. Options: null to inherit model.device, or cpu, cuda, cuda:0, mps.
+    reid_device: null
+    # FP16 ReID inference (GPU only; forced false on cpu/mps). Options: true, false.
+    reid_half: false
+    # Camera-motion compensation for boxmot trackers (helps panning cameras). Options: ecc, orb, sof, null to disable.
+    cmc_method: ecc
+    # Track each class with a separate ID space. Options: true, false.
+    per_class: false
+    # --- OC-SORT params (used when algorithm: ocsort) ---
+    ocsort:
+      # Detection confidence gate. Options: 0.0-1.0.
+      det_thresh: 0.2
+      # Frames a track survives without matching. Options: positive integer.
+      max_age: 30
+      # Matches before a track is output. Options: positive integer.
+      min_hits: 3
+      # Association gate (IoU-based; OC-SORT names this asso_threshold, not iou_threshold). Options: 0.0-1.0.
+      asso_threshold: 0.3
+      # Time window for observation-centric momentum. Options: positive integer.
+      delta_t: 3
+      # Association function. Options: iou, giou, ciou, diou, centroid.
+      asso_func: iou
+      # Momentum/inertia weight for direction consistency. Options: 0.0-1.0.
+      inertia: 0.2
+      # Also associate low-confidence boxes (BYTE-style). Options: true, false.
+      use_byte: false
+    # --- Deep OC-SORT params (used when algorithm: deepocsort) ---
+    deepocsort:
+      # Detection confidence gate. Options: 0.0-1.0.
+      det_thresh: 0.3
+      # Frames a track survives without matching. Options: positive integer.
+      max_age: 30
+      # Matches before a track is output. Options: positive integer.
+      min_hits: 3
+      # IoU association gate (Deep OC-SORT names this iou_threshold). Options: 0.0-1.0.
+      iou_threshold: 0.3
+      # Time window for observation-centric momentum. Options: positive integer.
+      delta_t: 3
+      # Association function. Options: iou, giou, ciou, diou, centroid.
+      asso_func: iou
+      # Momentum/inertia weight. Options: 0.0-1.0.
+      inertia: 0.2
+      # Appearance-embedding association weight. Options: 0.0-1.0.
+      w_association_emb: 0.5
+      # Fixed-alpha EMA weight for appearance memory. Options: 0.0-1.0.
+      alpha_fixed_emb: 0.95
+      # Disable appearance embeddings (motion-only; skips ReID download). Options: true, false.
+      embedding_off: false
+      # Disable internal camera-motion compensation. Options: true, false.
+      cmc_off: false
+    # --- BoT-SORT params (used when algorithm: botsort) ---
+    botsort:
+      # High detection threshold (first association). Options: 0.0-1.0.
+      track_high_thresh: 0.5
+      # Low detection threshold (second association). Options: 0.0-1.0.
+      track_low_thresh: 0.1
+      # Threshold to start a new track. Options: 0.0-1.0.
+      new_track_thresh: 0.6
+      # Frames a lost track is buffered. Options: positive integer.
+      track_buffer: 30
+      # Association match threshold. Options: 0.0-1.0.
+      match_thresh: 0.8
+      # Proximity (IoU) gate for appearance association. Options: 0.0-1.0.
+      proximity_thresh: 0.5
+      # Appearance similarity gate. Options: 0.0-1.0.
+      appearance_thresh: 0.25
+      # Use appearance ReID (false = motion-only, no ReID download). Options: true, false.
+      with_reid: true
+      # Fuse detection score during first association. Options: true, false.
+      fuse_first_associate: false
+    # --- ByteTrack params (used when algorithm: bytetrack) ---
+    bytetrack:
+      # Detection confidence gate (ByteTrack names this track_thresh). Options: 0.0-1.0.
+      track_thresh: 0.45
+      # Association match threshold. Options: 0.0-1.0.
+      match_thresh: 0.8
+      # Frames a lost track is buffered. Options: positive integer.
+      track_buffer: 25
+      # Video frame rate used for buffer timing. Options: positive integer.
+      frame_rate: 30
 
 crop:
   # Class IDs used to find class_crop windows from model predictions. Empty means all predicted classes are eligible.

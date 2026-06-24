@@ -30,7 +30,7 @@
 6. **編碼**：UTF-8，保留繁/簡中文（規則 3）。
 7. **終端體驗**：entrypoint `import colorama` 並呼叫 `colorama.init(autoreset=True)`；長迴圈用 `tqdm` 進度條（規則 6）。
 8. **顏色一致**：同一個 class ID 的 bbox 顏色在整次 run 內一致，沿用既有 `class_color()`（規則 16）。
-9. **不新增重相依套件**：Phase 1–4 不得新增第三方套件（追蹤、軌跡、圓形判斷都用 numpy / 既有 OpenCV / PIL 完成）。`scipy`/`sklearn` 等只在 Phase 3.2 視情況討論。WASB / SAM2 / 超解析屬 Phase 5。
+9. **相依套件**：原則上盡量不新增重相依；`circle` 追蹤器與 `rf_detr_video_tracking.py` 維持**純標準庫**（不載入模型，可離線單元測試）。**例外（依使用者明確要求）**：Module 3.1b 為 inference 接入 OC-SORT / Deep OC-SORT / BoT-SORT / ByteTrack，新增 `boxmot==13.0.0`（連帶 `lapx`/`filterpy`/`gdown`/`pandas`/`scikit-learn` 等，並會把 `numpy` 收斂到 1.26.x）。boxmot 採**延遲匯入**（只在選用 boxmot 演算法時才需要），且不安裝 `[yolo]` extra。WASB / SAM2 / 超解析仍屬 Phase 5。
 10. **下載走鏡像**：若某 Module 需要下載模型/資料，先判斷公網 IP 區域，CN/HK/MO/TW 用中國友善鏡像，其餘用官方來源（規則 8）。
 
 ## 與既有程式碼的接點（Phase 1 會用到）
@@ -78,6 +78,7 @@ Phase 4（場地邊界，optional）    Phase 5（advanced / future，pointers o
 - [ ] **2.3** Tiny-object augmentation preset — `now`
 - [ ] **2.4** Super-resolution ROI — `optional`
 - [ ] **3.1** 列舉所有球（multi-track）— `now`
+- [x] **3.1b** OC-SORT / Deep OC-SORT / BoT-SORT / ByteTrack（boxmot 介接）— `now` ✅ 已實作（`inference.tracking.algorithm`，預設 `circle`；各 boxmot 演算法用巢狀區塊）
 - [ ] **3.2** 主球選擇（player proximity + 群聚 + 遲滯）— `now`
 - [ ] **3.3** Camera-motion compensation — `optional`
 - [ ] **4.1** HSV grass ∩ player hull active region — `optional`
@@ -383,6 +384,43 @@ git diff --check
 **影響檔案**：`config/rf_detr_inference.yaml`（必要時降低 `model.confidence_threshold` 以保 recall）；`rf_detr_video_tracking.py`（確認多 track 行為）。
 **驗收**：多顆球同框時各自有獨立 `track_id`，交會後不長期黏錯（短暫 ID switch 可接受，由 3.2 再選主球）。
 
+## Module 3.1b — OC-SORT / Deep OC-SORT / BoT-SORT / ByteTrack（boxmot 介接）— `now` ✅ 已實作
+
+**目標**：playbook §B2。把成熟的多物件追蹤器（含小/快物件質心關聯與相機運動補償）接進 inference，讓使用者可在 `circle` 與 boxmot 系列之間切換；預設 `circle`。追蹤類別可設定，預設足球（重用既有 `target_class_ids`/`target_class_names`）。
+
+**影響檔案**：
+- `config/rf_detr_inference.yaml`：`inference.tracking` 新增 `algorithm` 與 boxmot 參數（每個 key 附 `#` 註解，規則 2）。
+- `rf_detr_video_tracking.py`：`TrackingConfig` / `parse_tracking_config` 加入 `algorithm` 與 boxmot 欄位與驗證；`FootballTracker.update` 加 `frame=None`（circle 忽略）。本檔**維持純標準庫**。
+- `rf_detr_boxmot_tracker.py`（新增）：`BoxmotTracker` 介接層，**延遲匯入** boxmot。
+- `inference_rf_detr_model.py`：`create_tracker` 工廠 + `resolved_tracker_device`；兩處 tracker 建構改用工廠、兩處 `tracker.update(..., frame=frame)` 傳入影格；新增 `--tracker`/`--reid-weights` CLI 與 ReID 區域鏡像警示（重用 `scripts/setup_pytorch_uv.py:detect_region`）。
+- `tests/test_rf_detr_boxmot_tracker.py`（新增）：以假 boxmot tracker 離線驗證。
+
+**介接層演算法規格**：
+- 只把目標類別的 prediction 轉成 boxmot 的 `dets`（N×6 `[x1,y1,x2,y2,conf,cls]`，COCO xywh→xyxy）。
+- 呼叫 `tracker.update(dets, frame)` 取得 M×8 `[x1,y1,x2,y2,track_id,conf,cls,det_ind]`，用 **`det_ind`** 把 track 對回原始 prediction（M 可能 < N 且亂序，**不可用位置對應**）。
+- 為每個 boxmot track id 維護一個 `TrackedBall`（圓心＝回傳 bbox 中心、`points` 軌跡、`hits`、`missing_frames`），因此既有渲染（`draw_track_overlays`）、`predictions.jsonl` 追蹤欄位、`tracking_summary.json` 完全沿用、不需更動。
+
+**config keys**：`algorithm`（`circle`/`ocsort`/`deepocsort`/`botsort`/`bytetrack`，預設 `circle`）、top-level 共用 `reid_weights`/`reid_device`/`reid_half`/`cmc_method`/`per_class`，以及每個 boxmot 演算法各自的**巢狀區塊** `ocsort:`/`deepocsort:`/`botsort:`/`bytetrack:`（完整清單見 Appendix B）。parser 把巢狀區塊對映到扁平的 `TrackingConfig` 欄位，adapter 不受影響。
+
+**相依（規則 8）**：`uv add 'boxmot==13.0.0'`（海外用官方 index；CN/HK/MO/TW 用 Tsinghua）；不裝 `[yolo]` extra。需驗證 `torch==2.11.0`/`torchvision==0.26.0` 未被動到（boxmot 會把 `numpy` 收斂到 1.26.x，實測 torch/torchvision/cv2/boxmot 共存正常）。
+
+**ReID（規則 8）**：`ocsort`/`bytetrack` 不需權重；`deepocsort`/`botsort` 用外觀 ReID，預設 `osnet_x0_25_msmt17.pt` 走 Google Drive 自動下載（CN 不穩）。請設 `reid_weights` 本機路徑略過下載，或用 `botsort.with_reid: false` / `algorithm: ocsort`。`reid_half` 僅 GPU 有效，CPU/MPS 自動關閉。
+
+**驗收**：
+- `algorithm: circle`（或任何演算法 `enabled: false`）輸出與既有版本逐位元組一致；既有 circle 測試全綠。
+- boxmot 系列：`det_ind` 對回正確、非目標類別追蹤欄位為 `None`、`.tracks` 可被既有渲染 helper 消費。
+- boxmot 未安裝卻選了 boxmot 演算法 → **執行期**丟出含安裝指引的清楚 ImportError（匯入期不報錯）。
+
+**測試指令**：
+```bash
+uv run python -m unittest tests.test_rf_detr_boxmot_tracker
+uv run python -m unittest tests.test_rf_detr_video_tracking
+uv run python -m py_compile inference_rf_detr_model.py rf_detr_video_tracking.py rf_detr_boxmot_tracker.py
+# 端到端（OC-SORT，無下載）：先 --dry-run 看估算，再去掉 --dry-run、加 --yes 實跑
+uv run python inference_rf_detr_model.py --config config/rf_detr_inference.yaml \
+  --source <sample_video.mp4> --tracker ocsort --output-dir runs/rf_detr/inference_ocsort_demo --dry-run
+```
+
 ## Module 3.2 — 主球選擇（player proximity + 群聚 + 遲滯）— `now`
 
 **目標**：playbook §C。從 N 條球 track 選出「比賽用球」。
@@ -460,8 +498,24 @@ playbook §D2 的學習式分割（DeepLab/SAM2）；重相依，另開子專案
 | `draw_trajectory` / `trajectory_max_points` / `trajectory_width` | `true / 30 / 2` | 軌跡渲染（`trajectory_max_points` 同時是記憶體上限；`null`→1024） |
 | `trajectory_max_age_frames` | `30` | 超過這麼多「影格」沒被偵測到，軌跡會逐點縮回並消失（球離開畫面後不殘留）；`null`=永久保留 |
 | `trajectory_per_track_color` / `trajectory_taper` / `draw_current_center` | `true / true / true` | 多球軌跡視覺：每球不同色、由舊到新漸粗、標目前球心 |
-| `draw_search_circle` | `false` | debug：畫目前搜尋圓 |
+| `draw_search_circle` | `false` | debug：畫目前搜尋圓（circle 專用） |
 | `label_track_id` | `true` | label 顯示 `football #id score` |
+
+**boxmot 介接（Module 3.1b；`algorithm` 非 `circle` 時生效；circle 專用半徑/速度欄位此時忽略）**
+
+| Key | 預設 | 說明 |
+|---|---|---|
+| `algorithm` | `circle` | 追蹤器：`circle`/`ocsort`/`deepocsort`/`botsort`/`bytetrack` |
+| `target_class_ids` / `target_class_names` | `[] / [football]` | 追蹤目標類別（所有演算法共用，預設足球） |
+| `reid_weights` | `null` | deepocsort/botsort 外觀 ReID 權重；填本機路徑可略過 Google Drive 下載 |
+| `reid_device` | `null` | ReID 裝置；`null` 沿用 `model.device` |
+| `reid_half` | `false` | FP16 ReID（僅 GPU；CPU/MPS 自動關閉） |
+| `cmc_method` | `ecc` | 相機運動補償：`ecc`/`orb`/`sof`/`null` |
+| `per_class` | `false` | 各類別獨立 ID 空間 |
+| `ocsort:` (巢狀) | 見 config | OC-SORT：`det_thresh 0.2`/`max_age 30`/`min_hits 3`/`asso_threshold 0.3`/`delta_t 3`/`asso_func iou`/`inertia 0.2`/`use_byte false` |
+| `deepocsort:` (巢狀) | 見 config | Deep OC-SORT：`det_thresh 0.3`/`max_age 30`/`min_hits 3`/`iou_threshold 0.3`/`delta_t 3`/`asso_func iou`/`inertia 0.2`/`w_association_emb 0.5`/`alpha_fixed_emb 0.95`/`embedding_off false`/`cmc_off false` |
+| `botsort:` (巢狀) | 見 config | BoT-SORT：`track_high_thresh 0.5`/`track_low_thresh 0.1`/`new_track_thresh 0.6`/`track_buffer 30`/`match_thresh 0.8`/`proximity_thresh 0.5`/`appearance_thresh 0.25`/`with_reid true`/`fuse_first_associate false` |
+| `bytetrack:` (巢狀) | 見 config | ByteTrack：`track_thresh 0.45`/`match_thresh 0.8`/`track_buffer 25`/`frame_rate 30` |
 
 # Appendix C — 驗證 cheatsheet
 
