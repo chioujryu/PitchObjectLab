@@ -1,12 +1,23 @@
-# Standalone config for inference_rf_detr_model.py.
-# Parameters are grouped by runtime, model, dataset, output, inference, and evaluation.
+# Standalone OC-SORT video config for inference_rf_detr_model.py.
+# Copy of the circle-tracking variant, tuned for a TINY, possibly very FAST ball whose boxes may
+# NOT overlap between adjacent frames (IoU between consecutive detections can be 0).
+# Runs SAHI 320x320 first-stage football detection and a centered 640x640 football recheck.
+# Source video 1983818210731298817.mp4, segment starting 00:09:00, OC-SORT football tracking.
+#
+# Why this handles IoU=0 between frames: OC-SORT associates each detection against the
+# Kalman-PREDICTED track box (using estimated velocity), and inference.tracking.ocsort.asso_func
+# is set to "centroid", which scores matches by center distance (1 - center_dist/frame_diagonal)
+# instead of box overlap -- so no overlap is required. inference.tracking.ocsort.asso_threshold
+# gates the maximum allowed center jump (see its comment).
+# Note: for the most extreme tiny+fast cases, algorithm: circle (centroid + growing search radius,
+# never uses IoU) is the purpose-built alternative in this repo.
 
 runtime:
   # Print wrapper status text. Options: true, false.
   verbose: true
   # Estimate outputs and exit before model loading/inference. Options: true, false.
   dry_run: false
-  # Ask before writing rendered images/videos, predictions, configs, or URL caches. Options: true, false.
+  # Ask before writing rendered videos, predictions, configs, or URL caches. Options: true, false.
   confirm_before_run: true
   # Skip confirmation after reviewing the estimate. Options: true, false.
   yes: false
@@ -21,7 +32,7 @@ runtime:
     default_train_seconds_per_batch: 0.7
     # Fallback test speed retained for shared schema. Options: positive seconds per image.
     default_test_seconds_per_image: 0.25
-    # Fallback inference speed for image sources and video detection frames. Options: positive seconds per image/frame.
+    # Fallback inference speed for video detection frames. Options: positive seconds per frame.
     default_inference_seconds_per_image: 0.25
     # Fallback cost for drawing/writing output video frames. Options: positive seconds per frame.
     default_video_render_seconds_per_frame: 0.005
@@ -30,7 +41,7 @@ model:
   # RF-DETR model size. Detection: base, nano, small, medium, large. Segmentation sizes are not used by this bbox renderer.
   size: large
   # RF-DETR checkpoint to load. Options: default, null/false, hosted key, or local .pth/.pt/.ckpt path.
-  pretrain_weights: default
+  pretrain_weights: C:\Users\XBOT\Documents\projects\PitchObjectLab\projects\rf_detr_trainer\large_checkpoint_best_ema.pth
   # Input resolution override. Options: null for model default, or positive integer.
   resolution: null
   # Class count override. Options: null to infer from checkpoint/config, or positive integer.
@@ -39,7 +50,7 @@ model:
   device: 0
   # Automatic mixed precision in RF-DETR. Options: true, false.
   amp: true
-  # Prediction confidence threshold used for rendered boxes. Options: 0.0-1.0.
+  # First-stage prediction confidence threshold. Options: 0.0-1.0.
   confidence_threshold: 0.25
   # Optional model label to output category-id mapping. Options: empty mapping, false to disable, or {model_label: category_id}.
   category_remapping: {}
@@ -61,13 +72,14 @@ output:
   # Output root when output_dir is empty. Options: pure string path.
   root: runs/rf_detr/inference
   # Run folder name when output_dir is empty. Supports {timestamp}. Options: string.
-  name: "rfdetr_inference_{timestamp}"
+  name: "rfdetr_inference_sahi320_football_recheck640_video_1983818210731298817_000900_001000_ocsort_{timestamp}"
   # Allow writing into an existing output directory. Options: true, false.
   exist_ok: false
 
 inference:
   # Input sources. Options: image path, video path, folder path, HTTP(S) image/video URL; folders may mix images and videos.
-  sources: []
+  sources:
+    - 'C:\Users\XBOT\Downloads\raw\1983818210731298817.mp4'
   # Recurse into folders. Options: true, false.
   recursive: true
   # Maximum discovered sources to infer after image/video caps. Options: all/null for every source, or a positive integer.
@@ -77,17 +89,18 @@ inference:
   # Maximum video sources to infer. Options: all/null for every video, or a positive integer for first N videos.
   max_videos: all
   # Inference mode. Options: full_image, sahi, class_crop.
-  mode: full_image
-  # RF-DETR image-source batch size for full_image/class_crop/sahi image inputs. Options: positive integer.
-  batch_size: 8
+  mode: sahi
+  # RF-DETR image-source batch size for sahi image inputs. Options: positive integer.
+  batch_size: 80
   # Image extensions included from folders. Options: list of extensions.
   image_extensions: [.bmp, .jpeg, .jpg, .png, .tif, .tiff, .webp]
   # Video extensions included from folders. Options: list of extensions.
   video_extensions: [.avi, .m4v, .mkv, .mov, .mp4, .mpeg, .mpg, .webm]
-  # Category IDs to render. Empty means draw all predicted classes. Options: list of category IDs.
+  # Category IDs to render. Empty means use render_class_names or draw all predicted classes. Options: list of category IDs.
   render_class_ids: []
-  # Category names to render. Empty means draw all predicted classes. Options: list of names.
-  render_class_names: []
+  # Category names to render. Only football boxes are drawn in rendered images/video frames. Options: list of names.
+  render_class_names:
+    - football
   # Save line-delimited prediction records. Options: true, false.
   save_predictions_jsonl: true
   video:
@@ -96,9 +109,9 @@ inference:
     # RF-DETR detection-frame batch size. Options: all/null to inherit inference.batch_size, or positive integer.
     batch_size: null
     # Start time for each video segment. Options: seconds, MM:SS, or HH:MM:SS.
-    start_time: 0
+    start_time: "00:10:00"
     # End time for each video segment. Options: all/null for video end, seconds, MM:SS, or HH:MM:SS.
-    end_time: all
+    end_time: "00:15:00"
     # Maximum selected duration to infer per video. Options: all/null for the full start/end range, seconds, MM:SS, or HH:MM:SS.
     max_seconds: all
     # Output video FPS. Options: null to preserve input FPS, or positive float.
@@ -107,36 +120,36 @@ inference:
     render_skipped_frames: true
   tracking:
     # Enable tracking for video inference. Options: true, false.
-    enabled: false
+    enabled: true
     # Tracking algorithm. Options: circle (built-in stdlib motion-only ball tracker), ocsort, deepocsort, botsort, bytetrack (via boxmot). ocsort/bytetrack need no ReID download; deepocsort/botsort use appearance ReID.
-    algorithm: circle
+    algorithm: ocsort
     # Category IDs to track. Empty means use target_class_names. Options: list of category IDs.
     target_class_ids: []
     # Category names to track. Empty with no target_class_ids defaults to football. Options: names such as [football].
     target_class_names:
       - football
-    # Base search radius (pixels) around a ball center for same-ball matching. Options: positive number.
+    # (circle-only; ignored when algorithm: ocsort) Base search radius (pixels) around a ball center for same-ball matching. Options: positive number.
     radius_pixels: 80
-    # Optional size-relative base radius: max(radius_pixels, radius_scale * max(bbox_w, bbox_h)). Options: null to disable, or positive number.
-    radius_scale: null
-    # Radius growth per missing detection frame, to catch fast/returning balls after gaps. Options: non-negative number.
-    radius_growth_per_missing_frame: 0.0
-    # Hard cap on the grown effective radius (pixels). Options: null for no cap, or positive number.
+    # (circle-only; ignored when algorithm: ocsort) Optional size-relative base radius: max(radius_pixels, radius_scale * max(bbox_w, bbox_h)). Options: null to disable, or positive number.
+    radius_scale: 10
+    # (circle-only; ignored when algorithm: ocsort) Radius growth per missing detection frame, to catch fast/returning balls after gaps. Options: non-negative number.
+    radius_growth_per_missing_frame: 10.0
+    # (circle-only; ignored when algorithm: ocsort) Hard cap on the grown effective radius (pixels). Options: null for no cap, or positive number.
     max_radius_pixels: null
-    # Frames a track may stay unmatched before it expires (finite avoids stale-track clutter). Options: all/null to never expire, or a non-negative integer.
-    max_missing_frames: 30
-    # Matches before a track is confirmed; only confirmed tracks draw trails/labels and count in the summary. Options: positive integer.
+    # Overlay retraction: frames a track may stay unmatched before its trail/label is dropped (set to ocsort.max_age so trails persist through gaps). Options: all/null to never expire, or a non-negative integer.
+    max_missing_frames: 60
+    # Render/confirm gate: matches before a track draws trails/labels and counts in the summary. boxmot already confirms tracks internally, so keep this low to show the ball immediately. Options: positive integer.
     min_hits: 1
-    # Match against both the static circle and a velocity-predicted circle during gaps. Options: true, false.
+    # (circle-only; ignored when algorithm: ocsort) Match against both the static circle and a velocity-predicted circle during gaps. Options: true, false.
     use_velocity_prediction: false
-    # EMA weight on previous velocity when use_velocity_prediction is true (higher = smoother). Options: 0.0-1.0.
+    # (circle-only; ignored when algorithm: ocsort) EMA weight on previous velocity when use_velocity_prediction is true (higher = smoother). Options: 0.0-1.0.
     velocity_smoothing: 0.5
     # Draw trajectory polyline for tracked balls in rendered videos. Options: true, false.
     draw_trajectory: true
     # Trajectory length in points/frames. null = full history (kept in memory up to 1024 points). Options: null, or a positive integer.
     trajectory_max_points: 30
     # Trail points older than this many video frames are dropped, so the trajectory retracts and disappears after the ball is lost. null = persist (never expire). Options: null, or a positive integer.
-    trajectory_max_age_frames: 30
+    trajectory_max_age_frames: 60
     # Trajectory line width (pixels). Options: positive integer.
     trajectory_width: 2
     # Use a distinct color per track for trajectories (bbox color stays the class color). Options: true, false.
@@ -145,11 +158,11 @@ inference:
     trajectory_taper: true
     # Mark the current ball center with a filled dot. Options: true, false.
     draw_current_center: true
-    # Draw the current search circle for each active track (debug overlay). Options: true, false.
+    # Draw the current search circle for each active track (debug overlay; circle-only). Options: true, false.
     draw_search_circle: false
     # Include the track ID in rendered football labels, e.g. "football #3 0.91". Options: true, false.
     label_track_id: true
-    # --- shared boxmot ReID / camera-motion (used by deepocsort/botsort; ignored when algorithm: circle) ---
+    # --- shared boxmot ReID / camera-motion (used by deepocsort/botsort; ignored by ocsort) ---
     # Local ReID .pt weights for deepocsort/botsort appearance. Options: null to auto-download (gdown/Google Drive, unreliable in CN/HK/MO/TW), or a local path such as weights/osnet_x0_25_msmt17.pt.
     reid_weights: null
     # Device for the ReID appearance model. Options: null to inherit model.device, or cpu, cuda, cuda:0, mps.
@@ -160,24 +173,24 @@ inference:
     cmc_method: ecc
     # Track each class with a separate ID space. Options: true, false.
     per_class: false
-    # --- OC-SORT params (used when algorithm: ocsort) ---
+    # --- OC-SORT params (active; algorithm: ocsort) -- tuned for a tiny, fast, non-overlapping ball ---
     ocsort:
-      # Detection confidence gate. Options: 0.0-1.0.
+      # Detection confidence gate (detections above go to the primary association). Options: 0.0-1.0.
       det_thresh: 0.2
-      # Frames a track survives without matching. Options: positive integer.
-      max_age: 30
-      # Matches before a track is output. Options: positive integer.
-      min_hits: 3
-      # Association gate (IoU-based; OC-SORT names this asso_threshold, not iou_threshold). Options: 0.0-1.0.
-      asso_threshold: 0.3
-      # Time window for observation-centric momentum. Options: positive integer.
+      # Frames a track survives without matching (high so a fast ball that is briefly missed keeps its velocity and ID). Options: positive integer.
+      max_age: 60
+      # Matches before a track is output (low to confirm a fast ball quickly). Options: positive integer.
+      min_hits: 2
+      # Association gate. With asso_func: centroid this is 1 - center_dist/frame_diagonal, so 0.95 keeps matches whose center jump is < (1-0.95)=5% of the frame diagonal (~110px@1080p, ~73px@720p). Lower (0.9) tolerates faster balls/bigger jumps; raise (0.97) is stricter and avoids grabbing a different ball. Options: 0.0-1.0.
+      asso_threshold: 0.95
+      # Time window (frames) used to estimate the velocity direction for observation-centric momentum. Options: positive integer.
       delta_t: 3
-      # Association function. Options: iou, giou, ciou, diou, centroid.
-      asso_func: iou
-      # Momentum/inertia weight for direction consistency. Options: 0.0-1.0.
-      inertia: 0.2
-      # Also associate low-confidence boxes (BYTE-style). Options: true, false.
-      use_byte: false
+      # Association function. centroid = center-distance (no bbox overlap required) -- the key setting for IoU=0 between frames. Options: iou, giou, ciou, diou, centroid.
+      asso_func: centroid
+      # Momentum/inertia weight for direction consistency (helps a fast, roughly linear ball). Options: 0.0-1.0.
+      inertia: 0.3
+      # Also associate low-confidence boxes in a second stage (recovers weak tiny-ball detections; also centroid-gated). Options: true, false.
+      use_byte: true
       # Kalman process-noise scale on POSITION velocity (vx, vy); scales Q[4:6,4:6]. Higher trusts the constant-velocity model less (observations correct position faster; better for erratic/bouncing balls), lower is smoother and trusts prediction more. Options: positive float (boxmot default 0.01).
       Q_xy_scaling: 0.01
       # Kalman process-noise scale on box-SCALE velocity (size growth rate); scales Q[-1,-1]. Higher lets box size change faster frame-to-frame (ball nearing/leaving camera), lower holds size steadier. Options: positive float (boxmot default 0.0001).
@@ -254,16 +267,16 @@ crop:
   fallback: full_image
 
 sahi:
-  # Slice height for sahi mode. Options: positive integer.
+  # Slice height for first-stage sahi mode. Options: positive integer.
   slice_height: 640
-  # Slice width for sahi mode. Options: positive integer.
+  # Slice width for first-stage sahi mode. Options: positive integer.
   slice_width: 640
   # Height overlap between adjacent slices. Options: 0.0-0.9.
   overlap_height_ratio: 0.2
   # Width overlap between adjacent slices. Options: 0.0-0.9.
   overlap_width_ratio: 0.2
   # Also run full-image prediction and merge with slices. Options: true, false.
-  standard_prediction: true
+  standard_prediction: false
   # SAHI postprocess type. Options: GREEDYNMM, NMM, NMS, LSNMS. GREEDYNMM is recommended for small slices.
   postprocess_type: GREEDYNMM
   # SAHI match metric. Options: IOS, IOU. IOS is recommended when small slice boxes cover parts of the same object.
@@ -273,7 +286,7 @@ sahi:
   # Class-agnostic slice merge. Options: true, false.
   postprocess_class_agnostic: false
   # RF-DETR SAHI slice/recheck batch size. Options: positive integer.
-  batch_size: 4
+  batch_size: 64
   recheck:
     # Run a second centered B*B verification pass for selected SAHI target-class boxes. Options: true, false.
     enabled: false

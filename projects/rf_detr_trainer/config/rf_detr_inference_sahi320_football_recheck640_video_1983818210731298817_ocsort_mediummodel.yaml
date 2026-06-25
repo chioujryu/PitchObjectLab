@@ -41,7 +41,7 @@ model:
   # RF-DETR model size. Detection: base, nano, small, medium, large. Segmentation sizes are not used by this bbox renderer.
   size: medium
   # RF-DETR checkpoint to load. Options: default, null/false, hosted key, or local .pth/.pt/.ckpt path.
-  pretrain_weights: 'C:\Users\XBOT\Documents\projects\PitchObjectLab\projects\rf_detr_trainer\checkpoint_best_ema.pth'
+  pretrain_weights: C:\Users\XBOT\Documents\projects\PitchObjectLab\projects\rf_detr_trainer\checkpoint_best_ema.pth
   # Input resolution override. Options: null for model default, or positive integer.
   resolution: null
   # Class count override. Options: null to infer from checkpoint/config, or positive integer.
@@ -109,9 +109,9 @@ inference:
     # RF-DETR detection-frame batch size. Options: all/null to inherit inference.batch_size, or positive integer.
     batch_size: null
     # Start time for each video segment. Options: seconds, MM:SS, or HH:MM:SS.
-    start_time: "00:10:00"
+    start_time: "00:05:00"
     # End time for each video segment. Options: all/null for video end, seconds, MM:SS, or HH:MM:SS.
-    end_time: "00:10:10"
+    end_time: "00:29:00"
     # Maximum selected duration to infer per video. Options: all/null for the full start/end range, seconds, MM:SS, or HH:MM:SS.
     max_seconds: all
     # Output video FPS. Options: null to preserve input FPS, or positive float.
@@ -181,22 +181,26 @@ inference:
       max_age: 60
       # Matches before a track is output (low to confirm a fast ball quickly). Options: positive integer.
       min_hits: 2
-      # Association gate. With asso_func: centroid this is 1 - center_dist/frame_diagonal, so 0.9 keeps matches whose center jump is < (1-0.9)=10% of the frame diagonal (~220px@1080p, ~150px@720p). Lower (0.85) tolerates faster balls/bigger jumps; raise (0.95) is stricter and avoids grabbing a different ball. Options: 0.0-1.0.
-      asso_threshold: 0.9
+      # Association gate. With asso_func: centroid this is 1 - center_dist/frame_diagonal, so 0.95 keeps matches whose center jump is < (1-0.95)=5% of the frame diagonal (~110px@1080p, ~73px@720p). Lower (0.9) tolerates faster balls/bigger jumps; raise (0.97) is stricter and avoids grabbing a different ball. Options: 0.0-1.0.
+      asso_threshold: 0.97
       # Time window (frames) used to estimate the velocity direction for observation-centric momentum. Options: positive integer.
       delta_t: 3
       # Association function. centroid = center-distance (no bbox overlap required) -- the key setting for IoU=0 between frames. Options: iou, giou, ciou, diou, centroid.
       asso_func: centroid
       # Momentum/inertia weight for direction consistency (helps a fast, roughly linear ball). Options: 0.0-1.0.
-      inertia: 0.2
+      inertia: 0.3
       # Also associate low-confidence boxes in a second stage (recovers weak tiny-ball detections; also centroid-gated). Options: true, false.
-      use_byte: true
+      use_byte: false
+      # Kalman process-noise scale on POSITION velocity (vx, vy); scales Q[4:6,4:6]. Higher trusts the constant-velocity model less (observations correct position faster; better for erratic/bouncing balls), lower is smoother and trusts prediction more. Options: positive float (boxmot default 0.01).
+      Q_xy_scaling: 0.01
+      # Kalman process-noise scale on box-SCALE velocity (size growth rate); scales Q[-1,-1]. Higher lets box size change faster frame-to-frame (ball nearing/leaving camera), lower holds size steadier. Options: positive float (boxmot default 0.0001).
+      Q_s_scaling: 0.0001
     # --- Deep OC-SORT params (used when algorithm: deepocsort) ---
     deepocsort:
       # Detection confidence gate. Options: 0.0-1.0.
       det_thresh: 0.3
       # Frames a track survives without matching. Options: positive integer.
-      max_age: 30
+      max_age: 60
       # Matches before a track is output. Options: positive integer.
       min_hits: 3
       # IoU association gate (Deep OC-SORT names this iou_threshold). Options: 0.0-1.0.
@@ -282,7 +286,7 @@ sahi:
   # Class-agnostic slice merge. Options: true, false.
   postprocess_class_agnostic: false
   # RF-DETR SAHI slice/recheck batch size. Options: positive integer.
-  batch_size: 64
+  batch_size: 32
   recheck:
     # Run a second centered B*B verification pass for selected SAHI target-class boxes. Options: true, false.
     enabled: true

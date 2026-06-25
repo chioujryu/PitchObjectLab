@@ -164,6 +164,9 @@ weights/
 *.pt
 *.pth
 *.ckpt
+# Extensionless model checkpoints (e.g. rf_detr EMA checkpoints)
+*checkpoint_best_ema
+*_best_ema
 *.tmp
 *.ts
 *.pb

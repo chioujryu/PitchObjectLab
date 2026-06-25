@@ -180,6 +180,10 @@ inference:
       inertia: 0.2
       # Also associate low-confidence boxes (BYTE-style). Options: true, false.
       use_byte: false
+      # Kalman process-noise scale on POSITION velocity (vx, vy); scales Q[4:6,4:6]. Higher trusts the constant-velocity model less (observations correct position faster; better for erratic/bouncing balls), lower is smoother and trusts prediction more. Options: positive float (boxmot default 0.01).
+      Q_xy_scaling: 0.01
+      # Kalman process-noise scale on box-SCALE velocity (size growth rate); scales Q[-1,-1]. Higher lets box size change faster frame-to-frame (ball nearing/leaving camera), lower holds size steadier. Options: positive float (boxmot default 0.0001).
+      Q_s_scaling: 0.0001
     # --- Deep OC-SORT params (used when algorithm: deepocsort) ---
     deepocsort:
       # Detection confidence gate. Options: 0.0-1.0.

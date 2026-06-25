@@ -85,6 +85,8 @@ def _build_boxmot_tracker(cfg: TrackingConfig, device: str) -> Any:
             asso_func=cfg.ocsort_asso_func,
             inertia=cfg.ocsort_inertia,
             use_byte=cfg.ocsort_use_byte,
+            Q_xy_scaling=cfg.ocsort_q_xy_scaling,
+            Q_s_scaling=cfg.ocsort_q_s_scaling,
         )
     if algorithm == "bytetrack":
         return ByteTrack(

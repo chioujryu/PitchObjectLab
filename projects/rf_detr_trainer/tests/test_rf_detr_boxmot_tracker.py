@@ -218,7 +218,13 @@ class ImportGuardTest(unittest.TestCase):
 class RealBoxmotSmokeTest(unittest.TestCase):
     @unittest.skipUnless(bt.boxmot_importable(), "boxmot not installed")
     def test_real_ocsort_tracks_a_moving_ball(self):
-        cfg = make_config(algorithm="ocsort", ocsort_min_hits=1, ocsort_det_thresh=0.1)
+        cfg = make_config(
+            algorithm="ocsort",
+            ocsort_min_hits=1,
+            ocsort_det_thresh=0.1,
+            ocsort_q_xy_scaling=1.0,
+            ocsort_q_s_scaling=0.5,
+        )
         tracker = bt.BoxmotTracker(cfg, device="cpu", frame_size=(128, 128))
         frame = np.zeros((128, 128, 3), dtype=np.uint8)
         rows = []

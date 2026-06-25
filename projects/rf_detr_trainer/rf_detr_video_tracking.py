@@ -127,6 +127,14 @@ def _as_positive_int(value: Any, default: int, field_name: str) -> int:
     return parsed
 
 
+def _as_positive_float(value: Any, default: float, field_name: str) -> float:
+    """Parse a strictly positive float (may exceed 1.0, unlike _as_unit_float)."""
+    parsed = _as_float(value, default, field_name)
+    if parsed <= 0.0:
+        raise ValueError(f"inference.tracking.{field_name} must be a positive number, got {parsed!r}")
+    return parsed
+
+
 # Tracking algorithms: "circle" is the built-in stdlib tracker in this module; the rest are
 # provided by the boxmot adapter (rf_detr_boxmot_tracker.BoxmotTracker).
 ALLOWED_ALGORITHMS: Tuple[str, ...] = ("circle", "ocsort", "deepocsort", "botsort", "bytetrack")
@@ -175,6 +183,8 @@ class TrackingConfig:
     ocsort_asso_func: str = "iou"
     ocsort_inertia: float = 0.2
     ocsort_use_byte: bool = False
+    ocsort_q_xy_scaling: float = 0.01
+    ocsort_q_s_scaling: float = 0.0001
     # Deep OC-SORT parameters.
     deepocsort_det_thresh: float = 0.3
     deepocsort_max_age: int = 30
@@ -379,6 +389,8 @@ def parse_tracking_config(
         ocsort_asso_func=_as_str(ocsort.get("asso_func"), "iou", "ocsort.asso_func"),
         ocsort_inertia=_as_unit_float(ocsort.get("inertia"), 0.2, "ocsort.inertia"),
         ocsort_use_byte=_as_bool(ocsort.get("use_byte"), False),
+        ocsort_q_xy_scaling=_as_positive_float(ocsort.get("Q_xy_scaling"), 0.01, "ocsort.Q_xy_scaling"),
+        ocsort_q_s_scaling=_as_positive_float(ocsort.get("Q_s_scaling"), 0.0001, "ocsort.Q_s_scaling"),
         deepocsort_det_thresh=_as_unit_float(deepocsort.get("det_thresh"), 0.3, "deepocsort.det_thresh"),
         deepocsort_max_age=_as_positive_int(deepocsort.get("max_age"), 30, "deepocsort.max_age"),
         deepocsort_min_hits=_as_positive_int(deepocsort.get("min_hits"), 3, "deepocsort.min_hits"),
