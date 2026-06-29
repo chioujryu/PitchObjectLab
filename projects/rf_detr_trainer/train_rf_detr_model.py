@@ -2667,6 +2667,17 @@ def build_model_kwargs(config: Mapping[str, Any]) -> Dict[str, Any]:
         kwargs["device"] = device
     if model_cfg.get("amp") is not None:
         kwargs["amp"] = bool(model_cfg["amp"])
+    # Optional pluggable P2 (stride-4) feature level. Fully inert unless model.p2.enabled.
+    # ensure_p2_support patches rfdetr in-process (relax projector_scale Literal + teach the
+    # backbone P2=4.0); projector_scale + overrides become real ModelConfig kwargs. This is the
+    # shared model-build choke point, so this also covers test/inference/tracking entrypoints.
+    p2_cfg = model_cfg.get("p2", {}) or {}
+    if bool(p2_cfg.get("enabled", False)):
+        from rf_detr_p2 import apply_p2_overrides, ensure_p2_support, resolve_p2_projector_scale
+
+        ensure_p2_support(p2_cfg)
+        kwargs["projector_scale"] = resolve_p2_projector_scale(p2_cfg)
+        apply_p2_overrides(kwargs, p2_cfg)
     should_pass, pretrain = normalize_pretrain_weights(model_cfg.get("pretrain_weights", "default"))
     if should_pass:
         if pretrain == "default":
