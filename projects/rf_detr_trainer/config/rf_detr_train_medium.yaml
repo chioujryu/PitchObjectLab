@@ -1,5 +1,4 @@
-# Train config for train_rf_detr_model.py.
-# Dataset YAML files stay in their framework-native Ultralytics format.
+# Main config for train_rf_detr_model.py.
 # Every path can be absolute or relative. Relative paths are resolved from the repo root when possible.
 
 # Runtime controls for dry-run, prompts, verbosity, seeds, and estimates. Options: mapping.
@@ -8,10 +7,8 @@ runtime:
   verbose: true
   # Validate config and estimate output files without starting training. Options: true, false.
   dry_run: false
-  # Ask before creating checkpoints, logs, metrics, plots, caches, or dataset grids. Options: true, false.
+  # Ask before creating checkpoints, logs, metrics, plots, or dataset grids. Options: true, false.
   confirm_before_run: true
-  # Seed used for deterministic visual sampling during final/periodic tests. Options: integer.
-  seed: 0
   # Runtime-estimate settings. Options: mapping.
   time_estimate:
     # Print rough HH:MM:SS runtime estimates before execution. Options: true, false.
@@ -30,23 +27,71 @@ runtime:
 # Model construction settings. Options: mapping.
 model:
   # RF-DETR model size. Detection: base, nano, small, medium, large. Segmentation: seg-preview, seg-nano, seg-small, seg-medium, seg-large, seg-xlarge, seg-2xlarge.
-  size: large
+  size: medium
   # Input resolution override. Options: null to use model default, or an int divisible by patch_size * num_windows.
   resolution: null
   # Pretrained weights. Options: default, null/false to disable, hosted key like rf-detr-medium.pth, or a local .pth path.
   pretrain_weights: default
   # Optional class count override. Options: null to auto-detect from dataset, or a positive integer.
-  num_classes: 3
+  num_classes: null
   # Model construction device. Options: auto, cpu, cuda, cuda:0. Training device is controlled by train.device.
-  device: cuda:7
+  device: auto
   # Automatic mixed precision behavior in RF-DETR model config. Options: true, false.
   amp: true
-  # Prediction confidence threshold used by wrapper final/periodic tests. Options: 0.0-1.0.
-  confidence_threshold: 0.25
-  # Optional model label to dataset category-id mapping for evaluation. Options: empty mapping, false to disable, or {model_label: dataset_category_id}.
-  category_remapping: {}
   # Extra RF-DETR ModelConfig keys. Options: any supported model key such as freeze_encoder, gradient_checkpointing, compile, num_queries.
   extra_model_args: {}
+  # ---- P2 high-resolution feature level (stride-4) for tiny-object (e.g. football) detection ----
+  # RF-DETR has no native P2. When enabled, the trainer applies an in-process patch (rf_detr_p2.py,
+  # version-controlled, survives `uv sync`) that (1) allows "P2" in projector_scale and (2) teaches
+  # the backbone the P2 (scale-factor 4.0) branch the projector already implements (two stride-2
+  # ConvTranspose2d). The decoder's deformable-attention levels, level embeds, two-stage query
+  # selection, and per-level positional encoding all adapt automatically. Pretrained weights load
+  # non-strictly: the new P2 projector stage and the resized deformable-attention layers start
+  # randomly initialized, so fine-tune from a checkpoint. Same model.size + model.p2 block must be
+  # set in test/inference configs to rebuild a P2-trained checkpoint.
+  # Memory note: P2 (stride-4) dominates token count. If you hit OOM, set overrides.gradient_checkpointing: true,
+  # lower train.batch_size + raise train.grad_accum_steps, and/or raise num_windows via extra_model_args.
+  p2:
+    # Master switch. Options: false to disable (no patch applied, stock RF-DETR), true to enable P2.
+    enabled: true
+    # Feature levels for projector AND decoder. Must be ascending P-name order; length = decoder levels.
+    # name -> (stride, scale): P2->(4, x4), P3->(8, x2), P4->(16, x1), P5->(32, x0.5), P6->(64, x0.25).
+    # Must include "P2" to actually use the P2 level. Examples: [P2, P3, P4], [P2, P3, P4, P5], [P2, P4].
+    projector_scale: [P2, P3, P4]
+    # P2 projector implementation settings. Options: mapping.
+    projector:
+      # MultiScaleProjector internals applied to EVERY stage (P2 included). null = upstream default.
+      # NOTE: these are NOT stored in the checkpoint's ModelConfig. If you change them at train time,
+      # set the same values in the test/inference config so the rebuilt architecture matches.
+      # C2f (CSPRepLayer) depth per stage. Options: null for upstream default (3), or a positive integer.
+      num_blocks: null
+      # Stochastic-depth survival probability for extra feature levels during training. Options: null for 1.0 (off), or 0.0-1.0.
+      survival_prob: null
+      # Force-zero the last N ViT feature maps before projecting. Options: null for 0 (off), or non-negative integer.
+      force_drop_last_n_features: null
+      # LayerNorm inside projector convs. Options: null to inherit model layer_norm, true, false.
+      layer_norm: null
+      # RMSNorm inside projector convs. Options: null to inherit model rms_norm, true, false.
+      rms_norm: null
+    # Pretrained-weight loading compatibility settings. Options: mapping.
+    weights:
+      # RF-DETR loads pretrained weights with strict=False already; new P2/decoder params are random-init.
+      # Suppress the expected PretrainWeightsCompatibilityWarning for the projector_scale change. Options: true, false.
+      suppress_compat_warning: true
+    # Validated RF-DETR model override keys. Options: mapping.
+    overrides:
+      # Convenience overrides applied to the RF-DETR ModelConfig only when P2 is enabled. null = leave
+      # the variant default / value from the model.* section. When set, these win over model.*.
+      # Input resolution. Options: null, or int divisible by patch_size * num_windows. Higher helps small objects.
+      resolution: null
+      # Decoder query count. Options: null, or positive integer. Raise for many same-frame objects (balls+players+refs).
+      num_queries: null
+      # Selected predictions at postprocess. Options: null, or positive integer. Usually match num_queries.
+      num_select: null
+      # Deformable-attention sampling points per level per head. Options: null, or positive integer (upstream 2 or 4).
+      dec_n_points: null
+      # Gradient checkpointing to fit the larger P2 token count in memory. Options: null, true, false.
+      gradient_checkpointing: null
 
 # Dataset discovery and limiting settings. Options: mapping.
 dataset:
@@ -60,9 +105,9 @@ dataset:
   # labelme_json      - LabelMe JSON annotations.
   source_format: ultralytics_yolo
   # Source dataset root. Options: RF-DETR/Roboflow root, YOLO root, VOC root, DOTA root, LabelMe root, or COCO root.
-  dataset_dir: "/home/new_users/zhiyu/datasets/soccer/spatial_perception/Xbotgo/站立运动员、足球、球门检测数据集V1/outputs/YoloFormat/all_parameters_sahi_object_crop_classcrop_train_val_960_classesall_max_samplesall"
+  dataset_dir: C:\Users\XBOT\Documents\Datasets\all_parameters_SAHI_640_classesall_max_samples2000
   # Ultralytics YOLO dataset YAML. Options: empty string to auto-find data.yaml/data.yml/dataset.yaml in dataset_dir, or a YAML path.
-  data_yaml: "/home/new_users/zhiyu/datasets/soccer/spatial_perception/Xbotgo/站立运动员、足球、球门检测数据集V1/outputs/YoloFormat/all_parameters_sahi_object_crop_classcrop_train_val_960_classesall_max_samplesall/dataset.yaml"
+  data_yaml: ""
   # COCO annotation file for single-file COCO datasets. Options: empty string to auto-find common annotations/*.json files.
   coco_json: ""
   # Image directory used with coco_json when image file names are relative. Options: empty string to infer from dataset_dir.
@@ -110,27 +155,27 @@ output:
   output_dir: ""
   # Output root when output_dir is empty. Options: runs/rf_detr, D:/runs/{dataset_name}, /mnt/runs/rf_detr.
   # Supports the same placeholders as output_dir.
-  root: "/home/new_users/zhiyu/projects/PitchObjectLab/runs/detect/站立運動員_足球_球門檢測數據集2025/train"
+  root: runs/rf_detr/all_parameters_SAHI_640/train
   # Run folder name when output_dir is empty. Options: pure string or placeholder template.
   # Supports the same placeholders as output_dir.
-  name: "rfdetr_sahi_object_crop_classcrop_960_{model_size}_e{epochs}_b{batch_size}_val{eval_interval}_test{test_interval_epochs}_{timestamp}"
+  name: "rfdetr_{model_size}_e{epochs}_b{batch_size}_val{eval_interval}_test{test_interval_epochs}_{timestamp}"
   # Allow using an existing output directory. Options: true, false.
   exist_ok: false
 
 # Training hyperparameters and runtime settings. Options: mapping.
 train:
-  # RF-DETR dataset root forwarded into TrainConfig. Options: empty to copy dataset.dataset_dir, or explicit path. For ultralytics_yolo sources this is replaced with the converted cache before training.
-  dataset_dir: "/home/new_users/zhiyu/datasets/soccer/spatial_perception/Xbotgo/站立运动员、足球、球门检测数据集V1/outputs/YoloFormat/all_parameters_sahi_object_crop_classcrop_train_val_960_classesall_max_samplesall"
+  # RF-DETR dataset root forwarded into TrainConfig. Options: empty to copy dataset.dataset_dir, or explicit path.
+  dataset_dir: C:\Users\XBOT\Documents\Datasets\all_parameters_SAHI_640_classesall_max_samples2000
   # Dataset file type. Options: roboflow, coco, yolo, o365. roboflow auto-detects Roboflow COCO/YOLO layouts.
   dataset_file: roboflow
   # CUDA/CPU selector. Options: auto, cpu, cuda, 0, 1, 0,1, cuda:0, mps, -1.
-  device: 4,5
+  device: 0
   # Number of training epochs. Options: any positive integer.
-  epochs: 20
+  epochs: 50
   # Micro batch size per optimizer step. Options: positive integer, or auto for RF-DETR auto-batch probing.
-  batch_size: 16
+  batch_size: 4
   # Gradient accumulation steps. Effective per-device batch = batch_size * grad_accum_steps. Options: positive integer.
-  grad_accum_steps: 8
+  grad_accum_steps: 4
   # Per-device effective batch target when batch_size=auto. Options: positive integer.
   auto_batch_target_effective: 16
   # Max labels per image assumption for auto-batch probing. Options: positive integer.
@@ -248,17 +293,6 @@ train:
   # Extra RF-DETR TrainConfig keys not listed above. Example: {freeze_encoder: true}
   extra_train_args: {}
 
-# Metric/evaluation settings. Options: mapping.
-evaluation:
-  # Evaluation type for wrapper final/periodic tests. Options: auto, bbox, segm, segmentation, mask, masks.
-  type: auto
-  # Write per-class metrics JSON/CSV. Options: true, false.
-  classwise: true
-  # COCO max detections list. Options: one, two, or three positive integers.
-  max_detections: [1, 10, 500]
-  # Operating-point and error-case IoU threshold. Options: 0.0-1.0.
-  match_iou_threshold: 0.5
-
 # Scheduled and final test settings. Options: mapping.
 periodic_test:
   # Enable scheduled test-set evaluation during training. Options: true, false.
@@ -363,7 +397,7 @@ periodic_test:
   # Number of model input cases per saved test_batch grid. Options: positive integer.
   model_input_batch_size: 9
   # Split used for scheduled and final wrapper tests. Options: test-original, test, val, valid, train.
-  split: test
+  split: test-original
   # Maximum images evaluated in each scheduled/final test. Options: all/null for full split, or a positive integer for first N images.
   max_images: all
   # Run test every N epochs. Options: 0 disables epoch interval, positive integer enables.
@@ -380,20 +414,8 @@ periodic_test:
   final_output_dir_name: final_test
   # Write per-class test metrics JSON/CSV. Options: true, false. true is recommended.
   classwise: true
-  # Save PR/confusion/curve plots during wrapper tests. Options: true, false.
-  plots: false
-  # Save raw evaluated dataset case images during wrapper tests. Options: true, false.
-  save_dataset_cases: false
-  # Prediction confidence threshold override for wrapper tests. Options: null to use model.confidence_threshold, or 0.0-1.0.
-  conf: null
-  # Max detections used in wrapper test metrics. Options: null to use evaluation.max_detections/eval_max_dets, or positive integer.
-  max_dets: null
-  # IoU threshold for wrapper TP/FP/FN and error-case matching. Options: null to use evaluation.match_iou_threshold, or 0.0-1.0.
-  match_iou_threshold: null
   # RF-DETR full-image/class-crop evaluator batch size for scheduled/final tests. Options: positive integer.
   batch_size: 4
-  # Adapter dataloader workers for standalone-style evaluation. Options: 2 by project rule.
-  num_workers: 2
   # Error-case diagnostic settings. Options: mapping.
   error_cases:
     # Save target-class missed/misclassified/false-positive examples after scheduled/final tests. Options: true, false.
@@ -428,10 +450,8 @@ periodic_test:
 
 # PyTorch Lightning trainer override settings. Options: mapping.
 trainer:
-  # Extra PyTorch Lightning Trainer kwargs. Options: any Trainer key such as precision, fast_dev_run, limit_train_batches, num_sanity_val_steps.
-  extra_trainer_args:
-    # Initial validation sanity batches before training. Options: 0 disables; positive integer enables. Use 0 for multi-GPU RF-DETR to avoid distributed mAP sync timeout before epoch 1.
-    num_sanity_val_steps: 0
+  # Extra PyTorch Lightning Trainer kwargs. Options: any Trainer key such as precision, fast_dev_run, limit_train_batches.
+  extra_trainer_args: {}
 
 # Small demo/smoke-run overrides. Options: mapping.
 demo:

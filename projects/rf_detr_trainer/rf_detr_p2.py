@@ -14,11 +14,16 @@ The *installed* ``rfdetr`` package is already 95% ready for P2:
   ``level_embed``, two-stage top-K query selection, ``spatial_shapes`` and the
   per-level sine positional encoding all derive dynamically from the level count
   and per-map size. An extra level "just works" structurally.
-* Pretrained weights load with ``strict=False`` + PE interpolation, so the new P2
-  projector stage and the resized deformable-attention layers simply start
-  randomly initialised -- fine for fine-tuning from a checkpoint.
+* Pretrained weights load with ``strict=False`` + PE interpolation. But the stock
+  detection checkpoints are single-scale (``projector_scale=["P4"]`` for every size,
+  nano..large), so enabling P2 changes ``num_feature_levels`` and *resizes* existing
+  deformable-attention ``sampling_offsets``/``attention_weights`` Linear layers plus the
+  projector's first stage. ``torch``'s ``strict=False`` only skips missing/extra *keys*,
+  not size-mismatched ones, so the loader would raise ``RuntimeError``. We therefore drop
+  the mismatched checkpoint tensors so they start randomly initialised -- exactly the
+  documented fine-tuning behavior.
 
-Only two spots block P2, and both live in ``.venv`` (not version-controlled):
+Three spots block P2, and all live in ``.venv`` (not version-controlled):
 
 1. ``rfdetr.config.ModelConfig.projector_scale`` is
    ``List[Literal["P3", "P4", "P5"]]`` (each variant re-declares its own, even
@@ -27,6 +32,10 @@ Only two spots block P2, and both live in ``.venv`` (not version-controlled):
 2. ``Backbone.__init__`` builds a *local* dict
    ``level2scalefactor = dict(P3=2.0, P4=1.0, P5=0.5, P6=0.25)`` with no ``P2`` key
    -> ``KeyError`` when ``"P2"`` is requested.
+3. ``rfdetr.models.weights.load_pretrain_weights`` ends in
+   ``nn_model.load_state_dict(ckpt, strict=False)``; ``strict=False`` does NOT skip
+   size-mismatched tensors, so the P2 feature-level-count change makes it raise. We
+   override ``LWDETR.load_state_dict`` to drop those tensors on non-strict loads.
 
 Rather than edit ``.venv`` (lost on ``uv sync``), this module applies an in-process
 monkey-patch, version-controlled here and applied *only* when ``model.p2.enabled``
@@ -89,13 +98,14 @@ _PROJECTOR_DEFAULTS = {
 
 _LITERAL_PATCHED = False
 _BACKBONE_PATCHED = False
+_PRETRAIN_FILTER_PATCHED = False
 _WARN_FILTER_INSTALLED = False
 _PATCHED_INIT: Any = None  # the installed _p2_backbone_init, for idempotency checks/tests
 
 
 def is_patched() -> bool:
-    """Return True once the rfdetr Literal + backbone patches have been applied."""
-    return _LITERAL_PATCHED and _BACKBONE_PATCHED
+    """Return True once the rfdetr Literal + backbone + loader patches have been applied."""
+    return _LITERAL_PATCHED and _BACKBONE_PATCHED and _PRETRAIN_FILTER_PATCHED
 
 
 def _first(value: Any, fallback: Any) -> Any:
@@ -333,6 +343,53 @@ def _patch_backbone_init() -> None:
     _BACKBONE_PATCHED = True
 
 
+def _patch_pretrain_weight_filter() -> None:
+    """Drop size-mismatched checkpoint tensors on non-strict ``LWDETR.load_state_dict``.
+
+    Stock detection checkpoints are single-scale (``projector_scale=["P4"]``); enabling
+    P2 changes ``num_feature_levels`` and resizes existing deformable-attention Linear
+    layers + the projector's first stage. ``torch``'s ``strict=False`` skips only
+    missing/extra keys, not size-mismatched ones, so ``load_pretrain_weights`` would
+    raise. We drop those tensors so they start randomly initialised (the documented P2
+    behavior). Applied only under P2, only on ``strict=False`` loads; a matching P2
+    checkpoint (test / inference / resume) mismatches nothing and loads unchanged.
+    """
+    global _PRETRAIN_FILTER_PATCHED
+    import rfdetr.models.lwdetr as lwdetr_module
+
+    model_cls = lwdetr_module.LWDETR
+    existing = model_cls.__dict__.get("load_state_dict")
+    if existing is not None and getattr(existing, "_p2_drops_mismatch", False):
+        _PRETRAIN_FILTER_PATCHED = True
+        return
+    base_load_state_dict = model_cls.load_state_dict  # inherited nn.Module.load_state_dict
+
+    def load_state_dict(self, state_dict, strict=True, *args, **kwargs):
+        if not strict:
+            model_state = self.state_dict()
+            mismatched = [
+                key
+                for key, value in state_dict.items()
+                if key in model_state
+                and hasattr(value, "shape")
+                and tuple(value.shape) != tuple(model_state[key].shape)
+            ]
+            if mismatched:
+                drop = set(mismatched)
+                state_dict = {k: v for k, v in state_dict.items() if k not in drop}
+                warnings.warn(
+                    f"[rf_detr_p2] Dropped {len(mismatched)} size-mismatched pretrained "
+                    f"tensor(s) so they start randomly initialised (P2 changes the "
+                    f"feature-level count); e.g. {mismatched[0]}.",
+                    stacklevel=2,
+                )
+        return base_load_state_dict(self, state_dict, strict, *args, **kwargs)
+
+    load_state_dict._p2_drops_mismatch = True
+    model_cls.load_state_dict = load_state_dict
+    _PRETRAIN_FILTER_PATCHED = True
+
+
 def _suppress_compat_warning() -> None:
     """Silence the expected projector_scale PretrainWeightsCompatibilityWarning."""
     try:
@@ -365,3 +422,4 @@ def ensure_p2_support(p2_config: Optional[Mapping[str, Any]] = None) -> None:
     _check_version()
     _relax_projector_scale_literal()
     _patch_backbone_init()
+    _patch_pretrain_weight_filter()

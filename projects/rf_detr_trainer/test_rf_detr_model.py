@@ -375,7 +375,7 @@ def build_internal_test_config(config: Mapping[str, Any]) -> Dict[str, Any]:
         "dataset_file": "roboflow",
         "batch_size": int(test_settings.get("batch_size", 4) or 4),
         "grad_accum_steps": 1,
-        "num_workers": int(test.get("num_workers", 0) or 0),
+        "num_workers": int(test.get("num_workers", 2) or 2),
         "device": device,
         "eval_max_dets": _last_max_det(evaluation),
         "run_test": False,
@@ -433,6 +433,11 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
             bar.update(bar.total - bar.n)
             return 0
 
+        output_dir.mkdir(parents=True, exist_ok=True)
+        if timing_context is not None:
+            timing_context["outputs_created"] = True
+        trainer.start_run_log_capture(output_dir, "test", timing_context)
+
         dataset_metadata = trainer.materialize_dataset_plan(
             dataset_plan,
             internal_config,
@@ -449,8 +454,6 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
             metadata={"event": "standalone_test_start", "dataset": dataset_metadata},
             source_config=source_config,
         )
-        if timing_context is not None:
-            timing_context["outputs_created"] = True
         bar.update(1)
 
         model_cls = trainer.get_model_class(str(internal_config.get("model", {}).get("size", "medium")))

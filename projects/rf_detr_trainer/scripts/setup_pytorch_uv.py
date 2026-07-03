@@ -118,6 +118,33 @@ def choose_cuda_tag(cuda_version: Optional[str], forced: Optional[str], device: 
     return "cpu"
 
 
+def index_has_pinned_torch(index_url: str, cuda_tag: str, timeout: float = 8.0) -> bool:
+    """Return true when the index exposes this project's pinned torch wheel."""
+    expected = f"torch-{TORCH_VERSION}"
+    if cuda_tag != "cpu":
+        expected = f"{expected}+{cuda_tag}"
+    try:
+        request = urllib.request.Request(index_url, headers={"User-Agent": "rf-detr-trainer-setup/1.0"})
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            html = response.read().decode("utf-8", errors="ignore")
+    except (OSError, urllib.error.URLError):
+        return False
+    return expected in html or expected.replace("+", "%2B") in html
+
+
+def resolve_index_urls(region: str, cuda_tag: str) -> Tuple[str, str, Optional[str]]:
+    """Choose package indexes, falling back when a regional PyTorch mirror lacks the pinned wheel."""
+    index_url = PYTORCH_INDEXES[region][cuda_tag]
+    note = None
+    if region == "china" and not index_has_pinned_torch(index_url, cuda_tag):
+        note = (
+            f"China PyTorch mirror did not expose torch=={TORCH_VERSION} for {cuda_tag}; "
+            "falling back to the official PyTorch wheel index while keeping the PyPI mirror."
+        )
+        index_url = PYTORCH_INDEXES["official"][cuda_tag]
+    return index_url, PYPI_INDEXES[region], note
+
+
 def index_name(cuda_tag: str) -> str:
     """Return the uv index name for a PyTorch wheel tag."""
     return f"pytorch-{cuda_tag}"
@@ -125,7 +152,7 @@ def index_name(cuda_tag: str) -> str:
 
 def update_dependency_line(text: str, package: str, version: str) -> str:
     """Replace or insert a dependency line in pyproject.toml dependencies."""
-    pattern = rf'(?m)^    "{re.escape(package)}[^"]*",\s*$'
+    pattern = rf'(?m)^    "{re.escape(package)}(?=(?:\[|[<>=!~]|"))[^"]*",\s*$'
     replacement = f'    "{package}=={version}",'
     if re.search(pattern, text):
         return re.sub(pattern, replacement, text)
@@ -205,8 +232,7 @@ def main() -> int:
 
     cuda_version = detect_cuda_version()
     cuda_tag = choose_cuda_tag(cuda_version, args.cuda_tag, args.device)
-    index_url = PYTORCH_INDEXES[region][cuda_tag]
-    default_index_url = PYPI_INDEXES[region]
+    index_url, default_index_url, index_note = resolve_index_urls(region, cuda_tag)
     plan = {
         "project_dir": str(PROJECT_DIR),
         "pyproject": str(PYPROJECT),
@@ -219,6 +245,7 @@ def main() -> int:
         "torchvision": TORCHVISION_VERSION,
         "pypi_index": default_index_url,
         "pytorch_index": index_url,
+        "pytorch_index_note": index_note,
         "will_run_uv_sync": not args.no_sync,
     }
     blue("PyTorch uv setup plan:")

@@ -188,6 +188,76 @@ def blue(message: str, verbose: bool = True, force: bool = False) -> None:
         print(Fore.BLUE + Style.BRIGHT + message)
 
 
+class TeeTextStream:
+    """Write console output to the original stream and an output run log."""
+
+    def __init__(self, stream: Any, log_file: Any) -> None:
+        self.stream = stream
+        self.log_file = log_file
+
+    def write(self, data: str) -> int:
+        written = self.stream.write(data)
+        self.log_file.write(data)
+        return written
+
+    def flush(self) -> None:
+        self.stream.flush()
+        self.log_file.flush()
+
+    def isatty(self) -> bool:
+        return bool(getattr(self.stream, "isatty", lambda: False)())
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.stream, name)
+
+
+def start_run_log_capture(
+    output_dir: Path,
+    task: str,
+    context: Optional[MutableMapping[str, Any]] = None,
+    enabled: bool = True,
+) -> Optional[Path]:
+    """Mirror stdout/stderr into output_dir/run.log for output-producing runs."""
+    if not enabled:
+        return None
+    if context is not None and context.get("run_log_capture"):
+        return Path(str(context.get("log_path")))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_path = output_dir / "run.log"
+    log_file = log_path.open("a", encoding="utf-8", buffering=1)
+    capture = {
+        "stdout": sys.stdout,
+        "stderr": sys.stderr,
+        "log_file": log_file,
+        "log_path": str(log_path),
+    }
+    sys.stdout = TeeTextStream(sys.stdout, log_file)  # type: ignore[assignment]
+    sys.stderr = TeeTextStream(sys.stderr, log_file)  # type: ignore[assignment]
+    if context is not None:
+        context["run_log_capture"] = capture
+        context["log_path"] = str(log_path)
+    print(f"Run log: {log_path}")
+    print(f"Run log started for {task} at {datetime.now().isoformat(timespec='seconds')}")
+    return log_path
+
+
+def stop_run_log_capture(context: Optional[MutableMapping[str, Any]]) -> None:
+    """Restore stdout/stderr and close the active run log capture."""
+    if context is None:
+        return
+    capture = context.pop("run_log_capture", None)
+    if not capture:
+        return
+    try:
+        print(f"Run log ended at {datetime.now().isoformat(timespec='seconds')}")
+        sys.stdout.flush()
+        sys.stderr.flush()
+    finally:
+        sys.stdout = capture["stdout"]
+        sys.stderr = capture["stderr"]
+        capture["log_file"].close()
+
+
 def parse_bool(value: Any) -> bool:
     """Parse a human-friendly boolean value."""
     if isinstance(value, bool):
@@ -706,46 +776,51 @@ def start_run_timing(task: str, verbose: bool = True) -> Dict[str, Any]:
 
 def finish_run_timing(context: MutableMapping[str, Any]) -> None:
     """Print elapsed time and write run_timing.json when an output dir exists."""
-    ended_at_monotonic = time.monotonic()
-    elapsed_seconds = max(0.0, ended_at_monotonic - float(context.get("started_at_monotonic", ended_at_monotonic)))
-    elapsed_hms = format_duration_hms(elapsed_seconds)
-    verbose = bool(context.get("verbose", True))
-    if verbose:
-        blue(f"Elapsed time: {elapsed_hms}", verbose=True, force=True)
-    else:
-        print(f"Elapsed time: {elapsed_hms}")
+    try:
+        ended_at_monotonic = time.monotonic()
+        elapsed_seconds = max(0.0, ended_at_monotonic - float(context.get("started_at_monotonic", ended_at_monotonic)))
+        elapsed_hms = format_duration_hms(elapsed_seconds)
+        verbose = bool(context.get("verbose", True))
+        if verbose:
+            blue(f"Elapsed time: {elapsed_hms}", verbose=True, force=True)
+        else:
+            print(f"Elapsed time: {elapsed_hms}")
 
-    output_dir = context.get("output_dir")
-    dry_run = bool(context.get("dry_run", False))
-    if output_dir is None or dry_run or not bool(context.get("outputs_created", False)):
-        return
-    output_path = Path(str(output_dir))
-    if not output_path.exists():
-        return
+        output_dir = context.get("output_dir")
+        dry_run = bool(context.get("dry_run", False))
+        if output_dir is None or dry_run or not bool(context.get("outputs_created", False)):
+            return
+        output_path = Path(str(output_dir))
+        if not output_path.exists():
+            return
 
-    estimate = dict(context.get("estimate", {}) or {})
-    units = float(estimate.get("runtime_units") or 0.0)
-    throughput: Dict[str, Any] = {"runtime_units": units}
-    if units > 0:
-        throughput["seconds_per_runtime_unit"] = elapsed_seconds / units
+        estimate = dict(context.get("estimate", {}) or {})
+        units = float(estimate.get("runtime_units") or 0.0)
+        throughput: Dict[str, Any] = {"runtime_units": units}
+        if units > 0:
+            throughput["seconds_per_runtime_unit"] = elapsed_seconds / units
 
-    payload = {
-        "task": context.get("task"),
-        "success": bool(context.get("success", False)),
-        "started_at": context.get("started_at"),
-        "ended_at": datetime.now().isoformat(timespec="seconds"),
-        "elapsed_seconds": round(elapsed_seconds, 3),
-        "elapsed_hms": elapsed_hms,
-        "estimated_runtime_seconds": estimate.get("estimated_runtime_seconds"),
-        "estimated_runtime_hms": estimate.get("estimated_runtime_hms"),
-        "estimated_runtime_source": estimate.get("estimated_runtime_source"),
-        "estimated_runtime_confidence": estimate.get("estimated_runtime_confidence"),
-        "runtime_estimate_basis": estimate.get("runtime_estimate_basis", {}),
-        "throughput": throughput,
-    }
-    if context.get("error"):
-        payload["error"] = context["error"]
-    write_json(output_path / "run_timing.json", payload)
+        payload = {
+            "task": context.get("task"),
+            "success": bool(context.get("success", False)),
+            "started_at": context.get("started_at"),
+            "ended_at": datetime.now().isoformat(timespec="seconds"),
+            "elapsed_seconds": round(elapsed_seconds, 3),
+            "elapsed_hms": elapsed_hms,
+            "estimated_runtime_seconds": estimate.get("estimated_runtime_seconds"),
+            "estimated_runtime_hms": estimate.get("estimated_runtime_hms"),
+            "estimated_runtime_source": estimate.get("estimated_runtime_source"),
+            "estimated_runtime_confidence": estimate.get("estimated_runtime_confidence"),
+            "runtime_estimate_basis": estimate.get("runtime_estimate_basis", {}),
+            "throughput": throughput,
+        }
+        if context.get("error"):
+            payload["error"] = context["error"]
+        if context.get("log_path"):
+            payload["log_path"] = context["log_path"]
+        write_json(output_path / "run_timing.json", payload)
+    finally:
+        stop_run_log_capture(context)
 
 
 def maybe_count_images(path: Optional[Path]) -> Optional[int]:
@@ -2678,6 +2753,16 @@ def build_model_kwargs(config: Mapping[str, Any]) -> Dict[str, Any]:
         ensure_p2_support(p2_cfg)
         kwargs["projector_scale"] = resolve_p2_projector_scale(p2_cfg)
         apply_p2_overrides(kwargs, p2_cfg)
+    # Optional pluggable TrackNetV5 motion module. Fully inert unless model.motion.enabled.
+    # ensure_motion_support patches LWDETR.forward in-process (wraps backbone output for MDD
+    # feature-gating and R-STR refinement). attach_motion_module() must be called separately
+    # after the model object is constructed (see _attach_motion_module_if_enabled below).
+    motion_cfg = model_cfg.get("motion", {}) or {}
+    if bool(motion_cfg.get("enabled", False)):
+        from rf_detr_motion import apply_motion_overrides, ensure_motion_support
+
+        ensure_motion_support(motion_cfg)
+        apply_motion_overrides(kwargs, motion_cfg)
     should_pass, pretrain = normalize_pretrain_weights(model_cfg.get("pretrain_weights", "default"))
     if should_pass:
         if pretrain == "default":
@@ -2725,6 +2810,7 @@ def build_train_kwargs(config: Mapping[str, Any], output_dir: Path) -> Dict[str,
     train_kwargs: Dict[str, Any] = {}
     train_kwargs.update(train)
     train_kwargs.update(extra)
+    train_kwargs.setdefault("num_workers", 2)
     train_kwargs["dataset_dir"] = str(resolve_existing_or_raw(train_kwargs["dataset_dir"], [Path.cwd(), REPO_ROOT, PROJECT_DIR]))
     train_kwargs["output_dir"] = str(output_dir)
     if device not in (None, "", "auto"):
@@ -2907,12 +2993,12 @@ def parse_device_to_trainer_kwargs(device: Optional[str]) -> Dict[str, Any]:
     if text == "-1":
         return {"accelerator": "auto", "devices": "auto"}
     if "," in text:
-        ids = [int(part.strip()) for part in text.split(",") if part.strip()]
-        return {"accelerator": "gpu", "devices": ids}
+        ids = [str(int(part.strip())) for part in text.split(",") if part.strip()]
+        return {"accelerator": "gpu", "devices": ",".join(ids)}
     if text.isdigit():
-        return {"accelerator": "gpu", "devices": [int(text)]}
+        return {"accelerator": "gpu", "devices": f"{int(text)},"}
     if text.startswith("cuda:") and text.split(":", 1)[1].isdigit():
-        return {"accelerator": "gpu", "devices": [int(text.split(":", 1)[1])]}
+        return {"accelerator": "gpu", "devices": f"{int(text.split(':', 1)[1])},"}
     return {"accelerator": text}
 
 
@@ -3021,7 +3107,7 @@ def build_eval_dataloader(datamodule: Any, model_config: Any, train_config: Any,
     from rfdetr.utilities.tensors import collate_fn
 
     dataset = build_dataset(split, build_namespace(model_config, train_config), model_config.resolution)
-    num_workers = int(getattr(train_config, "num_workers", 0) or 0)
+    num_workers = int(getattr(train_config, "num_workers", 2) or 2)
     pin_memory = getattr(datamodule, "_pin_memory", False)
     persistent_workers = bool(num_workers > 0 and getattr(datamodule, "_persistent_workers", False))
     prefetch_factor = getattr(datamodule, "_prefetch_factor", None) if num_workers > 0 else None
@@ -4077,6 +4163,7 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
             output_dir.mkdir(parents=True, exist_ok=True)
             if timing_context is not None:
                 timing_context["outputs_created"] = True
+            start_run_log_capture(output_dir, "train", timing_context, enabled=not distributed_child)
             bar.set_description("Dataset")
             dataset_metadata = materialize_dataset_plan(dataset_plan, config, output_dir, verbose)
             export_distributed_child_runtime(config, output_dir, timestamp)
@@ -4113,6 +4200,14 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
 
         blue(f"Creating RF-DETR model: {model_cls.__name__}.", verbose)
         rf_model = model_cls(**model_kwargs)
+        # Attach the TrackNetV5 motion module after the backbone is built so that
+        # the projector output channel count is available for MotionModule sizing.
+        _motion_cfg = config.get("model", {}).get("motion", {}) or {}
+        if bool(_motion_cfg.get("enabled", False)):
+            from rf_detr_motion import attach_motion_module
+
+            attach_motion_module(rf_model.model, _motion_cfg)
+            blue("TrackNetV5 motion module (MDD + R-STR) attached to LWDETR.", verbose)
         train_config = rf_model.get_train_config(**train_kwargs)
         if train_config.batch_size == "auto":
             from rfdetr.detr import _ensure_model_on_device

@@ -9,21 +9,28 @@ Use this skill when editing `projects/rf_detr_trainer` or related object-detecti
 
 ## Workflow
 
-1. Inspect the request for contradictions, missing details, and risky assumptions before editing. If a high-impact choice cannot be resolved from the repo, ask for confirmation.
-2. Read current entrypoints/configs first: `train_rf_detr_model.py`, `test_rf_detr_model.py`, `config/*.yaml`, `README.md`, and `AGENTS.md`.
-3. Keep execution config parameters grouped as `runtime`, `model`, `dataset`, `output`, task-specific settings, and `evaluation`. Every execution-config key needs a nearby `#` comment with purpose and valid options.
-4. Preserve framework-native dataset YAMLs. Do not add trainer-only keys to Ultralytics data YAMLs.
-5. Any output-producing code must:
+1. Inspect the request for contradictions, missing details, risky assumptions, and safer alternatives before editing. Then do broad web/source research when network access is available, summarize findings and the proposed change, and get developer confirmation before implementation; if the task is strictly local/offline or network is forbidden, state that clearly before continuing. If a high-impact choice cannot be resolved from the repo, ask for confirmation.
+2. When creating a new project, major tool, or standalone module, choose a clear project name that fits the purpose, domain, and expected users. Do not rename this project or existing public entrypoints without explicit confirmation.
+3. Read current entrypoints/configs first: `train_rf_detr_model.py`, `test_rf_detr_model.py`, `inference_rf_detr_model.py`, `config/*.yaml`, `README.md`, and `AGENTS.md`.
+4. Keep execution config parameters grouped as `runtime`, `model`, `dataset`, `output`, task-specific settings, and `evaluation`. Every execution-config key needs a nearby `#` comment with purpose and valid options. Output folders must be configurable by parameters, placeholders, or plain string templates.
+5. Preserve framework-native dataset YAMLs. Do not add trainer-only keys to Ultralytics data YAMLs.
+6. Any output-producing code must:
    - print file-count and disk-usage estimates before writing;
    - include a rough HH:MM:SS runtime estimate before writing;
    - ask for confirmation unless `--yes` or config bypass is enabled;
+   - provide a no-confirm execution path such as `--yes`;
    - create missing output directories;
    - save source/resolved config metadata inside the output folder;
    - print elapsed HH:MM:SS at process exit and write `run_timing.json` when outputs were created;
    - write JSON/YAML with UTF-8 Chinese text preserved.
-6. Python entrypoints should import `colorama`, call `colorama.init(autoreset=True)`, include a triple-quoted usage docstring, and show progress bars for long loops.
-7. CUDA must be configurable as `auto`, `cpu`, `cuda`, `cuda:N`, or specific IDs. Keep Windows and Linux path handling.
-8. For package/model/dataset downloads, check public IP region first. Use China/HK/MO/TW mirrors when detected, otherwise official sources.
+7. Python entrypoints should import `colorama`, call `colorama.init(autoreset=True)`, include a triple-quoted `"""..."""` usage docstring, and show progress bars for long loops.
+8. CUDA must be configurable as `auto`, `cpu`, `cuda`, `cuda:N`, or specific IDs. Keep Windows and Linux path handling.
+9. For package/model/dataset downloads, check the observed public IP region first. Use China/HK/MO/TW mirrors when detected, otherwise official sources, and allow mirror/source overrides so the workflow works with or without VPN.
+10. Keep DataLoader/worker-style parallelism uniformly set to `2` in configs and defaults unless the developer explicitly asks for a different value.
+11. Maintain a project-local `uv` environment. If `.venv` is missing, create it through `uv`; if it exists, add new dependencies with `uv add` and keep `pyproject.toml`/`uv.lock` in sync so future setup only needs `uv sync`.
+12. GPU PyTorch setup must auto-detect hardware and choose the appropriate PyTorch build/index. Reuse `scripts/setup_pytorch_uv.py` when possible and follow the region-aware download rule.
+13. Update `README.md` whenever entrypoint usage, config options, setup steps, or output behavior changes.
+14. Every runnable script must produce useful console logs. For output-producing runs, write logs or a log summary inside the output folder when practical.
 
 ## Test Diagnostics
 

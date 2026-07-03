@@ -2,6 +2,7 @@
 # Dataset YAML files stay in their framework-native Ultralytics format.
 # Every path can be absolute or relative. Relative paths are resolved from the repo root when possible.
 
+# Runtime controls for dry-run, prompts, verbosity, seeds, and estimates. Options: mapping.
 runtime:
   # Print wrapper status text in bright blue. Options: true, false.
   verbose: true
@@ -12,6 +13,7 @@ runtime:
   # Seed used for deterministic visual sampling during final/periodic tests. Options: integer.
   seed: 0
 
+# Model construction settings. Options: mapping.
 model:
   # RF-DETR model size. Detection: base, nano, small, medium, large. Segmentation: seg-preview, seg-nano, seg-small, seg-medium, seg-large, seg-xlarge, seg-2xlarge.
   size: large
@@ -32,6 +34,7 @@ model:
   # Extra RF-DETR ModelConfig keys. Options: any supported model key such as freeze_encoder, gradient_checkpointing, compile, num_queries.
   extra_model_args: {}
 
+# Dataset discovery and limiting settings. Options: mapping.
 dataset:
   # Dataset source format before this trainer prepares it. Options:
   # auto              - auto-detect supported layouts.
@@ -72,6 +75,7 @@ dataset:
   # Dataset format passed to RF-DETR TrainConfig. Options: roboflow, coco, yolo, o365. roboflow auto-detects COCO/YOLO and is recommended.
   dataset_file: roboflow
 
+# Output directory settings and naming templates. Options: mapping.
 output:
   # Exact output directory. Options: empty string to use root/name, or any Windows/Linux path.
   # Supports placeholders:
@@ -91,6 +95,7 @@ output:
   # Allow using an existing output directory. Options: true, false.
   exist_ok: true
 
+# Training hyperparameters and runtime settings. Options: mapping.
 train:
   # RF-DETR dataset root forwarded into TrainConfig. Options: empty to copy dataset.dataset_dir, or explicit path. For ultralytics_yolo sources this is replaced with the converted cache before training.
   dataset_dir: "/home/new_users/zhiyu/datasets/soccer/spatial_perception/Xbotgo/站立运动员、足球、球门检测数据集V1/outputs/YoloFormat/all_parameters_sahi_object_crop_classcrop_train_val_960_classesall_max_samplesall"
@@ -142,7 +147,7 @@ train:
   ema_tau: 100
   # EMA update interval in optimizer steps. Options: positive integer.
   ema_update_interval: 1
-  # Dataloader workers. Options: 0 for maximum Windows compatibility, or positive integer.
+  # Dataloader workers. Options: 2 by project rule.
   num_workers: 2
   # Enable early stopping. Options: true, false.
   early_stopping: true
@@ -221,6 +226,7 @@ train:
   # Extra RF-DETR TrainConfig keys not listed above. Example: {freeze_encoder: true}
   extra_train_args: {}
 
+# Metric/evaluation settings. Options: mapping.
 evaluation:
   # Evaluation type for wrapper final/periodic tests. Options: auto, bbox, segm, segmentation, mask, masks.
   type: auto
@@ -231,12 +237,15 @@ evaluation:
   # Operating-point and error-case IoU threshold. Options: 0.0-1.0.
   match_iou_threshold: 0.5
 
+# Scheduled and final test settings. Options: mapping.
 periodic_test:
   # Enable scheduled test-set evaluation during training. Options: true, false.
   enabled: false
+  # Test mode selector block. Options: mapping.
   test_mode:
     # Test mode. Options: full_image, sahi, class_crop.
     mode: sahi
+  # Class-crop/object-crop test settings. Options: mapping.
   crop:
     # Class IDs used to find class_crop windows from model predictions. Empty means all predicted classes are eligible.
     class_ids: []
@@ -252,6 +261,7 @@ periodic_test:
     padding_ratio: 0.05
     # Behavior when no crop class is predicted. Options: full_image.
     fallback: full_image
+  # SAHI sliced-inference settings. Options: mapping.
   sahi:
     # Slice/window height for periodic/final sahi mode. Options: positive integer.
     slice_height: 640
@@ -273,6 +283,7 @@ periodic_test:
     postprocess_class_agnostic: false
     # SAHI model input batch size. Options: positive integer.
     batch_size: 1
+  # Visual sample filtering/rendering settings. Options: mapping.
   visual_samples:
     # Save sampled prediction test images with GT and predictions during periodic/final tests. Options: true, false.
     enabled: false
@@ -334,8 +345,9 @@ periodic_test:
   match_iou_threshold: null
   # Adapter batch size for standalone-style evaluation. Options: positive integer.
   batch_size: 1
-  # Adapter dataloader workers for standalone-style evaluation. Options: 0 for Windows compatibility, or positive integer.
-  num_workers: 0
+  # Adapter dataloader workers for standalone-style evaluation. Options: 2 by project rule.
+  num_workers: 2
+  # Error-case diagnostic settings. Options: mapping.
   error_cases:
     # Save target-class missed/misclassified/false-positive examples after scheduled/final tests. Options: true, false.
     enabled: true
@@ -367,10 +379,12 @@ periodic_test:
   # Show a progress bar during manual scheduled/final test. Options: true, false.
   progress_bar: true
 
+# PyTorch Lightning trainer override settings. Options: mapping.
 trainer:
   # Extra PyTorch Lightning Trainer kwargs. Options: any Trainer key such as precision, fast_dev_run, limit_train_batches.
   extra_trainer_args: {}
 
+# Small demo/smoke-run overrides. Options: mapping.
 demo:
   # Enable small demo output mode. Options: true, false.
   enabled: false

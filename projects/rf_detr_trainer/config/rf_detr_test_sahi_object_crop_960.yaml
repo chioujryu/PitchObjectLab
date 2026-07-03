@@ -1,6 +1,7 @@
 # Standalone SAHI test config for test_rf_detr_model.py.
 # Every execution parameter is grouped and commented; dataset YAML files remain standard Ultralytics YAML.
 
+# Runtime controls for dry-run, prompts, verbosity, seeds, and estimates. Options: mapping.
 runtime:
   # Print wrapper status text. Options: true, false.
   verbose: true
@@ -12,6 +13,7 @@ runtime:
   yes: false
   # Seed used for deterministic sampling. Options: integer.
   seed: 0
+  # Runtime-estimate settings. Options: mapping.
   time_estimate:
     # Print rough HH:MM:SS runtime estimates before execution. Options: true, false.
     enabled: true
@@ -26,6 +28,7 @@ runtime:
     # Fallback video render speed retained for shared schema. Options: positive seconds per frame.
     default_video_render_seconds_per_frame: 0.005
 
+# Model construction settings. Options: mapping.
 model:
   # RF-DETR model size. Options: base, nano, small, medium, large, seg-preview, seg-nano, seg-small, seg-medium, seg-large, seg-xlarge, seg-2xlarge.
   size: medium
@@ -46,6 +49,7 @@ model:
   # Extra RF-DETR ModelConfig keys. Options: any supported model config key.
   extra_model_args: {}
 
+# Dataset discovery and limiting settings. Options: mapping.
 dataset:
   # Dataset source format. Options: auto, rfdetr, roboflow, ultralytics_yolo, coco_json, pascal_voc, dota, labelme_json.
   source_format: ultralytics_yolo
@@ -70,6 +74,7 @@ dataset:
   # Dataset file type forwarded to RF-DETR. Options: roboflow, coco, yolo, o365.
   dataset_file: roboflow
 
+# Output directory settings and naming templates. Options: mapping.
 output:
   # Exact output directory. Options: empty string to use root/name, absolute path, or relative path.
   output_dir: ""
@@ -80,14 +85,17 @@ output:
   # Allow writing into an existing output directory. Options: true, false.
   exist_ok: false
 
+# Standalone test settings. Options: mapping.
 test:
   # Dataset split to test. Options: test-original, test, val, valid, train.
   split: test-original
   # Maximum images to evaluate. Options: all/null for the full split, or a positive integer for first N images.
   max_images: all
+  # Test mode selector block. Options: mapping.
   test_mode:
     # Test mode. Options: full_image, class_crop, sahi.
     mode: sahi
+  # Class-crop/object-crop test settings. Options: mapping.
   crop:
     # Class IDs used to find class_crop windows. Empty means all predicted classes are eligible.
     class_ids: []
@@ -104,6 +112,7 @@ test:
     padding_ratio: 0.05
     # Behavior when no crop class is predicted. Options: full_image.
     fallback: full_image
+  # SAHI sliced-inference settings. Options: mapping.
   sahi:
     # Slice height. Options: positive integer.
     slice_height: 640
@@ -125,6 +134,7 @@ test:
     postprocess_class_agnostic: false
     # RF-DETR SAHI slice/recheck batch size. Options: positive integer.
     batch_size: 4
+    # recheck nested configuration block. Options: mapping.
     recheck:
       # Run a second centered B*B verification pass for selected SAHI target-class boxes. Options: true, false.
       enabled: false
@@ -147,6 +157,7 @@ test:
       center_padding_ratio: 0.0
       # Maximum target boxes rechecked per image. Options: 0 disables rechecking; positive integer caps by score.
       max_rechecks_per_image: 50
+  # Visual sample filtering/rendering settings. Options: mapping.
   visual_samples:
     # Save sampled prediction test images with GT and predictions. Options: true, false.
     enabled: true
@@ -190,12 +201,13 @@ test:
   model_input_batch_size: 9
   # RF-DETR full-image/class-crop evaluator batch size. Options: positive integer.
   batch_size: 4
-  # Adapter dataloader workers. Options: 0 for Windows compatibility, or positive integer.
-  num_workers: 0
+  # Adapter dataloader workers. Options: 2 by project rule.
+  num_workers: 2
   # Max detections for metrics. Options: positive integer.
   max_dets: 500
   # IoU threshold for TP/FP/FN and error cases. Options: 0.0-1.0.
   match_iou_threshold: 0.5
+  # Error-case diagnostic settings. Options: mapping.
   error_cases:
     # Save football missed/misclassified/false-positive diagnostic images. Options: true, false.
     enabled: true
@@ -225,6 +237,7 @@ test:
     # JPEG quality when format=jpg. Options: 1-100.
     jpeg_quality: 92
 
+# Metric/evaluation settings. Options: mapping.
 evaluation:
   # Evaluation type. Options: auto, bbox, segm, segmentation, mask, masks.
   type: auto

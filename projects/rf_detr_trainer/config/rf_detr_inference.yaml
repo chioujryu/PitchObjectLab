@@ -1,6 +1,7 @@
 # Standalone config for inference_rf_detr_model.py.
 # Parameters are grouped by runtime, model, dataset, output, inference, and evaluation.
 
+# Runtime controls for dry-run, prompts, verbosity, seeds, and estimates. Options: mapping.
 runtime:
   # Print wrapper status text. Options: true, false.
   verbose: true
@@ -12,6 +13,7 @@ runtime:
   yes: false
   # Seed reserved for deterministic future sampling. Options: integer.
   seed: 0
+  # Runtime-estimate settings. Options: mapping.
   time_estimate:
     # Print rough HH:MM:SS runtime estimates before execution. Options: true, false.
     enabled: true
@@ -26,6 +28,7 @@ runtime:
     # Fallback cost for drawing/writing output video frames. Options: positive seconds per frame.
     default_video_render_seconds_per_frame: 0.005
 
+# Model construction settings. Options: mapping.
 model:
   # RF-DETR model size. Detection: base, nano, small, medium, large. Segmentation sizes are not used by this bbox renderer.
   size: large
@@ -46,6 +49,7 @@ model:
   # Extra RF-DETR ModelConfig keys. Options: any supported model config key.
   extra_model_args: {}
 
+# Dataset discovery and limiting settings. Options: mapping.
 dataset:
   # Class names for labels/colors. Options: list like [standing_player, football], mapping like {0: football}, or [] to label by ID.
   class_names:
@@ -55,6 +59,7 @@ dataset:
   # Optional dataset YAML used only to read names when class_names is empty. Options: empty string or path to YAML with names.
   data_yaml: ""
 
+# Output directory settings and naming templates. Options: mapping.
 output:
   # Exact output directory. Options: empty string to use root/name, absolute path, or relative path.
   output_dir: ""
@@ -65,6 +70,7 @@ output:
   # Allow writing into an existing output directory. Options: true, false.
   exist_ok: false
 
+# Inference source, batching, rendering, and tracking settings. Options: mapping.
 inference:
   # Input sources. Options: image path, video path, folder path, HTTP(S) image/video URL; folders may mix images and videos.
   sources: []
@@ -90,6 +96,7 @@ inference:
   render_class_names: []
   # Save line-delimited prediction records. Options: true, false.
   save_predictions_jsonl: true
+  # Video inference settings. Options: mapping.
   video:
     # Detection FPS for videos. Options: null to detect every frame, or positive float such as 5.
     detection_fps: null
@@ -105,6 +112,7 @@ inference:
     output_fps: null
     # Draw latest detections on skipped frames when detection_fps is lower than video FPS. Options: true, false.
     render_skipped_frames: true
+  # Video tracking settings. Options: mapping.
   tracking:
     # Enable tracking for video inference. Options: true, false.
     enabled: false
@@ -237,6 +245,7 @@ inference:
       # Video frame rate used for buffer timing. Options: positive integer.
       frame_rate: 30
 
+# Class-crop/object-crop test settings. Options: mapping.
 crop:
   # Class IDs used to find class_crop windows from model predictions. Empty means all predicted classes are eligible.
   class_ids: []
@@ -253,6 +262,7 @@ crop:
   # Behavior when no crop class is predicted. Options: full_image.
   fallback: full_image
 
+# SAHI sliced-inference settings. Options: mapping.
 sahi:
   # Slice height for sahi mode. Options: positive integer.
   slice_height: 640
@@ -274,6 +284,7 @@ sahi:
   postprocess_class_agnostic: false
   # RF-DETR SAHI slice/recheck batch size. Options: positive integer.
   batch_size: 4
+  # recheck nested configuration block. Options: mapping.
   recheck:
     # Run a second centered B*B verification pass for selected SAHI target-class boxes. Options: true, false.
     enabled: false
@@ -297,6 +308,7 @@ sahi:
     # Maximum target boxes rechecked per image. Options: 0 disables rechecking; positive integer caps by score.
     max_rechecks_per_image: 50
 
+# Metric/evaluation settings. Options: mapping.
 evaluation:
   # Reserved for consistency with train/test configs. Options: bbox.
   type: bbox

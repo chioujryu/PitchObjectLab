@@ -144,6 +144,18 @@ class RFDETRModelSizeTest(unittest.TestCase):
                 kwargs = trainer.build_model_kwargs({"model": {"device": raw_device}})
                 self.assertNotIn("device", kwargs)
 
+    def test_train_device_parser_returns_rfdetr_compatible_devices(self):
+        cases = [
+            ("0", {"accelerator": "gpu", "devices": "0,"}),
+            ("cuda:0", {"accelerator": "gpu", "devices": "0,"}),
+            ("4,5", {"accelerator": "gpu", "devices": "4,5"}),
+            ("-1", {"accelerator": "auto", "devices": "auto"}),
+            ("cpu", {"accelerator": "cpu"}),
+        ]
+        for raw_device, expected in cases:
+            with self.subTest(raw_device=raw_device):
+                self.assertEqual(trainer.parse_device_to_trainer_kwargs(raw_device), expected)
+
     def test_multigpu_training_uses_find_unused_ddp_strategy(self):
         trainer_kwargs = trainer.parse_device_to_trainer_kwargs("4,5")
         trainer.apply_multigpu_ddp_strategy({"train": {"strategy": "auto"}}, trainer_kwargs, verbose=False)

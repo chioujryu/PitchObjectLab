@@ -1,6 +1,5 @@
-# Standalone video config for inference_rf_detr_model.py.
-# Runs SAHI 320x320 first-stage football detection and a centered 640x640 football recheck.
-# Source video 1983818210731298817.mp4, segment 00:09:00-00:10:00, with football tracking enabled.
+# Standalone config for inference_rf_detr_model.py.
+# Parameters are grouped by runtime, model, dataset, output, inference, and evaluation.
 
 # Runtime controls for dry-run, prompts, verbosity, seeds, and estimates. Options: mapping.
 runtime:
@@ -8,7 +7,7 @@ runtime:
   verbose: true
   # Estimate outputs and exit before model loading/inference. Options: true, false.
   dry_run: false
-  # Ask before writing rendered videos, predictions, configs, or URL caches. Options: true, false.
+  # Ask before writing rendered images/videos, predictions, configs, or URL caches. Options: true, false.
   confirm_before_run: true
   # Skip confirmation after reviewing the estimate. Options: true, false.
   yes: false
@@ -24,7 +23,7 @@ runtime:
     default_train_seconds_per_batch: 0.7
     # Fallback test speed retained for shared schema. Options: positive seconds per image.
     default_test_seconds_per_image: 0.25
-    # Fallback inference speed for video detection frames. Options: positive seconds per frame.
+    # Fallback inference speed for image sources and video detection frames. Options: positive seconds per image/frame.
     default_inference_seconds_per_image: 0.25
     # Fallback cost for drawing/writing output video frames. Options: positive seconds per frame.
     default_video_render_seconds_per_frame: 0.005
@@ -32,9 +31,9 @@ runtime:
 # Model construction settings. Options: mapping.
 model:
   # RF-DETR model size. Detection: base, nano, small, medium, large. Segmentation sizes are not used by this bbox renderer.
-  size: medium
+  size: large
   # RF-DETR checkpoint to load. Options: default, null/false, hosted key, or local .pth/.pt/.ckpt path.
-  pretrain_weights: 'C:\Users\XBOT\Documents\projects\PitchObjectLab\projects\rf_detr_trainer\checkpoint_best_ema.pth'
+  pretrain_weights: default
   # Input resolution override. Options: null for model default, or positive integer.
   resolution: null
   # Class count override. Options: null to infer from checkpoint/config, or positive integer.
@@ -43,12 +42,64 @@ model:
   device: 0
   # Automatic mixed precision in RF-DETR. Options: true, false.
   amp: true
-  # First-stage prediction confidence threshold. Options: 0.0-1.0.
+  # Prediction confidence threshold used for rendered boxes. Options: 0.0-1.0.
   confidence_threshold: 0.25
   # Optional model label to output category-id mapping. Options: empty mapping, false to disable, or {model_label: category_id}.
   category_remapping: {}
   # Extra RF-DETR ModelConfig keys. Options: any supported model config key.
   extra_model_args: {}
+  # ---- P2 high-resolution feature level (stride-4) for tiny-object (e.g. football) detection ----
+  # RF-DETR has no native P2. When enabled, the trainer applies an in-process patch (rf_detr_p2.py,
+  # version-controlled, survives `uv sync`) that (1) allows "P2" in projector_scale and (2) teaches
+  # the backbone the P2 (scale-factor 4.0) branch the projector already implements (two stride-2
+  # ConvTranspose2d). The decoder's deformable-attention levels, level embeds, two-stage query
+  # selection, and per-level positional encoding all adapt automatically. Pretrained weights load
+  # non-strictly: the new P2 projector stage and the resized deformable-attention layers start
+  # randomly initialized, so fine-tune from a checkpoint. Same model.size + model.p2 block must be
+  # set in test/inference configs to rebuild a P2-trained checkpoint.
+  # Memory note: P2 (stride-4) dominates token count. If you hit OOM, set overrides.gradient_checkpointing: true,
+  # lower train.batch_size + raise train.grad_accum_steps, and/or raise num_windows via extra_model_args.
+  p2:
+    # Master switch. Options: false to disable (no patch applied, stock RF-DETR), true to enable P2.
+    enabled: true
+    # Feature levels for projector AND decoder. Must be ascending P-name order; length = decoder levels.
+    # name -> (stride, scale): P2->(4, x4), P3->(8, x2), P4->(16, x1), P5->(32, x0.5), P6->(64, x0.25).
+    # Must include "P2" to actually use the P2 level. Examples: [P2, P3, P4], [P2, P3, P4, P5], [P2, P4].
+    projector_scale: [P2, P3, P4]
+    # P2 projector implementation settings. Options: mapping.
+    projector:
+      # MultiScaleProjector internals applied to EVERY stage (P2 included). null = upstream default.
+      # NOTE: these are NOT stored in the checkpoint's ModelConfig. If you change them at train time,
+      # set the same values in the test/inference config so the rebuilt architecture matches.
+      # C2f (CSPRepLayer) depth per stage. Options: null for upstream default (3), or a positive integer.
+      num_blocks: null
+      # Stochastic-depth survival probability for extra feature levels during training. Options: null for 1.0 (off), or 0.0-1.0.
+      survival_prob: null
+      # Force-zero the last N ViT feature maps before projecting. Options: null for 0 (off), or non-negative integer.
+      force_drop_last_n_features: null
+      # LayerNorm inside projector convs. Options: null to inherit model layer_norm, true, false.
+      layer_norm: null
+      # RMSNorm inside projector convs. Options: null to inherit model rms_norm, true, false.
+      rms_norm: null
+    # Pretrained-weight loading compatibility settings. Options: mapping.
+    weights:
+      # RF-DETR loads pretrained weights with strict=False already; new P2/decoder params are random-init.
+      # Suppress the expected PretrainWeightsCompatibilityWarning for the projector_scale change. Options: true, false.
+      suppress_compat_warning: true
+    # Validated RF-DETR model override keys. Options: mapping.
+    overrides:
+      # Convenience overrides applied to the RF-DETR ModelConfig only when P2 is enabled. null = leave
+      # the variant default / value from the model.* section. When set, these win over model.*.
+      # Input resolution. Options: null, or int divisible by patch_size * num_windows. Higher helps small objects.
+      resolution: null
+      # Decoder query count. Options: null, or positive integer. Raise for many same-frame objects (balls+players+refs).
+      num_queries: null
+      # Selected predictions at postprocess. Options: null, or positive integer. Usually match num_queries.
+      num_select: null
+      # Deformable-attention sampling points per level per head. Options: null, or positive integer (upstream 2 or 4).
+      dec_n_points: null
+      # Gradient checkpointing to fit the larger P2 token count in memory. Options: null, true, false.
+      gradient_checkpointing: null
 
 # Dataset discovery and limiting settings. Options: mapping.
 dataset:
@@ -65,17 +116,16 @@ output:
   # Exact output directory. Options: empty string to use root/name, absolute path, or relative path.
   output_dir: ""
   # Output root when output_dir is empty. Options: pure string path.
-  root: runs/rf_detr/inference
+  root: runs/rf_detr/all_parameters_SAHI_640/inference
   # Run folder name when output_dir is empty. Supports {timestamp}. Options: string.
-  name: "rfdetr_inference_sahi320_football_recheck640_video_1983818210731298817_000900_001000_{timestamp}"
+  name: "rfdetr_inference_{timestamp}"
   # Allow writing into an existing output directory. Options: true, false.
   exist_ok: false
 
 # Inference source, batching, rendering, and tracking settings. Options: mapping.
 inference:
   # Input sources. Options: image path, video path, folder path, HTTP(S) image/video URL; folders may mix images and videos.
-  sources:
-    - 'C:\Users\XBOT\Downloads\raw\1983818210731298817.mp4'
+  sources: []
   # Recurse into folders. Options: true, false.
   recursive: true
   # Maximum discovered sources to infer after image/video caps. Options: all/null for every source, or a positive integer.
@@ -85,18 +135,17 @@ inference:
   # Maximum video sources to infer. Options: all/null for every video, or a positive integer for first N videos.
   max_videos: all
   # Inference mode. Options: full_image, sahi, class_crop.
-  mode: sahi
-  # RF-DETR image-source batch size for sahi image inputs. Options: positive integer.
-  batch_size: 80
+  mode: full_image
+  # RF-DETR image-source batch size for full_image/class_crop/sahi image inputs. Options: positive integer.
+  batch_size: 8
   # Image extensions included from folders. Options: list of extensions.
   image_extensions: [.bmp, .jpeg, .jpg, .png, .tif, .tiff, .webp]
   # Video extensions included from folders. Options: list of extensions.
   video_extensions: [.avi, .m4v, .mkv, .mov, .mp4, .mpeg, .mpg, .webm]
-  # Category IDs to render. Empty means use render_class_names or draw all predicted classes. Options: list of category IDs.
+  # Category IDs to render. Empty means draw all predicted classes. Options: list of category IDs.
   render_class_ids: []
-  # Category names to render. Only football boxes are drawn in rendered images/video frames. Options: list of names.
-  render_class_names:
-    - football
+  # Category names to render. Empty means draw all predicted classes. Options: list of names.
+  render_class_names: []
   # Save line-delimited prediction records. Options: true, false.
   save_predictions_jsonl: true
   # Video inference settings. Options: mapping.
@@ -106,9 +155,9 @@ inference:
     # RF-DETR detection-frame batch size. Options: all/null to inherit inference.batch_size, or positive integer.
     batch_size: null
     # Start time for each video segment. Options: seconds, MM:SS, or HH:MM:SS.
-    start_time: "00:09:00"
+    start_time: 0
     # End time for each video segment. Options: all/null for video end, seconds, MM:SS, or HH:MM:SS.
-    end_time: "00:20:00"
+    end_time: all
     # Maximum selected duration to infer per video. Options: all/null for the full start/end range, seconds, MM:SS, or HH:MM:SS.
     max_seconds: all
     # Output video FPS. Options: null to preserve input FPS, or positive float.
@@ -118,7 +167,7 @@ inference:
   # Video tracking settings. Options: mapping.
   tracking:
     # Enable tracking for video inference. Options: true, false.
-    enabled: true
+    enabled: false
     # Tracking algorithm. Options: circle (built-in stdlib motion-only ball tracker), ocsort, deepocsort, botsort, bytetrack (via boxmot). ocsort/bytetrack need no ReID download; deepocsort/botsort use appearance ReID.
     algorithm: circle
     # Category IDs to track. Empty means use target_class_names. Options: list of category IDs.
@@ -129,15 +178,15 @@ inference:
     # Base search radius (pixels) around a ball center for same-ball matching. Options: positive number.
     radius_pixels: 80
     # Optional size-relative base radius: max(radius_pixels, radius_scale * max(bbox_w, bbox_h)). Options: null to disable, or positive number.
-    radius_scale: 10
+    radius_scale: null
     # Radius growth per missing detection frame, to catch fast/returning balls after gaps. Options: non-negative number.
-    radius_growth_per_missing_frame: 10.0
+    radius_growth_per_missing_frame: 0.0
     # Hard cap on the grown effective radius (pixels). Options: null for no cap, or positive number.
     max_radius_pixels: null
-    # Frames a track may stay unmatched before it expires (finite avoids stale-track clutter / id-hopping). Options: all/null to never expire, or a non-negative integer.
+    # Frames a track may stay unmatched before it expires (finite avoids stale-track clutter). Options: all/null to never expire, or a non-negative integer.
     max_missing_frames: 30
     # Matches before a track is confirmed; only confirmed tracks draw trails/labels and count in the summary. Options: positive integer.
-    min_hits: 3
+    min_hits: 1
     # Match against both the static circle and a velocity-predicted circle during gaps. Options: true, false.
     use_velocity_prediction: false
     # EMA weight on previous velocity when use_velocity_prediction is true (higher = smoother). Options: 0.0-1.0.
@@ -267,16 +316,16 @@ crop:
 
 # SAHI sliced-inference settings. Options: mapping.
 sahi:
-  # Slice height for first-stage sahi mode. Options: positive integer.
-  slice_height: 320
-  # Slice width for first-stage sahi mode. Options: positive integer.
-  slice_width: 320
+  # Slice height for sahi mode. Options: positive integer.
+  slice_height: 640
+  # Slice width for sahi mode. Options: positive integer.
+  slice_width: 640
   # Height overlap between adjacent slices. Options: 0.0-0.9.
   overlap_height_ratio: 0.2
   # Width overlap between adjacent slices. Options: 0.0-0.9.
   overlap_width_ratio: 0.2
   # Also run full-image prediction and merge with slices. Options: true, false.
-  standard_prediction: false
+  standard_prediction: true
   # SAHI postprocess type. Options: GREEDYNMM, NMM, NMS, LSNMS. GREEDYNMM is recommended for small slices.
   postprocess_type: GREEDYNMM
   # SAHI match metric. Options: IOS, IOU. IOS is recommended when small slice boxes cover parts of the same object.
@@ -286,18 +335,18 @@ sahi:
   # Class-agnostic slice merge. Options: true, false.
   postprocess_class_agnostic: false
   # RF-DETR SAHI slice/recheck batch size. Options: positive integer.
-  batch_size: 64
+  batch_size: 4
   # recheck nested configuration block. Options: mapping.
   recheck:
     # Run a second centered B*B verification pass for selected SAHI target-class boxes. Options: true, false.
-    enabled: true
+    enabled: false
     # Target category IDs for SAHI recheck. Empty means use target_class_names; if both empty and enabled, default is football.
     target_class_ids: []
     # Target category names for SAHI recheck. Empty with enabled defaults to football. Options: category names such as [football].
     target_class_names:
       - football
     # B*B centered crop size for the second pass. Options: positive integer pixels.
-    crop_size: 640
+    crop_size: 960
     # Confidence threshold for the second pass. Options: 0.0-1.0.
     second_confidence_threshold: 0.25
     # Weight applied to the first-stage confidence. Options: non-negative float.
@@ -305,7 +354,7 @@ sahi:
     # Weight applied to the best second-stage confidence. Options: non-negative float.
     second_weight: 0.5
     # Minimum fused confidence to keep the first-stage box. Options: 0.0-1.0.
-    fused_confidence_threshold: 0.5
+    fused_confidence_threshold: 0.25
     # Extra relative padding around the first-stage box for center-hit matching. Options: non-negative float.
     center_padding_ratio: 0.0
     # Maximum target boxes rechecked per image. Options: 0 disables rechecking; positive integer caps by score.

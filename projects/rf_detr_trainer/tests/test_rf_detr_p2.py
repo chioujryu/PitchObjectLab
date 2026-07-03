@@ -7,6 +7,8 @@ These cover the config helpers and the in-process rfdetr patch:
 * the relaxed projector_scale Literal,
 * the patched Backbone actually building a P2 (scale-factor 4.0) branch and
   producing the right number/ratio of feature maps,
+* the LWDETR.load_state_dict filter that drops size-mismatched pretrained tensors
+  on non-strict loads (so a P2 feature-level-count change does not raise),
 * idempotency.
 
 The patch is process-global and only widens behavior (extra allowed scales; a
@@ -168,6 +170,56 @@ class P2PatchTest(unittest.TestCase):
         self.assertEqual(h_p2, 2 * h_p3)
         self.assertEqual(h_p3, 2 * h_p4)
         self.assertEqual(h_p4, resolution // 16)  # P4 == native ViT stride-16 map
+
+
+class P2WeightLoaderFilterTest(unittest.TestCase):
+    """The patched LWDETR.load_state_dict drops size-mismatched tensors on non-strict loads.
+
+    Stock RF-DETR detection/seg checkpoints are single-scale (projector_scale ["P4"]);
+    enabling P2 resizes the deformable-attention Linear layers + projector first stage,
+    which torch's strict=False would otherwise reject. The patched method is generic over
+    ``self`` (uses ``self.state_dict()`` + the base loader), so it is exercised here on a
+    plain ``nn.Linear`` rather than a full (heavy) LWDETR build.
+    """
+
+    def test_loader_is_patched_on_lwdetr(self):
+        rf_detr_p2.ensure_p2_support({"enabled": True})
+        import rfdetr.models.lwdetr as lwdetr_module
+
+        patched = lwdetr_module.LWDETR.__dict__.get("load_state_dict")
+        self.assertIsNotNone(patched)
+        self.assertTrue(getattr(patched, "_p2_drops_mismatch", False))
+
+    def test_non_strict_drops_mismatch_keeps_matching(self):
+        import torch
+        from torch import nn
+
+        rf_detr_p2.ensure_p2_support({"enabled": True})
+        import rfdetr.models.lwdetr as lwdetr_module
+
+        patched = lwdetr_module.LWDETR.__dict__["load_state_dict"]
+        module = nn.Linear(4, 3)  # weight [3, 4], bias [3]
+        state_dict = {
+            "weight": torch.zeros(9, 4),  # size-mismatched -> must be dropped
+            "bias": torch.ones(3),        # matches -> must be loaded
+        }
+        with self.assertWarns(UserWarning):
+            result = patched(module, state_dict, strict=False)
+        self.assertIn("weight", result.missing_keys)  # dropped -> reported missing
+        self.assertTrue(torch.allclose(module.bias, torch.ones(3)))
+
+    def test_strict_load_is_not_filtered(self):
+        import torch
+        from torch import nn
+
+        rf_detr_p2.ensure_p2_support({"enabled": True})
+        import rfdetr.models.lwdetr as lwdetr_module
+
+        patched = lwdetr_module.LWDETR.__dict__["load_state_dict"]
+        module = nn.Linear(4, 3)
+        state_dict = {"weight": torch.zeros(9, 4), "bias": torch.zeros(3)}
+        with self.assertRaises(RuntimeError):  # strict=True keeps base behavior (no filtering)
+            patched(module, state_dict, strict=True)
 
 
 if __name__ == "__main__":

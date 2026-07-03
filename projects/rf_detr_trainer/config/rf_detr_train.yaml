@@ -1,6 +1,7 @@
 # Main config for train_rf_detr_model.py.
 # Every path can be absolute or relative. Relative paths are resolved from the repo root when possible.
 
+# Runtime controls for dry-run, prompts, verbosity, seeds, and estimates. Options: mapping.
 runtime:
   # Print wrapper status text in bright blue. Options: true, false.
   verbose: true
@@ -8,6 +9,7 @@ runtime:
   dry_run: false
   # Ask before creating checkpoints, logs, metrics, plots, or dataset grids. Options: true, false.
   confirm_before_run: true
+  # Runtime-estimate settings. Options: mapping.
   time_estimate:
     # Print rough HH:MM:SS runtime estimates before execution. Options: true, false.
     enabled: true
@@ -22,6 +24,7 @@ runtime:
     # Fallback video render speed retained for shared schema. Options: positive seconds per frame.
     default_video_render_seconds_per_frame: 0.005
 
+# Model construction settings. Options: mapping.
 model:
   # RF-DETR model size. Detection: base, nano, small, medium, large. Segmentation: seg-preview, seg-nano, seg-small, seg-medium, seg-large, seg-xlarge, seg-2xlarge.
   size: large
@@ -55,6 +58,7 @@ model:
     # name -> (stride, scale): P2->(4, x4), P3->(8, x2), P4->(16, x1), P5->(32, x0.5), P6->(64, x0.25).
     # Must include "P2" to actually use the P2 level. Examples: [P2, P3, P4], [P2, P3, P4, P5], [P2, P4].
     projector_scale: [P2, P3, P4]
+    # P2 projector implementation settings. Options: mapping.
     projector:
       # MultiScaleProjector internals applied to EVERY stage (P2 included). null = upstream default.
       # NOTE: these are NOT stored in the checkpoint's ModelConfig. If you change them at train time,
@@ -69,10 +73,12 @@ model:
       layer_norm: null
       # RMSNorm inside projector convs. Options: null to inherit model rms_norm, true, false.
       rms_norm: null
+    # Pretrained-weight loading compatibility settings. Options: mapping.
     weights:
       # RF-DETR loads pretrained weights with strict=False already; new P2/decoder params are random-init.
       # Suppress the expected PretrainWeightsCompatibilityWarning for the projector_scale change. Options: true, false.
       suppress_compat_warning: true
+    # Validated RF-DETR model override keys. Options: mapping.
     overrides:
       # Convenience overrides applied to the RF-DETR ModelConfig only when P2 is enabled. null = leave
       # the variant default / value from the model.* section. When set, these win over model.*.
@@ -87,6 +93,7 @@ model:
       # Gradient checkpointing to fit the larger P2 token count in memory. Options: null, true, false.
       gradient_checkpointing: null
 
+# Dataset discovery and limiting settings. Options: mapping.
 dataset:
   # Dataset source format before this trainer prepares it. Options:
   # auto              - auto-detect supported layouts.
@@ -135,6 +142,7 @@ dataset:
   # Dataset format passed to RF-DETR TrainConfig. Options: roboflow, coco, yolo, o365. roboflow auto-detects COCO/YOLO and is recommended.
   dataset_file: roboflow
 
+# Output directory settings and naming templates. Options: mapping.
 output:
   # Exact output directory. Options: empty string to use root/name, or any Windows/Linux path.
   # Supports placeholders:
@@ -154,6 +162,7 @@ output:
   # Allow using an existing output directory. Options: true, false.
   exist_ok: false
 
+# Training hyperparameters and runtime settings. Options: mapping.
 train:
   # RF-DETR dataset root forwarded into TrainConfig. Options: empty to copy dataset.dataset_dir, or explicit path.
   dataset_dir: /home/new_users/zhiyu/datasets/soccer/spatial_perception/Xbotgo/站立运动员、足球、球门检测数据集V1/outputs/YoloFormat/all_parameters_sahi_object_crop_classcrop_train_val_960_classesall_max_samplesall
@@ -205,7 +214,7 @@ train:
   ema_tau: 100
   # EMA update interval in optimizer steps. Options: positive integer.
   ema_update_interval: 1
-  # Dataloader workers. Options: 0 for maximum Windows compatibility, or positive integer.
+  # Dataloader workers. Options: 2 by project rule.
   num_workers: 2
   # Enable early stopping. Options: true, false.
   early_stopping: true
@@ -280,16 +289,37 @@ train:
   # DataLoader prefetch_factor. Options: null for auto, positive integer.
   prefetch_factor: null
   # Augmentation config dictionary. Options: null or RF-DETR aug_config keys.
-  aug_config: null
+  aug_config:
+    # HorizontalFlip nested configuration block. Options: mapping.
+    HorizontalFlip:
+      # p setting for this config block. Options: documented value for this RF-DETR config section.
+      p: 0.5
+    # RandomBrightnessContrast nested configuration block. Options: mapping.
+    RandomBrightnessContrast:
+      # brightness_limit setting for this config block. Options: documented value for this RF-DETR config section.
+      brightness_limit: 0.3
+      # contrast_limit setting for this config block. Options: documented value for this RF-DETR config section.
+      contrast_limit: 0.3
+      # p setting for this config block. Options: documented value for this RF-DETR config section.
+      p: 0.5
+    # GaussianBlur nested configuration block. Options: mapping.
+    GaussianBlur:
+      # blur_limit setting for this config block. Options: documented value for this RF-DETR config section.
+      blur_limit: 3
+      # p setting for this config block. Options: documented value for this RF-DETR config section.
+      p: 0.3
   # Extra RF-DETR TrainConfig keys not listed above. Example: {freeze_encoder: true}
   extra_train_args: {}
 
+# Scheduled and final test settings. Options: mapping.
 periodic_test:
   # Enable scheduled test-set evaluation during training. Options: true, false.
   enabled: false
+  # Test mode selector block. Options: mapping.
   test_mode:
     # Test mode. Options: full_image, sahi, class_crop.
     mode: sahi
+  # Class-crop/object-crop test settings. Options: mapping.
   crop:
     # Class IDs used to find class_crop windows from model predictions. Empty means all predicted classes are eligible.
     class_ids: []
@@ -305,6 +335,7 @@ periodic_test:
     padding_ratio: 0.05
     # Behavior when no crop class is predicted. Options: full_image.
     fallback: full_image
+  # SAHI sliced-inference settings. Options: mapping.
   sahi:
     # Slice/window height for periodic/final sahi mode. Options: positive integer.
     slice_height: 640
@@ -326,6 +357,7 @@ periodic_test:
     postprocess_class_agnostic: false
     # RF-DETR SAHI slice/recheck batch size for scheduled/final tests. Options: positive integer.
     batch_size: 4
+    # recheck nested configuration block. Options: mapping.
     recheck:
       # Run a second centered B*B verification pass for selected SAHI target-class boxes. Options: true, false.
       enabled: false
@@ -348,6 +380,7 @@ periodic_test:
       center_padding_ratio: 0.0
       # Maximum target boxes rechecked per image. Options: 0 disables rechecking; positive integer caps by score.
       max_rechecks_per_image: 50
+  # Visual sample filtering/rendering settings. Options: mapping.
   visual_samples:
     # Save sampled prediction test images with GT and predictions during periodic/final tests. Options: true, false.
     enabled: false
@@ -401,6 +434,7 @@ periodic_test:
   classwise: true
   # RF-DETR full-image/class-crop evaluator batch size for scheduled/final tests. Options: positive integer.
   batch_size: 4
+  # Error-case diagnostic settings. Options: mapping.
   error_cases:
     # Save target-class missed/misclassified/false-positive examples after scheduled/final tests. Options: true, false.
     enabled: true
@@ -432,10 +466,12 @@ periodic_test:
   # Show a progress bar during manual scheduled/final test. Options: true, false.
   progress_bar: true
 
+# PyTorch Lightning trainer override settings. Options: mapping.
 trainer:
   # Extra PyTorch Lightning Trainer kwargs. Options: any Trainer key such as precision, fast_dev_run, limit_train_batches.
   extra_trainer_args: {}
 
+# Small demo/smoke-run overrides. Options: mapping.
 demo:
   # Enable small demo output mode. Options: true, false.
   enabled: false

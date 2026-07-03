@@ -33,10 +33,11 @@ uv run python scripts/setup_pytorch_uv.py --yes
 The setup script writes the selected PyTorch index into `pyproject.toml`; after
 that, `uv sync` is enough for future environment setup. China/HK/MO/TW IP
 regions use mirror indexes by default, while other regions use official PyTorch
-indexes.
+indexes. Use `--region official` or `--region china` when a VPN makes the public
+IP different from the download route you want.
 
 On Windows and Linux, `uv sync` installs the CUDA 12.8 PyTorch wheels from
-the official PyTorch index configured in `pyproject.toml`. The CUDA build can
+the PyTorch index configured in `pyproject.toml`. The CUDA build can
 still run on CPU when no CUDA GPU is available; use `train.device: cpu` or
 `--device cpu` to force CPU, and use `auto`, `cuda`, `0`, or `cuda:0` to use
 GPU when available.
@@ -79,6 +80,31 @@ Skip the confirmation prompt after you accept the estimate:
 ```bash
 uv run python train_rf_detr_model.py --yes
 ```
+
+Training and evaluation DataLoader workers are standardized at `2` in configs
+and defaults for stable Windows/Linux behavior.
+
+## P2 / TrackNetV5 Smoke Checks
+
+These configs verify that the custom RF-DETR P2 head, TrackNetV5-style motion
+module, and combined P2+motion stack can reach the training preflight on the
+local dataset:
+
+```bash
+uv run python train_rf_detr_model.py --config config/rf_detr_train_smoke_p2_medium.yaml --dry-run --yes
+uv run python train_rf_detr_model.py --config config/rf_detr_train_smoke_motion_v5_medium.yaml --dry-run --yes
+uv run python train_rf_detr_model.py --config config/rf_detr_train_smoke_motion_v5_p2_medium.yaml --dry-run --yes
+```
+
+The target dataset path is:
+
+```text
+C:\Users\XBOT\Documents\Datasets\all_parameters_SAHI_640_classesall_max_samples2000
+```
+
+Remove `--dry-run` only after accepting the printed file-count, disk-usage, and
+HH:MM:SS runtime estimate. Each real run writes a config snapshot,
+`run_timing.json`, and `run.log` into the output folder.
 
 ## Common CLI Examples
 
@@ -469,4 +495,5 @@ Training outputs are written to `<output_dir>/`:
 
 - Scheduled in-training test is designed for single-process training. If you use `train.device: "0,1"` or another multi-process strategy, scheduled test is skipped during fit to avoid distributed synchronization issues; final test still runs after training.
 - Every output folder includes the config snapshot that created it.
+- Output-producing runs also write `run.log` in the output folder by mirroring console/stderr output after confirmation. Dry runs only print estimates and do not create output folders.
 - Demo mode writes to `projects/rf_detr_trainer/demo_runs/` and clamps epochs, batch size, logging, and checkpoint interval.

@@ -1230,6 +1230,7 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
     output_dir.mkdir(parents=True, exist_ok=True)
     if timing_context is not None:
         timing_context["outputs_created"] = True
+    trainer.start_run_log_capture(output_dir, "inference", timing_context)
     cache_dir = output_dir / "source_cache"
     resolved_items = [download_url(item, cache_dir) if item.is_url else item for item in items]
     categories = build_categories(config)
