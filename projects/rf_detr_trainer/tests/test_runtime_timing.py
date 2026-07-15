@@ -1,4 +1,5 @@
 from pathlib import Path
+import io
 import json
 import sys
 import tempfile
@@ -137,6 +138,24 @@ class RuntimeTimingTest(unittest.TestCase):
             self.assertTrue(data["success"])
             self.assertEqual(data["estimated_runtime_hms"], "00:00:02")
             self.assertGreater(data["throughput"]["seconds_per_runtime_unit"], 0)
+
+    def test_tee_text_stream_ignores_closed_log_file(self):
+        console = io.StringIO()
+        log_file = tempfile.TemporaryFile("w+", encoding="utf-8")
+        try:
+            tee = trainer.TeeTextStream(console, log_file)
+
+            self.assertEqual(tee.write("normal\n"), len("normal\n"))
+            tee.flush()
+            log_file.seek(0)
+            self.assertEqual(log_file.read(), "normal\n")
+
+            log_file.close()
+            self.assertEqual(tee.write("\x1b[0m"), len("\x1b[0m"))
+            tee.flush()
+            self.assertTrue(console.getvalue().endswith("\x1b[0m"))
+        finally:
+            log_file.close()
 
 
 if __name__ == "__main__":

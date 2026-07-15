@@ -41,7 +41,7 @@ model:
   resolution: null
   # Class count override. Options: null to infer from dataset, or positive integer.
   num_classes: null
-  # Device selector. Options: auto, cpu, cuda, cuda:0, 0, 1, mps, -1.
+  # Device selector. Options: auto, cpu, cuda, cuda:0, 0, 1, "0,1" for round-robin multi-GPU, mps, -1.
   device: 0
   # Automatic mixed precision in RF-DETR. Options: true, false.
   amp: true
@@ -150,6 +150,10 @@ test:
   split: test
   # Maximum images to evaluate. Options: all/null for the full split, or a positive integer for first N images.
   max_images: all
+  # Standalone multiprocessing settings. Options: mapping.
+  parallel:
+    # Balanced test-data chunks and concurrent model replicas. Options: positive integer; 1 disables multiprocessing and preserves the single-model path.
+    chunks: 1
   # Test mode selector block. Options: mapping.
   test_mode:
     # Test mode. Options: full_image, class_crop, sahi.

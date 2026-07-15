@@ -1,4 +1,4 @@
-# Standalone config for test_rf_detr_model.py.
+# Standalone full-image test config for the large P2 soccer-ball checkpoint.
 # Parameters are grouped by runtime, model, dataset, output, test, and evaluation.
 
 # Runtime controls for dry-run, prompts, verbosity, seeds, and estimates. Options: mapping.
@@ -20,11 +20,11 @@ runtime:
     # Prefer latest sibling run_timing.json throughput when available. Options: true, false.
     use_history: true
     # Fallback train speed retained for shared schema. Options: positive seconds per training batch.
-    default_train_seconds_per_batch: 0.7
+    default_train_seconds_per_batch: 1.4
     # Fallback standalone test speed for first runs. Options: positive seconds per image.
-    default_test_seconds_per_image: 0.25
+    default_test_seconds_per_image: 0.35
     # Fallback inference speed retained for shared schema. Options: positive seconds per image/frame.
-    default_inference_seconds_per_image: 0.25
+    default_inference_seconds_per_image: 0.35
     # Fallback video render speed retained for shared schema. Options: positive seconds per frame.
     default_video_render_seconds_per_frame: 0.005
 
@@ -33,13 +33,13 @@ model:
   # RF-DETR model size. Detection: base, nano, small, medium, large. Segmentation: seg-preview, seg-nano, seg-small, seg-medium, seg-large, seg-xlarge, seg-2xlarge.
   size: large
   # RF-DETR checkpoint to test. Options: default, null/false, hosted key, or local .pth/.pt/.ckpt path.
-  pretrain_weights: default
+  pretrain_weights: /home/new_users/zhiyu/trash/Large/checkpoint_best_ema.pth
   # Input resolution override. Options: null for model default, or an int divisible by model window requirements.
   resolution: null
   # Class count override. Options: null to infer from dataset, or positive integer.
-  num_classes: null
+  num_classes: 1
   # Device selector. Options: auto, cpu, cuda, cuda:0, 0, 1, "0,1" for round-robin multi-GPU, mps, -1.
-  device: 0
+  device: cuda:7
   # Automatic mixed precision in RF-DETR. Options: true, false.
   amp: true
   # Prediction confidence threshold used by inference and operating metrics. Options: 0.0-1.0.
@@ -48,34 +48,22 @@ model:
   category_remapping: {}
   # Extra RF-DETR ModelConfig keys. Options: any supported model config key.
   extra_model_args: {}
-  # ---- P2 high-resolution feature level (stride-4) for tiny-object (e.g. football) detection ----
+  # ---- P2 high-resolution feature level (stride-4) for tiny-object soccer-ball detection ----
   # RF-DETR has no native P2. When enabled, the trainer applies an in-process patch (rf_detr_p2.py,
-  # version-controlled, survives `uv sync`) that (1) allows "P2" in projector_scale and (2) teaches
-  # the backbone the P2 (scale-factor 4.0) branch the projector already implements (two stride-2
-  # ConvTranspose2d). The decoder's deformable-attention levels, level embeds, two-stage query
-  # selection, and per-level positional encoding all adapt automatically. Pretrained weights load
-  # non-strictly: the new P2 projector stage and the resized deformable-attention layers start
-  # randomly initialized, so fine-tune from a checkpoint. Same model.size + model.p2 block must be
-  # set in test/inference configs to rebuild a P2-trained checkpoint.
-  # Memory note: P2 (stride-4) dominates token count. If you hit OOM, set overrides.gradient_checkpointing: true,
-  # lower train.batch_size + raise train.grad_accum_steps, and/or raise num_windows via extra_model_args.
+  # version-controlled, survives `uv sync`) that allows "P2" in projector_scale and teaches
+  # the backbone the P2 (scale-factor 4.0) branch the projector already implements.
   p2:
-    # Master switch. Options: false to disable (no patch applied, stock RF-DETR), true to enable P2.
+    # Master switch. Options: false to disable, true to enable P2.
     enabled: true
-    # Feature levels for projector AND decoder. Must be ascending P-name order; length = decoder levels.
-    # name -> (stride, scale): P2->(4, x4), P3->(8, x2), P4->(16, x1), P5->(32, x0.5), P6->(64, x0.25).
-    # Must include "P2" to actually use the P2 level. Examples: [P2, P3, P4], [P2, P3, P4, P5], [P2, P4].
+    # Feature levels for projector AND decoder. Options include P2, P3, P4, P5, P6 in ascending P-name order.
     projector_scale: [P2, P3, P4]
     # P2 projector implementation settings. Options: mapping.
     projector:
-      # MultiScaleProjector internals applied to EVERY stage (P2 included). null = upstream default.
-      # NOTE: these are NOT stored in the checkpoint's ModelConfig. If you change them at train time,
-      # set the same values in the test/inference config so the rebuilt architecture matches.
-      # C2f (CSPRepLayer) depth per stage. Options: null for upstream default (3), or a positive integer.
+      # C2f depth per projector stage. Options: null for upstream default, or a positive integer.
       num_blocks: null
-      # Stochastic-depth survival probability for extra feature levels during training. Options: null for 1.0 (off), or 0.0-1.0.
+      # Stochastic-depth survival probability for extra feature levels. Options: null for 1.0, or 0.0-1.0.
       survival_prob: null
-      # Force-zero the last N ViT feature maps before projecting. Options: null for 0 (off), or non-negative integer.
+      # Force-zero the last N ViT feature maps before projecting. Options: null for 0, or non-negative integer.
       force_drop_last_n_features: null
       # LayerNorm inside projector convs. Options: null to inherit model layer_norm, true, false.
       layer_norm: null
@@ -83,32 +71,93 @@ model:
       rms_norm: null
     # Pretrained-weight loading compatibility settings. Options: mapping.
     weights:
-      # RF-DETR loads pretrained weights with strict=False already; new P2/decoder params are random-init.
-      # Suppress the expected PretrainWeightsCompatibilityWarning for the projector_scale change. Options: true, false.
+      # Suppress the expected PretrainWeightsCompatibilityWarning for projector_scale changes. Options: true, false.
       suppress_compat_warning: true
     # Validated RF-DETR model override keys. Options: mapping.
     overrides:
-      # Convenience overrides applied to the RF-DETR ModelConfig only when P2 is enabled. null = leave
-      # the variant default / value from the model.* section. When set, these win over model.*.
-      # Input resolution. Options: null, or int divisible by patch_size * num_windows. Higher helps small objects.
+      # Input resolution override applied only when P2 is enabled. Options: null to use model.resolution, or a valid integer.
       resolution: null
-      # Decoder query count. Options: null, or positive integer. Raise for many same-frame objects (balls+players+refs).
+      # Decoder query count. Options: null for model default, or positive integer.
       num_queries: null
-      # Selected predictions at postprocess. Options: null, or positive integer. Usually match num_queries.
+      # Selected predictions at postprocess. Options: null for model default, or positive integer.
       num_select: null
-      # Deformable-attention sampling points per level per head. Options: null, or positive integer (upstream 2 or 4).
+      # Deformable-attention sampling points per level per head. Options: null for model default, or positive integer.
       dec_n_points: null
-      # Gradient checkpointing to fit the larger P2 token count in memory. Options: null, true, false.
-      gradient_checkpointing: null
+      # Gradient checkpointing flag in the rebuilt model config. Options: null, true, false.
+      gradient_checkpointing: true
+  # TrackNetV5-inspired motion-module settings. This checkpoint has no motion_module weights.
+  motion:
+    # Master switch. Options: false to disable, true to enable motion modules.
+    enabled: false
+    # Motion module type. Options: tracknet_v5, none.
+    type: tracknet_v5
+    # Temporal frame-context settings. Options: mapping.
+    temporal:
+      # Number of frames in the temporal window. Options: positive odd integer.
+      num_frames: 3
+      # Temporal stride between frames. Options: positive integer.
+      frame_stride: 1
+      # Synthetic fallback for still images. Options: identity, noise, real.
+      fallback_mode: identity
+      # Noise standard deviation when fallback_mode=noise. Options: non-negative float.
+      noise_std: 0.02
+    # TrackNetV5 motion submodule settings. Options: mapping.
+    tracknet_v5:
+      # Motion Direction Decoupling settings. Options: mapping.
+      mdd:
+        # Enable MDD polarity fields. Options: true, false.
+        enabled: false
+        # Total motion channels are 2 * polarity_channels. Options: positive integer.
+        polarity_channels: 4
+        # MDD attention settings. Options: mapping.
+        attention:
+          # Learn attention parameters. Options: true, false.
+          learnable: true
+          # Initial sigmoid sharpness. Options: positive float.
+          init_k: 1.0
+          # Initial sigmoid midpoint. Options: float.
+          init_m: 0.5
+      # Regional Spatio-Temporal Refinement settings. Options: mapping.
+      rstr:
+        # Enable R-STR refinement. Options: true, false.
+        enabled: true
+        # Number of R-STR blocks. Options: positive integer.
+        num_blocks: 1
+        # Hidden dimension. Options: positive integer.
+        hidden_dim: 256
+        # Attention heads. Options: positive integer.
+        num_heads: 8
+        # Attention mode. Options: divided, joint.
+        attention_mode: divided
+        # Dropout probability. Options: 0.0-1.0.
+        dropout: 0.1
+        # Use pixel shuffle in refinement. Options: true, false.
+        use_pixel_shuffle: true
+        # Context mask probability. Options: 0.0-1.0.
+        context_mask_prob: 0.1
+    # Motion auxiliary-loss settings. Options: mapping.
+    loss:
+      # Motion attention auxiliary loss weight. Options: non-negative float; 0.0 disables.
+      motion_attention_weight: 0.0
+    # Validated RF-DETR model override keys for motion models. Options: mapping.
+    overrides:
+      # Input resolution override. Options: null to use model.resolution, or a valid integer.
+      resolution: null
+      # Decoder query count. Options: null for model default, or positive integer.
+      num_queries: null
+      # Selected predictions at postprocess. Options: null for model default, or positive integer.
+      num_select: null
+      # Gradient checkpointing flag for motion-enabled models. Options: null, true, false.
+      gradient_checkpointing: true
 
 # Dataset discovery and limiting settings. Options: mapping.
 dataset:
   # Dataset source format. Options: auto, rfdetr, roboflow, ultralytics_yolo, coco_json, pascal_voc, dota, labelme_json.
   source_format: ultralytics_yolo
   # Source dataset root. Options: RF-DETR/Roboflow root, YOLO root, VOC root, DOTA root, LabelMe root, or COCO root.
-  dataset_dir: C:\Users\XBOT\Documents\Datasets\all_parameters_SAHI_640_classesall_max_samples2000
+  dataset_dir: /home/new_users/zhiyu/datasets/soccer/spatial_perception/Xbotgo/soccer_ball_merged_v1/outputs/yolo_reviewed_sam3_augmented_320-1921_sahi_1280
   # Ultralytics YOLO dataset YAML. Options: empty string to auto-find, or YAML path.
-  data_yaml: ""
+  data_yaml: /home/new_users/zhiyu/datasets/soccer/spatial_perception/Xbotgo/soccer_ball_merged_v1/outputs/yolo_reviewed_sam3_augmented_320-1921_sahi_1280/dataset.yaml
   # COCO annotation file for coco_json source_format. Options: empty string to auto-find, or JSON path.
   coco_json: ""
   # Image directory used with coco_json. Options: empty string to infer from dataset_dir, or image folder path.
@@ -135,9 +184,9 @@ output:
   # {eval_interval}, {test_interval_epochs}, {test_interval_minutes}, {test_split}, {logger_project}, {logger_run}.
   output_dir: ""
   # Output root when output_dir is empty. Options: pure string or placeholder template.
-  root: runs/rf_detr/all_parameters_SAHI_640/test
+  root: /home/new_users/zhiyu/projects/PitchObjectLab/runs/rf_detr/test
   # Run folder name when output_dir is empty. Options: pure string or placeholder template.
-  name: "rfdetr_test_{model_size}_{test_split}_{timestamp}"
+  name: "rfdetr_large_p2_{timestamp}"
   # Allow writing into an existing output directory. Options: true, false.
   exist_ok: false
 
@@ -154,14 +203,14 @@ test:
   # Test mode selector block. Options: mapping.
   test_mode:
     # Test mode. Options: full_image, class_crop, sahi.
-    mode: class_crop
+    mode: sahi
   # Class-crop/object-crop test settings. Options: mapping.
   crop:
     # Class IDs used to find class_crop windows from model predictions. Empty means all predicted classes are eligible.
     class_ids: []
     # Class names used to find class_crop windows from model predictions. Empty means all predicted classes are eligible.
     class_names:
-      - standing_player
+      - soccer_ball
     # Crop source. Options: prediction.
     source: prediction
     # Confidence threshold for the first pass that finds the crop window. Options: 0.0-1.0.
@@ -193,16 +242,16 @@ test:
     # Class-agnostic slice merge. Options: true, false.
     postprocess_class_agnostic: false
     # RF-DETR SAHI slice/recheck batch size. Options: positive integer.
-    batch_size: 4
+    batch_size: 1
     # recheck nested configuration block. Options: mapping.
     recheck:
       # Run a second centered B*B verification pass for selected SAHI target-class boxes. Options: true, false.
-      enabled: false
+      enabled: true
       # Target category IDs for SAHI recheck. Empty means use target_class_names; if both empty and enabled, default is football.
       target_class_ids: []
-      # Target category names for SAHI recheck. Empty with enabled defaults to football. Options: category names such as [football].
+      # Target category names for SAHI recheck. Empty with enabled defaults to football. Options: category names such as [soccer_ball].
       target_class_names:
-        - football
+        - soccer_ball
       # B*B centered crop size for the second pass. Options: positive integer pixels.
       crop_size: 960
       # Confidence threshold for the second pass. Options: 0.0-1.0.
@@ -222,7 +271,7 @@ test:
     # Save sampled prediction test images with GT and predictions. Options: true, false.
     enabled: true
     # Maximum sampled prediction images to save; also caps error-case images by default. Options: null for all candidates, or non-negative integer.
-    max_images: 25
+    max_images: 100
     # Visual subfolder under output. Options: folder name or placeholder template.
     output_subdir: visuals
     # Sampling mode. Options: first, last, random.
@@ -235,12 +284,14 @@ test:
     filter_match: any
     # Candidate class IDs. Empty means no class filter. Options: list of category IDs.
     class_ids: []
-    # Candidate class names. Empty means no class filter. Options: list of category names, e.g. [football].
-    class_names: []
+    # Candidate class names. Empty means no class filter. Options: list of category names, e.g. [soccer_ball].
+    class_names:
+      - soccer_ball
     # Category IDs to draw in visual images. Empty means draw all GT/prediction classes. Options: list of category IDs.
     render_class_ids: []
     # Category names to draw in visual images. Empty means draw all GT/prediction classes. Options: list of category names.
-    render_class_names: []
+    render_class_names:
+      - soccer_ball
     # Minimum GT instances required for candidate selection. Options: non-negative integer.
     min_gt_instances: 0
     # Minimum predictions required for candidate selection. Options: non-negative integer.
@@ -260,7 +311,7 @@ test:
   # Number of images in each saved model-input batch grid. Options: positive integer.
   model_input_batch_size: 9
   # RF-DETR full-image/class-crop evaluator batch size. Options: positive integer.
-  batch_size: 4
+  batch_size: 1
   # DataLoader workers for TrainConfig adapter. Options: 2 by project rule.
   num_workers: 2
   # Max detections used in evaluation metrics. Options: positive integer.
@@ -273,17 +324,18 @@ test:
     enabled: true
     # Target category IDs. Empty means use target_class_names; if both are empty, default is football.
     target_class_ids: []
-    # Target category names. Default: football.
+    # Target category names. Default here is soccer_ball for this one-class dataset.
     target_class_names:
-      - football
+      - soccer_ball
     # Category IDs to draw in error-case images. Empty means draw all GT/prediction classes. Options: list of category IDs.
     render_class_ids: []
     # Category names to draw in error-case images. Empty means draw all GT/prediction classes. Options: list of category names.
-    render_class_names: []
+    render_class_names:
+      - soccer_ball
     # Shared maximum diagnostic images to save. Options: null for all matching images, or non-negative integer.
-    max_images: 25
+    max_images: 100
     # Backward-compatible missed-image cap. Options: null or non-negative integer.
-    max_missed_images: 25
+    max_missed_images: 100
     # Backward-compatible false-positive-image cap. Options: null or non-negative integer.
     max_false_positive_images: 25
     # Prediction confidence threshold for error-case matching. Options: null to use model/evaluation threshold, or 0.0-1.0.

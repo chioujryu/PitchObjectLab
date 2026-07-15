@@ -57,9 +57,12 @@ import argparse
 import contextlib
 import csv
 import hashlib
+import importlib
 import inspect
 import io
 import json
+import math
+import multiprocessing
 import os
 import random
 import re
@@ -126,6 +129,23 @@ class DatasetBundle:
     annotations: List[Dict[str, Any]]
     coco: Dict[str, Any]
     source_kind: str
+
+
+class ParallelInferenceError(RuntimeError):
+    """Report one or more failed parallel inference chunks with their terminal summary."""
+
+    def __init__(self, summary: Mapping[str, Any]) -> None:
+        self.summary = dict(summary)
+        failed = [
+            assignment
+            for assignment in self.summary.get("assignments", [])
+            if assignment.get("status") == "failed"
+        ]
+        details = "; ".join(
+            f"chunk_id={assignment.get('chunk_id')} device={assignment.get('device')}"
+            for assignment in failed
+        )
+        super().__init__(f"Parallel inference failed for {details or 'unknown chunk(s)'}.")
 
 
 def blue(message: str, verbose: bool = True, force: bool = False) -> None:
@@ -369,6 +389,39 @@ def parse_devices(model_cfg: Mapping[str, Any]) -> List[str]:
     if "," in device and not device.lower().startswith("cuda:"):
         return [normalize_device(part) for part in device.split(",") if part.strip()]
     return [normalize_device(device)]
+
+
+def _positive_inference_chunks(value: Any) -> int:
+    """Validate the explicit inference.chunks setting."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("inference.chunks must be a positive integer.")
+    return int(value)
+
+
+def resolve_inference_chunk_count(config: Mapping[str, Any], image_count: int) -> int:
+    """Resolve the authoritative chunk count and reject empty assignments."""
+    inference_cfg = config.get("inference", {})
+    if not isinstance(inference_cfg, Mapping):
+        inference_cfg = {}
+    if "chunks" in inference_cfg:
+        chunks = _positive_inference_chunks(inference_cfg.get("chunks"))
+    else:
+        model_cfg = config.get("model", {})
+        chunks = len(parse_devices(model_cfg if isinstance(model_cfg, Mapping) else {}))
+    if chunks > int(image_count):
+        raise ValueError(
+            f"inference.chunks resolved to {chunks}, but image_count is only {int(image_count)}."
+        )
+    return chunks
+
+
+def expand_chunk_devices(devices: Sequence[str], chunks: int) -> List[str]:
+    """Assign every inference chunk a device in deterministic round-robin order."""
+    chunk_count = _positive_inference_chunks(chunks)
+    normalized_devices = [normalize_device(device) for device in devices]
+    if not normalized_devices:
+        raise ValueError("model.devices must resolve to at least one device.")
+    return [normalized_devices[index % len(normalized_devices)] for index in range(chunk_count)]
 
 
 def cuda_index(device: str) -> Optional[int]:
@@ -1934,12 +1987,46 @@ def build_inference_model(config: Mapping[str, Any], device: str, prebuilt_model
     """Build the configured inference model."""
     if prebuilt_model is not None:
         return prebuilt_model
+    model_cfg = config["model"]
+    if "factory" in model_cfg and model_cfg.get("factory") is not None:
+        factory_spec = model_cfg.get("factory")
+        if not isinstance(factory_spec, str) or not factory_spec.strip() or "." not in factory_spec.strip():
+            raise ValueError(
+                "model.factory must be a non-empty dotted import string in 'module.attribute' form."
+            )
+        factory_spec = factory_spec.strip()
+        module_name, attribute_name = factory_spec.rsplit(".", 1)
+        if (
+            factory_spec.startswith(".")
+            or not module_name
+            or not attribute_name
+            or any(not part.isidentifier() for part in module_name.split("."))
+            or not attribute_name.isidentifier()
+        ):
+            raise ValueError(
+                "model.factory must be a non-empty dotted import string in 'module.attribute' form."
+            )
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError as error:
+            raise ImportError(
+                f"Could not import model.factory {factory_spec!r} from module {module_name!r}: {error}"
+            ) from error
+        try:
+            factory = getattr(module, attribute_name)
+        except AttributeError as error:
+            raise ImportError(
+                f"Could not resolve model.factory {factory_spec!r} in module {module_name!r}."
+            ) from error
+        if not callable(factory):
+            raise TypeError(f"model.factory {factory_spec!r} must resolve to a callable.")
+        return factory(model_cfg, device)
     if use_sahi_inference(config):
-        model_type = str(config["model"].get("type", "ultralytics")).strip().lower()
+        model_type = str(model_cfg.get("type", "ultralytics")).strip().lower()
         if model_type in {"rfdetr", "rf-detr", "rf_detr"}:
-            return build_rfdetr_model(config["model"], device)
-        return build_detection_model(config["model"], device)
-    return build_direct_model(config["model"], device)
+            return build_rfdetr_model(model_cfg, device)
+        return build_detection_model(model_cfg, device)
+    return build_direct_model(model_cfg, device)
 
 
 def remap_model_category_id(category_id: int, model_cfg: Mapping[str, Any]) -> int:
@@ -2970,6 +3057,7 @@ def predict_image(
 
 
 def inference_worker(
+    chunk_id: int,
     records: List[Dict[str, Any]],
     config: Mapping[str, Any],
     output_dir_text: str,
@@ -2978,36 +3066,70 @@ def inference_worker(
 ) -> Dict[str, Any]:
     """Multiprocessing-safe worker for image-level inference."""
     output_dir = Path(output_dir_text)
+    worker_config = dict(config)
+    worker_model_config = dict(config.get("model", {}))
+    worker_model_config["device"] = device
+    worker_model_config["devices"] = []
+    worker_config["model"] = worker_model_config
+    validate_runtime_devices(worker_config, verbose=False)
+    model_load_start = time.perf_counter()
     inference_model = build_inference_model(config, device)
+    model_load_seconds = time.perf_counter() - model_load_start
     visual_ids = set(int(image_id) for image_id in visual_image_ids)
     all_predictions: List[Dict[str, Any]] = []
     all_stats: List[Dict[str, Any]] = []
     visual_rows: List[Dict[str, Any]] = []
     image_records = [ImageRecord(**record) for record in records]
 
+    inference_start = time.perf_counter()
     if is_rfdetr_model_type(config.get("model", {})):
-        predictions, stats, visuals = run_batched_rfdetr_records(
+        all_predictions, all_stats, visual_rows = run_batched_rfdetr_records(
             image_records,
             inference_model,
             config,
             output_dir,
             list(visual_ids),
         )
-        return {"predictions": predictions, "stats": stats, "visuals": visuals, "device": device}
+    else:
+        for image in image_records:
+            predictions, stat, visual_row = predict_image(
+                image=image,
+                inference_model=inference_model,
+                config=config,
+                output_dir=output_dir,
+                save_visual=image.image_id in visual_ids,
+            )
+            all_predictions.extend(predictions)
+            all_stats.append(stat)
+            if visual_row is not None:
+                visual_rows.append(visual_row)
+    inference_seconds = time.perf_counter() - inference_start
 
-    for image in image_records:
-        predictions, stat, visual_row = predict_image(
-            image=image,
-            inference_model=inference_model,
-            config=config,
-            output_dir=output_dir,
-            save_visual=image.image_id in visual_ids,
-        )
-        all_predictions.extend(predictions)
-        all_stats.append(stat)
-        if visual_row is not None:
-            visual_rows.append(visual_row)
-    return {"predictions": all_predictions, "stats": all_stats, "visuals": visual_rows, "device": device}
+    effective_batch_sizes = set()
+    for stat in all_stats:
+        value = stat.get("batch_size")
+        if isinstance(value, bool):
+            continue
+        try:
+            batch_size = int(value)
+        except (TypeError, ValueError):
+            continue
+        if batch_size > 0:
+            effective_batch_sizes.add(batch_size)
+    return {
+        "predictions": all_predictions,
+        "stats": all_stats,
+        "visuals": visual_rows,
+        "chunk_id": int(chunk_id),
+        "device": device,
+        "image_count": len(image_records),
+        "prediction_count": len(all_predictions),
+        "model_load_seconds": model_load_seconds,
+        "inference_seconds": inference_seconds,
+        "effective_batch_sizes": sorted(effective_batch_sizes),
+        "status": "success",
+        "error": None,
+    }
 
 
 def chunk_records(records: Sequence[ImageRecord], chunks: int) -> List[List[Dict[str, Any]]]:
@@ -3049,28 +3171,176 @@ def run_batched_rfdetr_records(
     return all_predictions, all_stats, visual_rows
 
 
+def _failed_parallel_assignment(plan: Mapping[str, Any], error: Exception) -> Dict[str, Any]:
+    """Build a deterministic failed assignment from the parent's submitted plan."""
+    return {
+        "chunk_id": int(plan["chunk_id"]),
+        "device": str(plan["device"]),
+        "image_count": int(plan["image_count"]),
+        "prediction_count": 0,
+        "model_load_seconds": 0.0,
+        "inference_seconds": 0.0,
+        "effective_batch_sizes": [],
+        "status": "failed",
+        "error": {"type": type(error).__name__, "message": str(error)},
+    }
+
+
+def _validate_parallel_worker_result(
+    result: Any,
+    plan: Mapping[str, Any],
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Validate an untrusted worker result against its parent-owned assignment plan."""
+    if not isinstance(result, Mapping):
+        raise ValueError("worker result must be a mapping.")
+
+    status = result.get("status")
+    if status not in {"success", "failed"}:
+        raise ValueError(f"worker result status must be 'success' or 'failed', got {status!r}.")
+
+    expected_values = {
+        "chunk_id": int(plan["chunk_id"]),
+        "device": str(plan["device"]),
+        "image_count": int(plan["image_count"]),
+    }
+    for field, expected in expected_values.items():
+        actual = result.get(field)
+        if isinstance(actual, bool) or actual != expected:
+            raise ValueError(
+                f"worker result {field}={actual!r} does not match submitted {field}={expected!r}."
+            )
+
+    predictions = result.get("predictions")
+    stats = result.get("stats")
+    visuals = result.get("visuals")
+    if not isinstance(predictions, list):
+        raise ValueError("worker result predictions must be a list.")
+    if not isinstance(stats, list):
+        raise ValueError("worker result stats must be a list.")
+    if not isinstance(visuals, list):
+        raise ValueError("worker result visuals must be a list.")
+
+    prediction_count = result.get("prediction_count")
+    if isinstance(prediction_count, bool) or not isinstance(prediction_count, int):
+        raise ValueError("worker result prediction_count must be an integer.")
+    if prediction_count != len(predictions):
+        raise ValueError(
+            "worker result prediction_count does not match the predictions payload: "
+            f"{prediction_count} != {len(predictions)}."
+        )
+
+    prediction_fields = (
+        ("image_id", int),
+        ("category_id", int),
+        ("score", float),
+    )
+    for index, prediction in enumerate(predictions):
+        if not isinstance(prediction, Mapping):
+            raise ValueError(f"worker result predictions[{index}] must be a mapping.")
+        for field, converter in prediction_fields:
+            try:
+                converter(prediction[field])
+            except (KeyError, TypeError, ValueError, OverflowError) as error:
+                raise ValueError(
+                    f"worker result predictions[{index}].{field} must be convertible "
+                    f"to {converter.__name__}."
+                ) from error
+
+    for index, stat in enumerate(stats):
+        if not isinstance(stat, Mapping):
+            raise ValueError(f"worker result stats[{index}] must be a mapping.")
+        try:
+            int(stat["image_id"])
+        except (KeyError, TypeError, ValueError, OverflowError) as error:
+            raise ValueError(
+                f"worker result stats[{index}].image_id must be convertible to int."
+            ) from error
+
+    for index, visual in enumerate(visuals):
+        if not isinstance(visual, Mapping):
+            raise ValueError(f"worker result visuals[{index}] must be a mapping.")
+
+    times: Dict[str, float] = {}
+    for field in ("model_load_seconds", "inference_seconds"):
+        value = result.get(field)
+        if isinstance(value, bool):
+            raise ValueError(f"worker result {field} must be a non-negative number.")
+        try:
+            numeric_value = float(value)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"worker result {field} must be a finite non-negative number."
+            ) from error
+        if not math.isfinite(numeric_value) or numeric_value < 0:
+            raise ValueError(f"worker result {field} must be a finite non-negative number.")
+        times[field] = numeric_value
+
+    effective_batch_sizes = result.get("effective_batch_sizes")
+    if not isinstance(effective_batch_sizes, list):
+        raise ValueError("worker result effective_batch_sizes must be a list.")
+    for batch_size in effective_batch_sizes:
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
+            raise ValueError(
+                "worker result effective_batch_sizes members must be positive integers."
+            )
+    normalized_batch_sizes = sorted(set(effective_batch_sizes))
+
+    error_info = result.get("error")
+    if status == "success":
+        if error_info is not None:
+            raise ValueError("successful worker result error must be null.")
+        normalized_error = None
+        normalized_prediction_count = prediction_count
+    else:
+        if not isinstance(error_info, Mapping) or "type" not in error_info or "message" not in error_info:
+            raise ValueError("failed worker result error must contain type and message.")
+        normalized_error = {
+            "type": str(error_info["type"]),
+            "message": str(error_info["message"]),
+        }
+        normalized_prediction_count = 0
+
+    assignment = {
+        **expected_values,
+        "prediction_count": normalized_prediction_count,
+        "model_load_seconds": times["model_load_seconds"],
+        "inference_seconds": times["inference_seconds"],
+        "effective_batch_sizes": normalized_batch_sizes,
+        "status": status,
+        "error": normalized_error,
+    }
+    return assignment, predictions, stats, visuals
+
+
 def run_inference(
     dataset: DatasetBundle,
     config: Mapping[str, Any],
     output_dir: Path,
     quiet: bool,
     prebuilt_model: Any = None,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+) -> Tuple[
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+    Optional[Dict[str, Any]],
+]:
     """Run inference across all images."""
     devices = parse_devices(config["model"])
-    if prebuilt_model is not None and len(devices) != 1:
-        devices = [devices[0]]
+    chunk_count = resolve_inference_chunk_count(config, len(dataset.images))
+    chunk_devices = expand_chunk_devices(devices, chunk_count)
+    if prebuilt_model is not None and chunk_count > 1:
+        raise ValueError("prebuilt_model is not supported for multi-chunk inference.")
     engine = inference_engine_name(config)
     progress_enabled = bool(config["progress"].get("images", True)) and not quiet
     # Visuals are rendered after inference so sampling can use GT and/or prediction filters.
     visual_image_ids: set = set()
 
-    if len(devices) == 1:
-        inference_model = build_inference_model(config, devices[0], prebuilt_model=prebuilt_model)
+    if chunk_count == 1:
+        inference_model = build_inference_model(config, chunk_devices[0], prebuilt_model=prebuilt_model)
         if is_rfdetr_model_type(config.get("model", {})):
             progress_bar = tqdm(total=len(dataset.images), desc=f"{engine} inference", unit="image") if progress_enabled else None
             try:
-                return run_batched_rfdetr_records(
+                predictions, stats, visuals = run_batched_rfdetr_records(
                     dataset.images,
                     inference_model,
                     config,
@@ -3078,6 +3348,7 @@ def run_inference(
                     list(visual_image_ids),
                     progress_bar=progress_bar,
                 )
+                return predictions, stats, visuals, None
             finally:
                 if progress_bar is not None:
                     progress_bar.close()
@@ -3099,28 +3370,137 @@ def run_inference(
             all_stats.append(stat)
             if visual_row is not None:
                 visual_rows.append(visual_row)
-        return all_predictions, all_stats, visual_rows
+        return all_predictions, all_stats, visual_rows, None
 
-    chunks = chunk_records(dataset.images, len(devices))
-    blue(f"Using image-level multiprocessing on devices: {', '.join(devices)}", verbose=not quiet)
-    all_predictions = []
-    all_stats = []
-    visual_rows = []
-    with ProcessPoolExecutor(max_workers=len(chunks)) as executor:
-        futures = []
-        for index, records in enumerate(chunks):
-            device = devices[index % len(devices)]
-            worker_visual_ids = [record["image_id"] for record in records if record["image_id"] in visual_image_ids]
-            futures.append(executor.submit(inference_worker, records, config, str(output_dir), device, worker_visual_ids))
-        iterator = as_completed(futures)
-        if progress_enabled:
-            iterator = tqdm(iterator, total=len(futures), desc=f"{engine} device chunks", unit="chunk")
-        for future in iterator:
+    chunks = chunk_records(dataset.images, chunk_count)
+    plans = []
+    for index, records in enumerate(chunks):
+        plans.append(
+            {
+                "chunk_id": index,
+                "records": records,
+                "device": chunk_devices[index],
+                "image_count": len(records),
+                "visual_image_ids": [
+                    record["image_id"]
+                    for record in records
+                    if record["image_id"] in visual_image_ids
+                ],
+            }
+        )
+    blue(
+        f"Using {chunk_count} image-level multiprocessing chunks on devices: {', '.join(devices)}",
+        verbose=not quiet,
+    )
+    assignments_by_chunk: Dict[int, Dict[str, Any]] = {}
+    payloads_by_chunk: Dict[
+        int,
+        Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]],
+    ] = {}
+    futures: Dict[Any, Mapping[str, Any]] = {}
+    controller_error: Optional[Exception] = None
+    wall_start = time.perf_counter()
+
+    def record_terminal_future(future: Any, plan: Mapping[str, Any]) -> None:
+        chunk_id = int(plan["chunk_id"])
+        try:
             result = future.result()
-            all_predictions.extend(result["predictions"])
-            all_stats.extend(result["stats"])
-            visual_rows.extend(result["visuals"])
-    return all_predictions, all_stats, visual_rows
+            assignment, predictions, stats, visuals = _validate_parallel_worker_result(result, plan)
+        except Exception as error:
+            assignments_by_chunk[chunk_id] = _failed_parallel_assignment(plan, error)
+            return
+        assignments_by_chunk[chunk_id] = assignment
+        if assignment["status"] == "success":
+            payloads_by_chunk[chunk_id] = (predictions, stats, visuals)
+
+    try:
+        spawn_context = multiprocessing.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=chunk_count, mp_context=spawn_context) as executor:
+            for plan in plans:
+                try:
+                    future = executor.submit(
+                        inference_worker,
+                        plan["chunk_id"],
+                        plan["records"],
+                        config,
+                        str(output_dir),
+                        plan["device"],
+                        plan["visual_image_ids"],
+                    )
+                except Exception as error:
+                    controller_error = error
+                    break
+                futures[future] = plan
+
+            try:
+                iterator = as_completed(futures)
+                if progress_enabled:
+                    iterator = tqdm(
+                        iterator,
+                        total=len(futures),
+                        desc=f"{engine} device chunks",
+                        unit="chunk",
+                    )
+                for future in iterator:
+                    record_terminal_future(future, futures[future])
+            except Exception as error:
+                if controller_error is None:
+                    controller_error = error
+            finally:
+                for future, plan in futures.items():
+                    if int(plan["chunk_id"]) not in assignments_by_chunk:
+                        record_terminal_future(future, plan)
+    except Exception as error:
+        if controller_error is None:
+            controller_error = error
+
+    missing_plans = [
+        plan for plan in plans if int(plan["chunk_id"]) not in assignments_by_chunk
+    ]
+    if missing_plans:
+        missing_error = controller_error or RuntimeError("Parallel chunk did not produce a terminal result.")
+        for plan in missing_plans:
+            assignments_by_chunk[int(plan["chunk_id"])] = _failed_parallel_assignment(
+                plan,
+                missing_error,
+            )
+    elif controller_error is not None and not any(
+        assignment["status"] == "failed" for assignment in assignments_by_chunk.values()
+    ):
+        for plan in plans:
+            assignments_by_chunk[int(plan["chunk_id"])] = _failed_parallel_assignment(
+                plan,
+                controller_error,
+            )
+
+    assignments = [assignments_by_chunk[index] for index in range(chunk_count)]
+    parallel_summary = {
+        "status": "failed" if any(item["status"] == "failed" for item in assignments) else "success",
+        "chunks": chunk_count,
+        "devices_requested": devices,
+        "wall_seconds": time.perf_counter() - wall_start,
+        "assignments": assignments,
+    }
+    if parallel_summary["status"] == "failed":
+        raise ParallelInferenceError(parallel_summary)
+
+    all_predictions: List[Dict[str, Any]] = []
+    all_stats: List[Dict[str, Any]] = []
+    visual_rows: List[Dict[str, Any]] = []
+    for chunk_id in range(chunk_count):
+        predictions, stats, visuals = payloads_by_chunk[chunk_id]
+        all_predictions.extend(predictions)
+        all_stats.extend(stats)
+        visual_rows.extend(visuals)
+    all_predictions.sort(
+        key=lambda item: (
+            int(item["image_id"]),
+            int(item["category_id"]),
+            -float(item["score"]),
+        )
+    )
+    all_stats.sort(key=lambda item: int(item["image_id"]))
+    return all_predictions, all_stats, visual_rows, parallel_summary
 
 
 def xywh_to_xyxy(box: Sequence[float]) -> np.ndarray:
@@ -4268,6 +4648,7 @@ def normalize_config(config: MutableMapping[str, Any], source_config: Path) -> T
     demo_cfg = config.setdefault("demo", {})
 
     quiet = bool(runtime.get("quiet", False))
+    runtime["validate_devices_in_parent"] = bool(runtime.get("validate_devices_in_parent", True))
     if quiet:
         runtime["verbose"] = False
     if "mode" not in inference_cfg:
@@ -4287,6 +4668,8 @@ def normalize_config(config: MutableMapping[str, Any], source_config: Path) -> T
     engine = inference_engine_name(config)
     inference_cfg["engine"] = engine
     inference_cfg["batch_size"] = positive_int_setting(inference_cfg.get("batch_size"), 1, "inference.batch_size")
+    if "chunks" in inference_cfg:
+        inference_cfg["chunks"] = _positive_inference_chunks(inference_cfg.get("chunks"))
     sahi_cfg["batch_size"] = positive_int_setting(sahi_cfg.get("batch_size"), inference_cfg["batch_size"], "sahi.batch_size")
     model_type = str(model_cfg.get("type", "ultralytics")).strip().lower()
     if mode != shared_modes.SAHI_MODE and model_type not in {"ultralytics", "rfdetr", "rf-detr", "rf_detr"}:
@@ -4460,7 +4843,10 @@ def run_evaluation(
 
     engine = inference_engine_name(config)
     blue(str(config["runtime"].get("banner", "OBJECT DETECTION DATASET EVALUATION")), verbose=verbose, force=not quiet)
-    validate_runtime_devices(config, verbose=verbose)
+    if bool(config["runtime"].get("validate_devices_in_parent", True)):
+        validate_runtime_devices(config, verbose=verbose)
+    else:
+        blue("CUDA device validation is deferred to spawned inference workers.", verbose=verbose)
     blue("Loading dataset and building COCO ground truth in memory...", verbose=verbose)
     dataset = load_dataset(config, output_info)
     config["dataset_categories"] = dataset.categories
@@ -4481,7 +4867,44 @@ def run_evaluation(
         write_json(gt_path, add_config_metadata_to_coco(dataset.coco, output_info, config))
 
     blue(f"Running {engine} inference...", verbose=verbose)
-    predictions, stats_rows, _ = run_inference(dataset, config, output_dir, quiet=quiet, prebuilt_model=prebuilt_model)
+    try:
+        predictions, stats_rows, _, parallel_summary = run_inference(
+            dataset,
+            config,
+            output_dir,
+            quiet=quiet,
+            prebuilt_model=prebuilt_model,
+        )
+    except ParallelInferenceError as error:
+        parallel_summary_path = output_dir / "parallel_summary.json"
+        try:
+            write_json(parallel_summary_path, error.summary)
+            manifest.append(
+                {
+                    "path": str(parallel_summary_path),
+                    "kind": "runtime",
+                    "description": "Failed parallel inference chunk timing and status summary.",
+                }
+            )
+            if bool(config["output"].get("save_output_manifest", True)):
+                write_json(
+                    output_dir / "output_manifest.json",
+                    {"metadata": output_info, "config": config, "outputs": manifest},
+                )
+        finally:
+            if not save_ground_truth:
+                gt_path.unlink(missing_ok=True)
+        raise
+    if parallel_summary is not None:
+        parallel_summary_path = output_dir / "parallel_summary.json"
+        write_json(parallel_summary_path, parallel_summary)
+        manifest.append(
+            {
+                "path": str(parallel_summary_path),
+                "kind": "runtime",
+                "description": "Parallel inference chunk timing and status summary.",
+            }
+        )
     predictions = sorted(predictions, key=lambda item: (int(item["image_id"]), int(item["category_id"]), -float(item["score"])))
 
     predictions_path = output_dir / "predictions_coco.json"
@@ -4784,7 +5207,7 @@ Example usage:
         write_json(gt_path, add_config_metadata_to_coco(dataset.coco, output_info, config))
 
     blue(f"Running {engine} inference...", verbose=verbose)
-    predictions, stats_rows, _ = run_inference(dataset, config, output_dir, quiet=quiet)
+    predictions, stats_rows, _, _ = run_inference(dataset, config, output_dir, quiet=quiet)
     predictions = sorted(predictions, key=lambda item: (int(item["image_id"]), int(item["category_id"]), -float(item["score"])))
 
     predictions_path = output_dir / "predictions_coco.json"

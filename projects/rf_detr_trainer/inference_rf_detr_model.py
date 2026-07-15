@@ -659,7 +659,13 @@ def build_prediction_config(config: Mapping[str, Any], categories: Sequence[Mapp
 
 def load_rfdetr_model(config: Mapping[str, Any]) -> Any:
     model_cls = trainer.get_model_class(str(config.get("model", {}).get("size", "medium")))
-    return model_cls(**trainer.build_model_kwargs(config))
+    rf_model = model_cls(**trainer.build_model_kwargs(config))
+    motion_config = config.get("model", {}).get("motion", {}) or {}
+    if bool(motion_config.get("enabled", False)):
+        from rf_detr_motion import attach_motion_module
+
+        attach_motion_module(rf_model.model, motion_config)
+    return rf_model
 
 
 def resolved_tracker_device(config: Mapping[str, Any], tracking_config: Any) -> str:

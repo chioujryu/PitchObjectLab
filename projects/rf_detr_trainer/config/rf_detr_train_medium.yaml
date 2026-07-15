@@ -7,7 +7,7 @@ runtime:
   verbose: true
   # Validate config and estimate output files without starting training. Options: true, false.
   dry_run: false
-  # Ask before creating checkpoints, logs, metrics, plots, or dataset grids. Options: true, false.
+  # Ask before creating checkpoints, logs, metrics, plots, or validation prediction grids. Options: true, false.
   confirm_before_run: true
   # Runtime-estimate settings. Options: mapping.
   time_estimate:
@@ -203,7 +203,7 @@ train:
   # AdamW gradient clipping max norm. Options: positive float.
   clip_max_norm: 0.1
   # Save archive checkpoint every N epochs. Options: positive integer.
-  checkpoint_interval: 10
+  checkpoint_interval: 1
   # Resume checkpoint path. Options: null, or path to RF-DETR .pth/.ckpt checkpoint.
   resume: null
   # Use exponential moving average weights. Options: true, false.
@@ -276,8 +276,6 @@ train:
   fp16_eval: false
   # Do not save weights. Options: true, false.
   dont_save_weights: false
-  # Save augmented train/validation dataset grid images before training. Options: true, false. This writes image files to output_dir/dataset_grids.
-  save_dataset_grids: true
   # Compute validation loss during validation. Options: true, false.
   compute_val_loss: true
   # Compute test loss in Lightning test_step. Options: true, false. Wrapper manual test focuses on metrics.
@@ -289,7 +287,25 @@ train:
   # DataLoader prefetch_factor. Options: null for auto, positive integer.
   prefetch_factor: null
   # Augmentation config dictionary. Options: null or RF-DETR aug_config keys.
-  aug_config: null
+  aug_config:
+    # HorizontalFlip nested configuration block. Options: mapping.
+    HorizontalFlip:
+      # p setting for this config block. Options: documented value for this RF-DETR config section.
+      p: 0.5
+    # RandomBrightnessContrast nested configuration block. Options: mapping.
+    RandomBrightnessContrast:
+      # brightness_limit setting for this config block. Options: documented value for this RF-DETR config section.
+      brightness_limit: 0.3
+      # contrast_limit setting for this config block. Options: documented value for this RF-DETR config section.
+      contrast_limit: 0.3
+      # p setting for this config block. Options: documented value for this RF-DETR config section.
+      p: 0.5
+    # GaussianBlur nested configuration block. Options: mapping.
+    GaussianBlur:
+      # blur_limit setting for this config block. Options: documented value for this RF-DETR config section.
+      blur_limit: 3
+      # p setting for this config block. Options: documented value for this RF-DETR config section.
+      p: 0.3
   # Extra RF-DETR TrainConfig keys not listed above. Example: {freeze_encoder: true}
   extra_train_args: {}
 

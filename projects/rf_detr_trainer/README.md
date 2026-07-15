@@ -3,12 +3,12 @@
 Config-first RF-DETR training project with an Ultralytics-style workflow:
 
 1. Custom output directory using `output.output_dir` or `output.root` + `output.name`.
-2. Validation every N epochs through RF-DETR `eval_interval`.
+2. Validation every epoch by default through RF-DETR `eval_interval`.
 3. Scheduled test-set evaluation every N epochs or minutes.
 4. Final test-set evaluation after training.
-5. Overall and per-class test metrics saved as JSON and CSV.
+5. Per-epoch validation metrics plus overall/per-class test metrics saved as JSON and CSV.
 6. Config snapshots inside every training/test output folder.
-7. Augmented train/validation dataset sample grids saved before training.
+7. Train batch grids plus validation label/prediction grids for label checks.
 8. A file/resource estimate plus confirmation before large outputs are written.
 9. Auto-detection and cache conversion for RF-DETR/Roboflow, Ultralytics YOLO,
    COCO JSON, Pascal VOC, DOTA, and LabelMe JSON datasets.
@@ -118,7 +118,7 @@ uv run python train_rf_detr_model.py \
   --epochs 300 \
   --batch-size 4 \
   --grad-accum-steps 4 \
-  --eval-interval 5 \
+  --eval-interval 1 \
   --test-interval-epochs 30 \
   --output-dir /runs/rf_detr/football_medium \
   --yes
@@ -165,12 +165,19 @@ Segmentation: seg-preview, seg-nano, seg-small, seg-medium, seg-large, seg-xlarg
 auto, cpu, cuda, 0, 1, 0,1, cuda:0, mps, -1
 ```
 
-Validation interval:
+Validation and checkpoint defaults:
 
 ```yaml
 train:
-  eval_interval: 5
+  # Save archive checkpoint_<epoch>.pth every epoch.
+  checkpoint_interval: 1
+  # Run RF-DETR validation loader and metrics every epoch.
+  eval_interval: 1
 ```
+
+`train.eval_interval` is also forwarded to Lightning's
+`check_val_every_n_epoch` unless you explicitly override that key under
+`trainer.extra_trainer_args`.
 
 Scheduled test interval:
 
@@ -201,6 +208,11 @@ uv run python test_rf_detr_model.py \
   --model-size seg-large \
   --checkpoint runs/rf_detr/my_seg_run/checkpoint_best_total.pth \
   --yes
+
+uv run python test_rf_detr_model.py \
+  --config config/rf_detr_test.yaml \
+  --chunks 6 \
+  --yes
 ```
 
 `config/rf_detr_test.yaml` is test-only. Use `test.split`,
@@ -208,6 +220,39 @@ uv run python test_rf_detr_model.py \
 script builds any RF-DETR runtime adapter settings internally. Full-image
 segmentation tests use RF-DETR's mask-aware evaluation path; `sahi` and
 `class_crop` tests evaluate boxes.
+
+Standalone bounding-box tests can split the selected dataset across concurrent
+model replicas:
+
+```yaml
+model:
+  # One device or a comma-separated round-robin list.
+  device: "0,1"
+
+test:
+  parallel:
+    chunks: 6
+```
+
+Each chunk loads the same configured model and checkpoint. With `chunks: 6`
+and `device: 0`, six replicas run concurrently on GPU 0; with `device: "0,1"`,
+the six workers are assigned to GPUs `0,1,0,1,0,1`. The chunk count must be a
+positive integer no larger than the number of selected test images. Multiple
+replicas on one GPU multiply model-memory demand and do not imply a linear
+speedup, so use `--dry-run --chunks 6 --yes` to inspect the assignment and
+estimate first.
+
+Parallel workers produce one combined set of predictions, metrics, diagnostics,
+and aliases. `parallel_summary.json` records every chunk's device, image count,
+timings, effective batch sizes, and terminal status; any failed chunk fails the
+whole evaluation instead of publishing partial metrics. `chunks: 1` is the
+default and preserves the original single-model path. This setting applies only
+to `test_rf_detr_model.py`, not scheduled/final tests inside training.
+
+Mask-aware full-image segmentation (`evaluation.type: auto` or `segm`) requires
+`chunks: 1`. To run a segmentation checkpoint through parallel box evaluation,
+set `evaluation.type: bbox` explicitly; parallel `sahi` and `class_crop` modes
+also evaluate bounding boxes.
 
 Prediction visuals and football diagnostics are controlled in the test config:
 
@@ -242,16 +287,23 @@ Every standalone test prints a file/disk estimate before creating output folders
 or cache files. Use `--dry-run --yes` to inspect the estimate without running
 inference, and use `--yes` only after accepting the output size.
 
-Dataset sample grids:
+Batch grids are written directly in the training output folder:
 
-```yaml
-train:
-  save_dataset_grids: true
-```
+- `train_batch0.jpg`, `train_batch1.jpg`, `train_batch2.jpg` are captured from
+  the first training batches in a run to inspect labels and augmentations.
+  Boxes are rendered against the actual model-input tensor/mask size, so they
+  stay aligned after RF-DETR's in-step multi-scale resize.
+- `val_batch*_labels.jpg` and `val_batch*_pred.jpg` are refreshed after every
+  formal RF-DETR validation. Prediction grids overwrite the previous images
+  with the latest model predictions whose confidence score is at least `0.25`,
+  so low-confidence RF-DETR top-K candidates do not obscure useful diagnostics.
 
-When enabled, the trainer saves RF-DETR dataloader samples after resize,
-normalization reversal, and augmentation to `<output_dir>/dataset_grids/`.
-Use `--no-save-dataset-grids` to skip this for a run.
+The provided `rf_detr_train*.yaml` configs enable the same RF-DETR
+`train.aug_config` preset: horizontal flip, brightness/contrast jitter, and
+Gaussian blur. Set `train.aug_config: null` in a copied config to use RF-DETR's
+library default instead. Detection training keeps horizontal flip enabled; only
+keypoint training without configured `keypoint_flip_pairs` disables horizontal
+flip to avoid left/right joint label errors.
 
 Custom output address:
 
@@ -460,13 +512,21 @@ Training outputs are written to `<output_dir>/`:
 |-- checkpoint_best_total.pth
 |-- checkpoint_*.pth
 |-- metrics.csv
-|-- dataset_grids/
-|   |-- train_batch0_grid.jpg
-|   |-- train_batch1_grid.jpg
-|   |-- train_batch2_grid.jpg
-|   |-- val_batch0_grid.jpg
-|   |-- val_batch1_grid.jpg
-|   `-- val_batch2_grid.jpg
+|-- epoch_results/
+|   |-- epoch_metrics.csv
+|   |-- latest_val_metrics.json
+|   `-- epoch_0001/
+|       |-- val_metrics.json
+|       `-- val_metrics.csv
+|-- train_batch0.jpg
+|-- train_batch1.jpg
+|-- train_batch2.jpg
+|-- val_batch0_labels.jpg
+|-- val_batch0_pred.jpg
+|-- val_batch1_labels.jpg
+|-- val_batch1_pred.jpg
+|-- val_batch2_labels.jpg
+|-- val_batch2_pred.jpg
 |-- config/
 |   |-- merged_config.yaml
 |   |-- source_config.yaml
@@ -488,6 +548,9 @@ Training outputs are written to `<output_dir>/`:
     `-- config/
 ```
 
+Training configs default to `checkpoint_interval: 1` and `eval_interval: 1`,
+so every epoch keeps an archive checkpoint and writes scalar `val/*` metrics
+under `epoch_results/`.
 `test_metrics.json` contains the overall metrics and raw torchmetrics output.  
 `test_per_class_metrics.csv/json` contains per-class `ap`, `ar`, `f1`, `precision`, and `recall`.
 

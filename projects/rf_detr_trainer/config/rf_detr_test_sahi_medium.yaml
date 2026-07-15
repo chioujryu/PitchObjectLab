@@ -33,13 +33,13 @@ model:
   # RF-DETR model size. Options: base, nano, small, medium, large, seg-preview, seg-nano, seg-small, seg-medium, seg-large, seg-xlarge, seg-2xlarge.
   size: medium
   # Checkpoint to test. Options: default, null/false, hosted key, or local checkpoint path.
-  pretrain_weights: /home/new_users/zhiyu/projects/PitchObjectLab/runs/detect/站立運動員_足球_球門檢測數據集2025/train/rfdetr_medium_e50_b8_val1_test1_20260526214556/checkpoint_best_ema.pth
+  pretrain_weights: /home/new_users/zhiyu/trash/medium/checkpoint_best_ema.pth
   # Input resolution override. Options: null or valid RF-DETR resolution integer.
   resolution: null
   # Class count override. Options: null or positive integer.
-  num_classes: 3
-  # Device selector. Options: auto, cpu, cuda, cuda:0, 0, 1, mps, -1.
-  device: cuda:0
+  num_classes: 1
+  # Device selector. Options: auto, cpu, cuda, cuda:0, 0, 1, "0,1" for round-robin multi-GPU, mps, -1.
+  device: cuda:6
   # Automatic mixed precision. Options: true, false.
   amp: true
   # First-stage prediction confidence threshold. Options: 0.0-1.0.
@@ -48,15 +48,49 @@ model:
   category_remapping: {}
   # Extra RF-DETR ModelConfig keys. Options: any supported model config key.
   extra_model_args: {}
+  # P2 stride-4 feature-level settings. Required to load medium+P2 checkpoints (projector_scale [P2, P3, P4]).
+  p2:
+    # Enable P2 high-resolution feature level. Options: true, false.
+    enabled: true
+    # Feature levels for projector AND decoder. Options: P2, P3, P4, P5, P6 in ascending P-name order.
+    projector_scale: [P2, P3, P4]
+    # P2 projector implementation settings. Options: mapping.
+    projector:
+      # C2f depth per projector stage. Options: null for upstream default, or a positive integer.
+      num_blocks: null
+      # Stochastic-depth survival probability. Options: null for 1.0, or 0.0-1.0.
+      survival_prob: null
+      # Force-zero the last N ViT feature maps before projecting. Options: null for 0, or non-negative integer.
+      force_drop_last_n_features: null
+      # LayerNorm inside projector convs. Options: null to inherit model layer_norm, true, false.
+      layer_norm: null
+      # RMSNorm inside projector convs. Options: null to inherit model rms_norm, true, false.
+      rms_norm: null
+    # Pretrained-weight loading compatibility settings. Options: mapping.
+    weights:
+      # Suppress the expected PretrainWeightsCompatibilityWarning for projector_scale changes. Options: true, false.
+      suppress_compat_warning: true
+    # Validated RF-DETR model override keys. Options: mapping.
+    overrides:
+      # Input resolution override applied only when P2 is enabled. Options: null to use model.resolution, or a valid integer.
+      resolution: null
+      # Decoder query count. Options: null for model default, or positive integer.
+      num_queries: null
+      # Selected predictions at postprocess. Options: null for model default, or positive integer.
+      num_select: null
+      # Deformable-attention sampling points per level per head. Options: null for model default, or positive integer.
+      dec_n_points: null
+      # Gradient checkpointing flag in the rebuilt model config. Options: null, true, false.
+      gradient_checkpointing: null
 
 # Dataset discovery and limiting settings. Options: mapping.
 dataset:
   # Dataset source format. Options: auto, rfdetr, roboflow, ultralytics_yolo, coco_json, pascal_voc, dota, labelme_json.
   source_format: ultralytics_yolo
   # Source dataset root. Options: RF-DETR/Roboflow root, YOLO root, VOC root, DOTA root, LabelMe root, or COCO root.
-  dataset_dir: /home/new_users/zhiyu/datasets/soccer/spatial_perception/Xbotgo/站立运动员、足球、球门检测数据集V1/outputs/YoloFormat/all_parameters_object_crop_960_classesall_max_samplesall
+  dataset_dir: /home/new_users/zhiyu/datasets/soccer/spatial_perception/Xbotgo/soccer_ball_merged_v1/outputs/yolo_reviewed_sam3_augmented_320-1921_sahi_1280
   # Ultralytics YOLO dataset YAML. Options: empty string to auto-find, or YAML path.
-  data_yaml: /home/new_users/zhiyu/datasets/soccer/spatial_perception/Xbotgo/站立运动员、足球、球门检测数据集V1/outputs/YoloFormat/all_parameters_object_crop_960_classesall_max_samplesall/dataset.yaml
+  data_yaml: /home/new_users/zhiyu/datasets/soccer/spatial_perception/Xbotgo/soccer_ball_merged_v1/outputs/yolo_reviewed_sam3_augmented_320-1921_sahi_1280/dataset.yaml
   # COCO annotation file for coco_json. Options: empty string or JSON path.
   coco_json: ""
   # Image directory for coco_json. Options: empty string or image folder path.
@@ -79,18 +113,22 @@ output:
   # Exact output directory. Options: empty string, absolute path, relative path, or placeholder template.
   output_dir: ""
   # Output root when output_dir is empty. Supports placeholders such as {model_size}, {test_split}, {timestamp}.
-  root: /home/new_users/zhiyu/projects/PitchObjectLab/runs/detect/站立運動員_足球_球門檢測數據集2025/test
+  root: runs/rf_detr/test
   # Run folder name. Options: pure string or placeholder template.
-  name: "rfdetr_test_sahi320_football_recheck640_{model_size}_{test_split}_{timestamp}"
+  name: "rfdetr_{model_size}_motion_v5_e{epochs}_b{batch_size}_{timestamp}"
   # Allow existing output directory. Options: true, false.
   exist_ok: false
 
 # Standalone test settings. Options: mapping.
 test:
   # Dataset split. Options: test-original, test, val, valid, train.
-  split: test-original
+  split: test
   # Maximum images to evaluate. Options: all/null for the full split, or a positive integer for first N images.
-  max_images: 10000
+  max_images: all
+  # Standalone multiprocessing settings. Options: mapping.
+  parallel:
+    # Balanced test-data chunks and concurrent model replicas. Options: positive integer; 1 disables multiprocessing and preserves the single-model path.
+    chunks: 1
   # Test mode selector block. Options: mapping.
   test_mode:
     # Test mode. Options: full_image, class_crop, sahi.
@@ -101,7 +139,7 @@ test:
     class_ids: []
     # Crop class names. Empty means all predicted classes.
     class_names:
-      - standing_player
+      - soccer_ball
     # Crop source. Options: prediction.
     source: prediction
     # Source prediction confidence. Options: 0.0-1.0.
@@ -133,7 +171,7 @@ test:
     # Class-agnostic merge. Options: true, false.
     postprocess_class_agnostic: false
     # RF-DETR SAHI slice/recheck batch size. Options: positive integer.
-    batch_size: 4
+    batch_size: 64
     # recheck nested configuration block. Options: mapping.
     recheck:
       # Run a second centered B*B verification pass for selected SAHI target-class boxes. Options: true, false.
@@ -142,7 +180,7 @@ test:
       target_class_ids: []
       # Target category names for SAHI recheck. Empty with enabled defaults to football. Options: category names such as [football].
       target_class_names:
-        - football
+        - soccer_ball
       # B*B centered crop size for the second pass. Options: positive integer pixels.
       crop_size: 640
       # Confidence threshold for the second pass. Options: 0.0-1.0.
@@ -200,7 +238,7 @@ test:
   # Model-input batch grid size. Options: positive integer.
   model_input_batch_size: 9
   # RF-DETR full-image/class-crop evaluator batch size. Options: positive integer.
-  batch_size: 4
+  batch_size: 16
   # Adapter dataloader workers. Options: 2 by project rule.
   num_workers: 2
   # Max detections for metrics. Options: positive integer.
@@ -215,11 +253,11 @@ test:
     target_class_ids: []
     # Target category names. Default: football.
     target_class_names:
-      - football
+      - soccer_ball
     # Category IDs to draw in error-case images. Empty means draw all GT/prediction classes. Options: list of category IDs.
     render_class_ids: []
     # Category names to draw in error-case images. Empty means draw all GT/prediction classes. Options: list of category names.
-    render_class_names: [football]
+    render_class_names: [soccer_ball]
     # Shared max diagnostic images. Options: null or non-negative integer.
     max_images: 100
     # Legacy missed-image cap. Options: null or non-negative integer.

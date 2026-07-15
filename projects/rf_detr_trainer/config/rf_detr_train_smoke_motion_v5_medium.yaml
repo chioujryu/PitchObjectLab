@@ -268,8 +268,6 @@ train:
   fp16_eval: false
   # Disable weight checkpoint saving. Options: true, false.
   dont_save_weights: true
-  # Save dataset sample grids before training. Options: true, false.
-  save_dataset_grids: false
   # Compute validation loss. Options: true, false.
   compute_val_loss: true
   # Compute test loss. Options: true, false.
@@ -281,7 +279,25 @@ train:
   # DataLoader prefetch_factor. Options: null for auto or positive integer.
   prefetch_factor: null
   # Albumentations augmentation config. Options: null or transform mapping.
-  aug_config: null
+  aug_config:
+    # HorizontalFlip nested configuration block. Options: mapping.
+    HorizontalFlip:
+      # p setting for this config block. Options: documented value for this RF-DETR config section.
+      p: 0.5
+    # RandomBrightnessContrast nested configuration block. Options: mapping.
+    RandomBrightnessContrast:
+      # brightness_limit setting for this config block. Options: documented value for this RF-DETR config section.
+      brightness_limit: 0.3
+      # contrast_limit setting for this config block. Options: documented value for this RF-DETR config section.
+      contrast_limit: 0.3
+      # p setting for this config block. Options: documented value for this RF-DETR config section.
+      p: 0.5
+    # GaussianBlur nested configuration block. Options: mapping.
+    GaussianBlur:
+      # blur_limit setting for this config block. Options: documented value for this RF-DETR config section.
+      blur_limit: 3
+      # p setting for this config block. Options: documented value for this RF-DETR config section.
+      p: 0.3
   # Extra RF-DETR TrainConfig arguments. Options: mapping.
   extra_train_args: {}
 

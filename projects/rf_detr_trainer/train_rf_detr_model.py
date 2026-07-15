@@ -7,11 +7,12 @@ This project wraps the official RF-DETR PyTorch Lightning training stack and add
 2. Configurable validation interval through RF-DETR's eval_interval.
 3. Scheduled test-set evaluation every N epochs or N minutes.
 4. Final test-set evaluation after training.
-5. Overall and per-class test metrics written as JSON and CSV.
-6. Config snapshots inside every training/test output directory.
-7. Augmented dataset sample grids saved before training.
-8. A resource/file estimate and developer confirmation before heavy output is created.
-9. Linux and Windows path support.
+5. Per-epoch validation metrics written as JSON and CSV.
+6. Overall and per-class test metrics written as JSON and CSV.
+7. Config snapshots inside every training/test output directory.
+8. Train batch grids plus validation label/prediction grids for label checks.
+9. A resource/file estimate and developer confirmation before heavy output is created.
+10. Linux and Windows path support.
 
 Example usage:
 
@@ -178,8 +179,15 @@ MODEL_SIZE_ALIASES = {
 }
 PER_CLASS_FIELDS = ["class_id", "class", "ap", "ar", "f1", "precision", "recall"]
 METRIC_FIELDS = ["metric", "value"]
-DATASET_GRID_MAX_BATCHES = 3
-DATASET_GRID_SPLITS = ("train", "val")
+EPOCH_VAL_METRIC_FIELDS = ["epoch", "global_step", "created_at", "metric", "value"]
+TRAIN_BATCH_GRID_MAX_BATCHES = 3
+VALIDATION_PREDICTION_GRID_MAX_BATCHES = 3
+VALIDATION_PREDICTION_GRID_MIN_SCORE = 0.25
+BATCH_GRID_TILE_SIZE = 320
+BATCH_GRID_CAPTION_HEIGHT = 28
+BATCH_GRID_COLUMNS = 3
+BATCH_GRID_MAX_ITEMS = 9
+_RFDETR_DETECTION_HFLIP_PATCHED = False
 
 
 def blue(message: str, verbose: bool = True, force: bool = False) -> None:
@@ -195,14 +203,39 @@ class TeeTextStream:
         self.stream = stream
         self.log_file = log_file
 
+    @staticmethod
+    def _is_closed(stream: Any) -> bool:
+        """Return whether a stream is unavailable for writes."""
+        return stream is None or bool(getattr(stream, "closed", False))
+
+    @classmethod
+    def _write_if_open(cls, stream: Any, data: str) -> Optional[int]:
+        """Best-effort write for exit-time cleanup paths."""
+        if cls._is_closed(stream):
+            return None
+        try:
+            return stream.write(data)
+        except (OSError, ValueError):
+            return None
+
+    @classmethod
+    def _flush_if_open(cls, stream: Any) -> None:
+        """Best-effort flush for streams that may already be closed."""
+        if cls._is_closed(stream):
+            return
+        try:
+            stream.flush()
+        except (OSError, ValueError):
+            return
+
     def write(self, data: str) -> int:
-        written = self.stream.write(data)
-        self.log_file.write(data)
-        return written
+        written = self._write_if_open(self.stream, data)
+        self._write_if_open(self.log_file, data)
+        return len(data) if written is None else written
 
     def flush(self) -> None:
-        self.stream.flush()
-        self.log_file.flush()
+        self._flush_if_open(self.stream)
+        self._flush_if_open(self.log_file)
 
     def isatty(self) -> bool:
         return bool(getattr(self.stream, "isatty", lambda: False)())
@@ -601,6 +634,108 @@ def write_rows(path: Path, rows: Sequence[Mapping[str, Any]], fieldnames: Sequen
         writer.writeheader()
         for row in rows:
             writer.writerow({key: json_safe_value(row.get(key)) for key in fieldnames})
+
+
+def metric_scalar_value(value: Any) -> Optional[Any]:
+    """Return a JSON-safe scalar metric value, or None for non-scalar objects."""
+    safe = json_safe_value(value)
+    if isinstance(safe, list) and len(safe) == 1:
+        safe = safe[0]
+    if isinstance(safe, (bool, int, float, str)) or safe is None:
+        return safe
+    return None
+
+
+class EpochValidationResultsCallback(Callback):
+    """Persist validation metrics for every training epoch."""
+
+    def __init__(self, output_dir: Path, verbose: bool) -> None:
+        self.output_dir = output_dir
+        self.verbose = verbose
+        self.results_dir = output_dir / "epoch_results"
+        self.rows: List[Dict[str, Any]] = self._load_existing_rows()
+        self.written_epochs: set[int] = set()
+
+    def _load_existing_rows(self) -> List[Dict[str, Any]]:
+        """Load existing epoch metric rows so resumed runs preserve earlier results."""
+        path = self.results_dir / "epoch_metrics.csv"
+        if not path.exists():
+            return []
+        with path.open("r", encoding="utf-8", newline="") as file:
+            reader = csv.DictReader(file)
+            return [
+                {field: row.get(field) for field in EPOCH_VAL_METRIC_FIELDS}
+                for row in reader
+            ]
+
+    @staticmethod
+    def _row_epoch(row: Mapping[str, Any]) -> int:
+        """Parse an epoch number from a summary CSV row."""
+        try:
+            return int(row.get("epoch", -1) or -1)
+        except (TypeError, ValueError):
+            return -1
+
+    def _collect_val_metrics(self, trainer: Any) -> Dict[str, Any]:
+        metrics: Dict[str, Any] = {}
+        for source in (getattr(trainer, "callback_metrics", {}), getattr(trainer, "logged_metrics", {})):
+            if not isinstance(source, Mapping):
+                continue
+            for key, value in source.items():
+                metric_name = str(key)
+                if not metric_name.startswith("val/"):
+                    continue
+                scalar = metric_scalar_value(value)
+                if scalar is not None:
+                    metrics[metric_name] = scalar
+        return dict(sorted(metrics.items()))
+
+    def on_validation_epoch_end(self, trainer: Any, pl_module: Any) -> None:
+        """Write per-epoch validation metrics after RF-DETR logs them."""
+        del pl_module
+        if bool(getattr(trainer, "sanity_checking", False)):
+            return
+        if not bool(getattr(trainer, "is_global_zero", True)):
+            return
+
+        epoch_number = int(getattr(trainer, "current_epoch", -1)) + 1
+        if epoch_number <= 0 or epoch_number in self.written_epochs:
+            return
+
+        metrics = self._collect_val_metrics(trainer)
+        if not metrics:
+            return
+
+        created_at = datetime.now().isoformat(timespec="seconds")
+        global_step = int(getattr(trainer, "global_step", 0) or 0)
+        payload = {
+            "epoch": epoch_number,
+            "global_step": global_step,
+            "created_at": created_at,
+            "metrics": metrics,
+        }
+        epoch_dir = self.results_dir / f"epoch_{epoch_number:04d}"
+        write_json(epoch_dir / "val_metrics.json", payload)
+
+        epoch_rows = [
+            {
+                "epoch": epoch_number,
+                "global_step": global_step,
+                "created_at": created_at,
+                "metric": metric,
+                "value": value,
+            }
+            for metric, value in metrics.items()
+        ]
+        write_rows(epoch_dir / "val_metrics.csv", epoch_rows, EPOCH_VAL_METRIC_FIELDS)
+
+        self.rows = [row for row in self.rows if self._row_epoch(row) != epoch_number]
+        self.rows.extend(epoch_rows)
+        self.rows.sort(key=lambda row: (self._row_epoch(row), str(row.get("metric", ""))))
+        write_rows(self.results_dir / "epoch_metrics.csv", self.rows, EPOCH_VAL_METRIC_FIELDS)
+        write_json(self.results_dir / "latest_val_metrics.json", payload)
+        self.written_epochs.add(epoch_number)
+        blue(f"Saved epoch {epoch_number} validation metrics to {epoch_dir}.", verbose=self.verbose)
 
 
 def copy_if_exists(src: Optional[Path], dst: Path) -> None:
@@ -2574,16 +2709,25 @@ def estimate_outputs(
     checkpoint_interval = max(1, int(train.get("checkpoint_interval") or 10))
     checkpoint_files = 4 + int(math.ceil(epochs / checkpoint_interval))
     logger_files = 4
-    dataset_grid_files = 0
-    if bool(train.get("save_dataset_grids", False)):
-        dataset_grid_files = len(DATASET_GRID_SPLITS) * DATASET_GRID_MAX_BATCHES
+    train_batch_grid_files = TRAIN_BATCH_GRID_MAX_BATCHES
+    validation_label_grid_files = VALIDATION_PREDICTION_GRID_MAX_BATCHES
+    validation_prediction_grid_files = VALIDATION_PREDICTION_GRID_MAX_BATCHES
+    batch_grid_files = train_batch_grid_files + validation_label_grid_files + validation_prediction_grid_files
+    epoch_validation_result_files = epochs * 2 + 2
     per_test_files = 6 if bool(periodic.get("classwise", True)) else 4
     periodic_files = None if periodic_count is None else periodic_count * per_test_files
     final_files = per_test_files if bool(periodic.get("run_final_test", True)) else 0
-    total_known = checkpoint_files + logger_files + dataset_grid_files + final_files + (periodic_files or 0)
+    total_known = (
+        checkpoint_files
+        + logger_files
+        + batch_grid_files
+        + epoch_validation_result_files
+        + final_files
+        + (periodic_files or 0)
+    )
     approx_bytes = checkpoint_files * 250 * 1024 * 1024
-    if dataset_grid_files:
-        approx_bytes += 25 * 1024 * 1024
+    approx_bytes += epoch_validation_result_files * 8 * 1024
+    approx_bytes += batch_grid_files * 2 * 1024 * 1024
     dataset_cache_files = 0
     dataset_cache_bytes = 0
     dataset_source_format = dataset_plan.get("source_format") if dataset_plan else "unknown"
@@ -2612,13 +2756,18 @@ def estimate_outputs(
         "dataset_cache_disk_usage": format_bytes(dataset_cache_bytes),
         "split_image_counts": split_counts,
         "checkpoint_files": checkpoint_files,
-        "dataset_grid_files": dataset_grid_files,
-        "dataset_grid_dir": str(output_dir / "dataset_grids") if dataset_grid_files else None,
+        "epoch_validation_result_files": epoch_validation_result_files,
+        "epoch_validation_results_dir": str(output_dir / "epoch_results"),
+        "batch_grid_files": batch_grid_files,
+        "train_batch_grid_files": train_batch_grid_files,
+        "validation_label_grid_files": validation_label_grid_files,
+        "validation_prediction_grid_files": validation_prediction_grid_files,
+        "batch_grid_dir": str(output_dir),
         "periodic_test_files": periodic_files,
         "final_test_files": final_files,
         "estimated_total_files": total_known,
         "estimated_disk_usage": format_bytes(approx_bytes),
-        "note": "Estimates are conservative approximations. Metrics/json/log files depend on dataset size and enabled loggers.",
+        "note": "Estimates are conservative approximations. Batch grid images overwrite fixed filenames.",
     }
     add_runtime_estimate(
         estimate=estimate,
@@ -2772,6 +2921,130 @@ def build_model_kwargs(config: Mapping[str, Any]) -> Dict[str, Any]:
     return kwargs
 
 
+def _rfdetr_keypoint_flip_pairs_for_task(args: Any) -> Optional[List[int]]:
+    """Return RF-DETR keypoint flip pairs only for keypoint tasks."""
+    if bool(getattr(args, "use_grouppose_keypoints", False)):
+        return list(getattr(args, "keypoint_flip_pairs", []) or [])
+    return None
+
+
+def ensure_rfdetr_detection_hflip_support() -> None:
+    """Keep RF-DETR detection training from disabling HorizontalFlip augmentation."""
+    global _RFDETR_DETECTION_HFLIP_PATCHED
+    if _RFDETR_DETECTION_HFLIP_PATCHED:
+        return
+
+    import rfdetr.datasets as datasets_module
+    import rfdetr.datasets.coco as coco_module
+
+    if getattr(coco_module.build_roboflow_from_coco, "_pitchobjectlab_detection_hflip_patch", False):
+        _RFDETR_DETECTION_HFLIP_PATCHED = True
+        return
+
+    def build_coco(image_set: str, args: Any, resolution: int) -> Any:
+        root = Path(getattr(args, "dataset_dir", None) or args.coco_path)
+        if not root.exists():
+            coco_module.logger.error(f"COCO path {root} does not exist")
+            raise FileNotFoundError(f"COCO path {root} does not exist")
+
+        has_keypoints = getattr(args, "use_grouppose_keypoints", False)
+        mode = "person_keypoints" if has_keypoints else "instances"
+        paths = {
+            "train": (root / "train2017", root / "annotations" / f"{mode}_train2017.json"),
+            "val": (root / "val2017", root / "annotations" / f"{mode}_val2017.json"),
+            "test": (root / "test2017", root / "annotations" / "image_info_test-dev2017.json"),
+        }
+        img_folder, ann_file = paths[image_set.split("_")[0]]
+
+        include_keypoints = has_keypoints
+        resolved_backend = coco_module._resolve_runtime_augmentation_backend(getattr(args, "augmentation_backend", "cpu"))
+        gpu_postprocess = resolved_backend != "cpu"
+        make_transforms = (
+            coco_module.make_coco_transforms_square_div_64
+            if getattr(args, "square_resize_div_64", False)
+            else coco_module.make_coco_transforms
+        )
+        if getattr(args, "square_resize_div_64", False):
+            coco_module.logger.info(f"Building COCO {image_set} dataset with square resize at resolution {resolution}")
+        else:
+            coco_module.logger.info(f"Building COCO {image_set} dataset at resolution {resolution}")
+        return coco_module.CocoDetection(
+            img_folder,
+            ann_file,
+            transforms=make_transforms(
+                image_set,
+                resolution,
+                multi_scale=args.multi_scale,
+                expanded_scales=args.expanded_scales,
+                skip_random_resize=not args.do_random_resize_via_padding,
+                patch_size=args.patch_size,
+                num_windows=args.num_windows,
+                aug_config=getattr(args, "aug_config", None),
+                gpu_postprocess=gpu_postprocess,
+                keypoint_flip_pairs=_rfdetr_keypoint_flip_pairs_for_task(args),
+            ),
+            include_masks=getattr(args, "segmentation_head", False),
+            include_keypoints=include_keypoints,
+            num_keypoints_per_class=getattr(args, "num_keypoints_per_class", []),
+            remap_category_ids=include_keypoints,
+        )
+
+    def build_roboflow_from_coco(image_set: str, args: Any, resolution: int) -> Any:
+        root = Path(args.dataset_dir)
+        if not root.exists():
+            coco_module.logger.error(f"Roboflow dataset path {root} does not exist")
+            raise FileNotFoundError(f"Roboflow dataset path {root} does not exist")
+
+        paths = {
+            "train": (root / "train", root / "train" / "_annotations.coco.json"),
+            "val": (root / "valid", root / "valid" / "_annotations.coco.json"),
+            "test": (root / "test", root / "test" / "_annotations.coco.json"),
+        }
+        img_folder, ann_file = paths[image_set.split("_")[0]]
+
+        resolved_backend = coco_module._resolve_runtime_augmentation_backend(getattr(args, "augmentation_backend", "cpu"))
+        gpu_postprocess = resolved_backend != "cpu"
+        make_transforms = (
+            coco_module.make_coco_transforms_square_div_64
+            if getattr(args, "square_resize_div_64", False)
+            else coco_module.make_coco_transforms
+        )
+        if getattr(args, "square_resize_div_64", False):
+            coco_module.logger.info(
+                f"Building Roboflow {image_set} dataset with square resize at resolution {resolution}"
+            )
+        else:
+            coco_module.logger.info(f"Building Roboflow {image_set} dataset at resolution {resolution}")
+        return coco_module.CocoDetection(
+            img_folder,
+            ann_file,
+            transforms=make_transforms(
+                image_set,
+                resolution,
+                multi_scale=getattr(args, "multi_scale", False),
+                expanded_scales=getattr(args, "expanded_scales", False),
+                skip_random_resize=not getattr(args, "do_random_resize_via_padding", False),
+                patch_size=getattr(args, "patch_size", 16),
+                num_windows=getattr(args, "num_windows", 4),
+                aug_config=getattr(args, "aug_config", None),
+                gpu_postprocess=gpu_postprocess,
+                keypoint_flip_pairs=_rfdetr_keypoint_flip_pairs_for_task(args),
+            ),
+            include_masks=getattr(args, "segmentation_head", False),
+            include_keypoints=getattr(args, "use_grouppose_keypoints", False),
+            num_keypoints_per_class=getattr(args, "num_keypoints_per_class", []),
+            remap_category_ids=True,
+        )
+
+    build_coco._pitchobjectlab_detection_hflip_patch = True
+    build_roboflow_from_coco._pitchobjectlab_detection_hflip_patch = True
+    coco_module.build_coco = build_coco
+    coco_module.build_roboflow_from_coco = build_roboflow_from_coco
+    datasets_module.build_coco = build_coco
+    datasets_module.build_roboflow_from_coco = build_roboflow_from_coco
+    _RFDETR_DETECTION_HFLIP_PATCHED = True
+
+
 def normalize_model_constructor_device(value: Any) -> Optional[str]:
     """Normalize config/CLI shortcuts into RF-DETR model constructor device strings."""
     if value is None:
@@ -2819,164 +3092,503 @@ def build_train_kwargs(config: Mapping[str, Any], output_dir: Path) -> Dict[str,
     return train_kwargs
 
 
-def _save_val_prediction_grids_if_possible(
-    datamodule: Any,
-    pl_module: Any,
-    output_dir: Path,
-    max_batches: int,
-    verbose: bool,
-) -> List[Path]:
-    """Render early validation prediction grids from the current model when RF-DETR internals allow it."""
-    if pl_module is None:
-        return []
+def size_hw(value: Any) -> Optional[Tuple[float, float]]:
+    """Return a positive (height, width) pair from tensor/list-like values."""
+    values = flatten_tensor(value)
+    if len(values) < 2:
+        return None
     try:
-        import numpy as np
-        import torch
-        from PIL import Image, ImageDraw, ImageFont
-    except Exception as exc:
-        blue(f"Warning: validation prediction grids could not be initialized; training will continue. {exc}", force=True)
-        return []
+        height = float(values[0])
+        width = float(values[1])
+    except (TypeError, ValueError):
+        return None
+    if height <= 0 or width <= 0:
+        return None
+    return height, width
 
-    def tensor_to_image(tensor: Any) -> Image.Image:
-        array = tensor.detach().cpu().float().numpy()
-        mean = np.asarray([0.485, 0.456, 0.406], dtype=np.float32)[:, None, None]
-        std = np.asarray([0.229, 0.224, 0.225], dtype=np.float32)[:, None, None]
-        array = np.clip(array * std + mean, 0.0, 1.0)
-        return Image.fromarray((array.transpose(1, 2, 0) * 255).astype(np.uint8)).convert("RGB")
 
-    def draw_predictions_on_tile(image: Image.Image, result: Mapping[str, Any]) -> Image.Image:
-        tile_size = 320
-        scale = min(tile_size / max(1, image.width), tile_size / max(1, image.height))
-        resized = image.resize((max(1, int(image.width * scale)), max(1, int(image.height * scale))))
-        tile = Image.new("RGB", (tile_size, tile_size), color=(20, 20, 20))
-        paste_x = (tile_size - resized.width) // 2
-        paste_y = (tile_size - resized.height) // 2
-        tile.paste(resized, (paste_x, paste_y))
-        draw = ImageDraw.Draw(tile)
-        try:
-            font = ImageFont.truetype("arial.ttf", 12)
-        except Exception:
-            font = ImageFont.load_default()
-        boxes = flatten_tensor(result.get("boxes", []))
-        scores = flatten_tensor(result.get("scores", []))
-        labels = flatten_tensor(result.get("labels", []))
-        if boxes and not isinstance(boxes[0], list):
-            boxes = [boxes[index : index + 4] for index in range(0, len(boxes), 4)]
-        for index, box in enumerate(boxes[:100]):
-            if len(box) < 4:
-                continue
-            score = float(scores[index]) if index < len(scores) else 0.0
-            label = int(labels[index]) if index < len(labels) else 0
-            x1, y1, x2, y2 = [float(value) * scale for value in box[:4]]
-            x1 += paste_x
-            x2 += paste_x
-            y1 += paste_y
-            y2 += paste_y
-            draw.rectangle([x1, y1, x2, y2], outline=(239, 68, 68), width=2)
-            text = f"{label} {score:.2f}"
-            text_bbox = draw.textbbox((x1 + 2, y1 + 2), text, font=font)
-            draw.rectangle(text_bbox, fill=(239, 68, 68))
-            draw.text((x1 + 2, y1 + 2), text, fill=(255, 255, 255), font=font)
-        return tile
-
-    saved: List[Path] = []
-    was_training = bool(getattr(pl_module, "training", False))
+def tensor_image_size_hw(tensor: Any) -> Optional[Tuple[float, float]]:
+    """Return (height, width) from a CHW/HW image tensor-like value."""
+    shape = getattr(tensor, "shape", None)
+    if shape is None:
+        return None
     try:
-        loader = datamodule.val_dataloader()
-        pl_module.eval()
-        with torch.no_grad():
-            for batch_idx, batch in enumerate(loader):
-                if batch_idx >= max_batches:
-                    break
-                device = getattr(pl_module, "device", None)
-                model_batch = batch
-                if device is not None and hasattr(datamodule, "transfer_batch_to_device"):
-                    model_batch = datamodule.transfer_batch_to_device(batch, device, 0)
-                samples, targets = model_batch
-                outputs = pl_module.model(samples)
-                target_sizes = torch.stack([target.get("size", target.get("orig_size")) for target in targets])
-                results = pl_module.postprocess(outputs, target_sizes)
-                tensors = getattr(samples, "tensors", samples)
-                canvas = Image.new("RGB", (3 * 320, 3 * 348), color=(245, 245, 245))
-                draw = ImageDraw.Draw(canvas)
-                for sample_index, (single_image, result) in enumerate(zip(tensors[:9], results[:9])):
-                    col = sample_index % 3
-                    row = sample_index // 3
-                    x0 = col * 320
-                    y0 = row * 348
-                    tile = draw_predictions_on_tile(tensor_to_image(single_image), result)
-                    canvas.paste(tile, (x0, y0))
-                    draw.text((x0 + 6, y0 + 326), f"val pred batch={batch_idx} item={sample_index}", fill=(20, 20, 20))
-                path = output_dir / f"val_batch{batch_idx}_pred.jpg"
-                canvas.save(path, quality=92)
-                saved.append(path)
-    except Exception as exc:
-        blue(f"Warning: validation prediction grids could not be saved; training will continue. {exc}", force=True)
-    finally:
-        if was_training:
-            try:
-                pl_module.train()
-            except Exception:
-                pass
-    if saved:
-        blue(f"Saved {len(saved)} validation prediction grid image(s).", verbose=verbose, force=True)
-    return saved
-
-
-def save_dataset_grids_if_enabled(datamodule: Any, train_config: Any, output_dir: Path, verbose: bool, pl_module: Optional[Any] = None) -> List[Path]:
-    """Save augmented train/validation sample grids from the RF-DETR dataloaders."""
-    if not bool(getattr(train_config, "save_dataset_grids", False)):
-        return []
-    if os.environ.get("LOCAL_RANK", "0") != "0":
-        blue("Dataset sample grids skipped on non-zero local rank.", verbose)
-        return []
-
-    grids_output_dir = output_dir / "dataset_grids"
-    blue(f"Saving model-input dataset sample grids to: {grids_output_dir}", verbose=verbose, force=True)
-
-    try:
-        from rfdetr.datasets.save_grids import DatasetGridSaver
-    except Exception as exc:
-        blue(f"Warning: dataset sample grids could not be initialized; training will continue. {exc}", force=True)
-        return []
-
-    try:
-        datamodule.setup("fit")
-    except Exception as exc:
-        blue(f"Warning: dataset setup failed while saving sample grids; training will continue. {exc}", force=True)
-        return []
-
-    saved_files: List[Path] = []
-    for split in DATASET_GRID_SPLITS:
-        try:
-            loader = datamodule.train_dataloader() if split == "train" else datamodule.val_dataloader()
-            DatasetGridSaver(
-                loader,
-                grids_output_dir,
-                max_batches=DATASET_GRID_MAX_BATCHES,
-                dataset_type=split,
-            ).save_grid()
-            saved_files = sorted(grids_output_dir.glob("*_batch*_grid.jpg"))
-        except Exception as exc:
-            blue(f"Warning: failed to save {split} dataset sample grids; training will continue. {exc}", force=True)
-
-    if saved_files:
-        for index in range(DATASET_GRID_MAX_BATCHES):
-            train_grid = grids_output_dir / f"train_batch{index}_grid.jpg"
-            if train_grid.exists():
-                shutil.copy2(train_grid, output_dir / f"train_batch{index}.jpg")
-            val_grid = grids_output_dir / f"val_batch{index}_grid.jpg"
-            if val_grid.exists():
-                shutil.copy2(val_grid, output_dir / f"val_batch{index}_labels.jpg")
-        saved_files.extend(_save_val_prediction_grids_if_possible(datamodule, pl_module, output_dir, DATASET_GRID_MAX_BATCHES, verbose))
-        blue(
-            f"Saved {len(saved_files)} model-input dataset sample grid image(s): {grids_output_dir}",
-            verbose=verbose,
-            force=True,
-        )
+        dims = tuple(int(item) for item in shape)
+    except (TypeError, ValueError):
+        return None
+    if len(dims) >= 3:
+        height, width = dims[-2], dims[-1]
+    elif len(dims) == 2:
+        height, width = dims
     else:
-        blue("Warning: no dataset sample grid images were created; training will continue.", force=True)
-    return saved_files
+        return None
+    if height <= 0 or width <= 0:
+        return None
+    return float(height), float(width)
+
+
+def mask_valid_size_hw(mask: Any) -> Optional[Tuple[float, float]]:
+    """Return the visible (height, width) from an RF-DETR padding mask."""
+    if mask is None:
+        return None
+    try:
+        import torch
+    except Exception:
+        torch = None  # type: ignore[assignment]
+
+    if torch is not None and torch.is_tensor(mask):
+        mask_tensor = mask.detach().cpu().bool()
+        if mask_tensor.ndim < 2:
+            return None
+        if mask_tensor.ndim > 2:
+            mask_tensor = mask_tensor.reshape(-1, *mask_tensor.shape[-2:])[-1]
+        valid = ~mask_tensor
+        if not bool(valid.any()):
+            return None
+        ys, xs = valid.nonzero(as_tuple=True)
+        return float(int(ys.max().item()) + 1), float(int(xs.max().item()) + 1)
+
+    safe = json_safe_value(mask)
+    if not isinstance(safe, list) or not safe:
+        return None
+    valid_height = 0
+    valid_width = 0
+    for y, row in enumerate(safe):
+        if not isinstance(row, list):
+            continue
+        row_valid = [index for index, value in enumerate(row) if not bool(value)]
+        if not row_valid:
+            continue
+        valid_height = y + 1
+        valid_width = max(valid_width, max(row_valid) + 1)
+    if valid_height <= 0 or valid_width <= 0:
+        return None
+    return float(valid_height), float(valid_width)
+
+
+def batch_item_valid_size_hw(single_image: Any, mask: Any = None, target: Optional[Mapping[str, Any]] = None) -> Optional[Tuple[float, float]]:
+    """Return the coordinate size that matches a rendered batch-grid image."""
+    return mask_valid_size_hw(mask) or tensor_image_size_hw(single_image) or (
+        size_hw(target.get("size")) if isinstance(target, Mapping) else None
+    )
+
+
+def validation_tensor_to_image(tensor: Any) -> Any:
+    """Convert a normalized CHW model-input tensor into a PIL RGB image."""
+    import numpy as np
+    from PIL import Image
+
+    array = tensor.detach().cpu().float().numpy() if hasattr(tensor, "detach") else np.asarray(tensor, dtype=np.float32)
+    if array.ndim == 3 and array.shape[0] in {1, 3, 4}:
+        array = array[:3]
+        if array.shape[0] == 1:
+            array = np.repeat(array, 3, axis=0)
+        if array.shape[0] == 3:
+            mean = np.asarray([0.485, 0.456, 0.406], dtype=np.float32)[:, None, None]
+            std = np.asarray([0.229, 0.224, 0.225], dtype=np.float32)[:, None, None]
+            array = array * std + mean
+        array = np.clip(array, 0.0, 1.0)
+        array = (array.transpose(1, 2, 0) * 255).astype(np.uint8)
+    elif array.ndim == 2:
+        array = np.clip(array, 0.0, 1.0)
+        array = (np.repeat(array[:, :, None], 3, axis=2) * 255).astype(np.uint8)
+    else:
+        array = np.clip(array, 0.0, 1.0)
+        if array.ndim == 3 and array.shape[-1] >= 3:
+            array = (array[:, :, :3] * 255).astype(np.uint8)
+        else:
+            array = np.zeros((320, 320, 3), dtype=np.uint8)
+    return Image.fromarray(array).convert("RGB")
+
+
+def batch_grid_font() -> Any:
+    """Load a small font for batch grid labels."""
+    from PIL import ImageFont
+
+    try:
+        return ImageFont.truetype("arial.ttf", 12)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def make_batch_grid_tile(image: Any) -> Tuple[Any, Any, Any, float, int, int]:
+    """Create a fixed-size tile and return drawing primitives for annotation."""
+    from PIL import Image, ImageDraw
+
+    tile_size = BATCH_GRID_TILE_SIZE
+    scale = min(tile_size / max(1, image.width), tile_size / max(1, image.height))
+    resized = image.resize((max(1, int(image.width * scale)), max(1, int(image.height * scale))))
+    tile = Image.new("RGB", (tile_size, tile_size), color=(20, 20, 20))
+    paste_x = (tile_size - resized.width) // 2
+    paste_y = (tile_size - resized.height) // 2
+    tile.paste(resized, (paste_x, paste_y))
+    draw = ImageDraw.Draw(tile)
+    font = batch_grid_font()
+    return tile, draw, font, scale, paste_x, paste_y
+
+
+def box_rows(value: Any) -> List[List[float]]:
+    """Return a list of [x1, y1, x2, y2]-style box rows from tensor/list values."""
+    safe = json_safe_value(value)
+    if not isinstance(safe, list) or not safe:
+        return []
+    raw_rows = safe if isinstance(safe[0], list) else [safe[index : index + 4] for index in range(0, len(safe), 4)]
+    rows: List[List[float]] = []
+    for row in raw_rows:
+        if not isinstance(row, list) or len(row) < 4:
+            continue
+        try:
+            rows.append([float(item) for item in row[:4]])
+        except (TypeError, ValueError):
+            continue
+    return rows
+
+
+def labels_list(value: Any) -> List[int]:
+    """Return integer labels from tensor/list values."""
+    labels: List[int] = []
+    for item in flatten_tensor(value):
+        try:
+            labels.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    return labels
+
+
+def scores_list(value: Any) -> List[float]:
+    """Return float scores from tensor/list values."""
+    scores: List[float] = []
+    for item in flatten_tensor(value):
+        try:
+            scores.append(float(item))
+        except (TypeError, ValueError):
+            continue
+    return scores
+
+
+def prediction_rows_at_min_score(
+    result: Mapping[str, Any],
+    min_score: Optional[float] = VALIDATION_PREDICTION_GRID_MIN_SCORE,
+) -> Tuple[List[List[float]], List[int], List[float]]:
+    """Return prediction boxes, labels, and scores whose score passes the grid threshold."""
+    boxes = box_rows(result.get("boxes", []))
+    labels = labels_list(result.get("labels", []))
+    scores = scores_list(result.get("scores", []))
+    if min_score is None:
+        return boxes, labels, scores
+
+    threshold = float(min_score)
+    kept_boxes: List[List[float]] = []
+    kept_labels: List[int] = []
+    kept_scores: List[float] = []
+    for index, box in enumerate(boxes):
+        if index >= len(scores):
+            continue
+        score = float(scores[index])
+        if score < threshold:
+            continue
+        kept_boxes.append(box)
+        kept_labels.append(int(labels[index]) if index < len(labels) else 0)
+        kept_scores.append(score)
+    return kept_boxes, kept_labels, kept_scores
+
+
+def normalized_cxcywh_to_xyxy(
+    box: Sequence[float],
+    valid_size: Optional[Tuple[float, float]],
+) -> Optional[List[float]]:
+    """Convert RF-DETR normalized cxcywh target boxes to xyxy pixels."""
+    if len(box) < 4:
+        return None
+    valid_h, valid_w = valid_size or (1.0, 1.0)
+    cx, cy, width, height = [float(item) for item in box[:4]]
+    if max(abs(cx), abs(cy), abs(width), abs(height)) <= 2.0:
+        x1 = (cx - width / 2.0) * valid_w
+        y1 = (cy - height / 2.0) * valid_h
+        x2 = (cx + width / 2.0) * valid_w
+        y2 = (cy + height / 2.0) * valid_h
+    else:
+        x1, y1, x2, y2 = cx, cy, width, height
+    x1, x2 = sorted((max(0.0, min(valid_w, x1)), max(0.0, min(valid_w, x2))))
+    y1, y2 = sorted((max(0.0, min(valid_h, y1)), max(0.0, min(valid_h, y2))))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return [x1, y1, x2, y2]
+
+
+def target_boxes_xyxy(target: Mapping[str, Any]) -> List[List[float]]:
+    """Return RF-DETR target boxes as xyxy pixels in target.size coordinates."""
+    valid_size = size_hw(target.get("size")) or size_hw(target.get("orig_size"))
+    boxes: List[List[float]] = []
+    for box in box_rows(target.get("boxes", [])):
+        converted = normalized_cxcywh_to_xyxy(box, valid_size)
+        if converted is not None:
+            boxes.append(converted)
+    return boxes
+
+
+def draw_boxes_on_tile(
+    draw: Any,
+    font: Any,
+    boxes: Sequence[Sequence[float]],
+    labels: Sequence[int],
+    scores: Optional[Sequence[float]],
+    source_size: Optional[Tuple[float, float]],
+    valid_size: Optional[Tuple[float, float]],
+    scale: float,
+    paste_x: int,
+    paste_y: int,
+    color: Tuple[int, int, int],
+) -> None:
+    """Draw boxes in source coordinates onto a model-input tile."""
+    source_h, source_w = source_size or valid_size or (1.0, 1.0)
+    valid_h, valid_w = valid_size or source_size or (source_h, source_w)
+    x_to_image = valid_w / max(1.0, source_w)
+    y_to_image = valid_h / max(1.0, source_h)
+
+    for index, box in enumerate(boxes[:100]):
+        if len(box) < 4:
+            continue
+        label = int(labels[index]) if index < len(labels) else 0
+        x1 = float(box[0]) * x_to_image * scale + paste_x
+        y1 = float(box[1]) * y_to_image * scale + paste_y
+        x2 = float(box[2]) * x_to_image * scale + paste_x
+        y2 = float(box[3]) * y_to_image * scale + paste_y
+        x1, x2 = sorted((x1, x2))
+        y1, y2 = sorted((y1, y2))
+        draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
+        if scores is None:
+            text = str(label)
+        else:
+            score = float(scores[index]) if index < len(scores) else 0.0
+            text = f"{label} {score:.2f}"
+        text_bbox = draw.textbbox((x1 + 2, y1 + 2), text, font=font)
+        draw.rectangle(text_bbox, fill=color)
+        draw.text((x1 + 2, y1 + 2), text, fill=(255, 255, 255), font=font)
+
+
+def draw_validation_predictions_on_tile(
+    image: Any,
+    result: Mapping[str, Any],
+    source_size: Optional[Tuple[float, float]],
+    valid_size: Optional[Tuple[float, float]],
+    min_score: float = VALIDATION_PREDICTION_GRID_MIN_SCORE,
+) -> Any:
+    """Draw one validation prediction result onto a fixed-size tile."""
+    tile, draw, font, scale, paste_x, paste_y = make_batch_grid_tile(image)
+    boxes, labels, scores = prediction_rows_at_min_score(result, min_score)
+
+    draw_boxes_on_tile(
+        draw=draw,
+        font=font,
+        boxes=boxes,
+        labels=labels,
+        scores=scores,
+        source_size=source_size,
+        valid_size=valid_size,
+        scale=scale,
+        paste_x=paste_x,
+        paste_y=paste_y,
+        color=(239, 68, 68),
+    )
+    return tile
+
+
+def draw_target_labels_on_tile(
+    image: Any,
+    target: Mapping[str, Any],
+    valid_size: Optional[Tuple[float, float]] = None,
+    color: Tuple[int, int, int] = (37, 99, 235),
+) -> Any:
+    """Draw one RF-DETR target label set onto a fixed-size tile."""
+    tile, draw, font, scale, paste_x, paste_y = make_batch_grid_tile(image)
+    valid_size = valid_size or size_hw(target.get("size")) or size_hw(target.get("orig_size")) or (float(image.height), float(image.width))
+    boxes: List[List[float]] = []
+    for box in box_rows(target.get("boxes", [])):
+        converted = normalized_cxcywh_to_xyxy(box, valid_size)
+        if converted is not None:
+            boxes.append(converted)
+    draw_boxes_on_tile(
+        draw=draw,
+        font=font,
+        boxes=boxes,
+        labels=labels_list(target.get("labels", [])),
+        scores=None,
+        source_size=valid_size,
+        valid_size=valid_size,
+        scale=scale,
+        paste_x=paste_x,
+        paste_y=paste_y,
+        color=color,
+    )
+    return tile
+
+
+def make_batch_grid_canvas() -> Tuple[Any, Any]:
+    """Create a 3x3 batch grid canvas."""
+    from PIL import Image, ImageDraw
+
+    row_height = BATCH_GRID_TILE_SIZE + BATCH_GRID_CAPTION_HEIGHT
+    canvas = Image.new(
+        "RGB",
+        (BATCH_GRID_COLUMNS * BATCH_GRID_TILE_SIZE, BATCH_GRID_COLUMNS * row_height),
+        color=(245, 245, 245),
+    )
+    return canvas, ImageDraw.Draw(canvas)
+
+
+def save_batch_label_grid(batch: Any, output_dir: Path, path_name: str, caption_prefix: str) -> Path:
+    """Render one batch's target labels and overwrite a fixed output path."""
+    samples, targets = batch
+    tensors = getattr(samples, "tensors", samples)
+    masks = getattr(samples, "mask", None)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    canvas, draw = make_batch_grid_canvas()
+    row_height = BATCH_GRID_TILE_SIZE + BATCH_GRID_CAPTION_HEIGHT
+    for sample_index, (single_image, target) in enumerate(zip(tensors[:BATCH_GRID_MAX_ITEMS], targets[:BATCH_GRID_MAX_ITEMS])):
+        col = sample_index % BATCH_GRID_COLUMNS
+        row = sample_index // BATCH_GRID_COLUMNS
+        x0 = col * BATCH_GRID_TILE_SIZE
+        y0 = row * row_height
+        image = validation_tensor_to_image(single_image)
+        mask = masks[sample_index] if masks is not None and sample_index < len(masks) else None
+        valid_size = batch_item_valid_size_hw(single_image, mask, target if isinstance(target, Mapping) else None)
+        tile = draw_target_labels_on_tile(image, target if isinstance(target, Mapping) else {}, valid_size=valid_size)
+        canvas.paste(tile, (x0, y0))
+        draw.text((x0 + 6, y0 + BATCH_GRID_TILE_SIZE + 6), f"{caption_prefix} item={sample_index}", fill=(20, 20, 20))
+    path = output_dir / path_name
+    canvas.save(path, quality=92)
+    return path
+
+
+def save_train_batch_grid(batch: Any, output_dir: Path, batch_idx: int) -> Path:
+    """Render one training batch label grid."""
+    return save_batch_label_grid(batch, output_dir, f"train_batch{batch_idx}.jpg", f"train batch={batch_idx}")
+
+
+def save_validation_label_grid(batch: Any, output_dir: Path, batch_idx: int) -> Path:
+    """Render one validation batch label grid."""
+    return save_batch_label_grid(batch, output_dir, f"val_batch{batch_idx}_labels.jpg", f"val labels batch={batch_idx}")
+
+
+def save_validation_prediction_grid(batch: Any, outputs: Mapping[str, Any], output_dir: Path, batch_idx: int) -> Optional[Path]:
+    """Render one validation batch prediction grid and overwrite its fixed output path."""
+    results = outputs.get("results") if isinstance(outputs, Mapping) else None
+    if results is None:
+        return None
+    samples, targets = batch
+    tensors = getattr(samples, "tensors", samples)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    canvas, draw = make_batch_grid_canvas()
+    row_height = BATCH_GRID_TILE_SIZE + BATCH_GRID_CAPTION_HEIGHT
+    for sample_index, (single_image, result, target) in enumerate(zip(tensors[:BATCH_GRID_MAX_ITEMS], results[:BATCH_GRID_MAX_ITEMS], targets[:BATCH_GRID_MAX_ITEMS])):
+        col = sample_index % BATCH_GRID_COLUMNS
+        row = sample_index // BATCH_GRID_COLUMNS
+        x0 = col * BATCH_GRID_TILE_SIZE
+        y0 = row * row_height
+        image = validation_tensor_to_image(single_image)
+        source_size = size_hw(target.get("orig_size")) if isinstance(target, Mapping) else None
+        valid_size = size_hw(target.get("size")) if isinstance(target, Mapping) else None
+        tile = draw_validation_predictions_on_tile(image, result, source_size, valid_size)
+        canvas.paste(tile, (x0, y0))
+        draw.text((x0 + 6, y0 + BATCH_GRID_TILE_SIZE + 6), f"val pred batch={batch_idx} item={sample_index}", fill=(20, 20, 20))
+    path = output_dir / f"val_batch{batch_idx}_pred.jpg"
+    canvas.save(path, quality=92)
+    return path
+
+
+class TrainBatchGridCallback(Callback):
+    """Save the first few training batch label grids for label/augmentation checks."""
+
+    def __init__(self, output_dir: Path, verbose: bool, max_batches: int = TRAIN_BATCH_GRID_MAX_BATCHES) -> None:
+        self.output_dir = output_dir
+        self.verbose = verbose
+        self.max_batches = max(0, int(max_batches))
+        self.saved_indices: set[int] = set()
+        self.error_reported = False
+
+    def on_train_batch_end(
+        self,
+        trainer: Any,
+        pl_module: Any,
+        outputs: Any,
+        batch: Any,
+        batch_idx: int,
+    ) -> None:
+        del pl_module, outputs
+        if batch_idx >= self.max_batches or batch_idx in self.saved_indices:
+            return
+        if not bool(getattr(trainer, "is_global_zero", True)):
+            return
+        try:
+            path = save_train_batch_grid(batch, self.output_dir, batch_idx)
+        except Exception as exc:
+            if not self.error_reported:
+                blue(f"Warning: training batch grids could not be saved; training will continue. {exc}", force=True)
+                self.error_reported = True
+            return
+        self.saved_indices.add(batch_idx)
+        blue(f"Saved training batch grid image: {path}", verbose=self.verbose)
+
+
+class ValidationPredictionGridCallback(Callback):
+    """Refresh top-level validation label and prediction grid images after each validation."""
+
+    def __init__(self, output_dir: Path, verbose: bool, max_batches: int = VALIDATION_PREDICTION_GRID_MAX_BATCHES) -> None:
+        self.output_dir = output_dir
+        self.verbose = verbose
+        self.max_batches = max(0, int(max_batches))
+        self.saved_paths: List[Path] = []
+        self.error_reported = False
+
+    def on_validation_epoch_start(self, trainer: Any, pl_module: Any) -> None:
+        del pl_module
+        self.saved_paths = []
+        if bool(getattr(trainer, "sanity_checking", False)):
+            return
+        if not bool(getattr(trainer, "is_global_zero", True)):
+            return
+        for index in range(self.max_batches):
+            for suffix in ("labels", "pred"):
+                with contextlib.suppress(FileNotFoundError):
+                    (self.output_dir / f"val_batch{index}_{suffix}.jpg").unlink()
+
+    def on_validation_batch_end(
+        self,
+        trainer: Any,
+        pl_module: Any,
+        outputs: Any,
+        batch: Any,
+        batch_idx: int,
+        dataloader_idx: int = 0,
+    ) -> None:
+        del pl_module
+        if dataloader_idx != 0 or batch_idx >= self.max_batches:
+            return
+        if bool(getattr(trainer, "sanity_checking", False)):
+            return
+        if not bool(getattr(trainer, "is_global_zero", True)):
+            return
+        try:
+            label_path = save_validation_label_grid(batch, self.output_dir, batch_idx)
+            pred_path = save_validation_prediction_grid(batch, outputs, self.output_dir, batch_idx)
+        except Exception as exc:
+            if not self.error_reported:
+                blue(f"Warning: validation batch grids could not be saved; training will continue. {exc}", force=True)
+                self.error_reported = True
+            return
+        self.saved_paths.append(label_path)
+        if pred_path is not None:
+            self.saved_paths.append(pred_path)
+
+    def on_validation_epoch_end(self, trainer: Any, pl_module: Any) -> None:
+        del trainer, pl_module
+        if self.saved_paths:
+            blue(
+                f"Updated {len(self.saved_paths)} validation batch grid image(s).",
+                verbose=self.verbose,
+                force=True,
+            )
 
 
 def parse_device_to_trainer_kwargs(device: Optional[str]) -> Dict[str, Any]:
@@ -3060,6 +3672,24 @@ def apply_multigpu_validation_safety(trainer_kwargs: MutableMapping[str, Any], v
         "(num_sanity_val_steps=0) to avoid distributed mAP sync timeouts before training.",
         verbose,
     )
+
+
+def apply_validation_interval_to_trainer_kwargs(
+    config: Mapping[str, Any],
+    trainer_kwargs: MutableMapping[str, Any],
+    verbose: bool,
+) -> None:
+    """Make train.eval_interval control Lightning's validation loop frequency."""
+    if "check_val_every_n_epoch" in trainer_kwargs:
+        return
+    raw_interval = config.get("train", {}).get("eval_interval", 1)
+    try:
+        interval = max(1, int(raw_interval or 1))
+    except (TypeError, ValueError):
+        return
+    trainer_kwargs["check_val_every_n_epoch"] = interval
+    if interval > 1:
+        blue(f"Lightning validation loader will run every {interval} epoch(s).", verbose)
 
 
 def flatten_tensor(value: Any) -> List[Any]:
@@ -3822,7 +4452,6 @@ def apply_demo_mode(config: MutableMapping[str, Any], timestamp: str, verbose: b
     train["tensorboard"] = False
     train["wandb"] = False
     train["mlflow"] = False
-    train["save_dataset_grids"] = False
     output["output_dir"] = render_output_template(
         demo.get("output_dir", str(PROJECT_DIR / "demo_runs" / "demo_{timestamp}")),
         config,
@@ -3906,7 +4535,6 @@ def apply_cli_overrides(config: MutableMapping[str, Any], args: argparse.Namespa
         "early_stopping": args.early_stopping,
         "early_stopping_patience": args.early_stopping_patience,
         "progress_bar": args.progress_bar,
-        "save_dataset_grids": args.save_dataset_grids,
     }
     for key, value in train_overrides.items():
         if value is not None:
@@ -4024,19 +4652,6 @@ Example usage:
     parser.add_argument("--early-stopping", type=parse_bool, default=None, help="Enable early stopping.")
     parser.add_argument("--early-stopping-patience", type=int, default=None, help="Early stopping patience.")
     parser.add_argument("--progress-bar", choices=["tqdm", "rich", "none"], default=None, help="RF-DETR progress bar style.")
-    parser.add_argument(
-        "--save-dataset-grids",
-        dest="save_dataset_grids",
-        action="store_true",
-        default=None,
-        help="Save augmented train/validation sample grids before training.",
-    )
-    parser.add_argument(
-        "--no-save-dataset-grids",
-        dest="save_dataset_grids",
-        action="store_false",
-        help="Skip augmented dataset sample grid output.",
-    )
 
     parser.add_argument("--periodic-test", type=parse_bool, default=None, help="Enable scheduled in-training test.")
     parser.add_argument("--test-interval-epochs", type=int, default=None, help="Run test every N epochs.")
@@ -4102,7 +4717,7 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
     if not distributed_child:
         os.environ[DDP_TIMESTAMP_ENV] = timestamp
 
-    with tqdm(total=9, desc="Preparing", disable=distributed_child) as bar:
+    with tqdm(total=8, desc="Preparing", disable=distributed_child) as bar:
         config = load_yaml(source_config)
         apply_cli_overrides(config, args)
         verbose = bool(config.get("runtime", {}).get("verbose", True))
@@ -4186,6 +4801,7 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
         bar.update(1)
 
         blue("Importing RF-DETR training stack.", verbose)
+        ensure_rfdetr_detection_hflip_support()
         from rfdetr.training import RFDETRDataModule, RFDETRModelModule, build_trainer
         from rfdetr.training.auto_batch import resolve_auto_batch_config
 
@@ -4195,6 +4811,7 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
         device_value = train_kwargs.pop("_device", None)
         trainer_kwargs = parse_device_to_trainer_kwargs(device_value)
         trainer_kwargs.update(config.get("trainer", {}).get("extra_trainer_args", {}) or {})
+        apply_validation_interval_to_trainer_kwargs(config, trainer_kwargs, verbose)
         apply_multigpu_ddp_strategy(config, trainer_kwargs, verbose)
         apply_multigpu_validation_safety(trainer_kwargs, verbose)
 
@@ -4229,10 +4846,6 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
         module = RFDETRModelModule(rf_model.model_config, train_config)
         datamodule = RFDETRDataModule(rf_model.model_config, train_config)
 
-        bar.set_description("Sample grids")
-        dataset_grid_files = save_dataset_grids_if_enabled(datamodule, train_config, output_dir, verbose, pl_module=module)
-        bar.update(1)
-
         trainer = build_trainer(train_config, rf_model.model_config, **trainer_kwargs)
         trainer.callbacks.append(
             PeriodicManualTestCallback(
@@ -4245,6 +4858,9 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
                 verbose=verbose,
             )
         )
+        trainer.callbacks.append(TrainBatchGridCallback(output_dir=output_dir, verbose=verbose))
+        trainer.callbacks.append(ValidationPredictionGridCallback(output_dir=output_dir, verbose=verbose))
+        trainer.callbacks.append(EpochValidationResultsCallback(output_dir=output_dir, verbose=verbose))
         if not distributed_child:
             dump_config_snapshot(
                 output_dir=output_dir,
@@ -4256,7 +4872,19 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
                     "cwd": str(Path.cwd()),
                     "output_dir": str(output_dir),
                     "device": device_value or "auto",
-                    "dataset_grid_files": [str(path) for path in dataset_grid_files],
+                    "train_batch_grid_files": [
+                        str(output_dir / f"train_batch{index}.jpg")
+                        for index in range(TRAIN_BATCH_GRID_MAX_BATCHES)
+                    ],
+                    "validation_label_grid_files": [
+                        str(output_dir / f"val_batch{index}_labels.jpg")
+                        for index in range(VALIDATION_PREDICTION_GRID_MAX_BATCHES)
+                    ],
+                    "validation_prediction_grid_files": [
+                        str(output_dir / f"val_batch{index}_pred.jpg")
+                        for index in range(VALIDATION_PREDICTION_GRID_MAX_BATCHES)
+                    ],
+                    "validation_prediction_grid_min_score": VALIDATION_PREDICTION_GRID_MIN_SCORE,
                 },
                 source_config=source_config,
                 train_config=train_config,

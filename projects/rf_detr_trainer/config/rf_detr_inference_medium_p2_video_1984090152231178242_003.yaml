@@ -1,5 +1,6 @@
-# Standalone video config for inference_rf_detr_model.py.
-# Runs SAHI 320x320 first-stage football detection and a centered 640x640 football recheck.
+# Reproducible P2 video inference preset for inference_rf_detr_model.py.
+# The checkpoint architecture must match the enabled P2 and motion blocks below.
+# Parameters are grouped by runtime, model, dataset, output, inference, and evaluation.
 
 # Runtime controls for dry-run, prompts, verbosity, seeds, and estimates. Options: mapping.
 runtime:
@@ -7,7 +8,7 @@ runtime:
   verbose: true
   # Estimate outputs and exit before model loading/inference. Options: true, false.
   dry_run: false
-  # Ask before writing rendered videos, predictions, configs, or URL caches. Options: true, false.
+  # Ask before writing rendered images/videos, predictions, configs, or URL caches. Options: true, false.
   confirm_before_run: true
   # Skip confirmation after reviewing the estimate. Options: true, false.
   yes: false
@@ -23,7 +24,7 @@ runtime:
     default_train_seconds_per_batch: 0.7
     # Fallback test speed retained for shared schema. Options: positive seconds per image.
     default_test_seconds_per_image: 0.25
-    # Fallback inference speed for video detection frames. Options: positive seconds per frame.
+    # Fallback inference speed for image sources and video detection frames. Options: positive seconds per image/frame.
     default_inference_seconds_per_image: 0.25
     # Fallback cost for drawing/writing output video frames. Options: positive seconds per frame.
     default_video_render_seconds_per_frame: 0.005
@@ -33,7 +34,7 @@ model:
   # RF-DETR model size. Detection: base, nano, small, medium, large. Segmentation sizes are not used by this bbox renderer.
   size: medium
   # RF-DETR checkpoint to load. Options: default, null/false, hosted key, or local .pth/.pt/.ckpt path.
-  pretrain_weights: /home/new_users/zhiyu/projects/PitchObjectLab/runs/detect/站立運動員_足球_球門檢測數據集2025/train/rfdetr_medium_e50_b8_val1_test1_20260526214556/checkpoint_best_ema.pth
+  pretrain_weights: /home/new_users/zhiyu/projects/PitchObjectLab/runs/rf_detr/train/rfdetr_medium_motion_v5_e40_b4_20260710165058/checkpoint_best_ema.pth
   # Input resolution override. Options: null for model default, or positive integer.
   resolution: null
   # Class count override. Options: null to infer from checkpoint/config, or positive integer.
@@ -42,7 +43,7 @@ model:
   device: 0
   # Automatic mixed precision in RF-DETR. Options: true, false.
   amp: true
-  # First-stage prediction confidence threshold. Options: 0.0-1.0.
+  # Prediction confidence threshold used for rendered boxes. Options: 0.0-1.0.
   confidence_threshold: 0.25
   # Optional model label to output category-id mapping. Options: empty mapping, false to disable, or {model_label: category_id}.
   category_remapping: {}
@@ -61,7 +62,7 @@ model:
   # lower train.batch_size + raise train.grad_accum_steps, and/or raise num_windows via extra_model_args.
   p2:
     # Master switch. Options: false to disable (no patch applied, stock RF-DETR), true to enable P2.
-    enabled: false
+    enabled: true
     # Feature levels for projector AND decoder. Must be ascending P-name order; length = decoder levels.
     # name -> (stride, scale): P2->(4, x4), P3->(8, x2), P4->(16, x1), P5->(32, x0.5), P6->(64, x0.25).
     # Must include "P2" to actually use the P2 level. Examples: [P2, P3, P4], [P2, P3, P4, P5], [P2, P4].
@@ -100,7 +101,6 @@ model:
       dec_n_points: null
       # Gradient checkpointing to fit the larger P2 token count in memory. Options: null, true, false.
       gradient_checkpointing: null
-
 
   # ---- TrackNetV5 motion module ----
   # The config must match the motion architecture used to train the checkpoint.
@@ -201,11 +201,11 @@ dataset:
 # Output directory settings and naming templates. Options: mapping.
 output:
   # Exact output directory. Options: empty string to use root/name, absolute path, or relative path.
-  output_dir: ""
+  output_dir: runs/rf_detr/inference/rfdetr_medium_motion_v5_e40_b4
   # Output root when output_dir is empty. Options: pure string path.
-  root: /home/new_users/zhiyu/projects/PitchObjectLab/runs/detect/站立運動員_足球_球門檢測數據集2025/predict
+  root: runs/rf_detr/all_parameters_SAHI_640/inference
   # Run folder name when output_dir is empty. Supports {timestamp}. Options: string.
-  name: "rfdetr_inference_sahi320_football_recheck640_video_1984090152231178242_000000_000100_{timestamp}"
+  name: "rfdetr_medium_motion_v5_e40_b4_20260710165058_1984090152231178242_003_{timestamp}"
   # Allow writing into an existing output directory. Options: true, false.
   exist_ok: false
 
@@ -213,7 +213,7 @@ output:
 inference:
   # Input sources. Options: image path, video path, folder path, HTTP(S) image/video URL; folders may mix images and videos.
   sources:
-    - /home/new_users/zhiyu/datasets/soccer/raw/raw_video/1984090406020124673.mp4
+    - /home/new_users/zhiyu/datasets/soccer/raw/raw_video/1983818210731298817.mp4
   # Recurse into folders. Options: true, false.
   recursive: true
   # Maximum discovered sources to infer after image/video caps. Options: all/null for every source, or a positive integer.
@@ -224,17 +224,16 @@ inference:
   max_videos: all
   # Inference mode. Options: full_image, sahi, class_crop.
   mode: sahi
-  # RF-DETR image-source batch size for sahi image inputs. Options: positive integer.
+  # RF-DETR image-source batch size for full_image/class_crop/sahi image inputs. Options: positive integer.
   batch_size: 64
   # Image extensions included from folders. Options: list of extensions.
   image_extensions: [.bmp, .jpeg, .jpg, .png, .tif, .tiff, .webp]
   # Video extensions included from folders. Options: list of extensions.
   video_extensions: [.avi, .m4v, .mkv, .mov, .mp4, .mpeg, .mpg, .webm]
-  # Category IDs to render. Empty means use render_class_names or draw all predicted classes. Options: list of category IDs.
+  # Category IDs to render. Empty means draw all predicted classes. Options: list of category IDs.
   render_class_ids: []
-  # Category names to render. Only football boxes are drawn in rendered images/video frames. Options: list of names.
-  render_class_names:
-    - football
+  # Category names to render. Empty means draw all predicted classes. Options: list of names.
+  render_class_names: []
   # Save line-delimited prediction records. Options: true, false.
   save_predictions_jsonl: true
   # Video inference settings. Options: mapping.
@@ -244,9 +243,9 @@ inference:
     # RF-DETR detection-frame batch size. Options: all/null to inherit inference.batch_size, or positive integer.
     batch_size: null
     # Start time for each video segment. Options: seconds, MM:SS, or HH:MM:SS.
-    start_time: "00:10:00"
+    start_time: 00:10:00
     # End time for each video segment. Options: all/null for video end, seconds, MM:SS, or HH:MM:SS.
-    end_time: "00:20:00"
+    end_time: 00:10:05
     # Maximum selected duration to infer per video. Options: all/null for the full start/end range, seconds, MM:SS, or HH:MM:SS.
     max_seconds: all
     # Output video FPS. Options: null to preserve input FPS, or positive float.
@@ -405,16 +404,16 @@ crop:
 
 # SAHI sliced-inference settings. Options: mapping.
 sahi:
-  # Slice height for first-stage sahi mode. Options: positive integer.
+  # Slice height for sahi mode. Options: positive integer.
   slice_height: 320
-  # Slice width for first-stage sahi mode. Options: positive integer.
+  # Slice width for sahi mode. Options: positive integer.
   slice_width: 320
   # Height overlap between adjacent slices. Options: 0.0-0.9.
   overlap_height_ratio: 0.2
   # Width overlap between adjacent slices. Options: 0.0-0.9.
   overlap_width_ratio: 0.2
   # Also run full-image prediction and merge with slices. Options: true, false.
-  standard_prediction: false
+  standard_prediction: true
   # SAHI postprocess type. Options: GREEDYNMM, NMM, NMS, LSNMS. GREEDYNMM is recommended for small slices.
   postprocess_type: GREEDYNMM
   # SAHI match metric. Options: IOS, IOU. IOS is recommended when small slice boxes cover parts of the same object.
@@ -424,7 +423,7 @@ sahi:
   # Class-agnostic slice merge. Options: true, false.
   postprocess_class_agnostic: false
   # RF-DETR SAHI slice/recheck batch size. Options: positive integer.
-  batch_size: 64
+  batch_size: 4
   # recheck nested configuration block. Options: mapping.
   recheck:
     # Run a second centered B*B verification pass for selected SAHI target-class boxes. Options: true, false.

@@ -178,6 +178,16 @@ class RFDETRModelSizeTest(unittest.TestCase):
         trainer.apply_multigpu_ddp_strategy({"train": {"strategy": "auto"}}, trainer_kwargs, verbose=False)
         self.assertEqual(trainer_kwargs["strategy"], "deepspeed")
 
+    def test_train_eval_interval_controls_lightning_validation_frequency(self):
+        trainer_kwargs = {}
+        trainer.apply_validation_interval_to_trainer_kwargs({"train": {"eval_interval": 5}}, trainer_kwargs, verbose=False)
+        self.assertEqual(trainer_kwargs["check_val_every_n_epoch"], 5)
+
+    def test_explicit_lightning_validation_frequency_is_preserved(self):
+        trainer_kwargs = {"check_val_every_n_epoch": 2}
+        trainer.apply_validation_interval_to_trainer_kwargs({"train": {"eval_interval": 5}}, trainer_kwargs, verbose=False)
+        self.assertEqual(trainer_kwargs["check_val_every_n_epoch"], 2)
+
     def test_single_gpu_training_does_not_force_ddp_strategy(self):
         trainer_kwargs = trainer.parse_device_to_trainer_kwargs("4")
         trainer.apply_multigpu_ddp_strategy({"train": {"strategy": "auto"}}, trainer_kwargs, verbose=False)

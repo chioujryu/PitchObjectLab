@@ -17,6 +17,7 @@ Notes:
     - test.visual_samples.render_class_names/render_class_ids and test.error_cases.render_class_names/render_class_ids
       independently control which classes are drawn in visual and error-case images.
     - test.error_cases defaults to football diagnostics and writes GT/prediction boxes with scores.
+    - test.parallel.chunks or --chunks starts that many concurrent model replicas for bbox evaluation.
     - Before writing images, metrics, or cache files, the script prints a resource estimate and asks for confirmation unless --yes is used.
 """
 
@@ -25,10 +26,13 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import pickle
+from collections import Counter
 from collections.abc import Mapping
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, MutableMapping, Optional
 
 import colorama
@@ -37,7 +41,11 @@ from colorama import Fore, Style
 from tqdm import tqdm
 
 import rf_detr_runtime as trainer
-from projects.object_detection_dataset_evaluator.object_detection_dataset_evaluator import run_evaluation
+from projects.object_detection_dataset_evaluator.object_detection_dataset_evaluator import (
+    expand_chunk_devices,
+    parse_devices,
+    run_evaluation,
+)
 
 colorama.init(autoreset=True)
 
@@ -82,6 +90,201 @@ def apply_cli_overrides(config: MutableMapping[str, Any], args: argparse.Namespa
         test["batch_size"] = args.batch_size
     if args.sahi_batch_size is not None:
         test.setdefault("sahi", {})["batch_size"] = args.sahi_batch_size
+    if getattr(args, "chunks", None) is not None:
+        test.setdefault("parallel", {})["chunks"] = args.chunks
+
+
+def normalize_test_parallel_chunks(value: Any) -> int:
+    """Validate test.parallel.chunks as a positive integer."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("test.parallel.chunks must be a positive integer.")
+    return int(value)
+
+
+def standalone_parallel_chunks(config: Mapping[str, Any]) -> int:
+    """Return the normalized standalone-test chunk count (default one)."""
+    test_settings = config.get("test", {})
+    if not isinstance(test_settings, Mapping):
+        raise ValueError("test must be a mapping.")
+    parallel = test_settings.get("parallel", {})
+    if parallel is None:
+        parallel = {}
+    if not isinstance(parallel, Mapping):
+        raise ValueError("test.parallel must be a mapping.")
+    return normalize_test_parallel_chunks(parallel.get("chunks", 1))
+
+
+def _standalone_test_devices(config: Mapping[str, Any]) -> list[str]:
+    """Resolve model.device, including comma-separated CUDA device strings."""
+    model_cfg = config.get("model", {})
+    if not isinstance(model_cfg, Mapping):
+        model_cfg = {}
+    raw_device = model_cfg.get("device", "auto")
+    if isinstance(raw_device, str) and "," in raw_device:
+        parts = [part.strip() for part in raw_device.split(",") if part.strip()]
+        return parse_devices({"devices": parts})
+    effective_model_cfg = dict(model_cfg)
+    effective_model_cfg.setdefault("device", raw_device)
+    return parse_devices(effective_model_cfg)
+
+
+def build_test_parallel_plan(config: Mapping[str, Any], image_count: Optional[int]) -> Dict[str, Any]:
+    """Build deterministic chunk/device assignments for estimates and execution."""
+    chunks = standalone_parallel_chunks(config)
+    if image_count is not None and chunks > int(image_count):
+        raise ValueError(
+            f"test.parallel.chunks is {chunks}, but the evaluated image count is only {int(image_count)}."
+        )
+    devices = _standalone_test_devices(config)
+    assignments = expand_chunk_devices(devices, chunks)
+    device_counts = dict(Counter(assignments))
+    unique_devices = max(1, len(device_counts))
+    same_device_warning = None
+    if chunks > unique_devices:
+        same_device_warning = (
+            "Multiple concurrent model replicas share one or more devices; this does not increase the "
+            "runtime speedup cap and may increase VRAM usage or trigger CUDA OOM downshifts."
+        )
+    return {
+        "chunks": chunks,
+        "devices_requested": devices,
+        "chunk_devices": assignments,
+        "device_worker_counts": device_counts,
+        "unique_device_count": unique_devices,
+        "same_device_warning": same_device_warning,
+    }
+
+
+def configured_segmentation_head(config: Mapping[str, Any]) -> bool:
+    """Return the effective RF-DETR segmentation-head setting without model loading."""
+    model_cfg = config.get("model", {})
+    if not isinstance(model_cfg, Mapping):
+        return False
+    extra_model_args = model_cfg.get("extra_model_args", {}) or {}
+    if isinstance(extra_model_args, Mapping) and "segmentation_head" in extra_model_args:
+        return bool(extra_model_args["segmentation_head"])
+    return trainer.is_segmentation_model_size(model_cfg.get("size", "medium"))
+
+
+def validate_parallel_test_compatibility(config: Mapping[str, Any]) -> None:
+    """Reject mask-aware full-image segmentation evaluation in spawned workers."""
+    if standalone_parallel_chunks(config) <= 1:
+        return
+    test_settings = config.get("test", {})
+    mode = trainer.periodic_test_mode(test_settings if isinstance(test_settings, Mapping) else {})
+    evaluation = config.get("evaluation", {})
+    evaluation_type = str(
+        evaluation.get("type", "auto") if isinstance(evaluation, Mapping) else "auto"
+    ).strip().lower()
+    if (
+        configured_segmentation_head(config)
+        and mode == "full_image"
+        and evaluation_type != "bbox"
+    ):
+        raise ValueError(
+            "Parallel full_image testing for a segmentation model does not support mask-aware evaluation. "
+            "Set evaluation.type=bbox to run parallel bbox evaluation, or set test.parallel.chunks=1 "
+            "(or --chunks 1) for segmentation metrics."
+        )
+
+
+def _model_config_default_resolution(model_cls: Any) -> int:
+    """Read an RF-DETR variant's default resolution without constructing its model."""
+    candidates = [getattr(model_cls, "_model_config_class", None)]
+    try:
+        import rfdetr.config as rfdetr_config
+
+        candidates.append(getattr(rfdetr_config, f"{model_cls.__name__}Config", None))
+    except ImportError:
+        pass
+    for config_cls in candidates:
+        if config_cls is None:
+            continue
+        direct_value = getattr(config_cls, "resolution", None)
+        if isinstance(direct_value, int) and not isinstance(direct_value, bool) and direct_value > 0:
+            return direct_value
+        fields = getattr(config_cls, "model_fields", {})
+        field = fields.get("resolution") if isinstance(fields, Mapping) else None
+        default_value = getattr(field, "default", None)
+        if isinstance(default_value, int) and not isinstance(default_value, bool) and default_value > 0:
+            return default_value
+    raise ValueError(f"Could not determine the default resolution for {model_cls.__name__}.")
+
+
+def build_rfdetr_evaluator_preview(
+    config: Mapping[str, Any],
+    output_dir: Path,
+) -> tuple[SimpleNamespace, SimpleNamespace]:
+    """Build the lightweight evaluator inputs without loading a model or checkpoint."""
+    del output_dir  # Kept in the signature to mirror the concrete build path.
+    model_cfg = config.get("model", {})
+    if not isinstance(model_cfg, Mapping):
+        raise ValueError("model must be a mapping.")
+    model_cls = trainer.get_model_class(str(model_cfg.get("size", "medium")))
+    model_kwargs = trainer.build_model_kwargs(config)
+    resolution_value = model_kwargs.get("resolution")
+    resolution = (
+        int(resolution_value)
+        if resolution_value is not None
+        else _model_config_default_resolution(model_cls)
+    )
+    model_preview = SimpleNamespace(
+        resolution=resolution,
+        segmentation_head=configured_segmentation_head(config),
+    )
+
+    train_cfg = config.get("train", {})
+    dataset_cfg = config.get("dataset", {})
+    if not isinstance(train_cfg, Mapping):
+        raise ValueError("train must be a mapping.")
+    if not isinstance(dataset_cfg, Mapping):
+        raise ValueError("dataset must be a mapping.")
+    dataset_dir = str(train_cfg.get("dataset_dir") or dataset_cfg.get("dataset_dir") or "").strip()
+    if not dataset_dir:
+        raise ValueError("train.dataset_dir or dataset.dataset_dir is required for parallel testing.")
+    evaluation = config.get("evaluation", {})
+    if not isinstance(evaluation, Mapping):
+        evaluation = {}
+    train_preview = SimpleNamespace(
+        dataset_dir=dataset_dir,
+        eval_max_dets=int(train_cfg.get("eval_max_dets") or _last_max_det(evaluation)),
+    )
+    return model_preview, train_preview
+
+
+def build_parallel_rfdetr_evaluator_config(
+    config: Mapping[str, Any],
+    output_dir: Path,
+    split: str,
+) -> Dict[str, Any]:
+    """Build the spawn-worker evaluator config for standalone parallel testing."""
+    chunks = standalone_parallel_chunks(config)
+    if chunks <= 1:
+        raise ValueError("Parallel evaluator config requires test.parallel.chunks greater than 1.")
+    model_preview, train_preview = build_rfdetr_evaluator_preview(config, output_dir)
+    evaluator_config = trainer.build_rfdetr_evaluator_config(
+        merged_config=config,
+        model_config=model_preview,
+        train_config=train_preview,
+        output_dir=output_dir,
+        split=split,
+        test_section="test",
+    )
+    evaluator_config.setdefault("runtime", {})["validate_devices_in_parent"] = False
+    evaluator_config.setdefault("inference", {})["chunks"] = chunks
+    factory_config = {
+        "merged_config": deepcopy(dict(config)),
+        "output_dir": str(output_dir),
+    }
+    try:
+        pickle.dumps(factory_config)
+    except Exception as exc:
+        raise TypeError("Parallel RF-DETR factory_config must be multiprocessing-pickle-safe.") from exc
+    evaluator_model = evaluator_config.setdefault("model", {})
+    evaluator_model["devices"] = _standalone_test_devices(config)
+    evaluator_model["factory"] = "rf_detr_runtime.build_rfdetr_evaluator_model"
+    evaluator_model["factory_config"] = factory_config
+    return evaluator_config
 
 
 def _last_max_det(evaluation: Mapping[str, Any], default: int = 500) -> int:
@@ -220,6 +423,8 @@ def estimate_standalone_test_outputs(
     test_limit = trainer.parse_limit_value(test_settings.get("max_images"), "test.max_images")
     if test_limit is not None:
         image_count = min(int(image_count), test_limit) if image_count is not None else test_limit
+    parallel_plan = build_test_parallel_plan(config, int(image_count) if image_count is not None else None)
+    parallel_summary_files = 1 if parallel_plan["chunks"] > 1 else 0
 
     config_files = 6
     metric_files = 8 if bool(evaluation.get("classwise", True)) else 6
@@ -252,9 +457,17 @@ def estimate_standalone_test_outputs(
         + visual_files
         + error_case_files
         + dataset_cache_files
+        + parallel_summary_files
     )
     image_outputs = model_input_files + max(0, visual_files - 2 if visual_files else 0) + max(0, error_case_files - 3 if error_case_files else 0) + dataset_case_files
-    approx_bytes = dataset_cache_bytes + metric_files * 200_000 + image_outputs * 500_000 + plot_files * 350_000 + config_files * 50_000
+    approx_bytes = (
+        dataset_cache_bytes
+        + metric_files * 200_000
+        + image_outputs * 500_000
+        + plot_files * 350_000
+        + config_files * 50_000
+        + parallel_summary_files * 50_000
+    )
     estimate = {
         "output_dir": str(output_dir),
         "dataset_source_format": dataset_plan.get("source_format"),
@@ -269,6 +482,13 @@ def estimate_standalone_test_outputs(
         "error_case_files": error_case_files,
         "dataset_case_files": dataset_case_files,
         "plot_files": plot_files,
+        "parallel_chunks": parallel_plan["chunks"],
+        "parallel_model_replicas": parallel_plan["chunks"],
+        "parallel_devices_requested": parallel_plan["devices_requested"],
+        "parallel_chunk_devices": parallel_plan["chunk_devices"],
+        "parallel_device_worker_counts": parallel_plan["device_worker_counts"],
+        "parallel_summary_files": parallel_summary_files,
+        "parallel_same_device_warning": parallel_plan["same_device_warning"],
         "estimated_total_files": file_count,
         "estimated_disk_usage": trainer.format_bytes(approx_bytes),
         "note": "Test output estimates are conservative. Prediction-filtered visuals and error cases are known exactly after inference.",
@@ -278,9 +498,14 @@ def estimate_standalone_test_outputs(
         config=config,
         output_dir=output_dir,
         task="test",
-        runtime_units=float(image_count or 0),
+        runtime_units=float(image_count or 0) / float(parallel_plan["unique_device_count"]),
         default_rate_key="default_test_seconds_per_image",
-        basis={"test_images": image_count, "split": split},
+        basis={
+            "test_images": image_count,
+            "split": split,
+            "parallel_chunks": parallel_plan["chunks"],
+            "parallel_speedup_cap": parallel_plan["unique_device_count"],
+        },
     )
     return estimate
 
@@ -329,6 +554,11 @@ def build_internal_test_config(config: Mapping[str, Any]) -> Dict[str, Any]:
     sahi = test.get("sahi") or internal.get("sahi") or periodic_source.get("sahi") or {}
     error_cases = test.get("error_cases") or periodic_source.get("error_cases") or {}
     visual_samples = dict(test.get("visual_samples") or periodic_source.get("visual_samples") or {})
+    parallel_source = test.get("parallel", {}) or {}
+    if not isinstance(parallel_source, Mapping):
+        raise ValueError("test.parallel must be a mapping.")
+    parallel = dict(parallel_source)
+    parallel["chunks"] = normalize_test_parallel_chunks(parallel.get("chunks", 1))
     visual_sample_cap = _non_negative_int_or_none(visual_samples.get("max_images"))
     if visual_samples.get("max_images") is not None:
         visual_samples["max_images"] = visual_sample_cap
@@ -346,6 +576,7 @@ def build_internal_test_config(config: Mapping[str, Any]) -> Dict[str, Any]:
         **test,
         "split": split,
         "max_images": max_images,
+        "parallel": parallel,
         "test_mode": {"mode": mode},
         "crop": internal["crop"],
         "sahi": internal["sahi"],
@@ -396,6 +627,7 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
     parser.add_argument("--max-images", type=trainer.parse_scalar, help="Maximum test images to evaluate. Use all/null for all.")
     parser.add_argument("--batch-size", type=int, help="RF-DETR full-image/class-crop evaluator batch size.")
     parser.add_argument("--sahi-batch-size", type=int, help="RF-DETR SAHI slice/recheck batch size.")
+    parser.add_argument("--chunks", type=int, help="Concurrent standalone test chunks/model replicas.")
     parser.add_argument("--dry-run", action="store_true", help="Validate and print planned output without inference.")
     parser.add_argument("--yes", action="store_true", help="Skip confirmation.")
     args = parser.parse_args()
@@ -407,6 +639,8 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
         config = load_yaml(source_config)
         apply_cli_overrides(config, args)
         internal_config = build_internal_test_config(config)
+        validate_parallel_test_compatibility(internal_config)
+        parallel_chunks = standalone_parallel_chunks(internal_config)
         if timing_context is not None:
             timing_context["verbose"] = bool(internal_config.get("runtime", {}).get("verbose", True))
         bar.update(1)
@@ -444,6 +678,10 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
             output_dir,
             bool(internal_config.get("runtime", {}).get("verbose", True)),
         )
+        if dataset_plan.get("action") == "none" and dataset_plan.get("dataset_dir"):
+            resolved_dataset_dir = str(dataset_plan["dataset_dir"])
+            internal_config.setdefault("dataset", {})["dataset_dir"] = resolved_dataset_dir
+            internal_config.setdefault("train", {})["dataset_dir"] = resolved_dataset_dir
         if not internal_config.get("train", {}).get("dataset_dir"):
             internal_config["train"]["dataset_dir"] = internal_config.get("dataset", {}).get("dataset_dir", "")
         bar.update(1)
@@ -456,24 +694,45 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
         )
         bar.update(1)
 
-        model_cls = trainer.get_model_class(str(internal_config.get("model", {}).get("size", "medium")))
-        rf_model = model_cls(**trainer.build_model_kwargs(internal_config))
-        train_kwargs = trainer.build_train_kwargs(internal_config, output_dir)
-        train_kwargs.pop("_device", None)
-        train_config = rf_model.get_train_config(**train_kwargs)
-        rf_model._align_num_classes_from_dataset(train_config.dataset_dir)
+        rf_model = None
+        train_config = None
+        parallel_evaluator_config = None
+        if parallel_chunks > 1:
+            parallel_evaluator_config = build_parallel_rfdetr_evaluator_config(
+                internal_config,
+                output_dir,
+                str(internal_config.get("test", {}).get("split", "test")),
+            )
+        else:
+            rf_model, train_config = trainer.build_rfdetr_evaluator_runtime(
+                internal_config,
+                output_dir,
+            )
         bar.update(1)
 
     test_settings = internal_config.get("test", {})
     mode = trainer.periodic_test_mode(test_settings)
     evaluation_type = str(internal_config.get("evaluation", {}).get("type", "auto")).strip().lower()
-    segmentation_model = bool(getattr(rf_model.model_config, "segmentation_head", False))
+    segmentation_model = bool(
+        rf_model is not None and getattr(rf_model.model_config, "segmentation_head", False)
+    )
     use_segmentation_eval = (
         segmentation_model
         and mode == "full_image"
         and evaluation_type in {"auto", "segm", "segment", "segmentation", "mask", "masks"}
     )
-    if use_segmentation_eval:
+    if parallel_chunks > 1:
+        if parallel_evaluator_config is None:
+            raise RuntimeError("Parallel evaluator config was not initialized.")
+        result = run_evaluation(
+            deepcopy(parallel_evaluator_config),
+            source_config,
+            prebuilt_model=None,
+            print_summary=True,
+        )
+    elif use_segmentation_eval:
+        if rf_model is None or train_config is None:
+            raise RuntimeError("Single-model segmentation runtime was not initialized.")
         from rfdetr.training import RFDETRDataModule, RFDETRModelModule
 
         module = RFDETRModelModule(rf_model.model_config, train_config)
@@ -494,6 +753,8 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
             progress_bar=bool(test_settings.get("progress_bar", True)),
         )
     else:
+        if rf_model is None or train_config is None:
+            raise RuntimeError("Single-model evaluator runtime was not initialized.")
         evaluator_config = trainer.build_rfdetr_evaluator_config(
             merged_config=internal_config,
             model_config=rf_model.model_config,

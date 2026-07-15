@@ -98,7 +98,7 @@ model:
   # Patches LWDETR.forward in-process; survives uv sync.
   motion:
     # Master switch. Options: true, false.
-    enabled: true
+    enabled: false
     # Motion module type. Options: tracknet_v5, none.
     type: tracknet_v5
 
@@ -183,9 +183,9 @@ dataset:
   # Dataset source format. Options: auto, rfdetr, roboflow, ultralytics_yolo, coco_json, pascal_voc, dota, labelme_json.
   source_format: ultralytics_yolo
   # Dataset root directory. Options: local Windows/Linux path.
-  dataset_dir: C:\Users\XBOT\Documents\Datasets\all_parameters_SAHI_640_classesall_max_samples2000
+  dataset_dir: "/home/new_users/zhiyu/datasets/soccer/spatial_perception/Xbotgo/soccer_ball_merged_v1/outputs/yolo_reviewed_sam3_augmented_320-1921_sahi_1280"
   # Dataset YAML path for class names/splits. Options: local YAML path or null.
-  data_yaml: ""
+  data_yaml: "/home/new_users/zhiyu/datasets/soccer/spatial_perception/Xbotgo/soccer_ball_merged_v1/outputs/yolo_reviewed_sam3_augmented_320-1921_sahi_1280/dataset.yaml"
   # coco_json setting for this config block. Options: documented value for this RF-DETR config section.
   coco_json: ""
   # image_dir setting for this config block. Options: documented value for this RF-DETR config section.
@@ -220,7 +220,7 @@ output:
   # Exact output directory override. Options: empty string, local path, or placeholder template.
   output_dir: ""
   # Output root directory. Options: local path or placeholder template.
-  root: runs/rf_detr/all_parameters_SAHI_640/train
+  root: runs/rf_detr/train
   # Output run folder name. Options: plain string or placeholder template.
   name: "rfdetr_{model_size}_motion_v5_e{epochs}_b{batch_size}_{timestamp}"
   # Allow writing into an existing output directory. Options: true, false.
@@ -229,15 +229,15 @@ output:
 # Training hyperparameters and runtime settings. Options: mapping.
 train:
   # Dataset root directory. Options: local Windows/Linux path.
-  dataset_dir: C:\Users\XBOT\Documents\Datasets\all_parameters_SAHI_640_classesall_max_samples2000
+  dataset_dir: "/home/new_users/zhiyu/datasets/soccer/spatial_perception/Xbotgo/soccer_ball_merged_v1/outputs/yolo_reviewed_sam3_augmented_320-1921_sahi_1280"
   # RF-DETR dataset file/source selector. Options: roboflow or dataset YAML/relative file name.
   dataset_file: roboflow
   # Compute device selector. Options: auto, cpu, cuda, cuda:N, N, comma-separated GPU IDs, mps, -1.
-  device: 0
+  device: 2
   # Training epoch count. Options: positive integer.
-  epochs: 50
+  epochs: 40
   # Reduced from 4 → 2 to accommodate R-STR memory overhead per scale.
-  batch_size: 2
+  batch_size: 4
   # Raised from 4 → 8 to keep effective batch = 16.
   grad_accum_steps: 8
   # Auto-batch target effective batch size. Options: positive integer.
@@ -267,7 +267,7 @@ train:
   # Gradient clipping max norm. Options: non-negative number.
   clip_max_norm: 0.1
   # Checkpoint save interval in epochs. Options: positive integer.
-  checkpoint_interval: 10
+  checkpoint_interval: 1
   # Resume checkpoint path. Options: null or local checkpoint path.
   resume: null
   # Use exponential moving average weights. Options: true, false.
@@ -340,8 +340,6 @@ train:
   fp16_eval: false
   # Disable weight checkpoint saving. Options: true, false.
   dont_save_weights: false
-  # Save dataset sample grids before training. Options: true, false.
-  save_dataset_grids: true
   # Compute validation loss. Options: true, false.
   compute_val_loss: true
   # Compute test loss. Options: true, false.
@@ -353,7 +351,40 @@ train:
   # DataLoader prefetch_factor. Options: null for auto or positive integer.
   prefetch_factor: null
   # Albumentations augmentation config. Options: null or transform mapping.
-  aug_config: null
+  aug_config:
+    # Affine image-scale augmentation. Options: mapping accepted by Albumentations Affine.
+    Affine:
+      # Random content scale range. Options: [min, max]; [0.6, 1.0] only shrinks, similar to Ultralytics zoom-out scale.
+      # Random x/y translation range as image fraction. Options: [min, max].
+      translate_percent: [-0.05, 0.05]
+      # Rotation angle range in degrees. Options: number or [min, max].
+      rotate: 0
+      # Shear angle range in degrees. Options: number, [min, max], or x/y mapping.
+      shear: 0
+      # Border fill mode. Options: 0 for constant border, or other OpenCV border mode ints.
+      border_mode: 0
+      # Constant border fill color. Options: number or RGB list; [114, 114, 114] matches common YOLO gray padding.
+      fill: [114, 114, 114]
+      # Probability of applying this transform. Options: 0.0-1.0.
+      p: 0.5
+    # HorizontalFlip nested configuration block. Options: mapping.
+    HorizontalFlip:
+      # p setting for this config block. Options: documented value for this RF-DETR config section.
+      p: 0.5
+    # RandomBrightnessContrast nested configuration block. Options: mapping.
+    RandomBrightnessContrast:
+      # brightness_limit setting for this config block. Options: documented value for this RF-DETR config section.
+      brightness_limit: 0.3
+      # contrast_limit setting for this config block. Options: documented value for this RF-DETR config section.
+      contrast_limit: 0.3
+      # p setting for this config block. Options: documented value for this RF-DETR config section.
+      p: 0.5
+    # GaussianBlur nested configuration block. Options: mapping.
+    GaussianBlur:
+      # blur_limit setting for this config block. Options: documented value for this RF-DETR config section.
+      blur_limit: 3
+      # p setting for this config block. Options: documented value for this RF-DETR config section.
+      p: 0.3
   # Extra RF-DETR TrainConfig arguments. Options: mapping.
   extra_train_args: {}
 
@@ -364,7 +395,7 @@ periodic_test:
   # Test mode selector block. Options: mapping.
   test_mode:
     # Execution/test/inference mode. Options: full_image, sahi, class_crop, or block-specific values.
-    mode: sahi
+    mode: full_image
   # Class-crop/object-crop test settings. Options: mapping.
   crop:
     # class_ids setting for this config block. Options: documented value for this RF-DETR config section.
@@ -431,7 +462,7 @@ periodic_test:
     # Enable this feature/block. Options: true, false.
     enabled: false
     # Maximum images to process. Options: all/null for full data or positive integer.
-    max_images: 25
+    max_images: 300
     # output_subdir setting for this config block. Options: documented value for this RF-DETR config section.
     output_subdir: visuals
     # sampling_mode setting for this config block. Options: documented value for this RF-DETR config section.
@@ -461,7 +492,7 @@ periodic_test:
   # Saved model-input grid batch size. Options: positive integer.
   model_input_batch_size: 9
   # Dataset/evaluation split. Options: train, val, valid, test, test-original, or dataset-defined split.
-  split: test-original
+  split: test
   # Maximum images to process. Options: all/null for full data or positive integer.
   max_images: all
   # Scheduled test interval in epochs. Options: 0 to disable or positive integer.
@@ -492,11 +523,11 @@ periodic_test:
     # Rendered class names. Options: list of strings or empty for all.
     render_class_names: []
     # Maximum images to process. Options: all/null for full data or positive integer.
-    max_images: 25
+    max_images: 300
     # max_missed_images setting for this config block. Options: documented value for this RF-DETR config section.
-    max_missed_images: 25
+    max_missed_images: 300
     # max_false_positive_images setting for this config block. Options: documented value for this RF-DETR config section.
-    max_false_positive_images: 25
+    max_false_positive_images: 300
     # Prediction confidence threshold. Options: 0.0-1.0.
     confidence_threshold: null
     # IoU threshold for matching. Options: 0.0-1.0.

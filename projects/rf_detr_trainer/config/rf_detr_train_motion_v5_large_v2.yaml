@@ -157,9 +157,9 @@ dataset:
   # Dataset source format. Options: auto, rfdetr, roboflow, ultralytics_yolo, coco_json, pascal_voc, dota, labelme_json.
   source_format: ultralytics_yolo
   # Dataset root directory. Options: local Windows/Linux path.
-  dataset_dir: "/home/new_users/zhiyu/datasets/soccer/spatial_perception/Xbotgo/soccer_ball_merged_v1/outputs/yolo_reviewed_sam3_augmented"
+  dataset_dir: "/home/new_users/zhiyu/datasets/soccer/spatial_perception/Xbotgo/soccer_ball_merged_v1/outputs/yolo_reviewed_sam3_augmented_320-1921_sahi_1280"
   # Dataset YAML path for class names/splits. Options: local YAML path or null.
-  data_yaml: "/home/new_users/zhiyu/datasets/soccer/spatial_perception/Xbotgo/soccer_ball_merged_v1/outputs/yolo_reviewed_sam3_augmented/dataset.yaml"
+  data_yaml: "/home/new_users/zhiyu/datasets/soccer/spatial_perception/Xbotgo/soccer_ball_merged_v1/outputs/yolo_reviewed_sam3_augmented_320-1921_sahi_1280/dataset.yaml"
   # coco_json setting for this config block. Options: documented value for this RF-DETR config section.
   coco_json: ""
   # image_dir setting for this config block. Options: documented value for this RF-DETR config section.
@@ -203,13 +203,13 @@ output:
 # Training hyperparameters and runtime settings. Options: mapping.
 train:
   # Dataset root directory. Options: local Windows/Linux path.
-  dataset_dir: "/home/new_users/zhiyu/datasets/soccer/spatial_perception/Xbotgo/soccer_ball_merged_v1/outputs/yolo_reviewed_sam3_augmented"
+  dataset_dir: "/home/new_users/zhiyu/datasets/soccer/spatial_perception/Xbotgo/soccer_ball_merged_v1/outputs/yolo_reviewed_sam3_augmented_320-1921_sahi_1280"
   # RF-DETR dataset file/source selector. Options: roboflow or dataset YAML/relative file name.
   dataset_file: roboflow
   # Compute device selector. Options: auto, cpu, cuda, cuda:N, N, comma-separated GPU IDs, mps, -1.
-  device: 3,5,6,7
+  device: 1
   # Training epoch count. Options: positive integer.
-  epochs: 50
+  epochs: 20
   # Batch size. Options: positive integer or auto where supported.
   batch_size: 3
   # Gradient accumulation steps. Options: positive integer.
@@ -253,7 +253,7 @@ train:
   # EMA update interval. Options: positive integer.
   ema_update_interval: 1
   # DataLoader worker count. Options: 2 by project rule.
-  num_workers: 2
+  num_workers: 1
   # Enable early stopping. Options: true, false.
   early_stopping: true
   # Early-stopping patience. Options: positive integer.
@@ -263,7 +263,7 @@ train:
   # Use EMA metrics for early stopping. Options: true, false.
   early_stopping_use_ema: false
   # Validation interval in epochs. Options: positive integer.
-  eval_interval: 5
+  eval_interval: 1
   # Maximum detections for validation metrics. Options: positive integer.
   eval_max_dets: 500
   # Log per-class metrics during validation. Options: true, false.
@@ -287,7 +287,7 @@ train:
   # Use expanded scale set for multi-scale training. Options: true, false.
   expanded_scales: true
   # Use padding-based random resize. Options: true, false.
-  do_random_resize_via_padding: false
+  do_random_resize_via_padding: true
   # Force square resize divisible by 64. Options: true, false.
   square_resize_div_64: true
   # Drop-path rate. Options: 0.0-1.0.
@@ -326,6 +326,22 @@ train:
   prefetch_factor: null
   # Albumentations augmentation config. Options: null or transform mapping.
   aug_config:
+    # Affine image-scale augmentation. Options: mapping accepted by Albumentations Affine.
+    Affine:
+      # Random content scale range. Options: [min, max]; [0.6, 1.0] only shrinks, similar to Ultralytics zoom-out scale.
+      scale: [0.6, 1.0]
+      # Random x/y translation range as image fraction. Options: [min, max].
+      translate_percent: [-0.05, 0.05]
+      # Rotation angle range in degrees. Options: number or [min, max].
+      rotate: 0
+      # Shear angle range in degrees. Options: number, [min, max], or x/y mapping.
+      shear: 0
+      # Border fill mode. Options: 0 for constant border, or other OpenCV border mode ints.
+      border_mode: 0
+      # Constant border fill color. Options: number or RGB list; [114, 114, 114] matches common YOLO gray padding.
+      fill: [114, 114, 114]
+      # Probability of applying this transform. Options: 0.0-1.0.
+      p: 0.5
     # HorizontalFlip nested configuration block. Options: mapping.
     HorizontalFlip:
       # p setting for this config block. Options: documented value for this RF-DETR config section.

@@ -1,7 +1,9 @@
 from pathlib import Path
 import sys
 import tempfile
+from types import ModuleType, SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -132,10 +134,53 @@ class RfDetrInferenceTest(unittest.TestCase):
         for key in ("segment_frame_index", "segment_timestamp_seconds", "video_start_seconds", "video_end_seconds", "video_effective_end_seconds"):
             self.assertIn(key, row)
 
+    def test_load_model_attaches_motion_only_when_enabled(self):
+        rf_model = SimpleNamespace(model=object())
+        model_cls = unittest.mock.Mock(return_value=rf_model)
+        attached = unittest.mock.Mock()
+        motion_module = ModuleType("rf_detr_motion")
+        motion_module.attach_motion_module = attached
+
+        with patch.object(inference_runner.trainer, "get_model_class", return_value=model_cls), patch.object(
+            inference_runner.trainer, "build_model_kwargs", return_value={"device": "cpu"}
+        ), patch.dict(sys.modules, {"rf_detr_motion": motion_module}):
+            result = inference_runner.load_rfdetr_model({"model": {"size": "medium", "motion": {"enabled": True}}})
+
+        self.assertIs(result, rf_model)
+        model_cls.assert_called_once_with(device="cpu")
+        attached.assert_called_once_with(rf_model.model, {"enabled": True})
+
+    def test_load_model_skips_motion_attachment_when_disabled(self):
+        rf_model = SimpleNamespace(model=object())
+        model_cls = unittest.mock.Mock(return_value=rf_model)
+
+        with patch.object(inference_runner.trainer, "get_model_class", return_value=model_cls), patch.object(
+            inference_runner.trainer, "build_model_kwargs", return_value={}
+        ):
+            result = inference_runner.load_rfdetr_model({"model": {"size": "medium", "motion": {"enabled": False}}})
+
+        self.assertIs(result, rf_model)
+        model_cls.assert_called_once_with()
+
+    def test_all_inference_configs_declare_optional_architecture_blocks(self):
+        import yaml
+
+        config_dir = PROJECT_DIR / "config"
+        p2_video_preset = "rf_detr_inference_medium_p2_video_1984090152231178242_003.yaml"
+        for path in sorted(config_dir.glob("rf_detr_inference*.yaml")):
+            with self.subTest(config=path.name):
+                config = yaml.safe_load(path.read_text(encoding="utf-8"))
+                model = config["model"]
+                self.assertIn("p2", model)
+                self.assertIn("motion", model)
+                self.assertIn("enabled", model["p2"])
+                self.assertIn("enabled", model["motion"])
+                if path.name == p2_video_preset:
+                    self.assertTrue(model["p2"]["enabled"])
+                self.assertFalse(model["motion"]["enabled"])
+
     @staticmethod
     def _cli_args(**overrides):
-        from types import SimpleNamespace
-
         base = dict(
             yes=False, dry_run=False, source=None, output_dir=None, checkpoint=None, device=None,
             confidence_threshold=None, max_sources=None, max_images=None, max_videos=None,
