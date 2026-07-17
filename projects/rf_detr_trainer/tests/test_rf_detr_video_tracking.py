@@ -416,6 +416,95 @@ class SyntheticVideoTrackingTest(unittest.TestCase):
             self.assertTrue(batched_video.exists() and batched_video.stat().st_size > 0)
             self.assertTrue(all(row.get("track_id") is not None for row in one_pass_rows if row["category_id"] == 1))
 
+    def test_sahi_recheck_filter_runs_before_tracker_and_render(self):
+        class RecordingTracker:
+            def __init__(self):
+                self.seen_scores = []
+                self.tracks = []
+
+            def update(self, _frame_index, predictions, frame=None):
+                self.seen_scores.append([row["score"] for row in predictions])
+                return [dict(row) for row in predictions]
+
+        def predictions_for(record):
+            low = _scripted_prediction(record.image_id, 20, 20)
+            low["score"] = 0.49
+            boundary = _scripted_prediction(record.image_id, 40, 20)
+            boundary["score"] = 0.5
+            return [low, boundary]
+
+        def fake_predict_image(record, *_args, **_kwargs):
+            return predictions_for(record), None, None
+
+        def fake_predict_batch(records, *_args, **_kwargs):
+            return [predictions_for(record) for record in records], None, None
+
+        prediction_config = {
+            "model": {"confidence_threshold": 0.25},
+            "inference": {"mode": "sahi", "batch_size": 4},
+            "sahi": {
+                "batch_size": 4,
+                "recheck": {"enabled": True, "fused_confidence_threshold": 0.5},
+            },
+        }
+        tracking_config = inference_runner.video_tracking.parse_tracking_config(
+            {"inference": {"tracking": {"enabled": True, "algorithm": "circle"}}}, CATEGORIES
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            video_path = Path(tmp) / "clip.mp4"
+            _write_synthetic_video(video_path)
+            item = inference_runner.SourceItem(
+                source=str(video_path), kind="video", is_url=False, local_path=video_path
+            )
+            for batch_size in (1, 4):
+                with self.subTest(batch_size=batch_size):
+                    output_dir = Path(tmp) / f"filtered_{batch_size}"
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    video_cfg = {
+                        "batch_size": batch_size,
+                        "detection_fps": None,
+                        "start_time": 0,
+                        "end_time": "all",
+                        "max_seconds": "all",
+                        "output_fps": None,
+                        "render_skipped_frames": True,
+                    }
+                    tracker = RecordingTracker()
+                    rendered_scores = []
+
+                    def capture_render(image, rows, *_args, **_kwargs):
+                        rendered_scores.extend(row["score"] for row in rows)
+                        return image.convert("RGB")
+
+                    with mock.patch.object(
+                        inference_runner.evaluator, "predict_image", fake_predict_image
+                    ), mock.patch.object(
+                        inference_runner.evaluator, "predict_images_rfdetr", fake_predict_batch
+                    ), mock.patch.object(
+                        inference_runner, "create_tracker", return_value=tracker
+                    ), mock.patch.object(
+                        inference_runner, "draw_predictions", side_effect=capture_render
+                    ):
+                        rows, _, _ = inference_runner.predict_video_file(
+                            item,
+                            1,
+                            None,
+                            prediction_config,
+                            CATEGORIES,
+                            output_dir,
+                            [],
+                            video_cfg,
+                            tracking_config,
+                        )
+
+                    self.assertTrue(tracker.seen_scores)
+                    self.assertTrue(all(scores == [0.5] for scores in tracker.seen_scores))
+                    self.assertTrue(rows)
+                    self.assertTrue(all(row["score"] == 0.5 for row in rows))
+                    self.assertTrue(rendered_scores)
+                    self.assertTrue(all(score == 0.5 for score in rendered_scores))
+
 
 if __name__ == "__main__":
     unittest.main()

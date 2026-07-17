@@ -33,7 +33,7 @@ model:
   # RF-DETR model size. Options: base, nano, small, medium, large, seg-preview, seg-nano, seg-small, seg-medium, seg-large, seg-xlarge, seg-2xlarge.
   size: medium
   # Checkpoint to test. Options: default, null/false, hosted key, or local checkpoint path.
-  pretrain_weights: /home/new_users/zhiyu/trash/medium/checkpoint_best_ema.pth
+  pretrain_weights: /home/new_users/zhiyu/projects/PitchObjectLab/runs/rf_detr/train/rfdetr_medium_motion_v5_e40_b4_20260710165058/checkpoint_best_total.pth
   # Input resolution override. Options: null or valid RF-DETR resolution integer.
   resolution: null
   # Class count override. Options: null or positive integer.
@@ -153,9 +153,9 @@ test:
   # SAHI sliced-inference settings. Options: mapping.
   sahi:
     # Slice height. Options: positive integer.
-    slice_height: 320
+    slice_height: 160
     # Slice width. Options: positive integer.
-    slice_width: 320
+    slice_width: 160
     # Height overlap. Options: 0.0-0.9.
     overlap_height_ratio: 0.2
     # Width overlap. Options: 0.0-0.9.
@@ -182,7 +182,7 @@ test:
       target_class_names:
         - soccer_ball
       # B*B centered crop size for the second pass. Options: positive integer pixels.
-      crop_size: 640
+      crop_size: 320
       # Confidence threshold for the second pass. Options: 0.0-1.0.
       second_confidence_threshold: 0.25
       # Weight applied to the first-stage confidence. Options: non-negative float.
@@ -190,7 +190,7 @@ test:
       # Weight applied to the best second-stage confidence. Options: non-negative float.
       second_weight: 0.5
       # Minimum fused confidence to keep the first-stage box. Options: 0.0-1.0.
-      fused_confidence_threshold: 0.5
+      fused_confidence_threshold: 0.25
       # Extra relative padding around the first-stage box for center-hit matching. Options: non-negative float.
       center_padding_ratio: 0.0
       # Maximum target boxes rechecked per image. Options: 0 disables rechecking; positive integer caps by score.

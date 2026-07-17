@@ -348,6 +348,12 @@ uv run python inference_rf_detr_model.py --config config/rf_detr_inference.yaml 
 Each run writes rendered media, `predictions.jsonl`, `class_colors.json`, an
 `inference_summary.json`, and a config snapshot into the output folder.
 
+When `inference.mode: sahi` and `sahi.recheck.enabled: true`,
+`sahi.recheck.fused_confidence_threshold` is the final minimum score for every
+prediction class. The runner applies it before tracking, JSONL/summary output,
+and image/video rendering so every inference artifact uses the same filtered
+predictions. Scores equal to the threshold are retained.
+
 ### Video tracking
 
 Video inference can attach a multi-object tracker that adds stable `track_id`s, draws

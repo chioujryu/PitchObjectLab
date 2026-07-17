@@ -108,6 +108,72 @@ class RfDetrInferenceTest(unittest.TestCase):
 
         self.assertEqual(prediction_config["inference"]["batch_size"], 7)
 
+    def test_final_prediction_filter_uses_fused_threshold_for_all_classes(self):
+        config = {
+            "model": {"confidence_threshold": 0.25},
+            "inference": {"mode": "sahi"},
+            "sahi": {"recheck": {"enabled": True, "fused_confidence_threshold": 0.5}},
+        }
+        predictions = [
+            {"category_id": 0, "score": 0.49},
+            {"category_id": 0, "score": 0.5},
+            {"category_id": 1, "score": 0.8},
+        ]
+
+        filtered = inference_runner.filter_final_inference_predictions(predictions, config)
+
+        self.assertEqual([(row["category_id"], row["score"]) for row in filtered], [(0, 0.5), (1, 0.8)])
+
+    def test_final_prediction_filter_is_inactive_without_sahi_and_recheck(self):
+        predictions = [{"category_id": 1, "score": 0.1}]
+        configs = [
+            {"inference": {"mode": "full_image"}, "sahi": {"recheck": {"enabled": True, "fused_confidence_threshold": 0.5}}},
+            {"inference": {"mode": "sahi"}, "sahi": {"recheck": {"enabled": False, "fused_confidence_threshold": 0.5}}},
+        ]
+
+        for config in configs:
+            with self.subTest(config=config):
+                self.assertEqual(inference_runner.filter_final_inference_predictions(predictions, config), predictions)
+
+    def test_image_batch_uses_same_filtered_predictions_for_output_and_render(self):
+        from PIL import Image
+
+        config = {
+            "model": {"confidence_threshold": 0.25},
+            "inference": {"mode": "sahi", "batch_size": 1},
+            "sahi": {
+                "batch_size": 1,
+                "recheck": {"enabled": True, "fused_confidence_threshold": 0.5},
+            },
+        }
+        predictions = [
+            {"image_id": 1, "category_id": 0, "bbox": [1, 1, 5, 5], "score": 0.49},
+            {"image_id": 1, "category_id": 1, "bbox": [2, 2, 5, 5], "score": 0.5},
+        ]
+        rendered_scores = []
+
+        def capture_render(image, rows, *_args, **_kwargs):
+            rendered_scores.extend(row["score"] for row in rows)
+            return image.convert("RGB")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "image.jpg"
+            Image.new("RGB", (20, 20), color=(255, 255, 255)).save(image_path)
+            item = inference_runner.SourceItem(source=str(image_path), kind="image", local_path=image_path)
+            with patch.object(
+                inference_runner.evaluator,
+                "predict_images_rfdetr",
+                return_value=([predictions], [], []),
+            ), patch.object(inference_runner, "draw_predictions", side_effect=capture_render):
+                rows, outputs, _ = inference_runner.predict_image_files_batch(
+                    [item], 1, object(), config, [], root / "outputs", [], 1
+                )
+
+        self.assertEqual([row["score"] for row in rows], [0.5])
+        self.assertEqual(rendered_scores, [0.5])
+        self.assertEqual(outputs[0]["predictions"], 1)
+
     def test_draw_predictions_without_tracks_is_unchanged(self):
         from PIL import Image
 

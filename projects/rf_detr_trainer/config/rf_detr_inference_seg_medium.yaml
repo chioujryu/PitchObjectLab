@@ -442,7 +442,7 @@ sahi:
     first_weight: 0.5
     # Weight applied to the best second-stage confidence. Options: non-negative float.
     second_weight: 0.5
-    # Minimum fused confidence to keep the first-stage box. Options: 0.0-1.0.
+    # Final minimum score for every prediction class when inference.mode=sahi and recheck is enabled. Options: 0.0-1.0.
     fused_confidence_threshold: 0.25
     # Extra relative padding around the first-stage box for center-hit matching. Options: non-negative float.
     center_padding_ratio: 0.0

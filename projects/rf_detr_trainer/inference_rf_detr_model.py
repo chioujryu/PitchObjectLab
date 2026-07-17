@@ -657,6 +657,34 @@ def build_prediction_config(config: Mapping[str, Any], categories: Sequence[Mapp
     }
 
 
+def final_prediction_confidence_threshold(config: Mapping[str, Any]) -> Optional[float]:
+    """Return the final SAHI+recheck output threshold, or None when inactive."""
+    inference = dict(config.get("inference", {}) or {})
+    if str(inference.get("mode", "full_image")).strip().lower() != "sahi":
+        return None
+    sahi = dict(config.get("sahi", {}) or {})
+    recheck = dict(sahi.get("recheck", {}) or {})
+    if not bool(recheck.get("enabled", False)):
+        return None
+    model = dict(config.get("model", {}) or {})
+    return float(recheck.get("fused_confidence_threshold", model.get("confidence_threshold", 0.25)))
+
+
+def filter_final_inference_predictions(
+    predictions: Sequence[Mapping[str, Any]],
+    config: Mapping[str, Any],
+) -> List[Dict[str, Any]]:
+    """Apply the shared final confidence gate used by inference outputs and renders."""
+    threshold = final_prediction_confidence_threshold(config)
+    if threshold is None:
+        return [dict(prediction) for prediction in predictions]
+    return [
+        dict(prediction)
+        for prediction in predictions
+        if float(prediction.get("score", 0.0)) >= threshold
+    ]
+
+
 def load_rfdetr_model(config: Mapping[str, Any]) -> Any:
     model_cls = trainer.get_model_class(str(config.get("model", {}).get("size", "medium")))
     rf_model = model_cls(**trainer.build_model_kwargs(config))
@@ -776,6 +804,7 @@ def predict_image_file(
         width, height = image.size
     record = evaluator.ImageRecord(image_id=image_id, file_name=item.local_path.name, path=str(item.local_path), width=width, height=height)
     predictions, _, _ = evaluator.predict_image(record, model, prediction_config, output_dir, save_visual=False)
+    predictions = filter_final_inference_predictions(predictions, prediction_config)
     with Image.open(item.local_path) as image:
         rendered = draw_predictions(image, predictions, categories, render_ids)
     image_dir = output_dir / "images"
@@ -828,6 +857,7 @@ def predict_image_files_batch(
     outputs: List[Dict[str, Any]] = []
     for item, predictions in zip(items, predictions_by_image):
         assert item.local_path is not None
+        predictions = filter_final_inference_predictions(predictions, batch_config)
         with Image.open(item.local_path) as image:
             rendered = draw_predictions(image, predictions, categories, render_ids)
         target = image_dir / f"{trainer.sanitize_name(item.local_path.stem)}_pred.jpg"
@@ -930,6 +960,7 @@ def predict_video_file_one_pass(
                     height=height,
                 )
                 frame_predictions, _, _ = evaluator.predict_image(record, model, prediction_config, output_dir, save_visual=False)
+                frame_predictions = filter_final_inference_predictions(frame_predictions, prediction_config)
                 if tracker is not None:
                     frame_predictions = tracker.update(absolute_frame_index, frame_predictions, frame=frame)
                 for prediction in frame_predictions:
@@ -1016,7 +1047,10 @@ def predict_video_file_batched(
             return
         predictions_by_frame, _, _ = evaluator.predict_images_rfdetr(pending_records, model, batch_config, output_dir)
         for record, meta, frame_predictions in zip(pending_records, pending_meta, predictions_by_frame):
-            predictions_by_segment[int(meta["segment_frame_index"])] = frame_predictions
+            predictions_by_segment[int(meta["segment_frame_index"])] = filter_final_inference_predictions(
+                frame_predictions,
+                batch_config,
+            )
             Path(record.path).unlink(missing_ok=True)
         pending_records = []
         pending_meta = []

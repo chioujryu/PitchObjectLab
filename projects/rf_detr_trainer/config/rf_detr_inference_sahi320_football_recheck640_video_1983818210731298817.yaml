@@ -34,13 +34,13 @@ model:
   # RF-DETR model size. Detection: base, nano, small, medium, large. Segmentation sizes are not used by this bbox renderer.
   size: medium
   # RF-DETR checkpoint to load. Options: default, null/false, hosted key, or local .pth/.pt/.ckpt path.
-  pretrain_weights: 'C:\Users\XBOT\Documents\projects\PitchObjectLab\projects\rf_detr_trainer\checkpoint_best_ema.pth'
+  pretrain_weights: /home/new_users/zhiyu/projects/PitchObjectLab/runs/rf_detr/train/rfdetr_medium_motion_v5_e40_b4_20260710165058/checkpoint_best_ema.pth
   # Input resolution override. Options: null for model default, or positive integer.
   resolution: null
   # Class count override. Options: null to infer from checkpoint/config, or positive integer.
   num_classes: null
   # Device selector. Options: auto, cpu, cuda, cuda:0, 0, 1, mps, -1.
-  device: 0
+  device: 1
   # Automatic mixed precision in RF-DETR. Options: true, false.
   amp: true
   # First-stage prediction confidence threshold. Options: 0.0-1.0.
@@ -62,7 +62,7 @@ model:
   # lower train.batch_size + raise train.grad_accum_steps, and/or raise num_windows via extra_model_args.
   p2:
     # Master switch. Options: false to disable (no patch applied, stock RF-DETR), true to enable P2.
-    enabled: false
+    enabled: true
     # Feature levels for projector AND decoder. Must be ascending P-name order; length = decoder levels.
     # name -> (stride, scale): P2->(4, x4), P3->(8, x2), P4->(16, x1), P5->(32, x0.5), P6->(64, x0.25).
     # Must include "P2" to actually use the P2 level. Examples: [P2, P3, P4], [P2, P3, P4, P5], [P2, P4].
@@ -193,9 +193,7 @@ model:
 dataset:
   # Class names for labels/colors. Options: list like [standing_player, football], mapping like {0: football}, or [] to label by ID.
   class_names:
-    - standing_player
     - football
-    - goal
   # Optional dataset YAML used only to read names when class_names is empty. Options: empty string or path to YAML with names.
   data_yaml: ""
 
@@ -206,7 +204,7 @@ output:
   # Output root when output_dir is empty. Options: pure string path.
   root: runs/rf_detr/inference
   # Run folder name when output_dir is empty. Supports {timestamp}. Options: string.
-  name: "rfdetr_inference_sahi320_football_recheck640_video_1983818210731298817_000900_001000_{timestamp}"
+  name: "rfdetr_inference_sahi320_football_recheck640_video_1983818210731298817_{timestamp}"
   # Allow writing into an existing output directory. Options: true, false.
   exist_ok: false
 
@@ -214,7 +212,7 @@ output:
 inference:
   # Input sources. Options: image path, video path, folder path, HTTP(S) image/video URL; folders may mix images and videos.
   sources:
-    - 'C:\Users\XBOT\Downloads\raw\1983818210731298817.mp4'
+    - /home/new_users/zhiyu/datasets/soccer/raw/raw_video/2027564888428580866.mp4
   # Recurse into folders. Options: true, false.
   recursive: true
   # Maximum discovered sources to infer after image/video caps. Options: all/null for every source, or a positive integer.
@@ -243,11 +241,11 @@ inference:
     # Detection FPS for videos. Options: null to detect every frame, or positive float such as 5.
     detection_fps: null
     # RF-DETR detection-frame batch size. Options: all/null to inherit inference.batch_size, or positive integer.
-    batch_size: null
+    batch_size: 64
     # Start time for each video segment. Options: seconds, MM:SS, or HH:MM:SS.
-    start_time: "00:09:00"
+    start_time: "00:05:00"
     # End time for each video segment. Options: all/null for video end, seconds, MM:SS, or HH:MM:SS.
-    end_time: "00:20:00"
+    end_time: "00:40:00"
     # Maximum selected duration to infer per video. Options: all/null for the full start/end range, seconds, MM:SS, or HH:MM:SS.
     max_seconds: all
     # Output video FPS. Options: null to preserve input FPS, or positive float.
@@ -259,7 +257,7 @@ inference:
     # Enable tracking for video inference. Options: true, false.
     enabled: true
     # Tracking algorithm. Options: circle (built-in stdlib motion-only ball tracker), ocsort, deepocsort, botsort, bytetrack (via boxmot). ocsort/bytetrack need no ReID download; deepocsort/botsort use appearance ReID.
-    algorithm: circle
+    algorithm: ocsort
     # Category IDs to track. Empty means use target_class_names. Options: list of category IDs.
     target_class_ids: []
     # Category names to track. Empty with no target_class_ids defaults to football. Options: names such as [football].
@@ -407,9 +405,9 @@ crop:
 # SAHI sliced-inference settings. Options: mapping.
 sahi:
   # Slice height for first-stage sahi mode. Options: positive integer.
-  slice_height: 320
+  slice_height: 160
   # Slice width for first-stage sahi mode. Options: positive integer.
-  slice_width: 320
+  slice_width: 160
   # Height overlap between adjacent slices. Options: 0.0-0.9.
   overlap_height_ratio: 0.2
   # Width overlap between adjacent slices. Options: 0.0-0.9.
@@ -436,15 +434,15 @@ sahi:
     target_class_names:
       - football
     # B*B centered crop size for the second pass. Options: positive integer pixels.
-    crop_size: 640
+    crop_size: 320
     # Confidence threshold for the second pass. Options: 0.0-1.0.
     second_confidence_threshold: 0.25
     # Weight applied to the first-stage confidence. Options: non-negative float.
     first_weight: 0.5
     # Weight applied to the best second-stage confidence. Options: non-negative float.
     second_weight: 0.5
-    # Minimum fused confidence to keep the first-stage box. Options: 0.0-1.0.
-    fused_confidence_threshold: 0.5
+    # Final minimum score for every prediction class when inference.mode=sahi and recheck is enabled. Options: 0.0-1.0.
+    fused_confidence_threshold: 0.25
     # Extra relative padding around the first-stage box for center-hit matching. Options: non-negative float.
     center_padding_ratio: 0.0
     # Maximum target boxes rechecked per image. Options: 0 disables rechecking; positive integer caps by score.
