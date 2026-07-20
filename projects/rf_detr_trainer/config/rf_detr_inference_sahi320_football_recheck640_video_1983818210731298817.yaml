@@ -204,7 +204,7 @@ output:
   # Output root when output_dir is empty. Options: pure string path.
   root: runs/rf_detr/inference
   # Run folder name when output_dir is empty. Supports {timestamp}. Options: string.
-  name: "rfdetr_inference_sahi320_football_recheck640_video_1983818210731298817_{timestamp}"
+  name: "rfdetr_inference_{timestamp}"
   # Allow writing into an existing output directory. Options: true, false.
   exist_ok: false
 
@@ -212,7 +212,7 @@ output:
 inference:
   # Input sources. Options: image path, video path, folder path, HTTP(S) image/video URL; folders may mix images and videos.
   sources:
-    - /home/new_users/zhiyu/datasets/soccer/raw/raw_video/2027564888428580866.mp4
+    - /home/new_users/zhiyu/datasets/soccer/raw/raw_video/1984090406020124673.mp4
   # Recurse into folders. Options: true, false.
   recursive: true
   # Maximum discovered sources to infer after image/video caps. Options: all/null for every source, or a positive integer.
@@ -243,9 +243,9 @@ inference:
     # RF-DETR detection-frame batch size. Options: all/null to inherit inference.batch_size, or positive integer.
     batch_size: 64
     # Start time for each video segment. Options: seconds, MM:SS, or HH:MM:SS.
-    start_time: "00:05:00"
+    start_time: "00:42:00"
     # End time for each video segment. Options: all/null for video end, seconds, MM:SS, or HH:MM:SS.
-    end_time: "00:40:00"
+    end_time: "00:52:00"
     # Maximum selected duration to infer per video. Options: all/null for the full start/end range, seconds, MM:SS, or HH:MM:SS.
     max_seconds: all
     # Output video FPS. Options: null to preserve input FPS, or positive float.

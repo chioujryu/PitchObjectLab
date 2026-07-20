@@ -153,9 +153,9 @@ test:
   # SAHI sliced-inference settings. Options: mapping.
   sahi:
     # Slice height. Options: positive integer.
-    slice_height: 160
+    slice_height: 640
     # Slice width. Options: positive integer.
-    slice_width: 160
+    slice_width: 640
     # Height overlap. Options: 0.0-0.9.
     overlap_height_ratio: 0.2
     # Width overlap. Options: 0.0-0.9.
@@ -175,7 +175,7 @@ test:
     # recheck nested configuration block. Options: mapping.
     recheck:
       # Run a second centered B*B verification pass for selected SAHI target-class boxes. Options: true, false.
-      enabled: true
+      enabled: false
       # Target category IDs for SAHI recheck. Empty means use target_class_names; if both empty and enabled, default is football.
       target_class_ids: []
       # Target category names for SAHI recheck. Empty with enabled defaults to football. Options: category names such as [football].
