@@ -8,11 +8,17 @@ dependencies = [
     "boxmot==13.0.0",
     "colorama>=0.4.6",
     "pyyaml>=6.0.0",
-    "rfdetr[loggers,train]>=1.6.5",
+    "rfdetr[loggers,train]>=1.8.1",
     "sahi>=0.11.22",
     "torch==2.11.0",
     "torchvision==0.26.0",
     "tqdm>=4.67.0",
+]
+
+[project.optional-dependencies]
+tensorrt = [
+    "onnx>=1.16,<2",
+    "tensorrt-cu12>=10.16,<11",
 ]
 
 [tool.uv]

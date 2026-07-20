@@ -17,6 +17,7 @@ tests.  Tests that need rfdetr are guarded with unittest.skipIf.
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
 import torch
 import torch.nn as nn
@@ -272,6 +273,19 @@ class MotionModuleTest(unittest.TestCase):
         out = mod(images, feats)
         self.assertEqual(len(out), 2)
 
+    def test_tensor_only_export_matches_nested_forward(self):
+        mod = self._make_module()
+        mod.eval()
+        images = torch.rand(2, 3, 80, 80)
+        feats = self._make_fake_features(B=2, C=32, H=20, W=20)
+
+        nested_result = mod(images, feats)
+        export_result = mod.forward_export(images, [feat.tensors for feat in feats])
+
+        self.assertEqual(len(export_result), len(nested_result))
+        for nested, exported in zip(nested_result, export_result):
+            self.assertTrue(torch.allclose(nested.tensors, exported, atol=1e-6))
+
 
 # ---------------------------------------------------------------------------
 # Config helpers
@@ -377,6 +391,102 @@ class EnsureMotionSupportTest(unittest.TestCase):
     def test_is_patched_after_call(self):
         motion.ensure_motion_support()
         self.assertTrue(motion.is_patched())
+
+    def test_forward_export_is_patched(self):
+        motion.ensure_motion_support({"enabled": True, "type": "tracknet_v5"})
+        from rfdetr.models.lwdetr import LWDETR
+
+        self.assertTrue(getattr(LWDETR.forward_export, "_motion_patched", False))
+
+    def test_export_wrapper_applies_motion_to_tensor_features(self):
+        import rfdetr.models.lwdetr as lwdetr_module
+
+        class FakeBackbone(nn.Module):
+            def forward(self, tensors):
+                feature = tensors[:, :1]
+                mask = torch.zeros(
+                    tensors.shape[0], tensors.shape[2], tensors.shape[3], dtype=torch.bool
+                )
+                position = torch.zeros_like(feature)
+                return [feature], [mask], [position], None
+
+        class FakeMotion(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+
+            def forward_export(self, _images, features):
+                self.calls += 1
+                return [feature * 3.0 for feature in features]
+
+        class FakeLWDETR(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.backbone = FakeBackbone()
+                self.motion_module = FakeMotion()
+
+            def forward(self, samples, targets=None):
+                return self.backbone(samples)
+
+            def forward_export(self, tensors):
+                features, _, _, _ = self.backbone(tensors)
+                return features[0]
+
+        original_patched = motion._LWDETR_PATCHED
+        try:
+            with patch.object(lwdetr_module, "LWDETR", FakeLWDETR):
+                motion._LWDETR_PATCHED = False
+                motion._patch_lwdetr_motion_forward()
+                model = FakeLWDETR()
+                inputs = torch.ones(2, 3, 4, 4)
+
+                output = model.forward_export(inputs)
+
+                self.assertEqual(model.motion_module.calls, 1)
+                self.assertTrue(torch.equal(output, torch.full((2, 1, 4, 4), 3.0)))
+                self.assertIs(model.backbone.forward.__func__, FakeBackbone.forward)
+
+                traced = torch.jit.trace_module(
+                    model,
+                    {"forward_export": inputs},
+                    check_trace=False,
+                )
+                self.assertTrue(
+                    torch.equal(
+                        traced.forward_export(inputs),
+                        torch.full((2, 1, 4, 4), 3.0),
+                    )
+                )
+        finally:
+            motion._LWDETR_PATCHED = original_patched
+
+
+class MotionExportValidationTest(unittest.TestCase):
+    def test_disabled_motion_is_noop(self):
+        motion.assert_motion_export_ready(nn.Linear(2, 2), {"enabled": False})
+
+    def test_enabled_motion_requires_attached_module(self):
+        fake_lwdetr_type = type("LWDETR", (nn.Module,), {})
+        model = fake_lwdetr_type()
+        with self.assertRaisesRegex(RuntimeError, "no attached motion_module"):
+            motion.assert_motion_export_ready(
+                model,
+                {"enabled": True, "type": "tracknet_v5"},
+            )
+
+    def test_enabled_motion_requires_motion_aware_forward_export(self):
+        class ExportableMotion(nn.Module):
+            def forward_export(self, _images, features):
+                return features
+
+        fake_lwdetr_type = type("LWDETR", (nn.Module,), {})
+        model = fake_lwdetr_type()
+        model.motion_module = ExportableMotion()
+        with self.assertRaisesRegex(RuntimeError, "forward_export is not motion-aware"):
+            motion.assert_motion_export_ready(
+                model,
+                {"enabled": True, "type": "tracknet_v5"},
+            )
 
 
 # ---------------------------------------------------------------------------

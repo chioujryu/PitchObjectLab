@@ -108,6 +108,28 @@ class RfDetrInferenceTest(unittest.TestCase):
 
         self.assertEqual(prediction_config["inference"]["batch_size"], 7)
 
+    def test_stage_timing_summary_includes_sahi_and_recheck_ratios(self):
+        model = SimpleNamespace()
+        inference_runner.record_inference_timing_rows(
+            model,
+            [
+                {
+                    "elapsed_seconds": 2.0,
+                    "model_forward_seconds": 1.5,
+                    "sahi_model_forward_seconds": 1.0,
+                    "recheck_model_forward_seconds": 0.5,
+                    "postprocess_seconds": 0.5,
+                }
+            ],
+        )
+
+        summary = inference_runner.summarize_inference_timing_rows(model)
+
+        self.assertEqual(summary["images_or_frames"], 1)
+        self.assertAlmostEqual(summary["model_forward_ratio"], 0.75)
+        self.assertAlmostEqual(summary["sahi_model_forward_ratio"], 0.5)
+        self.assertAlmostEqual(summary["recheck_model_forward_ratio"], 0.25)
+
     def test_final_prediction_filter_uses_fused_threshold_for_all_classes(self):
         config = {
             "model": {"confidence_threshold": 0.25},
@@ -239,8 +261,12 @@ class RfDetrInferenceTest(unittest.TestCase):
                 model = config["model"]
                 self.assertIn("p2", model)
                 self.assertIn("motion", model)
+                self.assertIn("inference_optimization", model)
                 self.assertIn("enabled", model["p2"])
                 self.assertIn("enabled", model["motion"])
+                self.assertEqual(model["inference_optimization"]["backend"], "pytorch")
+                self.assertEqual(model["inference_optimization"]["pytorch"]["precision"], "fp32")
+                self.assertIn(model["inference_optimization"]["tensorrt"]["precision"], {"fp16", "bf16"})
                 if path.name == p2_video_preset:
                     self.assertTrue(model["p2"]["enabled"])
                 self.assertFalse(model["motion"]["enabled"])
@@ -252,6 +278,8 @@ class RfDetrInferenceTest(unittest.TestCase):
             confidence_threshold=None, max_sources=None, max_images=None, max_videos=None,
             batch_size=None, video_batch_size=None, max_seconds=None, video_start_time=None, video_end_time=None,
             track=False, no_track=False, track_radius=None, track_velocity=False,
+            inference_backend=None, inference_precision=None, tensorrt_engine=None,
+            tensorrt_cache_dir=None, tensorrt_force_rebuild=False,
         )
         base.update(overrides)
         return SimpleNamespace(**base)
@@ -273,6 +301,33 @@ class RfDetrInferenceTest(unittest.TestCase):
         config = {}
         inference_runner.apply_cli_overrides(config, self._cli_args())
         self.assertNotIn("tracking", config.get("inference", {}))
+
+    def test_cli_selects_tensorrt_bf16_and_artifact_options(self):
+        config = {
+            "model": {
+                "inference_optimization": {
+                    "tensorrt": {"manifest_path": "stale.engine.manifest.json"}
+                }
+            }
+        }
+        inference_runner.apply_cli_overrides(
+            config,
+            self._cli_args(
+                inference_backend="tensorrt",
+                inference_precision="bf16",
+                tensorrt_engine="model.engine",
+                tensorrt_cache_dir="trt-cache",
+                tensorrt_force_rebuild=True,
+            ),
+        )
+
+        settings = config["model"]["inference_optimization"]
+        self.assertEqual(settings["backend"], "tensorrt")
+        self.assertEqual(settings["tensorrt"]["precision"], "bf16")
+        self.assertEqual(settings["tensorrt"]["engine_path"], "model.engine")
+        self.assertEqual(settings["tensorrt"]["manifest_path"], "")
+        self.assertEqual(settings["tensorrt"]["cache_dir"], "trt-cache")
+        self.assertTrue(settings["tensorrt"]["force_rebuild"])
 
 
 if __name__ == "__main__":

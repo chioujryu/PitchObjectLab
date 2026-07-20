@@ -22,6 +22,17 @@ cd projects/rf_detr_trainer
 uv sync
 ```
 
+PyTorch inference is installed by default. Install the optional TensorRT 10
+CUDA 12 runtime only on a supported NVIDIA CUDA machine:
+
+```bash
+uv sync --extra tensorrt
+```
+
+The extra intentionally uses `onnx>=1.16,<2` and
+`tensorrt-cu12>=10.16,<11`; it does not install PyCUDA, onnxsim, or depend on
+the external `trtexec` command.
+
 Auto-select CPU/GPU PyTorch wheels by checking CUDA and the current public IP
 region first:
 
@@ -253,6 +264,76 @@ Mask-aware full-image segmentation (`evaluation.type: auto` or `segm`) requires
 `chunks: 1`. To run a segmentation checkpoint through parallel box evaluation,
 set `evaluation.type: bbox` explicitly; parallel `sahi` and `class_crop` modes
 also evaluate bounding boxes.
+
+### Inference acceleration (inference and standalone test)
+
+`inference_rf_detr_model.py` and `test_rf_detr_model.py` share the same optional
+inference acceleration settings. The default is PyTorch FP32 and preserves the
+legacy behavior. PyTorch BF16, TensorRT FP16, and TensorRT BF16 are the other
+supported modes:
+
+```yaml
+model:
+  # model.amp remains a separate RF-DETR construction/training setting.
+  inference_optimization:
+    backend: pytorch       # pytorch, tensorrt
+    pytorch:
+      precision: fp32      # fp32, bf16
+    tensorrt:
+      precision: fp16      # fp16, bf16
+      engine_path: ""      # empty => build/load the automatic cache
+      manifest_path: ""    # explicit engine: empty derives <engine>.manifest.json
+      cache_dir: ""        # empty => OS user cache
+      workspace_gib: 4
+      force_rebuild: false
+      profile:
+        min_batch_size: 1  # fixed: real tail batches are not padded
+        opt_batch_size: auto
+        max_batch_size: auto
+```
+
+Only these backend/precision pairs are valid: `pytorch/fp32`,
+`pytorch/bf16`, `tensorrt/fp16`, and `tensorrt/bf16`. TensorRT is CUDA-only;
+BF16 additionally requires a compatible Ampere-or-newer GPU and TensorRT 10.
+Unsupported hardware, missing optional packages, corrupt or incompatible
+artifacts, and invalid precision combinations fail immediately. The runner
+never silently falls back to PyTorch or another precision.
+
+Without `engine_path`, the runner exports dynamic-batch ONNX, builds an engine,
+and reuses a cache keyed by the checkpoint/model, TensorRT/CUDA versions, GPU,
+precision, output type, and batch profile. An explicit trusted engine must be
+paired with its project-generated JSON manifest (an empty `manifest_path`
+derives `<engine>.manifest.json`); a checkpoint, GPU, precision,
+I/O, class-count, or profile mismatch is rejected. Engine build time is reported
+separately from steady-state inference time.
+
+Equivalent CLI overrides are available on both entrypoints:
+
+```bash
+# PyTorch BF16
+uv run python test_rf_detr_model.py --config config/rf_detr_test.yaml \
+  --inference-backend pytorch --inference-precision bf16 --yes
+
+# TensorRT with automatic cache/build
+uv run python inference_rf_detr_model.py --config config/rf_detr_inference.yaml \
+  --inference-backend tensorrt --inference-precision fp16 \
+  --tensorrt-cache-dir D:/model-cache/rfdetr --yes
+
+# Reuse a trusted prebuilt engine and its adjacent/project manifest
+uv run python test_rf_detr_model.py --config config/rf_detr_test.yaml \
+  --inference-backend tensorrt --inference-precision bf16 \
+  --tensorrt-engine D:/engines/rfdetr.plan --yes
+```
+
+The full CLI set is `--inference-backend {pytorch,tensorrt}`,
+`--inference-precision {fp32,fp16,bf16}`, `--tensorrt-engine PATH`,
+`--tensorrt-cache-dir PATH`, and `--tensorrt-force-rebuild`.
+
+Acceleration covers image/video inference, full-image batches, SAHI, target
+class recheck, and class crop. Standalone full-image segmentation keeps true
+bbox+mask evaluation and requires `test.parallel.chunks: 1`; SAHI and class-crop
+segmentation modes continue to evaluate bounding boxes only. Training-time
+periodic/final tests are unchanged.
 
 Prediction visuals and football diagnostics are controlled in the test config:
 

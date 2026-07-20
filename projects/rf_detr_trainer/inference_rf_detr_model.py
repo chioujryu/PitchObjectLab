@@ -109,6 +109,24 @@ def apply_cli_overrides(config: MutableMapping[str, Any], args: argparse.Namespa
         model["device"] = args.device
     if args.confidence_threshold is not None:
         model["confidence_threshold"] = args.confidence_threshold
+    optimization = model.setdefault("inference_optimization", {})
+    backend_override = getattr(args, "inference_backend", None)
+    if backend_override is not None:
+        optimization["backend"] = backend_override
+    precision_override = getattr(args, "inference_precision", None)
+    if precision_override is not None:
+        active_backend = str(optimization.get("backend", "pytorch")).strip().lower()
+        optimization.setdefault(active_backend, {})["precision"] = precision_override
+    tensorrt = optimization.setdefault("tensorrt", {})
+    if getattr(args, "tensorrt_engine", None) is not None:
+        tensorrt["engine_path"] = args.tensorrt_engine
+        # CLI has no separate manifest flag; derive the adjacent project
+        # sidecar for the CLI-selected engine instead of retaining YAML state.
+        tensorrt["manifest_path"] = ""
+    if getattr(args, "tensorrt_cache_dir", None) is not None:
+        tensorrt["cache_dir"] = args.tensorrt_cache_dir
+    if getattr(args, "tensorrt_force_rebuild", False):
+        tensorrt["force_rebuild"] = True
     if args.max_sources is not None:
         inference["max_sources"] = args.max_sources
     if args.max_images is not None:
@@ -451,6 +469,9 @@ def estimate_outputs(items: Sequence[SourceItem], output_dir: Path, config: Mapp
         output_files += 1
     if bool((config.get("inference", {}).get("tracking", {}) or {}).get("enabled", False)):
         output_files += 1  # tracking_summary.json
+    tensorrt_artifacts = trainer.estimate_tensorrt_cache_artifacts(config)
+    output_files += int(tensorrt_artifacts["file_count"])
+    estimated_bytes = max(local_bytes, output_files * 500_000) + int(tensorrt_artifacts["bytes"])
     estimate = {
         "output_dir": str(output_dir),
         "sources": len(items),
@@ -462,9 +483,10 @@ def estimate_outputs(items: Sequence[SourceItem], output_dir: Path, config: Mapp
         "video_max_seconds": max_seconds if max_seconds is not None else "all",
         "estimated_video_detection_frames": detection_frames,
         "estimated_video_output_frames": output_frames,
+        "tensorrt_cache": tensorrt_artifacts,
         "estimated_total_files": output_files,
-        "estimated_disk_usage": trainer.format_bytes(max(local_bytes, output_files * 500_000)),
-        "note": "URL sizes and rendered video sizes are estimated before download/encoding.",
+        "estimated_disk_usage": trainer.format_bytes(estimated_bytes),
+        "note": "URL/rendered-video sizes and first-run TensorRT artifacts are conservative estimates.",
     }
     settings = trainer.runtime_time_estimate_settings(config)
     render_seconds = output_frames * trainer.positive_float_setting(settings, "default_video_render_seconds_per_frame")
@@ -482,7 +504,7 @@ def estimate_outputs(items: Sequence[SourceItem], output_dir: Path, config: Mapp
             "video_output_frames": output_frames,
             "video_work": video_work,
         },
-        extra_seconds=render_seconds,
+        extra_seconds=render_seconds + float(tensorrt_artifacts.get("estimated_build_seconds", 0) or 0),
     )
     return estimate
 
@@ -646,6 +668,7 @@ def build_prediction_config(config: Mapping[str, Any], categories: Sequence[Mapp
             "confidence_threshold": float(model.get("confidence_threshold", 0.25)),
             "image_size": model.get("resolution"),
             "category_remapping": model.get("category_remapping", {}),
+            "inference_optimization": dict(model.get("inference_optimization", {}) or {}),
         },
         "inference": {"mode": mode, "use_sahi": mode == "sahi", "batch_size": inference_batch_size(config)},
         "test_mode": {"mode": mode},
@@ -685,6 +708,52 @@ def filter_final_inference_predictions(
     ]
 
 
+def record_inference_timing_rows(model: Any, rows: Sequence[Mapping[str, Any]]) -> None:
+    """Attach evaluator timing rows to the predictor for the final run summary."""
+    collected = getattr(model, "_rf_detr_inference_timing_rows", None)
+    if not isinstance(collected, list):
+        collected = []
+        try:
+            setattr(model, "_rf_detr_inference_timing_rows", collected)
+        except (AttributeError, TypeError):
+            # Some lightweight third-party predictors (and test doubles) do not
+            # expose an instance dictionary. Prediction must remain usable even
+            # when optional run-level timing cannot be attached to that object.
+            return
+    collected.extend(dict(row) for row in rows if isinstance(row, Mapping))
+
+
+def summarize_inference_timing_rows(model: Any) -> Dict[str, Any]:
+    """Aggregate per-image evaluator timing into stable stage totals and ratios."""
+    rows = getattr(model, "_rf_detr_inference_timing_rows", [])
+    if not isinstance(rows, list):
+        rows = []
+
+    def total(key: str) -> float:
+        return sum(float(row.get(key, 0.0) or 0.0) for row in rows if isinstance(row, Mapping))
+
+    elapsed = total("elapsed_seconds")
+    model_forward = total("model_forward_seconds")
+    base_forward = total("base_model_forward_seconds")
+    sahi_forward = total("sahi_model_forward_seconds")
+    recheck_forward = total("recheck_model_forward_seconds")
+    preprocess = total("preprocess_seconds")
+    postprocess = total("postprocess_seconds")
+    return {
+        "images_or_frames": len(rows),
+        "total_seconds": elapsed,
+        "model_forward_seconds": model_forward,
+        "base_model_forward_seconds": base_forward,
+        "sahi_model_forward_seconds": sahi_forward,
+        "recheck_model_forward_seconds": recheck_forward,
+        "preprocess_seconds": preprocess,
+        "postprocess_seconds": postprocess,
+        "model_forward_ratio": model_forward / elapsed if elapsed > 0 else 0.0,
+        "sahi_model_forward_ratio": sahi_forward / elapsed if elapsed > 0 else 0.0,
+        "recheck_model_forward_ratio": recheck_forward / elapsed if elapsed > 0 else 0.0,
+    }
+
+
 def load_rfdetr_model(config: Mapping[str, Any]) -> Any:
     model_cls = trainer.get_model_class(str(config.get("model", {}).get("size", "medium")))
     rf_model = model_cls(**trainer.build_model_kwargs(config))
@@ -693,7 +762,12 @@ def load_rfdetr_model(config: Mapping[str, Any]) -> Any:
         from rf_detr_motion import attach_motion_module
 
         attach_motion_module(rf_model.model, motion_config)
-    return rf_model
+    accelerated_model, _ = trainer.configure_rfdetr_inference_acceleration(
+        rf_model,
+        config,
+        device=str(config.get("model", {}).get("device", "auto")),
+    )
+    return accelerated_model
 
 
 def resolved_tracker_device(config: Mapping[str, Any], tracking_config: Any) -> str:
@@ -803,7 +877,8 @@ def predict_image_file(
     with Image.open(item.local_path) as image:
         width, height = image.size
     record = evaluator.ImageRecord(image_id=image_id, file_name=item.local_path.name, path=str(item.local_path), width=width, height=height)
-    predictions, _, _ = evaluator.predict_image(record, model, prediction_config, output_dir, save_visual=False)
+    predictions, timing, _ = evaluator.predict_image(record, model, prediction_config, output_dir, save_visual=False)
+    record_inference_timing_rows(model, [timing])
     predictions = filter_final_inference_predictions(predictions, prediction_config)
     with Image.open(item.local_path) as image:
         rendered = draw_predictions(image, predictions, categories, render_ids)
@@ -850,7 +925,8 @@ def predict_image_files_batch(
             )
         )
     batch_config = prediction_config_with_batch(prediction_config, batch_size)
-    predictions_by_image, _, _ = evaluator.predict_images_rfdetr(records, model, batch_config, output_dir)
+    predictions_by_image, timing_rows, _ = evaluator.predict_images_rfdetr(records, model, batch_config, output_dir)
+    record_inference_timing_rows(model, timing_rows)
     image_dir = output_dir / "images"
     image_dir.mkdir(parents=True, exist_ok=True)
     all_rows: List[Dict[str, Any]] = []
@@ -959,7 +1035,10 @@ def predict_video_file_one_pass(
                     width=width,
                     height=height,
                 )
-                frame_predictions, _, _ = evaluator.predict_image(record, model, prediction_config, output_dir, save_visual=False)
+                frame_predictions, timing, _ = evaluator.predict_image(
+                    record, model, prediction_config, output_dir, save_visual=False
+                )
+                record_inference_timing_rows(model, [timing])
                 frame_predictions = filter_final_inference_predictions(frame_predictions, prediction_config)
                 if tracker is not None:
                     frame_predictions = tracker.update(absolute_frame_index, frame_predictions, frame=frame)
@@ -1045,7 +1124,10 @@ def predict_video_file_batched(
         nonlocal pending_records, pending_meta
         if not pending_records:
             return
-        predictions_by_frame, _, _ = evaluator.predict_images_rfdetr(pending_records, model, batch_config, output_dir)
+        predictions_by_frame, timing_rows, _ = evaluator.predict_images_rfdetr(
+            pending_records, model, batch_config, output_dir
+        )
+        record_inference_timing_rows(model, timing_rows)
         for record, meta, frame_predictions in zip(pending_records, pending_meta, predictions_by_frame):
             predictions_by_segment[int(meta["segment_frame_index"])] = filter_final_inference_predictions(
                 frame_predictions,
@@ -1222,6 +1304,23 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
     parser.add_argument("--checkpoint", help="RF-DETR checkpoint/pretrain_weights override.")
     parser.add_argument("--device", help="Device override: auto, cpu, cuda, cuda:0, 0, 1.")
     parser.add_argument("--confidence-threshold", type=float, help="Model confidence threshold override.")
+    parser.add_argument(
+        "--inference-backend",
+        choices=["pytorch", "tensorrt"],
+        help="Inference backend override. PyTorch FP32 remains the default.",
+    )
+    parser.add_argument(
+        "--inference-precision",
+        choices=["fp32", "fp16", "bf16"],
+        help="Precision for the active inference backend.",
+    )
+    parser.add_argument("--tensorrt-engine", help="Trusted TensorRT engine path; requires a compatible manifest.")
+    parser.add_argument("--tensorrt-cache-dir", help="TensorRT ONNX/engine cache directory override.")
+    parser.add_argument(
+        "--tensorrt-force-rebuild",
+        action="store_true",
+        help="Ignore a matching automatic TensorRT cache entry and rebuild it.",
+    )
     parser.add_argument("--max-sources", type=trainer.parse_scalar, help="Maximum discovered sources to run. Use all/null for all.")
     parser.add_argument("--max-images", type=trainer.parse_scalar, help="Maximum image sources to run. Use all/null for all.")
     parser.add_argument("--max-videos", type=trainer.parse_scalar, help="Maximum video sources to run. Use all/null for all.")
@@ -1245,9 +1344,11 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
         source_config = (Path.cwd() / source_config).resolve()
     config = load_yaml(source_config)
     apply_cli_overrides(config, args)
+    trainer.validate_inference_acceleration_config(config)
     verbose = bool(config.get("runtime", {}).get("verbose", True))
     if timing_context is not None:
         timing_context["verbose"] = verbose
+        timing_context["execution_profile"] = trainer.inference_execution_profile(config)
     timestamp = datetime.now().strftime(TIMESTAMP_FORMAT)
     output_dir = build_output_dir(config, timestamp)
     if timing_context is not None:
@@ -1264,6 +1365,10 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
     confirm = bool(config.get("runtime", {}).get("confirm_before_run", True))
     assume_yes = bool(config.get("runtime", {}).get("yes", False) or args.yes or not confirm)
     confirm_or_exit(estimate, verbose, assume_yes)
+    trainer.preflight_rfdetr_inference_acceleration(
+        config,
+        device=config.get("model", {}).get("device"),
+    )
     if bool(config.get("runtime", {}).get("dry_run", False)):
         return 0
 
@@ -1271,11 +1376,25 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
     if timing_context is not None:
         timing_context["outputs_created"] = True
     trainer.start_run_log_capture(output_dir, "inference", timing_context)
+    trainer.dump_config_snapshot(
+        output_dir=output_dir,
+        merged_config=config,
+        metadata={
+            "event": "inference_start",
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "source_count": len(items),
+            "execution_profile": trainer.inference_execution_profile(config),
+        },
+        source_config=source_config,
+    )
     cache_dir = output_dir / "source_cache"
     resolved_items = [download_url(item, cache_dir) if item.is_url else item for item in items]
     categories = build_categories(config)
     prediction_config = build_prediction_config(config, categories)
     model = load_rfdetr_model(config)
+    if timing_context is not None:
+        acceleration_handle = trainer.get_inference_acceleration_handle(model)
+        timing_context["acceleration"] = dict(acceleration_handle.metadata)
     render_ids = resolve_render_ids(config, categories)
     tracking_config = video_tracking.parse_tracking_config(config, categories)
     tracker_device = resolved_tracker_device(config, tracking_config)
@@ -1327,13 +1446,34 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
     trainer.write_json(output_dir / "class_colors.json", {"categories": categories, "colors": colors})
     if bool(config.get("inference", {}).get("save_predictions_jsonl", True)):
         write_predictions_jsonl(output_dir / "predictions.jsonl", all_predictions)
-    trainer.write_json(output_dir / "inference_summary.json", {"outputs": outputs, "prediction_count": len(all_predictions)})
+    stage_timing = summarize_inference_timing_rows(model)
+    if timing_context is not None:
+        timing_context["stage_timing"] = stage_timing
+    trainer.write_json(
+        output_dir / "inference_summary.json",
+        {"outputs": outputs, "prediction_count": len(all_predictions), "stage_timing": stage_timing},
+    )
+    if verbose and stage_timing["images_or_frames"]:
+        print(
+            Fore.BLUE
+            + Style.BRIGHT
+            + "Inference timing: "
+            + f"model={stage_timing['model_forward_ratio'] * 100.0:.2f}%, "
+            + f"SAHI={stage_timing['sahi_model_forward_ratio'] * 100.0:.2f}%, "
+            + f"recheck={stage_timing['recheck_model_forward_ratio'] * 100.0:.2f}%."
+        )
     if tracking_config.enabled:
         trainer.write_json(output_dir / "tracking_summary.json", video_tracking.build_tracking_summary(all_predictions))
     trainer.dump_config_snapshot(
         output_dir=output_dir,
         merged_config=config,
-        metadata={"event": "inference", "created_at": datetime.now().isoformat(timespec="seconds"), "outputs": outputs},
+        metadata={
+            "event": "inference",
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "outputs": outputs,
+            "acceleration": dict(trainer.get_inference_acceleration_handle(model).metadata),
+            "stage_timing": stage_timing,
+        },
         source_config=source_config,
     )
     if verbose:

@@ -2172,11 +2172,24 @@ def rfdetr_predict_batches(
     """Run RF-DETR model.predict on input batches with CUDA OOM downshift."""
     detections: List[Any] = []
     timing_rows: List[Dict[str, Any]] = []
+    model_state = getattr(model, "__dict__", None)
+    acceleration_handle = (
+        model_state.get("_rf_detr_acceleration_handle")
+        if isinstance(model_state, dict)
+        else None
+    )
+    consume_forward = getattr(acceleration_handle, "consume_forward_seconds", None)
+    consume_postprocess = getattr(acceleration_handle, "consume_postprocess_seconds", None)
+    stage_aware = callable(consume_forward) and callable(consume_postprocess)
     active_batch_size = max(1, int(batch_size))
     index = 0
+    batch_index = 0
     while index < len(inputs):
         current_size = min(active_batch_size, len(inputs) - index)
         current_inputs = list(inputs[index : index + current_size])
+        if stage_aware:
+            consume_forward()
+            consume_postprocess()
         start = time.perf_counter()
         try:
             with torch_inference_context():
@@ -2197,19 +2210,37 @@ def rfdetr_predict_batches(
                 )
                 continue
             raise
+        model_forward_seconds = float(consume_forward()) if stage_aware else 0.0
+        postprocess_seconds = float(consume_postprocess()) if stage_aware else 0.0
         elapsed = time.perf_counter() - start
+        if not stage_aware:
+            # Compatibility for external predictors that do not expose the
+            # shared acceleration runtime. New RF-DETR paths are stage-aware.
+            model_forward_seconds = elapsed
+        preprocess_seconds = max(0.0, elapsed - model_forward_seconds - postprocess_seconds)
         result_list = normalize_detection_list(result, len(current_inputs))
         per_image_elapsed = elapsed / max(1, len(current_inputs))
+        per_image_forward = model_forward_seconds / max(1, len(current_inputs))
+        per_image_postprocess = postprocess_seconds / max(1, len(current_inputs))
+        per_image_preprocess = preprocess_seconds / max(1, len(current_inputs))
         detections.extend(result_list)
         timing_rows.extend(
             {
                 "elapsed_seconds": per_image_elapsed,
+                "preprocess_seconds": per_image_preprocess,
+                "model_forward_seconds": per_image_forward,
+                "postprocess_seconds": per_image_postprocess,
                 "batch_elapsed_seconds": elapsed,
+                "batch_preprocess_seconds": preprocess_seconds,
+                "batch_model_forward_seconds": model_forward_seconds,
+                "batch_postprocess_seconds": postprocess_seconds,
                 "batch_size": len(current_inputs),
+                "batch_index": batch_index,
             }
             for _ in current_inputs
         )
         index += len(current_inputs)
+        batch_index += 1
     return detections, timing_rows
 
 
@@ -2282,7 +2313,9 @@ def predict_rfdetr_direct_batch(
     predictions_by_image: List[List[Dict[str, Any]]] = []
     stats: List[Dict[str, Any]] = []
     for image, detection, infer_width, infer_height, timing in zip(images, detections, infer_widths, infer_heights, timings):
+        conversion_started = time.perf_counter()
         predictions = rfdetr_detections_to_predictions(detection, image, model_cfg, infer_width, infer_height)
+        conversion_seconds = time.perf_counter() - conversion_started
         predictions_by_image.append(predictions)
         stats.append(
             {
@@ -2291,9 +2324,13 @@ def predict_rfdetr_direct_batch(
                 "width": infer_width,
                 "height": infer_height,
                 "predictions": len(predictions),
-                "elapsed_seconds": timing["elapsed_seconds"],
+                "elapsed_seconds": timing["elapsed_seconds"] + conversion_seconds,
+                "preprocess_seconds": timing.get("preprocess_seconds", 0.0),
+                "model_forward_seconds": timing.get("model_forward_seconds", timing["elapsed_seconds"]),
+                "postprocess_seconds": timing.get("postprocess_seconds", 0.0) + conversion_seconds,
                 "batch_elapsed_seconds": timing["batch_elapsed_seconds"],
                 "batch_size": timing["batch_size"],
+                "batch_index": timing["batch_index"],
                 "inference_engine": engine,
             }
         )
@@ -2537,15 +2574,35 @@ def apply_sahi_recheck_batch(
     recheck_cfg = dict(sahi_cfg.get("recheck", {}) or {})
     if not bool(recheck_cfg.get("enabled", False)):
         return [[dict(prediction) for prediction in predictions] for predictions in predictions_by_image], [
-            {"enabled": False} for _ in predictions_by_image
+            {
+                "enabled": False,
+                "model_forward_seconds": 0.0,
+                "preprocess_seconds": 0.0,
+                "postprocess_seconds": 0.0,
+                "elapsed_seconds": 0.0,
+                "batch_count": 0,
+                "effective_batch_sizes": [],
+            }
+            for _ in predictions_by_image
         ]
 
     target_ids = set(resolve_recheck_target_class_ids(config, recheck_cfg))
     if not target_ids:
         return [[dict(prediction) for prediction in predictions] for predictions in predictions_by_image], [
-            {"enabled": True, "target_class_ids": []} for _ in predictions_by_image
+            {
+                "enabled": True,
+                "target_class_ids": [],
+                "model_forward_seconds": 0.0,
+                "preprocess_seconds": 0.0,
+                "postprocess_seconds": 0.0,
+                "elapsed_seconds": 0.0,
+                "batch_count": 0,
+                "effective_batch_sizes": [],
+            }
+            for _ in predictions_by_image
         ]
 
+    recheck_start = time.perf_counter()
     crop_size = int(recheck_cfg.get("crop_size", max(int(sahi_cfg.get("slice_width", 640)), int(sahi_cfg.get("slice_height", 640)))))
     second_conf = float(recheck_cfg.get("second_confidence_threshold", config["model"].get("confidence_threshold", 0.25)))
     first_weight = float(recheck_cfg.get("first_weight", 0.5))
@@ -2562,6 +2619,12 @@ def apply_sahi_recheck_batch(
             "rechecked": 0,
             "passed": 0,
             "filtered": 0,
+            "model_forward_seconds": 0.0,
+            "preprocess_seconds": 0.0,
+            "postprocess_seconds": 0.0,
+            "elapsed_seconds": 0.0,
+            "batch_count": 0,
+            "effective_batch_sizes": [],
         }
         for _ in predictions_by_image
     ]
@@ -2571,6 +2634,8 @@ def apply_sahi_recheck_batch(
     task_heights: List[int] = []
     task_meta: List[Dict[str, Any]] = []
     rechecked_keys: set = set()
+    batch_indices_by_image: List[set] = [set() for _ in predictions_by_image]
+    batch_sizes_by_image: List[set] = [set() for _ in predictions_by_image]
 
     for image_index, (image, source_rgb, predictions) in enumerate(zip(images, source_rgbs, predictions_by_image)):
         indexed_targets = [
@@ -2608,7 +2673,7 @@ def apply_sahi_recheck_batch(
 
     passed_rows: Dict[Tuple[int, int], Dict[str, Any]] = {}
     if task_records:
-        second_predictions_by_task, _ = predict_rfdetr_direct_batch(
+        second_predictions_by_task, second_stats_by_task = predict_rfdetr_direct_batch(
             task_records,
             model,
             config,
@@ -2619,12 +2684,23 @@ def apply_sahi_recheck_batch(
             batch_size=rfdetr_sahi_batch_size(config),
             engine="rfdetr_recheck",
         )
-        for meta, second_predictions in zip(task_meta, second_predictions_by_task):
+        for meta, second_predictions, second_stat in zip(task_meta, second_predictions_by_task, second_stats_by_task):
             image_index = int(meta["image_index"])
             prediction_index = int(meta["prediction_index"])
             image = images[image_index]
             first_prediction = meta["first_prediction"]
             x, y, width, height = meta["crop"]
+            stats[image_index]["model_forward_seconds"] += float(
+                second_stat.get("model_forward_seconds", second_stat.get("elapsed_seconds", 0.0))
+            )
+            stats[image_index]["preprocess_seconds"] += float(second_stat.get("preprocess_seconds", 0.0))
+            stats[image_index]["postprocess_seconds"] += float(second_stat.get("postprocess_seconds", 0.0))
+            batch_index = second_stat.get("batch_index")
+            if isinstance(batch_index, int) and not isinstance(batch_index, bool) and batch_index >= 0:
+                batch_indices_by_image[image_index].add(batch_index)
+            batch_size = second_stat.get("batch_size")
+            if isinstance(batch_size, int) and not isinstance(batch_size, bool) and batch_size > 0:
+                batch_sizes_by_image[image_index].add(batch_size)
             projected = shared_modes.project_predictions_to_original(second_predictions, x, y, image.width, image.height)
             matching = [
                 item
@@ -2664,6 +2740,30 @@ def apply_sahi_recheck_batch(
                 continue
             output_predictions.append(dict(prediction))
         output_by_image.append(output_predictions)
+
+    recheck_elapsed = time.perf_counter() - recheck_start
+    known_stage_seconds = sum(
+        float(row["model_forward_seconds"])
+        + float(row["preprocess_seconds"])
+        + float(row["postprocess_seconds"])
+        for row in stats
+    )
+    non_model_seconds = max(0.0, recheck_elapsed - known_stage_seconds)
+    allocation_weights = [int(row["rechecked"]) for row in stats]
+    total_weight = sum(allocation_weights)
+    if total_weight <= 0:
+        allocation_weights = [1 for _ in stats]
+        total_weight = len(allocation_weights)
+    for image_index, row in enumerate(stats):
+        extra_postprocess = non_model_seconds * allocation_weights[image_index] / max(1, total_weight)
+        row["postprocess_seconds"] = float(row["postprocess_seconds"]) + extra_postprocess
+        row["elapsed_seconds"] = (
+            float(row["preprocess_seconds"])
+            + float(row["model_forward_seconds"])
+            + float(row["postprocess_seconds"])
+        )
+        row["batch_count"] = len(batch_indices_by_image[image_index])
+        row["effective_batch_sizes"] = sorted(batch_sizes_by_image[image_index])
     return output_by_image, stats
 
 
@@ -2687,13 +2787,32 @@ def predict_images_rfdetr_full(
     batch_size: Optional[int] = None,
 ) -> Tuple[List[List[Dict[str, Any]]], List[Dict[str, Any]]]:
     """Run batched RF-DETR full-image inference."""
-    return predict_rfdetr_direct_batch(
+    predictions_by_image, stats = predict_rfdetr_direct_batch(
         images,
         model,
         config,
         batch_size=batch_size or rfdetr_image_batch_size(config),
         engine="rfdetr",
     )
+    for stat in stats:
+        elapsed_seconds = float(stat.get("elapsed_seconds", 0.0))
+        model_forward_seconds = float(stat.get("model_forward_seconds", elapsed_seconds))
+        preprocess_seconds = float(stat.get("preprocess_seconds", 0.0))
+        postprocess_seconds = float(stat.get("postprocess_seconds", 0.0))
+        stat.update(
+            {
+                "base_model_forward_seconds": model_forward_seconds,
+                "sahi_model_forward_seconds": 0.0,
+                "recheck_model_forward_seconds": 0.0,
+                "model_forward_seconds": model_forward_seconds,
+                "preprocess_seconds": preprocess_seconds,
+                "postprocess_seconds": postprocess_seconds,
+                "model_forward_ratio": model_forward_seconds / elapsed_seconds if elapsed_seconds > 0.0 else 0.0,
+                "sahi_model_forward_ratio": 0.0,
+                "recheck_model_forward_ratio": 0.0,
+            }
+        )
+    return predictions_by_image, stats
 
 
 def predict_images_rfdetr_sahi(
@@ -2704,6 +2823,7 @@ def predict_images_rfdetr_sahi(
     """Run batched direct RF-DETR SAHI-style sliced prediction."""
     if not images:
         return [], []
+    sahi_started = time.perf_counter()
     sahi_cfg = config["sahi"]
     slice_batch_size = rfdetr_sahi_batch_size(config)
     windows_by_image: List[List[Tuple[int, int, int, int]]] = []
@@ -2734,7 +2854,9 @@ def predict_images_rfdetr_sahi(
             task_heights.append(height)
             task_meta.append((image_index, x, y, width, height))
 
-    elapsed_by_image = [0.0 for _ in images]
+    sahi_model_forward_by_image = [0.0 for _ in images]
+    base_model_forward_by_image = [0.0 for _ in images]
+    model_postprocess_by_image = [0.0 for _ in images]
     all_predictions: List[List[Dict[str, Any]]] = [[] for _ in images]
     if task_records:
         slice_predictions_by_task, slice_stats = predict_rfdetr_direct_batch(
@@ -2753,7 +2875,10 @@ def predict_images_rfdetr_sahi(
             all_predictions[image_index].extend(
                 shared_modes.project_predictions_to_original(crop_predictions, x, y, image.width, image.height)
             )
-            elapsed_by_image[image_index] += float(stat.get("elapsed_seconds", 0.0))
+            sahi_model_forward_by_image[image_index] += float(
+                stat.get("model_forward_seconds", stat.get("elapsed_seconds", 0.0))
+            )
+            model_postprocess_by_image[image_index] += float(stat.get("postprocess_seconds", 0.0))
 
     if bool(sahi_cfg.get("standard_prediction", True)):
         full_predictions_by_image, full_stats = predict_rfdetr_direct_batch(
@@ -2765,7 +2890,10 @@ def predict_images_rfdetr_sahi(
         )
         for image_index, (full_predictions, stat) in enumerate(zip(full_predictions_by_image, full_stats)):
             all_predictions[image_index].extend(full_predictions)
-            elapsed_by_image[image_index] += float(stat.get("elapsed_seconds", 0.0))
+            base_model_forward_by_image[image_index] += float(
+                stat.get("model_forward_seconds", stat.get("elapsed_seconds", 0.0))
+            )
+            model_postprocess_by_image[image_index] += float(stat.get("postprocess_seconds", 0.0))
 
     postprocess_start = time.perf_counter()
     postprocessed: List[List[Dict[str, Any]]] = []
@@ -2779,13 +2907,39 @@ def predict_images_rfdetr_sahi(
                 class_agnostic=bool(sahi_cfg.get("postprocess_class_agnostic", False)),
             )
         )
-    postprocess_elapsed = (time.perf_counter() - postprocess_start) / max(1, len(images))
+    postprocess_elapsed = time.perf_counter() - postprocess_start
     recheck_stats: List[Dict[str, Any]] = [{"enabled": False} for _ in images]
     if bool(dict(sahi_cfg.get("recheck", {}) or {}).get("enabled", False)):
         postprocessed, recheck_stats = apply_sahi_recheck_batch(images, model, config, source_rgbs, postprocessed)
 
+    total_sahi_elapsed = time.perf_counter() - sahi_started
+    known_stage_total = (
+        sum(base_model_forward_by_image)
+        + sum(sahi_model_forward_by_image)
+        + sum(float(row.get("model_forward_seconds", 0.0)) for row in recheck_stats)
+        + sum(model_postprocess_by_image)
+        + postprocess_elapsed
+        + sum(float(row.get("postprocess_seconds", 0.0)) for row in recheck_stats)
+    )
+    preprocess_per_image = max(0.0, total_sahi_elapsed - known_stage_total) / max(1, len(images))
     stats: List[Dict[str, Any]] = []
     for image_index, image in enumerate(images):
+        recheck_model_forward_seconds = float(recheck_stats[image_index].get("model_forward_seconds", 0.0))
+        recheck_postprocess_seconds = float(recheck_stats[image_index].get("postprocess_seconds", 0.0))
+        base_model_forward_seconds = base_model_forward_by_image[image_index]
+        sahi_model_forward_seconds = sahi_model_forward_by_image[image_index]
+        model_forward_seconds = (
+            base_model_forward_seconds
+            + sahi_model_forward_seconds
+            + recheck_model_forward_seconds
+        )
+        total_postprocess_seconds = (
+            model_postprocess_by_image[image_index]
+            + postprocess_elapsed / max(1, len(images))
+            + recheck_postprocess_seconds
+        )
+        preprocess_seconds = preprocess_per_image
+        elapsed_seconds = preprocess_seconds + model_forward_seconds + total_postprocess_seconds
         stats.append(
             {
                 "image_id": image.image_id,
@@ -2793,11 +2947,20 @@ def predict_images_rfdetr_sahi(
                 "width": image.width,
                 "height": image.height,
                 "predictions": len(postprocessed[image_index]),
-                "elapsed_seconds": elapsed_by_image[image_index] + postprocess_elapsed,
+                "elapsed_seconds": elapsed_seconds,
                 "inference_engine": "direct_sahi",
                 "slice_count": len(windows_by_image[image_index]),
                 "slice_batch_size": slice_batch_size,
                 "sahi_recheck": recheck_stats[image_index],
+                "base_model_forward_seconds": base_model_forward_seconds,
+                "sahi_model_forward_seconds": sahi_model_forward_seconds,
+                "recheck_model_forward_seconds": recheck_model_forward_seconds,
+                "model_forward_seconds": model_forward_seconds,
+                "preprocess_seconds": preprocess_seconds,
+                "postprocess_seconds": total_postprocess_seconds,
+                "model_forward_ratio": model_forward_seconds / elapsed_seconds if elapsed_seconds > 0.0 else 0.0,
+                "sahi_model_forward_ratio": sahi_model_forward_seconds / elapsed_seconds if elapsed_seconds > 0.0 else 0.0,
+                "recheck_model_forward_ratio": recheck_model_forward_seconds / elapsed_seconds if elapsed_seconds > 0.0 else 0.0,
             }
         )
     return postprocessed, stats
@@ -2811,6 +2974,7 @@ def predict_images_rfdetr_class_crop(
     """Run batched RF-DETR class-crop inference."""
     if not images:
         return [], []
+    class_crop_started = time.perf_counter()
     crop_cfg = shared_modes.default_crop_config(config)
     source_predictions_by_image, source_stats = predict_rfdetr_direct_batch(
         images,
@@ -2828,6 +2992,16 @@ def predict_images_rfdetr_class_crop(
     crop_widths: List[int] = []
     crop_heights: List[int] = []
     crop_meta: List[Dict[str, Any]] = []
+
+    def include_source_stages(stat: MutableMapping[str, Any], source_stat: Mapping[str, Any]) -> None:
+        for key in ("preprocess_seconds", "model_forward_seconds", "postprocess_seconds"):
+            source_fallback = source_stat.get("elapsed_seconds", 0.0) if key == "model_forward_seconds" else 0.0
+            stat_fallback = stat.get("elapsed_seconds", 0.0) if key == "model_forward_seconds" else 0.0
+            stat[key] = float(source_stat.get(key, source_fallback)) + float(stat.get(key, stat_fallback))
+        stat["elapsed_seconds"] = sum(
+            float(stat.get(key, 0.0))
+            for key in ("preprocess_seconds", "model_forward_seconds", "postprocess_seconds")
+        )
 
     for image_index, (image, source_predictions) in enumerate(zip(images, source_predictions_by_image)):
         window = shared_modes.select_crop_window_from_predictions(
@@ -2869,9 +3043,9 @@ def predict_images_rfdetr_class_crop(
         )
         for image_index, predictions, stat in zip(fallback_indices, fallback_predictions_by_image, fallback_stats):
             image = images[image_index]
+            include_source_stages(stat, source_stats[image_index])
             stat.update(
                 {
-                    "elapsed_seconds": float(source_stats[image_index].get("elapsed_seconds", 0.0)) + float(stat.get("elapsed_seconds", 0.0)),
                     "test_mode": "class_crop",
                     "model_input_type": "full_image",
                     "crop_fallback": True,
@@ -2902,12 +3076,12 @@ def predict_images_rfdetr_class_crop(
             crop_x = int(meta["crop_x"])
             crop_y = int(meta["crop_y"])
             projected = shared_modes.project_predictions_to_original(crop_predictions, crop_x, crop_y, image.width, image.height)
+            include_source_stages(stat, source_stats[image_index])
             stat.update(
                 {
                     "width": image.width,
                     "height": image.height,
                     "predictions": len(projected),
-                    "elapsed_seconds": float(source_stats[image_index].get("elapsed_seconds", 0.0)) + float(stat.get("elapsed_seconds", 0.0)),
                     "test_mode": "class_crop",
                     "model_input_type": "class_crop",
                     "crop_fallback": False,
@@ -2921,7 +3095,7 @@ def predict_images_rfdetr_class_crop(
             output_predictions[image_index] = projected
             output_stats[image_index] = stat
 
-    return [predictions or [] for predictions in output_predictions], [
+    resolved_stats = [
         stat or {
             "image_id": image.image_id,
             "file_name": image.file_name,
@@ -2929,11 +3103,46 @@ def predict_images_rfdetr_class_crop(
             "height": image.height,
             "predictions": 0,
             "elapsed_seconds": float(source_stats[index].get("elapsed_seconds", 0.0)),
+            "preprocess_seconds": float(source_stats[index].get("preprocess_seconds", 0.0)),
+            "model_forward_seconds": float(
+                source_stats[index].get("model_forward_seconds", source_stats[index].get("elapsed_seconds", 0.0))
+            ),
+            "postprocess_seconds": float(source_stats[index].get("postprocess_seconds", 0.0)),
             "inference_engine": "rfdetr_class_crop",
             "test_mode": "class_crop",
         }
         for index, (image, stat) in enumerate(zip(images, output_stats))
     ]
+    known_stage_seconds = sum(
+        float(stat.get("preprocess_seconds", 0.0))
+        + float(stat.get("model_forward_seconds", stat.get("elapsed_seconds", 0.0)))
+        + float(stat.get("postprocess_seconds", 0.0))
+        for stat in resolved_stats
+    )
+    extra_preprocess_per_image = max(
+        0.0,
+        time.perf_counter() - class_crop_started - known_stage_seconds,
+    ) / max(1, len(resolved_stats))
+    for stat in resolved_stats:
+        model_forward_seconds = float(stat.get("model_forward_seconds", stat.get("elapsed_seconds", 0.0)))
+        preprocess_seconds = float(stat.get("preprocess_seconds", 0.0)) + extra_preprocess_per_image
+        postprocess_seconds = float(stat.get("postprocess_seconds", 0.0))
+        elapsed_seconds = preprocess_seconds + model_forward_seconds + postprocess_seconds
+        stat.update(
+            {
+                "base_model_forward_seconds": model_forward_seconds,
+                "sahi_model_forward_seconds": 0.0,
+                "recheck_model_forward_seconds": 0.0,
+                "model_forward_seconds": model_forward_seconds,
+                "preprocess_seconds": preprocess_seconds,
+                "postprocess_seconds": postprocess_seconds,
+                "elapsed_seconds": elapsed_seconds,
+                "model_forward_ratio": model_forward_seconds / elapsed_seconds if elapsed_seconds > 0.0 else 0.0,
+                "sahi_model_forward_ratio": 0.0,
+                "recheck_model_forward_ratio": 0.0,
+            }
+        )
+    return [predictions or [] for predictions in output_predictions], resolved_stats
 
 
 def predict_images_rfdetr(
@@ -3075,6 +3284,17 @@ def inference_worker(
     model_load_start = time.perf_counter()
     inference_model = build_inference_model(config, device)
     model_load_seconds = time.perf_counter() - model_load_start
+    model_state = getattr(inference_model, "__dict__", None)
+    acceleration_handle = (
+        model_state.get("_rf_detr_acceleration_handle")
+        if isinstance(model_state, dict)
+        else None
+    )
+    acceleration_metadata = getattr(acceleration_handle, "metadata", None)
+    if isinstance(acceleration_metadata, Mapping):
+        acceleration_metadata = dict(acceleration_metadata)
+    else:
+        acceleration_metadata = None
     visual_ids = set(int(image_id) for image_id in visual_image_ids)
     all_predictions: List[Dict[str, Any]] = []
     all_stats: List[Dict[str, Any]] = []
@@ -3127,6 +3347,7 @@ def inference_worker(
         "model_load_seconds": model_load_seconds,
         "inference_seconds": inference_seconds,
         "effective_batch_sizes": sorted(effective_batch_sizes),
+        "acceleration": acceleration_metadata,
         "status": "success",
         "error": None,
     }
@@ -3181,6 +3402,7 @@ def _failed_parallel_assignment(plan: Mapping[str, Any], error: Exception) -> Di
         "model_load_seconds": 0.0,
         "inference_seconds": 0.0,
         "effective_batch_sizes": [],
+        "acceleration": None,
         "status": "failed",
         "error": {"type": type(error).__name__, "message": str(error)},
     }
@@ -3285,6 +3507,11 @@ def _validate_parallel_worker_result(
             )
     normalized_batch_sizes = sorted(set(effective_batch_sizes))
 
+    acceleration = result.get("acceleration")
+    if acceleration is not None and not isinstance(acceleration, Mapping):
+        raise ValueError("worker result acceleration must be a mapping or null.")
+    normalized_acceleration = dict(acceleration) if isinstance(acceleration, Mapping) else None
+
     error_info = result.get("error")
     if status == "success":
         if error_info is not None:
@@ -3306,6 +3533,7 @@ def _validate_parallel_worker_result(
         "model_load_seconds": times["model_load_seconds"],
         "inference_seconds": times["inference_seconds"],
         "effective_batch_sizes": normalized_batch_sizes,
+        "acceleration": normalized_acceleration,
         "status": status,
         "error": normalized_error,
     }
@@ -4096,6 +4324,61 @@ def write_table(path: Path, rows: Sequence[Mapping[str, Any]], metadata: Mapping
         writer.writeheader()
         for row in rows:
             writer.writerow({**metadata, **dict(row)})
+
+
+def summarize_inference_timing(stats_rows: Sequence[Mapping[str, Any]]) -> Dict[str, float]:
+    """Summarize additive RF-DETR stage timings without changing legacy timing keys."""
+    if not stats_rows:
+        return {"avg_inference_seconds_per_image": 0.0}
+
+    elapsed_values = [float(row.get("elapsed_seconds", 0.0)) for row in stats_rows]
+    summary = {
+        "avg_inference_seconds_per_image": float(np.mean(elapsed_values)),
+    }
+    if not any("model_forward_seconds" in row for row in stats_rows):
+        return summary
+
+    stage_fields = (
+        "preprocess_seconds",
+        "base_model_forward_seconds",
+        "sahi_model_forward_seconds",
+        "recheck_model_forward_seconds",
+        "model_forward_seconds",
+        "postprocess_seconds",
+    )
+    stage_totals = {
+        field: sum(float(row.get(field, 0.0)) for row in stats_rows)
+        for field in stage_fields
+    }
+    image_count = len(stats_rows)
+    summary.update(
+        {
+            "avg_preprocess_seconds_per_image": stage_totals["preprocess_seconds"] / image_count,
+            "avg_base_model_forward_seconds_per_image": stage_totals["base_model_forward_seconds"] / image_count,
+            "avg_sahi_model_forward_seconds_per_image": stage_totals["sahi_model_forward_seconds"] / image_count,
+            "avg_recheck_model_forward_seconds_per_image": stage_totals["recheck_model_forward_seconds"] / image_count,
+            "avg_model_forward_seconds_per_image": stage_totals["model_forward_seconds"] / image_count,
+            "avg_postprocess_seconds_per_image": stage_totals["postprocess_seconds"] / image_count,
+        }
+    )
+    total_elapsed = sum(elapsed_values)
+    if total_elapsed > 0.0:
+        summary.update(
+            {
+                "model_forward_ratio": stage_totals["model_forward_seconds"] / total_elapsed,
+                "sahi_model_forward_ratio": stage_totals["sahi_model_forward_seconds"] / total_elapsed,
+                "recheck_model_forward_ratio": stage_totals["recheck_model_forward_seconds"] / total_elapsed,
+            }
+        )
+    else:
+        summary.update(
+            {
+                "model_forward_ratio": 0.0,
+                "sahi_model_forward_ratio": 0.0,
+                "recheck_model_forward_ratio": 0.0,
+            }
+        )
+    return summary
 
 
 def write_metrics_tables(
@@ -4984,7 +5267,7 @@ def run_evaluation(
         "dataset_case_samples": len(dataset_case_rows),
         "visual_samples": len(visual_rows),
         "error_case_samples": len(error_case_rows),
-        "avg_inference_seconds_per_image": float(np.mean([row["elapsed_seconds"] for row in stats_rows])) if stats_rows else 0.0,
+        **summarize_inference_timing(stats_rows),
     }
 
     cat_name = {int(category["id"]): str(category.get("name", category["id"])) for category in dataset.categories}
@@ -5092,6 +5375,7 @@ def run_evaluation(
         "per_image": per_image_rows,
         "stats": stats_rows,
         "predictions": predictions,
+        "parallel_summary": parallel_summary,
         "manifest": manifest,
     }
 
@@ -5270,7 +5554,7 @@ Example usage:
         "inference_engine": engine,
         "dataset_case_samples": len(dataset_case_rows),
         "visual_samples": len(visual_rows),
-        "avg_inference_seconds_per_image": float(np.mean([row["elapsed_seconds"] for row in stats_rows])) if stats_rows else 0.0,
+        **summarize_inference_timing(stats_rows),
     }
 
     cat_name = {int(category["id"]): str(category.get("name", category["id"])) for category in dataset.categories}

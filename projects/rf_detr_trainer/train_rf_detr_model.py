@@ -829,8 +829,117 @@ def positive_float_setting(settings: Mapping[str, Any], key: str) -> float:
     return parsed
 
 
-def load_latest_timing_history(output_root: Path, task: str) -> Optional[Dict[str, Any]]:
-    """Load the newest sibling run_timing.json for a task."""
+def inference_execution_profile(config: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return the stable backend/model profile used to partition timing history."""
+    model = config.get("model", {})
+    if not isinstance(model, Mapping):
+        model = {}
+    optimization = model.get("inference_optimization", {})
+    if not isinstance(optimization, Mapping):
+        optimization = {}
+    backend = str(optimization.get("backend", "pytorch")).strip().lower()
+    backend_settings = optimization.get(backend, {})
+    if not isinstance(backend_settings, Mapping):
+        backend_settings = {}
+    default_precision = "fp32" if backend == "pytorch" else "fp16"
+    batch_values: List[int] = []
+
+    def add_batch(value: Any) -> None:
+        if isinstance(value, bool):
+            return
+        with contextlib.suppress(TypeError, ValueError):
+            parsed = int(value)
+            if parsed > 0:
+                batch_values.append(parsed)
+
+    test_settings = config.get("test", {})
+    if not isinstance(test_settings, Mapping):
+        test_settings = {}
+    inference_settings = config.get("inference", {})
+    if not isinstance(inference_settings, Mapping):
+        inference_settings = {}
+
+    if test_settings:
+        test_mode_settings = test_settings.get("test_mode", config.get("test_mode", {}))
+        if not isinstance(test_mode_settings, Mapping):
+            test_mode_settings = {}
+        workload_mode = str(test_mode_settings.get("mode", "full_image")).strip().lower()
+        sahi_settings = test_settings.get("sahi", config.get("sahi", {}))
+        if not isinstance(sahi_settings, Mapping):
+            sahi_settings = {}
+        if workload_mode == "sahi":
+            add_batch(sahi_settings.get("batch_size") or test_settings.get("batch_size"))
+        else:
+            add_batch(test_settings.get("batch_size"))
+    else:
+        workload_mode = str(inference_settings.get("mode", "full_image")).strip().lower()
+        test_mode_settings = {}
+        sahi_settings = config.get("sahi", {})
+        if not isinstance(sahi_settings, Mapping):
+            sahi_settings = {}
+        if workload_mode == "sahi":
+            add_batch(sahi_settings.get("batch_size") or inference_settings.get("batch_size"))
+        else:
+            add_batch(inference_settings.get("batch_size"))
+            video_settings = inference_settings.get("video", {})
+            if isinstance(video_settings, Mapping):
+                add_batch(video_settings.get("batch_size") or inference_settings.get("batch_size"))
+
+    recheck_settings = sahi_settings.get("recheck", {})
+    if not isinstance(recheck_settings, Mapping):
+        recheck_settings = {}
+
+    automatic_opt_batch = batch_values[0] if batch_values else 1
+    automatic_max_batch = max(batch_values, default=1)
+    trt_settings = optimization.get("tensorrt", {})
+    if not isinstance(trt_settings, Mapping):
+        trt_settings = {}
+    configured_profile = trt_settings.get("profile", {})
+    if not isinstance(configured_profile, Mapping):
+        configured_profile = {}
+
+    def resolved_profile_value(key: str, default: int) -> Any:
+        value = configured_profile.get(key, default)
+        if value is None or (isinstance(value, str) and value.strip().lower() == "auto"):
+            return default
+        return value
+
+    extra_model_args = model.get("extra_model_args", {})
+    if not isinstance(extra_model_args, Mapping):
+        extra_model_args = {}
+    return {
+        "backend": backend,
+        "precision": str(backend_settings.get("precision", default_precision)).strip().lower(),
+        "model_size": str(model.get("size", "medium")),
+        "resolution": model.get("resolution") or "default",
+        "checkpoint": str(model.get("pretrain_weights") or "default"),
+        "num_classes": model.get("num_classes") or "checkpoint",
+        "segmentation_head": bool(extra_model_args.get("segmentation_head", False)),
+        "p2": json_safe_value(model.get("p2", {}) or {}),
+        "motion": json_safe_value(model.get("motion", {}) or {}),
+        "tensorrt_profile": {
+            "min_batch_size": resolved_profile_value("min_batch_size", 1),
+            "opt_batch_size": resolved_profile_value("opt_batch_size", automatic_opt_batch),
+            "max_batch_size": resolved_profile_value("max_batch_size", automatic_max_batch),
+        },
+        "workload": {
+            "test_mode": workload_mode,
+            "batch_sizes": sorted(set(batch_values)) or [1],
+            "sahi_slice_height": sahi_settings.get("slice_height"),
+            "sahi_slice_width": sahi_settings.get("slice_width"),
+            "sahi_standard_prediction": bool(sahi_settings.get("standard_prediction", False)),
+            "recheck_enabled": bool(recheck_settings.get("enabled", False)),
+            "recheck_crop_size": recheck_settings.get("crop_size"),
+        },
+    }
+
+
+def load_latest_timing_history(
+    output_root: Path,
+    task: str,
+    execution_profile: Optional[Mapping[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Load the newest sibling timing record matching task and execution profile."""
     if not output_root.exists():
         return None
     candidates = sorted(
@@ -841,6 +950,10 @@ def load_latest_timing_history(output_root: Path, task: str) -> Optional[Dict[st
     for path in candidates:
         with contextlib.suppress(Exception):
             data = json.loads(path.read_text(encoding="utf-8"))
+            if data.get("task") != task or data.get("success") is not True:
+                continue
+            if execution_profile is not None and data.get("execution_profile") != dict(execution_profile):
+                continue
             if data.get("task") == task and data.get("success") is True:
                 return data
     return None
@@ -860,7 +973,11 @@ def add_runtime_estimate(
     settings = runtime_time_estimate_settings(config)
     units = max(0.0, float(runtime_units or 0.0))
     estimate["runtime_units"] = units
-    estimate["runtime_estimate_basis"] = dict(basis)
+    estimate_basis = dict(basis)
+    execution_profile = inference_execution_profile(config) if task in {"test", "inference"} else None
+    if execution_profile is not None:
+        estimate_basis["execution_profile"] = execution_profile
+    estimate["runtime_estimate_basis"] = estimate_basis
     if not bool(settings.get("enabled", True)):
         estimate.update(
             {
@@ -875,7 +992,7 @@ def add_runtime_estimate(
     rate = positive_float_setting(settings, default_rate_key)
     source = "default-rate"
     if bool(settings.get("use_history", True)):
-        history = load_latest_timing_history(output_dir.parent, task)
+        history = load_latest_timing_history(output_dir.parent, task, execution_profile)
         throughput = history.get("throughput", {}) if isinstance(history, Mapping) else {}
         history_rate = throughput.get("seconds_per_runtime_unit") if isinstance(throughput, Mapping) else None
         with contextlib.suppress(TypeError, ValueError):
@@ -931,9 +1048,46 @@ def finish_run_timing(context: MutableMapping[str, Any]) -> None:
 
         estimate = dict(context.get("estimate", {}) or {})
         units = float(estimate.get("runtime_units") or 0.0)
-        throughput: Dict[str, Any] = {"runtime_units": units}
-        if units > 0:
-            throughput["seconds_per_runtime_unit"] = elapsed_seconds / units
+        acceleration = context.get("acceleration", {})
+        if not isinstance(acceleration, Mapping):
+            acceleration = {}
+
+        def acceleration_seconds(key: str) -> float:
+            with contextlib.suppress(TypeError, ValueError):
+                return max(0.0, float(acceleration.get(key, 0.0) or 0.0))
+            return 0.0
+
+        export_seconds = acceleration_seconds("export_seconds")
+        build_seconds = acceleration_seconds("build_seconds")
+        load_seconds = acceleration_seconds("load_seconds")
+        warmup_seconds = acceleration_seconds("warmup_seconds")
+        one_time_acceleration_seconds = export_seconds + build_seconds + load_seconds + warmup_seconds
+
+        throughput_units = units
+        steady_state_seconds = max(0.0, elapsed_seconds - one_time_acceleration_seconds)
+        throughput_source = "entrypoint-minus-acceleration-setup"
+        stage_timing = context.get("stage_timing")
+        if isinstance(stage_timing, Mapping):
+            with contextlib.suppress(TypeError, ValueError):
+                stage_total = float(stage_timing.get("total_seconds", 0.0) or 0.0)
+                stage_units = float(stage_timing.get("images_or_frames", 0.0) or 0.0)
+                if stage_total >= 0.0 and stage_units > 0.0:
+                    steady_state_seconds = stage_total
+                    throughput_units = stage_units
+                    throughput_source = "stage_timing"
+
+        throughput: Dict[str, Any] = {
+            "runtime_units": throughput_units,
+            "requested_runtime_units": units,
+            "steady_state_seconds": steady_state_seconds,
+            "source": throughput_source,
+            "engine_export_seconds": export_seconds,
+            "engine_build_seconds": build_seconds,
+            "engine_load_seconds": load_seconds,
+            "warmup_seconds": warmup_seconds,
+        }
+        if throughput_units > 0:
+            throughput["seconds_per_runtime_unit"] = steady_state_seconds / throughput_units
 
         payload = {
             "task": context.get("task"),
@@ -949,6 +1103,17 @@ def finish_run_timing(context: MutableMapping[str, Any]) -> None:
             "runtime_estimate_basis": estimate.get("runtime_estimate_basis", {}),
             "throughput": throughput,
         }
+        execution_profile = context.get("execution_profile")
+        if execution_profile is None:
+            basis = estimate.get("runtime_estimate_basis", {})
+            if isinstance(basis, Mapping):
+                execution_profile = basis.get("execution_profile")
+        if execution_profile is not None:
+            payload["execution_profile"] = json_safe_value(execution_profile)
+        if context.get("acceleration") is not None:
+            payload["acceleration"] = json_safe_value(context["acceleration"])
+        if context.get("stage_timing") is not None:
+            payload["stage_timing"] = json_safe_value(context["stage_timing"])
         if context.get("error"):
             payload["error"] = context["error"]
         if context.get("log_path"):
@@ -3979,6 +4144,9 @@ def build_rfdetr_evaluator_config(
             "device": merged_config.get("train", {}).get("device", "cpu"),
             "image_size": resolution,
             "category_remapping": category_remapping,
+            "inference_optimization": deepcopy(
+                dict(merged_config.get("model", {}).get("inference_optimization", {}) or {})
+            ),
         },
         "sahi": sahi_cfg,
         "crop": test_settings.get("crop", {}) or {},
@@ -4126,8 +4294,14 @@ def manual_test_evaluation(
     source_config: Optional[Path],
     verbose: bool,
     progress_bar: bool,
+    inference_runtime: Any = None,
 ) -> Dict[str, Any]:
-    """Run a single-process RF-DETR test evaluation and write metrics."""
+    """Run a single-process RF-DETR test evaluation and write metrics.
+
+    ``inference_runtime`` is reserved for the standalone test entrypoint.  When
+    supplied, raw batches run through the selected FP32/BF16/TensorRT backend;
+    scheduled and final training evaluations keep the original Lightning path.
+    """
     periodic = merged_config.get("periodic_test", {})
     segmentation = bool(getattr(model_config, "segmentation_head", False))
     mode = periodic_test_mode(periodic)
@@ -4171,24 +4345,91 @@ def manual_test_evaluation(
     )
     converter = COCOEvalCallback(max_dets=max_dets, segmentation=segmentation, eval_interval=1, log_per_class_metrics=True)
     f1_local = init_matching_accumulator()
-    was_training = bool(pl_module.training)
-    pl_module.eval()
-    device = getattr(pl_module, "device", None)
+    using_inference_runtime = inference_runtime is not None
+    if using_inference_runtime:
+        was_training = False
+        device = getattr(inference_runtime, "device", None)
+        if device is None:
+            raise RuntimeError("Standalone inference runtime did not expose its execution device.")
+    else:
+        if pl_module is None:
+            raise ValueError("pl_module is required when inference_runtime is not provided.")
+        was_training = bool(pl_module.training)
+        pl_module.eval()
+        device = getattr(pl_module, "device", None)
     if device is not None:
         map_metric = map_metric.to(device)
 
     iterable: Iterable[Any] = loader
     if progress_bar:
         iterable = tqdm(loader, desc=f"{event} {split}", leave=False)
+    standalone_forward_seconds = 0.0
+    standalone_preprocess_seconds = 0.0
+    standalone_postprocess_seconds = 0.0
+    standalone_image_count = 0
     with torch.no_grad():
         for batch_idx, batch in enumerate(iterable):
-            batch = datamodule.transfer_batch_to_device(batch, pl_module.device, 0)
-            samples, targets = batch
-            outputs = pl_module.model(samples)
+            runtime_batch_started = time.perf_counter() if using_inference_runtime else 0.0
+            runtime_preprocess_seconds = 0.0
+            runtime_forward_seconds = 0.0
+            if using_inference_runtime:
+                samples, targets = batch
+                samples = samples.to(device)
+                targets = [
+                    {
+                        key: value.to(device) if torch.is_tensor(value) else value
+                        for key, value in target.items()
+                    }
+                    for target in targets
+                ]
+                if str(getattr(inference_runtime, "backend", "pytorch")) == "tensorrt":
+                    tensors = samples.tensors
+                    expected_resolution = int(getattr(model_config, "resolution"))
+                    if tensors.shape[-2:] != (expected_resolution, expected_resolution):
+                        raise ValueError(
+                            "TensorRT segmentation evaluation requires fixed square inputs at the model "
+                            f"resolution {expected_resolution}, got {tuple(tensors.shape[-2:])}. "
+                            "Keep square_resize_div_64 enabled."
+                        )
+                    if samples.mask is not None and bool(samples.mask.any().item()):
+                        raise ValueError(
+                            "TensorRT segmentation evaluation received padded/non-square samples. "
+                            "Keep square_resize_div_64 enabled."
+                        )
+                consume_forward = getattr(inference_runtime, "consume_forward_seconds", None)
+                consume_postprocess = getattr(inference_runtime, "consume_postprocess_seconds", None)
+                if callable(consume_forward):
+                    consume_forward()
+                if callable(consume_postprocess):
+                    consume_postprocess()
+                forward_started = time.perf_counter()
+                runtime_preprocess_seconds = forward_started - runtime_batch_started
+                outputs = inference_runtime.infer_raw(samples.tensors)
+                forward_wall_seconds = time.perf_counter() - forward_started
+                recorded_forward_seconds = float(consume_forward()) if callable(consume_forward) else 0.0
+                runtime_forward_seconds = recorded_forward_seconds or forward_wall_seconds
+                standalone_forward_seconds += runtime_forward_seconds
+                standalone_preprocess_seconds += runtime_preprocess_seconds
+                standalone_image_count += int(samples.tensors.shape[0])
+            else:
+                batch = datamodule.transfer_batch_to_device(batch, pl_module.device, 0)
+                samples, targets = batch
+                outputs = pl_module.model(samples)
             orig_sizes = torch.stack([target["orig_size"] for target in targets])
-            results = pl_module.postprocess(outputs, orig_sizes)
+            if using_inference_runtime:
+                results = inference_runtime.postprocess(outputs, orig_sizes)
+                if callable(consume_postprocess):
+                    consume_postprocess()
+            else:
+                results = pl_module.postprocess(outputs, orig_sizes)
             converted_preds = converter._convert_preds(results)
             converted_targets = converter._convert_targets(targets)
+            if using_inference_runtime:
+                runtime_batch_elapsed = time.perf_counter() - runtime_batch_started
+                standalone_postprocess_seconds += max(
+                    0.0,
+                    runtime_batch_elapsed - runtime_preprocess_seconds - runtime_forward_seconds,
+                )
             map_metric.update(converted_preds, converted_targets)
             matching = build_matching_data(
                 converted_preds,
@@ -4197,7 +4438,7 @@ def manual_test_evaluation(
                 iou_type="segm" if segmentation else "bbox",
             )
             merge_matching_data(f1_local, matching)
-    if was_training:
+    if not using_inference_runtime and was_training:
         pl_module.train()
 
     raw_metrics = map_metric.compute()
@@ -4248,6 +4489,25 @@ def manual_test_evaluation(
         "per_class": per_class_rows,
         "raw_torchmetrics": json_safe_value(raw_metrics),
     }
+    if using_inference_runtime:
+        timed_total = (
+            standalone_preprocess_seconds
+            + standalone_forward_seconds
+            + standalone_postprocess_seconds
+        )
+        payload["stage_timing"] = {
+            "images_or_frames": standalone_image_count,
+            "total_seconds": timed_total,
+            "preprocess_seconds": standalone_preprocess_seconds,
+            "model_forward_seconds": standalone_forward_seconds,
+            "base_model_forward_seconds": standalone_forward_seconds,
+            "sahi_model_forward_seconds": 0.0,
+            "recheck_model_forward_seconds": 0.0,
+            "postprocess_seconds": standalone_postprocess_seconds,
+            "model_forward_ratio": standalone_forward_seconds / timed_total if timed_total > 0 else 0.0,
+            "sahi_model_forward_ratio": 0.0,
+            "recheck_model_forward_ratio": 0.0,
+        }
     write_json(output_dir / "test_metrics.json", payload)
     write_rows(output_dir / "test_metrics.csv", metric_rows, METRIC_FIELDS)
     if write_classwise:

@@ -53,9 +53,8 @@ Public surface
 
 from __future__ import annotations
 
-import math
 import warnings
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -65,6 +64,7 @@ __all__ = [
     "MOTION_SETTINGS",
     "ensure_motion_support",
     "attach_motion_module",
+    "assert_motion_export_ready",
     "apply_motion_overrides",
     "is_patched",
     "MotionModule",
@@ -468,6 +468,30 @@ class MotionModule(nn.Module):
         Returns:
             Modulated feature list (same type/length as input).
         """
+        feature_tensors = [nested.tensors for nested in features]
+        modulated_tensors = self.forward_export(images, feature_tensors)
+
+        # Preserve the masks and NestedTensor contract used by regular LWDETR
+        # inference/training.  The tensor-only export path below deliberately
+        # shares all feature math with this path so ONNX cannot silently omit
+        # the motion module.
+        return [
+            _rebuild_nested_tensor(src, nested.mask)
+            for src, nested in zip(modulated_tensors, features)
+        ]
+
+    def forward_export(
+        self,
+        images: torch.Tensor,
+        features: List[torch.Tensor],
+    ) -> List[torch.Tensor]:
+        """Apply motion processing to tensor-only backbone export features.
+
+        RF-DETR's ONNX mode changes the backbone output from ``NestedTensor``
+        objects to raw tensors.  Keeping this as an explicit, shared path makes
+        the exported graph numerically equivalent to the regular motion path
+        while retaining RF-DETR's tensor-only export contract.
+        """
         # Build frame window for MDD.
         frames = self._make_frame_window(images)  # [B, T, 3, H, W]
 
@@ -479,9 +503,8 @@ class MotionModule(nn.Module):
 
         # Apply gates + RSTR to each feature scale.
         modulated = []
-        for i, nested in enumerate(features):
-            src = nested.tensors       # [B, C, H_i, W_i]
-            mask = nested.mask
+        for i, feature in enumerate(features):
+            src = feature  # [B, C, H_i, W_i]
 
             # Motion-guided feature gate.
             if motion_maps is not None and i < len(self.gates):
@@ -493,8 +516,7 @@ class MotionModule(nn.Module):
             if self.rstr_enabled and self.rstr_heads is not None and i < len(self.rstr_heads):
                 src = self.rstr_heads[i](src)
 
-            # Rebuild NestedTensor with modulated src.
-            modulated.append(_rebuild_nested_tensor(src, mask))
+            modulated.append(src)
 
         return modulated
 
@@ -554,11 +576,14 @@ def _patch_dinov2_channel_check() -> None:
 # ---------------------------------------------------------------------------
 
 def _patch_lwdetr_motion_forward() -> None:
-    """Wrap LWDETR.forward to call self.motion_module after the backbone.
+    """Wrap LWDETR forward paths to call motion after the backbone.
 
     The wrapper is transparent: if the model has no ``motion_module`` attribute
     (e.g. checkpoints loaded without motion support) the forward runs unchanged.
-    Only installed once even if ensure_motion_support() is called multiple times.
+    Both regular ``forward`` and tensor-only ``forward_export`` are patched;
+    omitting the latter would silently produce an ONNX/TensorRT graph without
+    the attached motion module.  Installed once even if
+    ``ensure_motion_support()`` is called multiple times.
     """
     global _LWDETR_PATCHED
     if _LWDETR_PATCHED:
@@ -571,6 +596,7 @@ def _patch_lwdetr_motion_forward() -> None:
             from rfdetr.util.misc import nested_tensor_from_tensor_list  # rfdetr < 1.6
 
         original_forward = lwdetr_module.LWDETR.forward
+        original_forward_export = lwdetr_module.LWDETR.forward_export
 
         def _motion_forward(self, samples, targets=None):
             # Normalise input to NestedTensor then extract raw pixels for motion.
@@ -606,8 +632,46 @@ def _patch_lwdetr_motion_forward() -> None:
             return result
 
         _motion_forward._motion_patched = True
+
+        def _motion_forward_export(self, tensors):
+            backbone_result = self.backbone(tensors)
+            if not isinstance(backbone_result, tuple) or len(backbone_result) != 4:
+                raise RuntimeError(
+                    "Motion-aware RF-DETR export expected the backbone to return "
+                    "(features, masks, positions, cross_attention_features)."
+                )
+            features, masks, poss, cross_attn_features = backbone_result
+
+            motion_module = getattr(self, "motion_module", None)
+            if motion_module is not None:
+                motion_export = getattr(motion_module, "forward_export", None)
+                if not callable(motion_export):
+                    raise RuntimeError(
+                        "Attached RF-DETR motion module has no tensor-only forward_export(); "
+                        "refusing to export a graph that would omit motion processing."
+                    )
+                features = motion_export(tensors, list(features))
+
+            # Resume the version-pinned upstream forward_export after its
+            # backbone call.  Replacing only the forward callable keeps the
+            # registered module/parameters intact while torch.onnx traces the
+            # already-computed backbone and motion tensors.
+            original_backbone_forward = self.backbone.forward
+
+            def _backbone_export_stub(_tensors):
+                return features, masks, poss, cross_attn_features
+
+            self.backbone.forward = _backbone_export_stub
+            try:
+                return original_forward_export(self, tensors)
+            finally:
+                self.backbone.forward = original_backbone_forward
+
+        _motion_forward_export._motion_patched = True
         if not getattr(original_forward, "_motion_patched", False):
             lwdetr_module.LWDETR.forward = _motion_forward
+        if not getattr(original_forward_export, "_motion_patched", False):
+            lwdetr_module.LWDETR.forward_export = _motion_forward_export
         _LWDETR_PATCHED = True
     except Exception as exc:
         warnings.warn(
@@ -713,6 +777,11 @@ def attach_motion_module(model: nn.Module, motion_cfg: Optional[Dict[str, Any]] 
     if mtype == "none":
         return
 
+    # Preserve intent separately from successful attachment.  The TensorRT
+    # export validator uses this marker to fail if model discovery/version skew
+    # prevented attachment instead of silently exporting a non-motion graph.
+    model._motion_export_required = True  # type: ignore[attr-defined]
+
     # Walk the wrapper chain to find LWDETR.
     lwdetr = _find_lwdetr(model)
     if lwdetr is None:
@@ -739,6 +808,57 @@ def attach_motion_module(model: nn.Module, motion_cfg: Optional[Dict[str, Any]] 
 
     motion_module = MotionModule(feature_channels, motion_cfg)
     lwdetr.motion_module = motion_module  # type: ignore[assignment]
+    lwdetr._motion_export_required = True  # type: ignore[attr-defined]
+
+
+def assert_motion_export_ready(
+    model: nn.Module,
+    motion_cfg: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Fail before ONNX export if enabled motion cannot enter the graph.
+
+    ``motion_cfg`` should be supplied by callers that know motion was requested.
+    Without it, an attached ``motion_module`` is treated as the signal that the
+    model requires motion-aware export.  Disabled/non-motion models remain a
+    no-op.
+    """
+    requested = None
+    if motion_cfg is not None:
+        requested = bool(motion_cfg.get("enabled", False)) and resolve_motion_type(motion_cfg) != "none"
+
+    lwdetr = _find_lwdetr(model)
+    attached = lwdetr is not None and getattr(lwdetr, "motion_module", None) is not None
+    if requested is None:
+        wrappers = [model]
+        if hasattr(model, "model"):
+            wrappers.append(model.model)
+        if hasattr(model, "model") and hasattr(model.model, "model"):
+            wrappers.append(model.model.model)
+        requested = attached or any(
+            bool(getattr(candidate, "_motion_export_required", False)) for candidate in wrappers
+        )
+    if requested is False:
+        return
+    if lwdetr is None:
+        raise RuntimeError(
+            "Motion-enabled RF-DETR export could not locate the LWDETR model; "
+            "refusing to build an ONNX/TensorRT graph without motion processing."
+        )
+    if not attached:
+        raise RuntimeError(
+            "Motion-enabled RF-DETR export has no attached motion_module; "
+            "call attach_motion_module() after constructing/aligning the model."
+        )
+    if not callable(getattr(lwdetr.motion_module, "forward_export", None)):
+        raise RuntimeError(
+            "The attached RF-DETR motion module does not support tensor-only ONNX export."
+        )
+    export_forward = getattr(type(lwdetr), "forward_export", None)
+    if not getattr(export_forward, "_motion_patched", False):
+        raise RuntimeError(
+            "LWDETR.forward_export is not motion-aware; call ensure_motion_support() "
+            "before constructing the model."
+        )
 
 
 def _find_lwdetr(model: nn.Module) -> Optional[nn.Module]:

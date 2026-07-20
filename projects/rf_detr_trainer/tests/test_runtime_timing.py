@@ -85,11 +85,13 @@ class RuntimeTimingTest(unittest.TestCase):
             root = Path(temp)
             history_dir = root / "old_run"
             history_dir.mkdir()
+            config = {"runtime": {"time_estimate": {"use_history": True}}}
             trainer.write_json(
                 history_dir / "run_timing.json",
                 {
                     "task": "test",
                     "success": True,
+                    "execution_profile": trainer.inference_execution_profile(config),
                     "throughput": {"seconds_per_runtime_unit": 2.0},
                 },
             )
@@ -108,6 +110,94 @@ class RuntimeTimingTest(unittest.TestCase):
             self.assertEqual(estimate["estimated_runtime_source"], "history")
             self.assertEqual(estimate["estimated_runtime_seconds"], 6.0)
             self.assertEqual(estimate["estimated_runtime_hms"], "00:00:06")
+
+    def test_runtime_estimate_ignores_different_backend_history(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            history_dir = root / "old_run"
+            history_dir.mkdir()
+            config = {"runtime": {"time_estimate": {"use_history": True}}}
+            trainer.write_json(
+                history_dir / "run_timing.json",
+                {
+                    "task": "test",
+                    "success": True,
+                    "execution_profile": {
+                        "backend": "tensorrt",
+                        "precision": "fp16",
+                        "model_size": "medium",
+                        "resolution": "default",
+                    },
+                    "throughput": {"seconds_per_runtime_unit": 9.0},
+                },
+            )
+            estimate = {}
+
+            trainer.add_runtime_estimate(
+                estimate=estimate,
+                config=config,
+                output_dir=root / "new_run",
+                task="test",
+                runtime_units=4,
+                default_rate_key="default_test_seconds_per_image",
+                basis={"test_images": 4},
+            )
+
+            self.assertEqual(estimate["estimated_runtime_source"], "default-rate")
+
+    def test_execution_profile_partitions_batch_architecture_and_workload(self):
+        base = {
+            "model": {
+                "size": "medium",
+                "pretrain_weights": "checkpoint-a.pth",
+                "p2": {"enabled": True},
+                "motion": {"enabled": False},
+                "inference_optimization": {
+                    "backend": "tensorrt",
+                    "tensorrt": {
+                        "precision": "fp16",
+                        "profile": {
+                            "min_batch_size": 1,
+                            "opt_batch_size": "auto",
+                            "max_batch_size": "auto",
+                        },
+                    },
+                },
+            },
+            "test": {"batch_size": 7, "test_mode": {"mode": "sahi"}, "sahi": {"batch_size": 24}},
+        }
+        changed = json.loads(json.dumps(base))
+        changed["test"]["sahi"]["batch_size"] = 64
+
+        first = trainer.inference_execution_profile(base)
+        second = trainer.inference_execution_profile(changed)
+
+        self.assertEqual(first["tensorrt_profile"]["max_batch_size"], 24)
+        self.assertEqual(second["tensorrt_profile"]["max_batch_size"], 64)
+        self.assertNotEqual(first, second)
+
+    def test_inference_execution_profile_uses_active_inference_mode_only(self):
+        config = {
+            "model": {
+                "inference_optimization": {
+                    "backend": "tensorrt",
+                    "tensorrt": {
+                        "precision": "fp16",
+                        "profile": {"opt_batch_size": "auto", "max_batch_size": "auto"},
+                    },
+                }
+            },
+            "inference": {"mode": "sahi", "batch_size": 8, "video": {"batch_size": 64}},
+            "sahi": {"batch_size": 24, "slice_height": 160, "slice_width": 160},
+            # Inactive sections must not pollute inference timing history.
+            "periodic_test": {"batch_size": 128},
+        }
+
+        profile = trainer.inference_execution_profile(config)
+
+        self.assertEqual(profile["workload"]["test_mode"], "sahi")
+        self.assertEqual(profile["workload"]["batch_sizes"], [24])
+        self.assertEqual(profile["tensorrt_profile"]["max_batch_size"], 24)
 
     def test_finish_run_timing_writes_json(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -128,6 +218,13 @@ class RuntimeTimingTest(unittest.TestCase):
                         "runtime_estimate_basis": {"image_sources": 2},
                     },
                     "started_at_monotonic": time.monotonic() - 0.01,
+                    "execution_profile": {
+                        "backend": "pytorch",
+                        "precision": "bf16",
+                        "model_size": "medium",
+                        "resolution": 576,
+                    },
+                    "acceleration": {"cache_hit": False, "backend": "pytorch", "precision": "bf16"},
                 }
             )
 
@@ -137,7 +234,40 @@ class RuntimeTimingTest(unittest.TestCase):
             self.assertEqual(data["task"], "inference")
             self.assertTrue(data["success"])
             self.assertEqual(data["estimated_runtime_hms"], "00:00:02")
+            self.assertEqual(data["execution_profile"]["precision"], "bf16")
+            self.assertEqual(data["acceleration"]["backend"], "pytorch")
             self.assertGreater(data["throughput"]["seconds_per_runtime_unit"], 0)
+
+    def test_finish_run_timing_keeps_engine_build_out_of_steady_state_rate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output_dir = Path(temp) / "run"
+            output_dir.mkdir()
+            context = trainer.start_run_timing("inference", verbose=False)
+            context.update(
+                {
+                    "output_dir": str(output_dir),
+                    "outputs_created": True,
+                    "success": True,
+                    "estimate": {"runtime_units": 2},
+                    "acceleration": {
+                        "export_seconds": 2.0,
+                        "build_seconds": 3.0,
+                        "load_seconds": 1.0,
+                        "warmup_seconds": 0.5,
+                    },
+                    "stage_timing": {"images_or_frames": 2, "total_seconds": 4.0},
+                }
+            )
+
+            trainer.finish_run_timing(context)
+
+            data = json.loads((output_dir / "run_timing.json").read_text(encoding="utf-8"))
+            throughput = data["throughput"]
+            self.assertEqual(throughput["source"], "stage_timing")
+            self.assertEqual(throughput["steady_state_seconds"], 4.0)
+            self.assertEqual(throughput["seconds_per_runtime_unit"], 2.0)
+            self.assertEqual(throughput["engine_export_seconds"], 2.0)
+            self.assertEqual(throughput["engine_build_seconds"], 3.0)
 
     def test_tee_text_stream_ignores_closed_log_file(self):
         console = io.StringIO()

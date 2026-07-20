@@ -51,7 +51,7 @@ model:
   num_classes: null
   # Device selector. Options: auto, cpu, cuda, cuda:0, 0, 1, mps, -1.
   device: 0
-  # Automatic mixed precision in RF-DETR. Options: true, false.
+  # RF-DETR AMP construction setting; separate from standalone inference_optimization. Options: true, false.
   amp: true
   # First-stage prediction confidence threshold. Options: 0.0-1.0.
   confidence_threshold: 0.25
@@ -59,6 +59,37 @@ model:
   category_remapping: {}
   # Extra RF-DETR ModelConfig keys. Options: any supported model config key.
   extra_model_args: {}
+  # Standalone inference/test acceleration settings. This does not change training-time AMP. Options: mapping.
+  inference_optimization:
+    # Inference runtime. Options: pytorch, tensorrt. PyTorch FP32 preserves the legacy behavior.
+    backend: pytorch
+    # PyTorch-only inference settings. Options: mapping.
+    pytorch:
+      # PyTorch compute precision. Options: fp32, bf16.
+      precision: fp32
+    # TensorRT-only inference settings. TensorRT is CUDA-only and fails instead of falling back. Options: mapping.
+    tensorrt:
+      # TensorRT engine precision. Options: fp16, bf16.
+      precision: fp16
+      # Existing serialized engine. Options: empty string for automatic cache/build, or a trusted .engine/.plan path.
+      engine_path: ""
+      # Project manifest paired with engine_path. Empty derives <engine>.manifest.json for an explicit engine. Options: empty string or manifest JSON path.
+      manifest_path: ""
+      # Engine/ONNX cache. Options: empty string for the OS user cache, or a writable directory path.
+      cache_dir: ""
+      # TensorRT builder workspace limit in GiB. Options: positive number.
+      workspace_gib: 4
+      # Ignore a valid cache entry and rebuild its artifacts. Options: true, false.
+      force_rebuild: false
+      # Dynamic-batch optimization profile. Spatial dimensions remain fixed to the model resolution. Options: mapping.
+      profile:
+        # Smallest accepted batch. Must stay 1 so real tail batches are valid. Options: 1.
+        min_batch_size: 1
+        # Preferred batch. Options: auto to infer from the task, or a positive integer.
+        opt_batch_size: auto
+        # Largest engine batch; larger calls are split into chunks. Options: auto to infer from the task, or a positive integer.
+        max_batch_size: auto
+
   # ---- P2 high-resolution feature level (stride-4) for tiny-object (e.g. football) detection ----
   # RF-DETR has no native P2. When enabled, the trainer applies an in-process patch (rf_detr_p2.py,
   # version-controlled, survives `uv sync`) that (1) allows "P2" in projector_scale and (2) teaches

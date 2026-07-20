@@ -79,6 +79,22 @@ def apply_cli_overrides(config: MutableMapping[str, Any], args: argparse.Namespa
         model["resolution"] = args.resolution
     if args.num_classes is not None:
         model["num_classes"] = args.num_classes
+    optimization = model.setdefault("inference_optimization", {})
+    backend_override = getattr(args, "inference_backend", None)
+    if backend_override is not None:
+        optimization["backend"] = backend_override
+    precision_override = getattr(args, "inference_precision", None)
+    if precision_override is not None:
+        active_backend = str(optimization.get("backend", "pytorch")).strip().lower()
+        optimization.setdefault(active_backend, {})["precision"] = precision_override
+    tensorrt = optimization.setdefault("tensorrt", {})
+    if getattr(args, "tensorrt_engine", None) is not None:
+        tensorrt["engine_path"] = args.tensorrt_engine
+        tensorrt["manifest_path"] = ""
+    if getattr(args, "tensorrt_cache_dir", None) is not None:
+        tensorrt["cache_dir"] = args.tensorrt_cache_dir
+    if getattr(args, "tensorrt_force_rebuild", False):
+        tensorrt["force_rebuild"] = True
     if args.output_dir:
         output["output_dir"] = args.output_dir
     if args.test_mode:
@@ -256,6 +272,8 @@ def build_parallel_rfdetr_evaluator_config(
     config: Mapping[str, Any],
     output_dir: Path,
     split: str,
+    *,
+    prepared_tensorrt: Optional[Mapping[str, Mapping[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Build the spawn-worker evaluator config for standalone parallel testing."""
     chunks = standalone_parallel_chunks(config)
@@ -276,6 +294,8 @@ def build_parallel_rfdetr_evaluator_config(
         "merged_config": deepcopy(dict(config)),
         "output_dir": str(output_dir),
     }
+    if prepared_tensorrt is not None:
+        factory_config["prepared_tensorrt"] = deepcopy(dict(prepared_tensorrt))
     try:
         pickle.dumps(factory_config)
     except Exception as exc:
@@ -344,6 +364,13 @@ def average_inference_seconds(result: Mapping[str, Any], output_dir: Path) -> Op
         if elapsed:
             return sum(elapsed) / len(elapsed)
 
+    stage_timing = result.get("stage_timing")
+    if isinstance(stage_timing, Mapping):
+        total = _float_or_none(stage_timing.get("total_seconds"))
+        count = _float_or_none(stage_timing.get("images_or_frames"))
+        if total is not None and count is not None and count > 0:
+            return total / count
+
     metrics_path = output_dir / "metrics_summary.json"
     if metrics_path.exists():
         data = json.loads(metrics_path.read_text(encoding="utf-8"))
@@ -373,9 +400,76 @@ def print_inference_timing_summary(result: Mapping[str, Any], output_dir: Path) 
     average = average_inference_seconds(result, output_dir)
     if average is not None:
         print(f"Average inference seconds per image: {average:.6f}")
+    timing = result.get("stage_timing")
+    if not isinstance(timing, Mapping):
+        timing = result.get("summary")
+    if isinstance(timing, Mapping):
+        labels = (
+            ("model_forward_ratio", "Model forward share"),
+            ("sahi_model_forward_ratio", "SAHI model-forward share"),
+            ("recheck_model_forward_ratio", "Recheck model-forward share"),
+        )
+        for key, label in labels:
+            value = _float_or_none(timing.get(key))
+            if value is not None:
+                print(f"{label}: {value * 100.0:.2f}%")
     stats_path = output_dir / "inference_stats.csv"
     if stats_path.exists():
         print(f"Per-image inference stats: {stats_path}")
+
+
+def normalized_stage_timing(result: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return additive timing totals in the shared run_timing.json schema."""
+
+    existing = result.get("stage_timing")
+    if isinstance(existing, Mapping):
+        timing = dict(existing)
+        forward_seconds = float(timing.get("model_forward_seconds", 0.0) or 0.0)
+        total_seconds = float(timing.get("total_seconds", 0.0) or 0.0)
+        timing.setdefault("base_model_forward_seconds", forward_seconds)
+        timing.setdefault("sahi_model_forward_seconds", 0.0)
+        timing.setdefault("recheck_model_forward_seconds", 0.0)
+        timing.setdefault("model_forward_ratio", forward_seconds / total_seconds if total_seconds > 0 else 0.0)
+        timing.setdefault("sahi_model_forward_ratio", 0.0)
+        timing.setdefault("recheck_model_forward_ratio", 0.0)
+        return timing
+    stats = result.get("stats")
+    if not isinstance(stats, list):
+        return {}
+    rows = [row for row in stats if isinstance(row, Mapping)]
+    if not rows:
+        return {}
+
+    def total(key: str, *, fallback: str | None = None) -> float:
+        return sum(
+            float(row.get(key, row.get(fallback, 0.0) if fallback is not None else 0.0) or 0.0)
+            for row in rows
+        )
+
+    total_seconds = total("elapsed_seconds")
+    forward_seconds = total("model_forward_seconds", fallback="elapsed_seconds")
+    timing = {
+        "images_or_frames": len(rows),
+        "total_seconds": total_seconds,
+        "preprocess_seconds": total("preprocess_seconds"),
+        "model_forward_seconds": forward_seconds,
+        "base_model_forward_seconds": total("base_model_forward_seconds"),
+        "sahi_model_forward_seconds": total("sahi_model_forward_seconds"),
+        "recheck_model_forward_seconds": total("recheck_model_forward_seconds"),
+        "postprocess_seconds": total("postprocess_seconds"),
+    }
+    timing.update(
+        {
+            "model_forward_ratio": forward_seconds / total_seconds if total_seconds > 0.0 else 0.0,
+            "sahi_model_forward_ratio": (
+                timing["sahi_model_forward_seconds"] / total_seconds if total_seconds > 0.0 else 0.0
+            ),
+            "recheck_model_forward_ratio": (
+                timing["recheck_model_forward_seconds"] / total_seconds if total_seconds > 0.0 else 0.0
+            ),
+        }
+    )
+    return timing
 
 
 def _non_negative_int_or_none(value: Any) -> Optional[int]:
@@ -447,6 +541,7 @@ def estimate_standalone_test_outputs(
     if dataset_plan.get("action") == "prepare_cache":
         dataset_cache_files = int(dataset_plan.get("cache_file_count", 0) or 0)
         dataset_cache_bytes = int(dataset_plan.get("copy_bytes", 0) or 0)
+    tensorrt_artifacts = trainer.estimate_tensorrt_cache_artifacts(config)
 
     file_count = (
         config_files
@@ -458,6 +553,7 @@ def estimate_standalone_test_outputs(
         + error_case_files
         + dataset_cache_files
         + parallel_summary_files
+        + int(tensorrt_artifacts["file_count"])
     )
     image_outputs = model_input_files + max(0, visual_files - 2 if visual_files else 0) + max(0, error_case_files - 3 if error_case_files else 0) + dataset_case_files
     approx_bytes = (
@@ -467,6 +563,7 @@ def estimate_standalone_test_outputs(
         + plot_files * 350_000
         + config_files * 50_000
         + parallel_summary_files * 50_000
+        + int(tensorrt_artifacts["bytes"])
     )
     estimate = {
         "output_dir": str(output_dir),
@@ -489,9 +586,10 @@ def estimate_standalone_test_outputs(
         "parallel_device_worker_counts": parallel_plan["device_worker_counts"],
         "parallel_summary_files": parallel_summary_files,
         "parallel_same_device_warning": parallel_plan["same_device_warning"],
+        "tensorrt_cache": tensorrt_artifacts,
         "estimated_total_files": file_count,
         "estimated_disk_usage": trainer.format_bytes(approx_bytes),
-        "note": "Test output estimates are conservative. Prediction-filtered visuals and error cases are known exactly after inference.",
+        "note": "Test outputs and first-run TensorRT cache artifacts are estimated conservatively.",
     }
     trainer.add_runtime_estimate(
         estimate=estimate,
@@ -506,6 +604,7 @@ def estimate_standalone_test_outputs(
             "parallel_chunks": parallel_plan["chunks"],
             "parallel_speedup_cap": parallel_plan["unique_device_count"],
         },
+        extra_seconds=float(tensorrt_artifacts.get("estimated_build_seconds", 0) or 0),
     )
     return estimate
 
@@ -622,6 +721,23 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
     parser.add_argument("--checkpoint", help="RF-DETR .pth checkpoint/pretrain_weights path.")
     parser.add_argument("--resolution", type=int, help="Input resolution override.")
     parser.add_argument("--num-classes", type=int, help="Optional class count override.")
+    parser.add_argument(
+        "--inference-backend",
+        choices=["pytorch", "tensorrt"],
+        help="Inference backend override. PyTorch FP32 remains the default.",
+    )
+    parser.add_argument(
+        "--inference-precision",
+        choices=["fp32", "fp16", "bf16"],
+        help="Precision for the active inference backend.",
+    )
+    parser.add_argument("--tensorrt-engine", help="Trusted TensorRT engine path; requires a compatible manifest.")
+    parser.add_argument("--tensorrt-cache-dir", help="TensorRT ONNX/engine cache directory override.")
+    parser.add_argument(
+        "--tensorrt-force-rebuild",
+        action="store_true",
+        help="Ignore a matching automatic TensorRT cache entry and rebuild it.",
+    )
     parser.add_argument("--output-dir", help="Exact output directory override.")
     parser.add_argument("--test-mode", choices=["full_image", "sahi", "class_crop"], help="Test mode override.")
     parser.add_argument("--max-images", type=trainer.parse_scalar, help="Maximum test images to evaluate. Use all/null for all.")
@@ -640,9 +756,11 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
         apply_cli_overrides(config, args)
         internal_config = build_internal_test_config(config)
         validate_parallel_test_compatibility(internal_config)
+        acceleration_settings = trainer.validate_inference_acceleration_config(internal_config)
         parallel_chunks = standalone_parallel_chunks(internal_config)
         if timing_context is not None:
             timing_context["verbose"] = bool(internal_config.get("runtime", {}).get("verbose", True))
+            timing_context["execution_profile"] = trainer.inference_execution_profile(internal_config)
         bar.update(1)
 
         timestamp = datetime.now().strftime(TIMESTAMP_FORMAT)
@@ -661,6 +779,16 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
         confirm = bool(internal_config.get("runtime", {}).get("confirm_before_run", True))
         assume_yes = bool(internal_config.get("runtime", {}).get("yes", False) or not confirm)
         confirm_test_or_exit(estimate, bool(internal_config.get("runtime", {}).get("verbose", True)), assume_yes)
+        preflight_devices = (
+            list(dict.fromkeys(_standalone_test_devices(internal_config)))
+            if parallel_chunks > 1
+            else [internal_config.get("model", {}).get("device")]
+        )
+        for preflight_device in preflight_devices:
+            trainer.preflight_rfdetr_inference_acceleration(
+                internal_config,
+                device=preflight_device,
+            )
         bar.update(1)
 
         if bool(internal_config.get("runtime", {}).get("dry_run", False)):
@@ -698,16 +826,36 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
         train_config = None
         parallel_evaluator_config = None
         if parallel_chunks > 1:
+            prepared_tensorrt = None
+            if acceleration_settings.backend == "tensorrt":
+                preparation = trainer.prepare_parallel_tensorrt_artifacts(
+                    internal_config,
+                    output_dir,
+                    _standalone_test_devices(internal_config),
+                )
+                prepared_tensorrt = preparation.get("device_artifacts")
+                if not isinstance(prepared_tensorrt, Mapping) or not prepared_tensorrt:
+                    raise RuntimeError("TensorRT preparation did not return worker artifacts.")
+                if timing_context is not None:
+                    timing_context["acceleration"] = {
+                        key: value
+                        for key, value in preparation.items()
+                        if key != "device_artifacts"
+                    }
             parallel_evaluator_config = build_parallel_rfdetr_evaluator_config(
                 internal_config,
                 output_dir,
                 str(internal_config.get("test", {}).get("split", "test")),
+                prepared_tensorrt=prepared_tensorrt,
             )
         else:
             rf_model, train_config = trainer.build_rfdetr_evaluator_runtime(
                 internal_config,
                 output_dir,
             )
+            if timing_context is not None:
+                acceleration_handle = trainer.get_inference_acceleration_handle(rf_model)
+                timing_context["acceleration"] = dict(acceleration_handle.metadata)
         bar.update(1)
 
     test_settings = internal_config.get("test", {})
@@ -733,13 +881,13 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
     elif use_segmentation_eval:
         if rf_model is None or train_config is None:
             raise RuntimeError("Single-model segmentation runtime was not initialized.")
-        from rfdetr.training import RFDETRDataModule, RFDETRModelModule
+        from rfdetr.training import RFDETRDataModule
 
-        module = RFDETRModelModule(rf_model.model_config, train_config)
         datamodule = RFDETRDataModule(rf_model.model_config, train_config)
+        inference_runtime = trainer.get_inference_acceleration_handle(rf_model)
         result = trainer.manual_test_evaluation(
             trainer=None,
-            pl_module=module,
+            pl_module=None,
             datamodule=datamodule,
             model_config=rf_model.model_config,
             train_config=train_config,
@@ -751,6 +899,7 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
             source_config=source_config,
             verbose=bool(internal_config.get("runtime", {}).get("verbose", True)),
             progress_bar=bool(test_settings.get("progress_bar", True)),
+            inference_runtime=inference_runtime,
         )
     else:
         if rf_model is None or train_config is None:
@@ -766,6 +915,43 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
         result = run_evaluation(deepcopy(evaluator_config), source_config, prebuilt_model=rf_model, print_summary=True)
     if not use_segmentation_eval:
         trainer.write_rfdetr_evaluator_aliases(output_dir, result)
+    if timing_context is not None and isinstance(result, Mapping):
+        parallel_summary = result.get("parallel_summary")
+        if isinstance(parallel_summary, Mapping):
+            assignments = parallel_summary.get("assignments", [])
+            if isinstance(assignments, list):
+                worker_acceleration = [
+                    {
+                        "chunk_id": assignment.get("chunk_id"),
+                        "device": assignment.get("device"),
+                        "model_load_seconds": assignment.get("model_load_seconds"),
+                        "acceleration": dict(assignment["acceleration"]),
+                    }
+                    for assignment in assignments
+                    if isinstance(assignment, Mapping) and isinstance(assignment.get("acceleration"), Mapping)
+                ]
+                acceleration_summary = dict(timing_context.get("acceleration", {}))
+                acceleration_summary["workers"] = worker_acceleration
+                acceleration_summary["worker_model_load_seconds"] = sum(
+                    float(item.get("model_load_seconds", 0.0) or 0.0)
+                    for item in assignments
+                    if isinstance(item, Mapping)
+                )
+                timing_context["acceleration"] = acceleration_summary
+        stage_timing = normalized_stage_timing(result)
+        if stage_timing:
+            timing_context["stage_timing"] = stage_timing
+    trainer.dump_config_snapshot(
+        output_dir=output_dir,
+        merged_config=internal_config,
+        metadata={
+            "event": "standalone_test_complete",
+            "dataset": dataset_metadata,
+            "acceleration": dict(timing_context.get("acceleration", {})) if timing_context is not None else {},
+            "stage_timing": dict(timing_context.get("stage_timing", {})) if timing_context is not None else {},
+        },
+        source_config=source_config,
+    )
     print_inference_timing_summary(result if isinstance(result, Mapping) else {}, output_dir)
     print(f"RF-DETR test output directory: {output_dir}")
     return 0

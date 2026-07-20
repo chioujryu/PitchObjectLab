@@ -11,6 +11,8 @@ from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import torch
+
 import rf_detr_runtime
 import test_rf_detr_model as test_runner
 
@@ -29,6 +31,11 @@ def _cli_args(**updates):
         "batch_size": None,
         "sahi_batch_size": None,
         "chunks": None,
+        "inference_backend": None,
+        "inference_precision": None,
+        "tensorrt_engine": None,
+        "tensorrt_cache_dir": None,
+        "tensorrt_force_rebuild": False,
     }
     values.update(updates)
     return argparse.Namespace(**values)
@@ -60,6 +67,64 @@ def _config(*, chunks=1, device="0", size="medium", mode="full_image", evaluatio
 
 
 class ParallelConfigTests(unittest.TestCase):
+    def test_standalone_acceleration_cli_overrides_yaml_and_derives_manifest(self):
+        config = {
+            "model": {
+                "inference_optimization": {
+                    "backend": "pytorch",
+                    "pytorch": {"precision": "fp32"},
+                    "tensorrt": {
+                        "precision": "fp16",
+                        "manifest_path": "stale.engine.manifest.json",
+                    },
+                }
+            }
+        }
+
+        test_runner.apply_cli_overrides(
+            config,
+            _cli_args(
+                inference_backend="tensorrt",
+                inference_precision="bf16",
+                tensorrt_engine="trusted.engine",
+                tensorrt_cache_dir="cache",
+            ),
+        )
+
+        optimization = config["model"]["inference_optimization"]
+        self.assertEqual(optimization["backend"], "tensorrt")
+        self.assertEqual(optimization["pytorch"]["precision"], "fp32")
+        self.assertEqual(optimization["tensorrt"]["precision"], "bf16")
+        self.assertEqual(optimization["tensorrt"]["engine_path"], "trusted.engine")
+        self.assertEqual(optimization["tensorrt"]["manifest_path"], "")
+        self.assertEqual(optimization["tensorrt"]["cache_dir"], "cache")
+
+    def test_acceleration_profile_uses_only_active_model_call_batches(self):
+        test_sahi = {
+            "test": {
+                "batch_size": 80,
+                "test_mode": {"mode": "sahi"},
+                "sahi": {"batch_size": 64},
+            }
+        }
+        inference_sahi = {
+            "inference": {"mode": "sahi", "batch_size": 80, "video": {"batch_size": 32}},
+            "sahi": {"batch_size": 64},
+        }
+        inference_full = {
+            "inference": {"mode": "full_image", "batch_size": 8, "video": {"batch_size": 5}},
+            "sahi": {"batch_size": 64},
+        }
+        inference_sahi_inherit = {
+            "inference": {"mode": "sahi", "batch_size": 12},
+            "sahi": {"batch_size": None},
+        }
+
+        self.assertEqual(rf_detr_runtime.inference_acceleration_batch_sizes(test_sahi), [64])
+        self.assertEqual(rf_detr_runtime.inference_acceleration_batch_sizes(inference_sahi), [64])
+        self.assertEqual(rf_detr_runtime.inference_acceleration_batch_sizes(inference_full), [8, 5])
+        self.assertEqual(rf_detr_runtime.inference_acceleration_batch_sizes(inference_sahi_inherit), [12])
+
     def test_all_standalone_test_configs_document_parallel_default(self):
         config_dir = Path(test_runner.__file__).resolve().parent / "config"
         paths = sorted(config_dir.glob("rf_detr_test*.yaml"))
@@ -68,6 +133,10 @@ class ParallelConfigTests(unittest.TestCase):
             with self.subTest(path=path.name):
                 config = test_runner.load_yaml(path)
                 self.assertEqual(config["test"]["parallel"]["chunks"], 1)
+                optimization = config["model"]["inference_optimization"]
+                self.assertEqual(optimization["backend"], "pytorch")
+                self.assertEqual(optimization["pytorch"]["precision"], "fp32")
+                self.assertIn(optimization["tensorrt"]["precision"], {"fp16", "bf16"})
 
     def test_chunks_default_to_one_and_cli_override_is_nested(self):
         internal = test_runner.build_internal_test_config({"model": {}, "dataset": {}, "test": {}})
@@ -169,8 +238,11 @@ class ParallelWiringTests(unittest.TestCase):
         self.assertEqual(result["model"]["factory"], "rf_detr_runtime.build_rfdetr_evaluator_model")
         self.assertEqual(result["model"]["devices"], ["cuda:0", "cuda:1"])
         factory_config = result["model"]["factory_config"]
-        self.assertEqual(factory_config["output_dir"], "/tmp/out")
-        self.assertEqual(factory_config["merged_config"]["train"]["dataset_dir"], "/tmp/materialized-dataset")
+        self.assertEqual(Path(factory_config["output_dir"]), Path("/tmp/out"))
+        self.assertEqual(
+            Path(factory_config["merged_config"]["train"]["dataset_dir"]),
+            Path("/tmp/materialized-dataset"),
+        )
         self.assertIsNot(factory_config["merged_config"], config)
 
     def test_resolution_preview_matches_constructor_precedence(self):
@@ -198,6 +270,73 @@ class ParallelWiringTests(unittest.TestCase):
 
 
 class SpawnFactoryTests(unittest.TestCase):
+    def test_parallel_preparation_builds_once_per_gpu_compatibility_profile(self):
+        config = _config(chunks=3, device="0,1,2")
+        config["model"]["inference_optimization"] = {
+            "backend": "tensorrt",
+            "tensorrt": {"precision": "fp16"},
+        }
+        built_devices = []
+
+        def preflight(_config, *, device):
+            return {
+                "backend": "tensorrt",
+                "precision": "fp16",
+                "device": f"cuda:{device}",
+            }
+
+        def properties(device):
+            return types.SimpleNamespace(name="same-gpu" if device.index in {0, 1} else "other-gpu")
+
+        def capability(device):
+            return (8, 9) if device.index in {0, 1} else (8, 6)
+
+        def build_runtime(_config, _output_dir, *, device):
+            built_devices.append(device)
+            model = types.SimpleNamespace(profile_index=len(built_devices))
+            return model, object()
+
+        def get_handle(model):
+            index = model.profile_index
+            return types.SimpleNamespace(
+                metadata={
+                    "cache_hit": False,
+                    "build_seconds": 1.0,
+                    "export_seconds": 0.5,
+                    "load_seconds": 0.1,
+                    "warmup_seconds": 0.1,
+                    "engine_path": f"/cache/{index}/model.engine",
+                    "manifest_path": f"/cache/{index}/model.engine.manifest.json",
+                }
+            )
+
+        with patch.object(
+            rf_detr_runtime,
+            "validate_inference_acceleration_config",
+            return_value=types.SimpleNamespace(backend="tensorrt", precision="fp16"),
+        ), patch.object(
+            rf_detr_runtime, "preflight_rfdetr_inference_acceleration", side_effect=preflight
+        ), patch.object(
+            torch.cuda, "get_device_properties", side_effect=properties
+        ), patch.object(
+            torch.cuda, "get_device_capability", side_effect=capability
+        ), patch.object(
+            rf_detr_runtime, "build_rfdetr_evaluator_runtime", side_effect=build_runtime
+        ), patch.object(
+            rf_detr_runtime, "get_inference_acceleration_handle", side_effect=get_handle
+        ):
+            result = rf_detr_runtime._prepare_parallel_tensorrt_profiles(
+                config,
+                "/tmp/out",
+                ["0", "1", "2"],
+            )
+
+        self.assertEqual(built_devices, ["cuda:0", "cuda:2"])
+        self.assertEqual(len(result["profiles"]), 2)
+        self.assertEqual(result["device_artifacts"]["0"]["engine_path"], "/cache/1/model.engine")
+        self.assertEqual(result["device_artifacts"]["1"]["engine_path"], "/cache/1/model.engine")
+        self.assertEqual(result["device_artifacts"]["2"]["engine_path"], "/cache/2/model.engine")
+
     def test_factory_overrides_devices_attaches_motion_and_aligns_classes(self):
         model = MagicMock()
         model.model = object()
@@ -238,6 +377,80 @@ class SpawnFactoryTests(unittest.TestCase):
         model.get_train_config.assert_called_once_with(dataset_dir="/tmp/materialized-dataset")
         model._align_num_classes_from_dataset.assert_called_once_with("/tmp/materialized-dataset")
         self.assertEqual(merged["model"]["device"], "0")
+
+    def test_factory_maps_prepared_engine_to_normalized_device_and_disables_rebuild(self):
+        merged = _config(device="0,1")
+        merged["model"]["inference_optimization"] = {
+            "backend": "tensorrt",
+            "tensorrt": {
+                "precision": "fp16",
+                "engine_path": "",
+                "manifest_path": "",
+                "force_rebuild": True,
+            },
+        }
+        factory_model_cfg = {
+            "factory_config": {
+                "merged_config": merged,
+                "output_dir": "/tmp/out",
+                "prepared_tensorrt": {
+                    "cuda:2": {
+                        "engine_path": "/tmp/cache/model.engine",
+                        "manifest_path": "/tmp/cache/model.engine.manifest.json",
+                        # The worker must force this off even if either source asks to rebuild.
+                        "force_rebuild": True,
+                    }
+                },
+            }
+        }
+        prepared_model = object()
+
+        with patch.object(
+            rf_detr_runtime,
+            "build_rfdetr_evaluator_runtime",
+            return_value=(prepared_model, object()),
+        ) as build_runtime:
+            result = rf_detr_runtime.build_rfdetr_evaluator_model(factory_model_cfg, "2")
+
+        self.assertIs(result, prepared_model)
+        worker_config = build_runtime.call_args.args[0]
+        worker_tensorrt = worker_config["model"]["inference_optimization"]["tensorrt"]
+        self.assertEqual(worker_tensorrt["engine_path"], "/tmp/cache/model.engine")
+        self.assertEqual(
+            worker_tensorrt["manifest_path"],
+            "/tmp/cache/model.engine.manifest.json",
+        )
+        self.assertFalse(worker_tensorrt["force_rebuild"])
+        self.assertEqual(build_runtime.call_args.kwargs["device"], "2")
+        self.assertTrue(
+            merged["model"]["inference_optimization"]["tensorrt"]["force_rebuild"],
+            "worker mapping must not mutate the shared parent config",
+        )
+
+    def test_factory_refuses_unmapped_worker_instead_of_rebuilding(self):
+        merged = _config(device="0")
+        merged["model"]["inference_optimization"] = {
+            "backend": "tensorrt",
+            "tensorrt": {"precision": "fp16", "force_rebuild": True},
+        }
+        factory_model_cfg = {
+            "factory_config": {
+                "merged_config": merged,
+                "output_dir": "/tmp/out",
+                "prepared_tensorrt": {
+                    "cuda:0": {
+                        "engine_path": "/tmp/cache/model.engine",
+                        "manifest_path": "/tmp/cache/model.engine.manifest.json",
+                    }
+                },
+            }
+        }
+
+        with patch.object(rf_detr_runtime, "build_rfdetr_evaluator_runtime") as build_runtime:
+            with self.assertRaisesRegex(RuntimeError, "not allowed to rebuild"):
+                rf_detr_runtime.build_rfdetr_evaluator_model(factory_model_cfg, "cuda:3")
+
+        build_runtime.assert_not_called()
 
 
 class StandaloneMainFlowTests(unittest.TestCase):
@@ -294,8 +507,8 @@ class StandaloneMainFlowTests(unittest.TestCase):
             get_model_class.assert_not_called()
             build_parallel.assert_called_once()
             built_config = build_parallel.call_args.args[0]
-            self.assertEqual(built_config["dataset"]["dataset_dir"], "/tmp/resolved-dataset")
-            self.assertEqual(built_config["train"]["dataset_dir"], "/tmp/resolved-dataset")
+            self.assertEqual(Path(built_config["dataset"]["dataset_dir"]), Path("/tmp/resolved-dataset"))
+            self.assertEqual(Path(built_config["train"]["dataset_dir"]), Path("/tmp/resolved-dataset"))
             self.assertIsNone(started[7].call_args.kwargs["prebuilt_model"])
 
     def test_single_chunk_main_keeps_prebuilt_model_path(self):

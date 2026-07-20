@@ -217,6 +217,38 @@ class RFDETRModelSizeTest(unittest.TestCase):
 
             self.assertAlmostEqual(tester.average_inference_seconds({}, output_dir), 0.20)
 
+    def test_standalone_stage_timing_uses_additive_totals(self):
+        timing = tester.normalized_stage_timing(
+            {
+                "stats": [
+                    {
+                        "elapsed_seconds": 2.0,
+                        "preprocess_seconds": 0.2,
+                        "base_model_forward_seconds": 0.5,
+                        "sahi_model_forward_seconds": 0.6,
+                        "recheck_model_forward_seconds": 0.3,
+                        "model_forward_seconds": 1.4,
+                        "postprocess_seconds": 0.4,
+                    },
+                    {
+                        "elapsed_seconds": 1.0,
+                        "preprocess_seconds": 0.1,
+                        "base_model_forward_seconds": 0.2,
+                        "sahi_model_forward_seconds": 0.3,
+                        "recheck_model_forward_seconds": 0.1,
+                        "model_forward_seconds": 0.6,
+                        "postprocess_seconds": 0.3,
+                    },
+                ]
+            }
+        )
+
+        self.assertEqual(timing["images_or_frames"], 2)
+        self.assertAlmostEqual(timing["total_seconds"], 3.0)
+        self.assertAlmostEqual(timing["model_forward_seconds"], 2.0)
+        self.assertAlmostEqual(timing["recheck_model_forward_seconds"], 0.4)
+        self.assertAlmostEqual(timing["model_forward_ratio"], 2.0 / 3.0)
+
     def test_standalone_test_settings_map_to_evaluator_config(self):
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as temp:
             dataset_dir = Path(temp) / "dataset"
