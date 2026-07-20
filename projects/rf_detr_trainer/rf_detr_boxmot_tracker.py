@@ -18,11 +18,11 @@ boxmot-backed multi-object tracking adapter for RF-DETR video inference.
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any
 
 import numpy as np
-
 from rf_detr_video_tracking import (
     TRACK_FIELDS,
     TrackedBall,
@@ -58,8 +58,8 @@ def effective_reid_half(cfg: TrackingConfig, device: str) -> bool:
 def _build_boxmot_tracker(cfg: TrackingConfig, device: str) -> Any:
     """Construct the underlying boxmot tracker for ``cfg.algorithm``.
 
-    boxmot is imported here (lazily) so importing this module never requires the dependency.
-    Tests monkeypatch this function to inject a fake tracker and run fully offline.
+    boxmot is imported here (lazily) so importing this module never requires the dependency. Tests monkeypatch this
+    function to inject a fake tracker and run fully offline.
     """
     try:
         # Pinned to boxmot==13.0.0: later releases (v19+) removed these top-level tracker
@@ -137,22 +137,22 @@ def _build_boxmot_tracker(cfg: TrackingConfig, device: str) -> Any:
 class BoxmotTracker:
     """Adapter exposing the FootballTracker interface on top of a boxmot tracker.
 
-    ``.tracks`` holds TrackedBall objects so the existing ``draw_track_overlays`` and the
-    module-level render helpers (is_track_visible / trail_points / live_center / effective_radius)
-    consume it unchanged, and ``update`` emits the same TRACK_FIELDS as FootballTracker.
+    ``.tracks`` holds TrackedBall objects so the existing ``draw_track_overlays`` and the module-level render helpers
+    (is_track_visible / trail_points / live_center / effective_radius) consume it unchanged, and ``update`` emits the
+    same TRACK_FIELDS as FootballTracker.
     """
 
     def __init__(
         self,
         cfg: TrackingConfig,
         device: str = "cpu",
-        frame_size: Optional[Tuple[int, int]] = None,
+        frame_size: tuple[int, int] | None = None,
     ) -> None:
         self.cfg = cfg
         self.device = device
         self.frame_size = frame_size  # (width, height)
-        self.tracks: List[TrackedBall] = []
-        self._by_id: Dict[int, TrackedBall] = {}
+        self.tracks: list[TrackedBall] = []
+        self._by_id: dict[int, TrackedBall] = {}
         self._tracker = _build_boxmot_tracker(cfg, device)
 
     def _is_target(self, prediction: Mapping[str, Any]) -> bool:
@@ -180,30 +180,26 @@ class BoxmotTracker:
             "bytetrack": cfg.bytetrack_track_buffer,
         }.get(cfg.algorithm, 30)
 
-    def build_dets(
-        self, predictions: Sequence[Mapping[str, Any]]
-    ) -> Tuple[np.ndarray, List[int]]:
+    def build_dets(self, predictions: Sequence[Mapping[str, Any]]) -> tuple[np.ndarray, list[int]]:
         """Build the (K,6) [x1,y1,x2,y2,conf,cls] det array for target classes only.
 
         Returns the array plus ``target_local_to_orig`` mapping each det row back to the
         original prediction index (so the boxmot ``det_ind`` output column resolves cleanly).
         """
-        target_local_to_orig: List[int] = []
-        det_rows: List[List[float]] = []
+        target_local_to_orig: list[int] = []
+        det_rows: list[list[float]] = []
         for index, pred in enumerate(predictions):
             if not self._is_target(pred):
                 continue
             x, y, w, h = [float(value) for value in pred.get("bbox", [0, 0, 0, 0])[:4]]
-            det_rows.append(
-                [x, y, x + w, y + h, float(pred.get("score", 0.0)), float(pred.get("category_id", 0))]
-            )
+            det_rows.append([x, y, x + w, y + h, float(pred.get("score", 0.0)), float(pred.get("category_id", 0))])
             target_local_to_orig.append(index)
         dets = np.asarray(det_rows, dtype=float) if det_rows else np.empty((0, 6), dtype=float)
         return dets, target_local_to_orig
 
     def update(
         self, frame_index: int, predictions: Sequence[Mapping[str, Any]], frame: Any = None
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Run boxmot for one frame and return rows (input order) with TRACK_FIELDS attached."""
         cfg = self.cfg
         dets, target_local_to_orig = self.build_dets(predictions)
@@ -213,14 +209,14 @@ class BoxmotTracker:
         out = self._tracker.update(dets, img)
         out_array = np.asarray(out, dtype=float) if out is not None else np.empty((0, 8), dtype=float)
 
-        assigned: Dict[int, TrackedBall] = {}
-        seen_ids: Set[int] = set()
+        assigned: dict[int, TrackedBall] = {}
+        seen_ids: set[int] = set()
         for row in out_array:
             if len(row) < 8:
                 # 8 columns (incl. det_ind) are required to map back; skip otherwise.
                 continue
-            track_id = int(round(float(row[4])))
-            det_ind = int(round(float(row[7])))
+            track_id = round(float(row[4]))
+            det_ind = round(float(row[7]))
             if not 0 <= det_ind < target_count:
                 # Predicted-but-unmatched / version drift: ignore (no original row to attach to).
                 continue
@@ -266,7 +262,7 @@ class BoxmotTracker:
                 self.tracks = survivors
                 self._by_id = {track.track_id: track for track in survivors}
 
-        rows: List[Dict[str, Any]] = []
+        rows: list[dict[str, Any]] = []
         for index, pred in enumerate(predictions):
             row = dict(pred)
             track = assigned.get(index)
@@ -286,6 +282,6 @@ class BoxmotTracker:
             rows.append(row)
         return rows
 
-    def confirmed_tracks(self) -> List[TrackedBall]:
+    def confirmed_tracks(self) -> list[TrackedBall]:
         """Tracks that have reached min_hits (used for rendering and summaries)."""
         return [track for track in self.tracks if track.hits >= self.cfg.min_hits]

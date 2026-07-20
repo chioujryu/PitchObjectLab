@@ -1,3 +1,3 @@
-from pitch_ball_tracker.detection.ball_filter import BallFilter, BallCandidate
+from pitch_ball_tracker.detection.ball_filter import BallCandidate, BallFilter
 
-__all__ = ["BallFilter", "BallCandidate"]
+__all__ = ["BallCandidate", "BallFilter"]

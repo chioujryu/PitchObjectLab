@@ -44,14 +44,11 @@ class DFINECriterion(nn.Module):
         share_matched_indices=False,
         label_smoothing: float = 0.0,
     ):
-        """Create the criterion.
-        Parameters:
-            matcher: module able to compute a matching between targets and proposals.
-            weight_dict: dict containing as key the names of the losses and as values their relative weight.
-            losses: list of all the losses to be applied. See get_loss for list of available losses.
-            num_classes: number of object categories, omitting the special no-object category.
-            reg_max (int): Max number of the discrete bins in D-FINE.
-            boxes_weight_format: format for boxes weight (iou, ).
+        """Create the criterion. Parameters: matcher: module able to compute a matching between targets and proposals.
+        weight_dict: dict containing as key the names of the losses and as values their relative weight. losses:
+        list of all the losses to be applied. See get_loss for list of available losses. num_classes: number of
+        object categories, omitting the special no-object category. reg_max (int): Max number of the discrete
+        bins in D-FINE. boxes_weight_format: format for boxes weight (iou, ).
         """
         super().__init__()
         self.num_classes = num_classes
@@ -73,9 +70,7 @@ class DFINECriterion(nn.Module):
         src_logits = outputs["pred_logits"]
         idx = self._get_src_permutation_idx(indices)
         target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
-        target_classes = torch.full(
-            src_logits.shape[:2], self.num_classes, dtype=torch.int64, device=src_logits.device
-        )
+        target_classes = torch.full(src_logits.shape[:2], self.num_classes, dtype=torch.int64, device=src_logits.device)
         target_classes[idx] = target_classes_o
 
         # build float one-hot then apply label smoothing
@@ -86,9 +81,7 @@ class DFINECriterion(nn.Module):
             # distribute smoothing mass over all classes
             target = target * (1 - eps) + eps / C
 
-        loss = torchvision.ops.sigmoid_focal_loss(
-            src_logits, target, self.alpha, self.gamma, reduction="none"
-        )
+        loss = torchvision.ops.sigmoid_focal_loss(src_logits, target, self.alpha, self.gamma, reduction="none")
         loss = loss.mean(1).sum() * src_logits.shape[1] / num_boxes
         return {"loss_focal": loss}
 
@@ -105,9 +98,7 @@ class DFINECriterion(nn.Module):
 
         src_logits = outputs["pred_logits"]
         target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
-        target_classes = torch.full(
-            src_logits.shape[:2], self.num_classes, dtype=torch.int64, device=src_logits.device
-        )
+        target_classes = torch.full(src_logits.shape[:2], self.num_classes, dtype=torch.int64, device=src_logits.device)
         target_classes[idx] = target_classes_o
         target = F.one_hot(target_classes, num_classes=self.num_classes + 1)[..., :-1]
 
@@ -118,16 +109,14 @@ class DFINECriterion(nn.Module):
         pred_score = F.sigmoid(src_logits).detach()
         weight = self.alpha * pred_score.pow(self.gamma) * (1 - target) + target_score
 
-        loss = F.binary_cross_entropy_with_logits(
-            src_logits, target_score, weight=weight, reduction="none"
-        )
+        loss = F.binary_cross_entropy_with_logits(src_logits, target_score, weight=weight, reduction="none")
         loss = loss.mean(1).sum() * src_logits.shape[1] / num_boxes
         return {"loss_vfl": loss}
 
     def loss_boxes(self, outputs, targets, indices, num_boxes, boxes_weight=None):
-        """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
-        targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
-        The target boxes are expected in format (center_x, center_y, w, h), normalized by the image size.
+        """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss targets dicts must
+        contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4] The target boxes are expected in
+        format (center_x, center_y, w, h), normalized by the image size.
         """
         assert "pred_boxes" in outputs
         idx = self._get_src_permutation_idx(indices)
@@ -137,18 +126,15 @@ class DFINECriterion(nn.Module):
         loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction="none")
         losses["loss_bbox"] = loss_bbox.sum() / num_boxes
 
-        loss_giou = 1 - torch.diag(
-            generalized_box_iou(box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(target_boxes))
-        )
+        loss_giou = 1 - torch.diag(generalized_box_iou(box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(target_boxes)))
         loss_giou = loss_giou if boxes_weight is None else loss_giou * boxes_weight
         losses["loss_giou"] = loss_giou.sum() / num_boxes
 
         return losses
 
     def loss_local(self, outputs, targets, indices, num_boxes, T=5):
-        """Compute Fine-Grained Localization (FGL) Loss
-        and Decoupled Distillation Focal (DDF) Loss."""
-
+        """Compute Fine-Grained Localization (FGL) Loss and Decoupled Distillation Focal (DDF) Loss.
+        """
         losses = {}
         if "pred_corners" in outputs:
             idx = self._get_src_permutation_idx(indices)
@@ -174,14 +160,10 @@ class DFINECriterion(nn.Module):
                         outputs["up"],
                     )
 
-            target_corners, weight_right, weight_left = (
-                self.fgl_targets_dn if "is_dn" in outputs else self.fgl_targets
-            )
+            target_corners, weight_right, weight_left = self.fgl_targets_dn if "is_dn" in outputs else self.fgl_targets
 
             ious = torch.diag(
-                box_iou(
-                    box_cxcywh_to_xyxy(outputs["pred_boxes"][idx]), box_cxcywh_to_xyxy(target_boxes)
-                )[0]
+                box_iou(box_cxcywh_to_xyxy(outputs["pred_boxes"][idx]), box_cxcywh_to_xyxy(target_boxes))[0]
             )
             weight_targets = ious.unsqueeze(-1).repeat(1, 1, 4).reshape(-1).detach()
 
@@ -209,9 +191,7 @@ class DFINECriterion(nn.Module):
                     weight_targets_local[idx] = ious.reshape_as(weight_targets_local[idx]).to(
                         weight_targets_local.dtype
                     )
-                    weight_targets_local = (
-                        weight_targets_local.unsqueeze(-1).repeat(1, 1, 4).reshape(-1).detach()
-                    )
+                    weight_targets_local = weight_targets_local.unsqueeze(-1).repeat(1, 1, 4).reshape(-1).detach()
 
                     loss_match_local = (
                         weight_targets_local
@@ -224,25 +204,21 @@ class DFINECriterion(nn.Module):
                         ).sum(-1)
                     )
                     if "is_dn" not in outputs:
-                        batch_scale = (
-                            8 / outputs["pred_boxes"].shape[0]
-                        )  # Avoid the influence of batch size per GPU
+                        batch_scale = 8 / outputs["pred_boxes"].shape[0]  # Avoid the influence of batch size per GPU
                         self.num_pos, self.num_neg = (
                             (mask.sum() * batch_scale) ** 0.5,
                             ((~mask).sum() * batch_scale) ** 0.5,
                         )
                     loss_match_local1 = loss_match_local[mask].mean() if mask.any() else 0
                     loss_match_local2 = loss_match_local[~mask].mean() if (~mask).any() else 0
-                    losses["loss_ddf"] = (
-                        loss_match_local1 * self.num_pos + loss_match_local2 * self.num_neg
-                    ) / (self.num_pos + self.num_neg)
+                    losses["loss_ddf"] = (loss_match_local1 * self.num_pos + loss_match_local2 * self.num_neg) / (
+                        self.num_pos + self.num_neg
+                    )
 
         return losses
 
     def _prepare_target_masks(self, targets, indices, out_h, out_w, device):
-        """
-        Returns a single tensor of GT masks stacked in matched order:
-        shape -> [M, out_h, out_w] (float32 in {0,1})
+        """Returns a single tensor of GT masks stacked in matched order: shape -> [M, out_h, out_w] (float32 in {0,1})
         If a sample has no masks (or misaligned counts), its matches are skipped.
         """
         tgt_masks_list = []
@@ -273,9 +249,8 @@ class DFINECriterion(nn.Module):
         return torch.cat(tgt_masks_list, dim=0), valid_match_counts
 
     def _prepare_target_boxes_for_masks(self, targets, indices, out_h, out_w, device):
-        """
-        Returns GT boxes in mask coordinate space [M, 4] (x1, y1, x2, y2) for cropped loss.
-        Boxes are in normalized cxcywh format in targets, converted to absolute xyxy in mask space.
+        """Returns GT boxes in mask coordinate space [M, 4] (x1, y1, x2, y2) for cropped loss. Boxes are in normalized
+        cxcywh format in targets, converted to absolute xyxy in mask space.
         """
         boxes_list = []
         for t, (_, J) in zip(targets, indices):
@@ -336,10 +311,9 @@ class DFINECriterion(nn.Module):
 
     @staticmethod
     def _cropped_bce_loss(pred_logits, tgt_masks, boxes, eps=1e-6):
-        """
-        YOLO-style cropped mask loss: compute BCE only inside GT box, normalize by box area.
-        This gives higher relative weight to boundaries and prevents the network from
-        being punished for garbage outside the object region.
+        """YOLO-style cropped mask loss: compute BCE only inside GT box, normalize by box area. This gives higher
+        relative weight to boundaries and prevents the network from being punished for garbage outside the
+        object region.
 
         pred_logits: [M, H, W] (logits)
         tgt_masks  : [M, H, W] (0/1 or soft)
@@ -349,7 +323,7 @@ class DFINECriterion(nn.Module):
         if pred_logits.shape[0] == 0:
             return pred_logits.sum() * 0.0
 
-        M, H, W = pred_logits.shape
+        _M, H, W = pred_logits.shape
         device = pred_logits.device
         dtype = pred_logits.dtype
 
@@ -390,10 +364,7 @@ class DFINECriterion(nn.Module):
 
     @staticmethod
     def _dice_loss(pred_logits, tgt_masks, eps=1e-6):
-        """
-        pred_logits: [M, H, W] (logits)
-        tgt_masks  : [M, H, W] (0/1)
-        returns scalar mean Dice loss
+        """pred_logits: [M, H, W] (logits) tgt_masks : [M, H, W] (0/1) returns scalar mean Dice loss.
         """
         pred = pred_logits.sigmoid()
         pred = pred.flatten(1)  # [M, H * W]
@@ -405,9 +376,8 @@ class DFINECriterion(nn.Module):
 
     @staticmethod
     def _cropped_dice_loss(pred_logits, tgt_masks, boxes, eps=1e-6):
-        """
-        YOLO-style cropped Dice loss: compute Dice only inside GT box.
-        This prevents the network from learning to suppress pixels far from the object.
+        """YOLO-style cropped Dice loss: compute Dice only inside GT box. This prevents the network from learning to
+        suppress pixels far from the object.
 
         pred_logits: [M, H, W] (logits)
         tgt_masks  : [M, H, W] (0/1 or soft)
@@ -417,7 +387,7 @@ class DFINECriterion(nn.Module):
         if pred_logits.shape[0] == 0:
             return pred_logits.sum() * 0.0
 
-        M, H, W = pred_logits.shape
+        _M, H, W = pred_logits.shape
         device = pred_logits.device
         dtype = pred_logits.dtype
 
@@ -505,11 +475,9 @@ class DFINECriterion(nn.Module):
     #     return weighted_bce
 
     def loss_masks(self, outputs, targets, indices, num_boxes):
-        """
-        YOLO-style cropped BCE and Dice loss for masks.
-        Computes loss only inside GT boxes and normalizes by box area.
-        This gives higher relative weight to boundaries and prevents the network
-        from being punished for pixels outside the object region.
+        """YOLO-style cropped BCE and Dice loss for masks. Computes loss only inside GT boxes and normalizes by box
+        area. This gives higher relative weight to boundaries and prevents the network from being punished for
+        pixels outside the object region.
 
         input:
             outputs["pred_masks"]: [B, Q, Hm, Wm] (logits)
@@ -521,7 +489,7 @@ class DFINECriterion(nn.Module):
             return {}
 
         pred_masks = outputs["pred_masks"]  # [B,Q,Hm,Wm]
-        B, Q, Hm, Wm = pred_masks.shape
+        _B, _Q, Hm, Wm = pred_masks.shape
 
         # Gather predictions for matched queries
         b_idx, q_idx = self._get_src_permutation_idx(indices)  # shapes [M], [M]
@@ -533,17 +501,13 @@ class DFINECriterion(nn.Module):
         pred_sel = pred_masks[b_idx, q_idx]  # [M, Hm, Wm]
 
         # Prepare matched GT masks resized to (Hm, Wm)
-        tgt_sel, valid_M = self._prepare_target_masks(
-            targets, indices, Hm, Wm, device=pred_masks.device
-        )
+        tgt_sel, valid_M = self._prepare_target_masks(targets, indices, Hm, Wm, device=pred_masks.device)
         if valid_M == 0:
             zero = pred_sel.sum() * 0
             return {"loss_mask_bce": zero, "loss_mask_dice": zero}
 
         # Prepare GT boxes in mask coordinate space for cropped loss
-        tgt_boxes = self._prepare_target_boxes_for_masks(
-            targets, indices, Hm, Wm, device=pred_masks.device
-        )
+        tgt_boxes = self._prepare_target_boxes_for_masks(targets, indices, Hm, Wm, device=pred_masks.device)
 
         # If for robustness some matched pairs were skipped (no GT mask),
         if pred_sel.shape[0] != tgt_sel.shape[0]:
@@ -610,11 +574,9 @@ class DFINECriterion(nn.Module):
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
 
     def forward(self, outputs, targets, **kwargs):
-        """This performs the loss computation.
-        Parameters:
-             outputs: dict of tensors, see the output specification of the model for the format
-             targets: list of dicts, such that len(targets) == batch_size.
-                      The expected keys in each dict depends on the losses applied, see each loss' doc
+        """This performs the loss computation. Parameters: outputs: dict of tensors, see the output specification of the
+        model for the format targets: list of dicts, such that len(targets) == batch_size. The expected keys in
+        each dict depends on the losses applied, see each loss' doc.
         """
         outputs_without_aux = {k: v for k, v in outputs.items() if "aux" not in k}
 
@@ -645,11 +607,9 @@ class DFINECriterion(nn.Module):
         else:
             assert "aux_outputs" in outputs, ""
 
-        # Compute the average number of target boxes accross all nodes, for normalization purposes
+        # Compute the average number of target boxes across all nodes, for normalization purposes
         num_boxes = sum(len(t["labels"]) for t in targets)
-        num_boxes = torch.as_tensor(
-            [num_boxes], dtype=torch.float, device=next(iter(outputs.values())).device
-        )
+        num_boxes = torch.as_tensor([num_boxes], dtype=torch.float, device=next(iter(outputs.values())).device)
         if is_dist_available_and_initialized():
             torch.distributed.all_reduce(num_boxes)
         num_boxes = torch.clamp(num_boxes / get_world_size(), min=1).item()
@@ -672,13 +632,9 @@ class DFINECriterion(nn.Module):
                     indices_in = indices_go if loss in ["boxes", "local"] else cached_indices[i]
                     num_boxes_in = num_boxes_go if loss in ["boxes", "local"] else num_boxes
                     meta = self.get_loss_meta_info(loss, aux_outputs, targets, indices_in)
-                    l_dict = self.get_loss(
-                        loss, aux_outputs, targets, indices_in, num_boxes_in, **meta
-                    )
+                    l_dict = self.get_loss(loss, aux_outputs, targets, indices_in, num_boxes_in, **meta)
 
-                    l_dict = {
-                        k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict
-                    }
+                    l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
                     l_dict = {k + f"_aux_{i}": v for k, v in l_dict.items()}
                     losses.update(l_dict)
 
@@ -691,9 +647,7 @@ class DFINECriterion(nn.Module):
                 meta = self.get_loss_meta_info(loss, aux_outputs, targets, indices_in)
                 l_dict = self.get_loss(loss, aux_outputs, targets, indices_in, num_boxes_in, **meta)
 
-                l_dict = {
-                    k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict
-                }
+                l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
                 l_dict = {k + "_pre": v for k, v in l_dict.items()}
                 losses.update(l_dict)
 
@@ -715,19 +669,15 @@ class DFINECriterion(nn.Module):
                     indices_in = indices_go if loss == "boxes" else cached_indices_enc[i]
                     num_boxes_in = num_boxes_go if loss == "boxes" else num_boxes
                     meta = self.get_loss_meta_info(loss, aux_outputs, enc_targets, indices_in)
-                    l_dict = self.get_loss(
-                        loss, aux_outputs, enc_targets, indices_in, num_boxes_in, **meta
-                    )
-                    l_dict = {
-                        k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict
-                    }
+                    l_dict = self.get_loss(loss, aux_outputs, enc_targets, indices_in, num_boxes_in, **meta)
+                    l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
                     l_dict = {k + f"_enc_{i}": v for k, v in l_dict.items()}
                     losses.update(l_dict)
 
             if class_agnostic:
                 self.num_classes = orig_num_classes
 
-        # In case of cdn auxiliary losses. For dfine
+        # In case of cdn auxiliary losses. For define
         if "dn_outputs" in outputs:
             assert "dn_meta" in outputs, ""
             indices_dn = self.get_cdn_matched_indices(outputs["dn_meta"], targets)
@@ -739,12 +689,8 @@ class DFINECriterion(nn.Module):
                 aux_outputs["up"], aux_outputs["reg_scale"] = outputs["up"], outputs["reg_scale"]
                 for loss in self.losses:
                     meta = self.get_loss_meta_info(loss, aux_outputs, targets, indices_dn)
-                    l_dict = self.get_loss(
-                        loss, aux_outputs, targets, indices_dn, dn_num_boxes, **meta
-                    )
-                    l_dict = {
-                        k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict
-                    }
+                    l_dict = self.get_loss(loss, aux_outputs, targets, indices_dn, dn_num_boxes, **meta)
+                    l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
                     l_dict = {k + f"_dn_{i}": v for k, v in l_dict.items()}
                     losses.update(l_dict)
 
@@ -755,9 +701,7 @@ class DFINECriterion(nn.Module):
                     "pred_boxes": outputs["dn_outputs"][-1]["pred_boxes"],
                 }
                 l_dict = self.loss_masks(dn_final_outputs, targets, indices_dn, dn_num_boxes)
-                l_dict = {
-                    k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict
-                }
+                l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
                 l_dict = {k + "_dn_final": v for k, v in l_dict.items()}
                 losses.update(l_dict)
 
@@ -766,12 +710,8 @@ class DFINECriterion(nn.Module):
                 aux_outputs = outputs["dn_pre_outputs"]
                 for loss in self.losses:
                     meta = self.get_loss_meta_info(loss, aux_outputs, targets, indices_dn)
-                    l_dict = self.get_loss(
-                        loss, aux_outputs, targets, indices_dn, dn_num_boxes, **meta
-                    )
-                    l_dict = {
-                        k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict
-                    }
+                    l_dict = self.get_loss(loss, aux_outputs, targets, indices_dn, dn_num_boxes, **meta)
+                    l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
                     l_dict = {k + "_dn_pre": v for k, v in l_dict.items()}
                     losses.update(l_dict)
 
@@ -787,15 +727,11 @@ class DFINECriterion(nn.Module):
         target_boxes = torch.cat([t["boxes"][j] for t, (_, j) in zip(targets, indices)], dim=0)
 
         if self.boxes_weight_format == "iou":
-            iou, _ = box_iou(
-                box_cxcywh_to_xyxy(src_boxes.detach()), box_cxcywh_to_xyxy(target_boxes)
-            )
+            iou, _ = box_iou(box_cxcywh_to_xyxy(src_boxes.detach()), box_cxcywh_to_xyxy(target_boxes))
             iou = torch.diag(iou)
         elif self.boxes_weight_format == "giou":
             iou = torch.diag(
-                generalized_box_iou(
-                    box_cxcywh_to_xyxy(src_boxes.detach()), box_cxcywh_to_xyxy(target_boxes)
-                )
+                generalized_box_iou(box_cxcywh_to_xyxy(src_boxes.detach()), box_cxcywh_to_xyxy(target_boxes))
             )
         else:
             raise AttributeError()
@@ -811,7 +747,7 @@ class DFINECriterion(nn.Module):
 
     @staticmethod
     def get_cdn_matched_indices(dn_meta, targets):
-        """get_cdn_matched_indices"""
+        """get_cdn_matched_indices."""
         dn_positive_idx, dn_num_group = dn_meta["dn_positive_idx"], dn_meta["dn_num_group"]
         num_gts = [len(t["labels"]) for t in targets]
         device = targets[0]["labels"].device
@@ -843,9 +779,9 @@ class DFINECriterion(nn.Module):
         dis_left = label.long()
         dis_right = dis_left + 1
 
-        loss = F.cross_entropy(pred, dis_left, reduction="none") * weight_left.reshape(
-            -1
-        ) + F.cross_entropy(pred, dis_right, reduction="none") * weight_right.reshape(-1)
+        loss = F.cross_entropy(pred, dis_left, reduction="none") * weight_left.reshape(-1) + F.cross_entropy(
+            pred, dis_right, reduction="none"
+        ) * weight_right.reshape(-1)
 
         if weight is not None:
             weight = weight.float()

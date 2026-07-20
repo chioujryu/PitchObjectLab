@@ -1,4 +1,4 @@
-"""
+r"""
 Standalone RF-DETR test runner with full_image, sahi, and class_crop modes.
 
 Usage:
@@ -25,18 +25,18 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, MutableMapping, Optional
+from typing import Any
 
 import colorama
+import rf_detr_runtime as trainer
 import yaml
 from colorama import Fore, Style
 from tqdm import tqdm
 
-import rf_detr_runtime as trainer
 from projects.object_detection_dataset_evaluator.object_detection_dataset_evaluator import run_evaluation
 
 colorama.init(autoreset=True)
@@ -45,7 +45,7 @@ DEFAULT_CONFIG = Path(__file__).resolve().parent / "config" / "rf_detr_test.yaml
 TIMESTAMP_FORMAT = "%Y%m%d%H%M%S"
 
 
-def load_yaml(path: Path) -> Dict[str, Any]:
+def load_yaml(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as file:
         data = yaml.safe_load(file) or {}
     if not isinstance(data, dict):
@@ -114,14 +114,14 @@ def normalize_test_device(value: Any) -> str:
     return text
 
 
-def _float_or_none(value: Any) -> Optional[float]:
+def _float_or_none(value: Any) -> float | None:
     try:
         return float(value)
     except (TypeError, ValueError):
         return None
 
 
-def average_inference_seconds(result: Mapping[str, Any], output_dir: Path) -> Optional[float]:
+def average_inference_seconds(result: Mapping[str, Any], output_dir: Path) -> float | None:
     """Return average inference seconds per image from result payload or saved evaluator files."""
     summary = result.get("summary")
     if isinstance(summary, Mapping):
@@ -175,7 +175,7 @@ def print_inference_timing_summary(result: Mapping[str, Any], output_dir: Path) 
         print(f"Per-image inference stats: {stats_path}")
 
 
-def _non_negative_int_or_none(value: Any) -> Optional[int]:
+def _non_negative_int_or_none(value: Any) -> int | None:
     if value is None:
         return None
     if isinstance(value, str) and value.strip().lower() in {"", "all", "none", "null"}:
@@ -206,7 +206,7 @@ def estimate_standalone_test_outputs(
     config: Mapping[str, Any],
     output_dir: Path,
     dataset_plan: Mapping[str, Any],
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Estimate standalone test files before materializing dataset or output folders."""
     test_settings = config.get("test", {})
     evaluation = config.get("evaluation", {})
@@ -253,8 +253,19 @@ def estimate_standalone_test_outputs(
         + error_case_files
         + dataset_cache_files
     )
-    image_outputs = model_input_files + max(0, visual_files - 2 if visual_files else 0) + max(0, error_case_files - 3 if error_case_files else 0) + dataset_case_files
-    approx_bytes = dataset_cache_bytes + metric_files * 200_000 + image_outputs * 500_000 + plot_files * 350_000 + config_files * 50_000
+    image_outputs = (
+        model_input_files
+        + max(0, visual_files - 2 if visual_files else 0)
+        + max(0, error_case_files - 3 if error_case_files else 0)
+        + dataset_case_files
+    )
+    approx_bytes = (
+        dataset_cache_bytes
+        + metric_files * 200_000
+        + image_outputs * 500_000
+        + plot_files * 350_000
+        + config_files * 50_000
+    )
     estimate = {
         "output_dir": str(output_dir),
         "dataset_source_format": dataset_plan.get("source_format"),
@@ -292,14 +303,20 @@ def confirm_test_or_exit(estimate: Mapping[str, Any], verbose: bool, assume_yes:
     print(json.dumps(dict(estimate), indent=2, ensure_ascii=False))
     if assume_yes:
         if verbose:
-            print(Fore.BLUE + Style.BRIGHT + "Confirmation skipped because --yes or confirm_before_run=false is enabled.")
+            print(
+                Fore.BLUE + Style.BRIGHT + "Confirmation skipped because --yes or confirm_before_run=false is enabled."
+            )
         return
-    answer = input(Fore.BLUE + Style.BRIGHT + "Continue and start standalone test? [y/N]: " + Style.RESET_ALL).strip().lower()
+    answer = (
+        input(Fore.BLUE + Style.BRIGHT + "Continue and start standalone test? [y/N]: " + Style.RESET_ALL)
+        .strip()
+        .lower()
+    )
     if answer not in {"y", "yes"}:
         raise SystemExit("Aborted by developer before test output was produced.")
 
 
-def build_internal_test_config(config: Mapping[str, Any]) -> Dict[str, Any]:
+def build_internal_test_config(config: Mapping[str, Any]) -> dict[str, Any]:
     """Translate a test-only YAML into the internal RF-DETR/evaluator shape."""
     internal = deepcopy(dict(config))
     test = dict(internal.get("test", {}) or {})
@@ -319,10 +336,12 @@ def build_internal_test_config(config: Mapping[str, Any]) -> Dict[str, Any]:
     test_mode = test.get("test_mode", {})
     test_mode_value = test_mode.get("mode") if isinstance(test_mode, Mapping) else None
     mode = (
-        internal.get("test_mode", {}).get("mode")
-        if isinstance(internal.get("test_mode"), Mapping)
-        else None
-    ) or test_mode_value or test.get("mode") or periodic_mode or "full_image"
+        (internal.get("test_mode", {}).get("mode") if isinstance(internal.get("test_mode"), Mapping) else None)
+        or test_mode_value
+        or test.get("mode")
+        or periodic_mode
+        or "full_image"
+    )
     split = str(test.get("split") or periodic_source.get("split") or dataset.get("split", "test") or "test")
     max_images = trainer.parse_limit_value(test.get("max_images", periodic_source.get("max_images")), "test.max_images")
     crop = test.get("crop") or internal.get("crop") or periodic_source.get("crop") or {}
@@ -340,8 +359,12 @@ def build_internal_test_config(config: Mapping[str, Any]) -> Dict[str, Any]:
     internal["crop"] = dict(crop)
     internal["sahi"] = dict(sahi)
     evaluation.setdefault("classwise", bool(test.get("classwise", periodic_source.get("classwise", True))))
-    evaluation.setdefault("max_detections", [1, 10, int(test.get("max_dets", periodic_source.get("max_dets", 500)) or 500)])
-    evaluation.setdefault("match_iou_threshold", float(test.get("match_iou_threshold", periodic_source.get("match_iou_threshold", 0.5))))
+    evaluation.setdefault(
+        "max_detections", [1, 10, int(test.get("max_dets", periodic_source.get("max_dets", 500)) or 500)]
+    )
+    evaluation.setdefault(
+        "match_iou_threshold", float(test.get("match_iou_threshold", periodic_source.get("match_iou_threshold", 0.5)))
+    )
     test_settings = {
         **test,
         "split": split,
@@ -354,7 +377,9 @@ def build_internal_test_config(config: Mapping[str, Any]) -> Dict[str, Any]:
         "plots": bool(test.get("plots", periodic_source.get("plots", False))),
         "save_dataset_cases": bool(test.get("save_dataset_cases", periodic_source.get("save_dataset_cases", False))),
         "visual_samples": dict(visual_samples),
-        "model_input_batch_size": int(test.get("model_input_batch_size", periodic_source.get("model_input_batch_size", 9)) or 9),
+        "model_input_batch_size": int(
+            test.get("model_input_batch_size", periodic_source.get("model_input_batch_size", 9)) or 9
+        ),
         "batch_size": int(test.get("batch_size", periodic_source.get("batch_size", 4)) or 4),
         "error_cases": dict(error_cases),
         "conf": model.get("confidence_threshold", 0.25),
@@ -384,7 +409,7 @@ def build_internal_test_config(config: Mapping[str, Any]) -> Dict[str, Any]:
     return internal
 
 
-def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int:
+def _main_impl(timing_context: MutableMapping[str, Any] | None = None) -> int:
     parser = argparse.ArgumentParser(description="RF-DETR standalone test runner.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="Path to rf_detr_test.yaml.")
     parser.add_argument("--model-size", help="RF-DETR size override, e.g. medium, large, seg-small, seg-2xlarge.")
@@ -393,7 +418,9 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
     parser.add_argument("--num-classes", type=int, help="Optional class count override.")
     parser.add_argument("--output-dir", help="Exact output directory override.")
     parser.add_argument("--test-mode", choices=["full_image", "sahi", "class_crop"], help="Test mode override.")
-    parser.add_argument("--max-images", type=trainer.parse_scalar, help="Maximum test images to evaluate. Use all/null for all.")
+    parser.add_argument(
+        "--max-images", type=trainer.parse_scalar, help="Maximum test images to evaluate. Use all/null for all."
+    )
     parser.add_argument("--batch-size", type=int, help="RF-DETR full-image/class-crop evaluator batch size.")
     parser.add_argument("--sahi-batch-size", type=int, help="RF-DETR SAHI slice/recheck batch size.")
     parser.add_argument("--dry-run", action="store_true", help="Validate and print planned output without inference.")

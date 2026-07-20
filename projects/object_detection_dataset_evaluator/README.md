@@ -32,7 +32,8 @@ If your machine blocks the default uv cache folder, use a local cache:
 
 ```bash
 # PowerShell
-$env:UV_CACHE_DIR="$PWD/.uv-cache"; uv sync
+$env:UV_CACHE_DIR="$PWD/.uv-cache"
+uv sync
 
 # Linux/macOS
 UV_CACHE_DIR="$PWD/.uv-cache" uv sync
@@ -116,14 +117,14 @@ Important sections:
 
 ```yaml
 inference:
-  mode: sahi          # full_image, sahi, class_crop
+  mode: sahi # full_image, sahi, class_crop
   use_sahi: true
 
 test_mode:
   mode: sahi
 
 crop:
-  class_names: []     # empty means all predicted classes can define the crop
+  class_names: [] # empty means all predicted classes can define the crop
   source_conf: 0.25
   padding_pixels: 0
   padding_ratio: 0.05

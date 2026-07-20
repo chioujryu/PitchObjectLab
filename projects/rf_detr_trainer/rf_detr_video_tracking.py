@@ -17,12 +17,13 @@ from __future__ import annotations
 
 import math
 from collections import deque
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any
 
 # Tracking fields attached to every prediction row when tracking is enabled.
 # Non-target predictions receive these same keys set to None.
-TRACK_FIELDS: Tuple[str, ...] = (
+TRACK_FIELDS: tuple[str, ...] = (
     "track_id",
     "track_center_x",
     "track_center_y",
@@ -68,7 +69,7 @@ def _as_float(value: Any, default: float, field_name: str) -> float:
         raise ValueError(f"inference.tracking.{field_name} must be a number, got {value!r}") from exc
 
 
-def _as_optional_float(value: Any, field_name: str) -> Optional[float]:
+def _as_optional_float(value: Any, field_name: str) -> float | None:
     if _is_null_token(value):
         return None
     try:
@@ -77,7 +78,7 @@ def _as_optional_float(value: Any, field_name: str) -> Optional[float]:
         raise ValueError(f"inference.tracking.{field_name} must be a number or null, got {value!r}") from exc
 
 
-def _as_optional_int(value: Any, field_name: str) -> Optional[int]:
+def _as_optional_int(value: Any, field_name: str) -> int | None:
     """Parse an int that may be the all/null sentinel (returns None for 'all'/null)."""
     if _is_null_token(value):
         return None
@@ -104,7 +105,7 @@ def _as_str(value: Any, default: str, field_name: str) -> str:
     return text or default
 
 
-def _as_optional_str(value: Any) -> Optional[str]:
+def _as_optional_str(value: Any) -> str | None:
     """Return a stripped string, or None for null/none/empty sentinels."""
     if _is_null_token(value):
         return None
@@ -137,9 +138,9 @@ def _as_positive_float(value: Any, default: float, field_name: str) -> float:
 
 # Tracking algorithms: "circle" is the built-in stdlib tracker in this module; the rest are
 # provided by the boxmot adapter (rf_detr_boxmot_tracker.BoxmotTracker).
-ALLOWED_ALGORITHMS: Tuple[str, ...] = ("circle", "ocsort", "deepocsort", "botsort", "bytetrack")
+ALLOWED_ALGORITHMS: tuple[str, ...] = ("circle", "ocsort", "deepocsort", "botsort", "bytetrack")
 # boxmot trackers that consume an appearance ReID model (need reid_weights / device).
-APPEARANCE_ALGORITHMS: Tuple[str, ...] = ("deepocsort", "botsort")
+APPEARANCE_ALGORITHMS: tuple[str, ...] = ("deepocsort", "botsort")
 _ALLOWED_CMC_METHODS = {"ecc", "orb", "sof", "sparseoptflow", "file", "files"}
 
 
@@ -148,18 +149,18 @@ class TrackingConfig:
     """Parsed and validated `inference.tracking` settings."""
 
     enabled: bool = False
-    target_class_ids: Set[int] = field(default_factory=set)
+    target_class_ids: set[int] = field(default_factory=set)
     radius_pixels: float = 80.0
-    radius_scale: Optional[float] = None
+    radius_scale: float | None = None
     radius_growth_per_missing_frame: float = 0.0
-    max_radius_pixels: Optional[float] = None
-    max_missing_frames: Optional[int] = None
+    max_radius_pixels: float | None = None
+    max_missing_frames: int | None = None
     min_hits: int = 1
     use_velocity_prediction: bool = False
     velocity_smoothing: float = 0.5
     draw_trajectory: bool = True
-    trajectory_max_points: Optional[int] = 30
-    trajectory_max_age_frames: Optional[int] = 30
+    trajectory_max_points: int | None = 30
+    trajectory_max_age_frames: int | None = 30
     trajectory_width: int = 2
     trajectory_per_track_color: bool = True
     trajectory_taper: bool = True
@@ -169,10 +170,10 @@ class TrackingConfig:
     # Algorithm selector: "circle" (this module) or boxmot-backed trackers.
     algorithm: str = "circle"
     # Shared boxmot ReID / camera-motion settings (only used by boxmot algorithms).
-    reid_weights: Optional[str] = None
-    reid_device: Optional[str] = None
+    reid_weights: str | None = None
+    reid_device: str | None = None
     reid_half: bool = False
-    cmc_method: Optional[str] = "ecc"
+    cmc_method: str | None = "ecc"
     per_class: bool = False
     # OC-SORT parameters.
     ocsort_det_thresh: float = 0.2
@@ -229,10 +230,10 @@ class TrackedBall:
     hits: int = 0
     first_frame_index: int = 0
     last_seen_frame_index: int = 0
-    points: "Deque[Tuple[int, float, float]]" = field(default_factory=deque)
+    points: deque[tuple[int, float, float]] = field(default_factory=deque)
 
 
-def bbox_center(prediction: Mapping[str, Any]) -> Tuple[float, float]:
+def bbox_center(prediction: Mapping[str, Any]) -> tuple[float, float]:
     """Return the center (cx, cy) of a COCO xywh bbox."""
     x, y, width, height = [float(value) for value in prediction.get("bbox", [0, 0, 0, 0])[:4]]
     return x + width / 2.0, y + height / 2.0
@@ -252,7 +253,7 @@ def effective_radius(track: TrackedBall, cfg: TrackingConfig) -> float:
     return radius
 
 
-def predicted_center(track: TrackedBall, cfg: TrackingConfig, elapsed_frames: int = 0) -> Tuple[float, float]:
+def predicted_center(track: TrackedBall, cfg: TrackingConfig, elapsed_frames: int = 0) -> tuple[float, float]:
     """Gate center: extrapolate by velocity over the elapsed frames when enabled, else last center."""
     if cfg.use_velocity_prediction and elapsed_frames > 0:
         return (
@@ -269,7 +270,7 @@ def _history_maxlen(cfg: TrackingConfig) -> int:
     return DEFAULT_HISTORY_LIMIT
 
 
-def is_track_visible(track: TrackedBall, current_frame_index: Optional[int], cfg: TrackingConfig) -> bool:
+def is_track_visible(track: TrackedBall, current_frame_index: int | None, cfg: TrackingConfig) -> bool:
     """Whether a track's overlay should be drawn: confirmed and seen within trajectory_max_age_frames."""
     if track.hits < cfg.min_hits:
         return False
@@ -278,7 +279,7 @@ def is_track_visible(track: TrackedBall, current_frame_index: Optional[int], cfg
     return current_frame_index - track.last_seen_frame_index <= cfg.trajectory_max_age_frames
 
 
-def trail_points(track: TrackedBall, current_frame_index: Optional[int], cfg: TrackingConfig) -> List[Tuple[float, float]]:
+def trail_points(track: TrackedBall, current_frame_index: int | None, cfg: TrackingConfig) -> list[tuple[float, float]]:
     """Trail (x, y) points to draw; points older than trajectory_max_age_frames are dropped so the trail retracts."""
     if cfg.trajectory_max_age_frames is None or current_frame_index is None:
         return [(point_x, point_y) for (_, point_x, point_y) in track.points]
@@ -290,14 +291,14 @@ def trail_points(track: TrackedBall, current_frame_index: Optional[int], cfg: Tr
     ]
 
 
-def live_center(track: TrackedBall, current_frame_index: Optional[int], cfg: TrackingConfig) -> Tuple[float, float]:
+def live_center(track: TrackedBall, current_frame_index: int | None, cfg: TrackingConfig) -> tuple[float, float]:
     """Current drawn position: velocity-extrapolated through a detection gap, else the last detected center."""
     if current_frame_index is None:
         return track.center_x, track.center_y
     return predicted_center(track, cfg, current_frame_index - track.last_seen_frame_index)
 
 
-def _category_name_to_id(categories: Sequence[Mapping[str, Any]]) -> Dict[str, int]:
+def _category_name_to_id(categories: Sequence[Mapping[str, Any]]) -> dict[str, int]:
     return {str(category.get("name", category["id"])).casefold(): int(category["id"]) for category in categories}
 
 
@@ -308,7 +309,7 @@ def parse_tracking_config(
     """Build a TrackingConfig from `inference.tracking`, resolving target class IDs."""
     raw = dict((config.get("inference", {}) or {}).get("tracking", {}) or {})
 
-    target_ids: Set[int] = {int(value) for value in (raw.get("target_class_ids") or [])}
+    target_ids: set[int] = {int(value) for value in (raw.get("target_class_ids") or [])}
     if not target_ids:
         name_to_id = _category_name_to_id(categories)
         names = [str(value).casefold() for value in (raw.get("target_class_names") or [])]
@@ -341,9 +342,7 @@ def parse_tracking_config(
 
     algorithm = _as_str(raw.get("algorithm"), "circle", "algorithm").casefold()
     if algorithm not in ALLOWED_ALGORITHMS:
-        raise ValueError(
-            f"inference.tracking.algorithm must be one of {list(ALLOWED_ALGORITHMS)}, got {algorithm!r}"
-        )
+        raise ValueError(f"inference.tracking.algorithm must be one of {list(ALLOWED_ALGORITHMS)}, got {algorithm!r}")
     cmc_method = _as_optional_str(raw.get("cmc_method", "ecc"))
     if cmc_method is not None and cmc_method.casefold() not in _ALLOWED_CMC_METHODS:
         raise ValueError(
@@ -427,7 +426,7 @@ class FootballTracker:
 
     def __init__(self, cfg: TrackingConfig) -> None:
         self.cfg = cfg
-        self.tracks: List[TrackedBall] = []
+        self.tracks: list[TrackedBall] = []
         self.next_id = 1
 
     def _is_target(self, prediction: Mapping[str, Any]) -> bool:
@@ -475,7 +474,7 @@ class FootballTracker:
 
     def update(
         self, frame_index: int, predictions: Sequence[Mapping[str, Any]], frame: Any = None
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Associate this frame's detections, returning rows (input order) with tracking fields.
 
         `frame` is accepted for interface parity with the boxmot adapter and ignored here
@@ -487,8 +486,8 @@ class FootballTracker:
             ((index, pred) for index, pred in enumerate(predictions) if self._is_target(pred)),
             key=lambda item: -float(item[1].get("score", 0.0)),
         )
-        centers: Dict[int, Tuple[float, float]] = {index: bbox_center(pred) for index, pred in ordered_targets}
-        score_rank: Dict[int, int] = {index: rank for rank, (index, _) in enumerate(ordered_targets)}
+        centers: dict[int, tuple[float, float]] = {index: bbox_center(pred) for index, pred in ordered_targets}
+        score_rank: dict[int, int] = {index: rank for rank, (index, _) in enumerate(ordered_targets)}
 
         # Global association: collect every valid detection<->track pair, then assign nearest first.
         candidates = []
@@ -500,9 +499,9 @@ class FootballTracker:
                     candidates.append((distance, track.track_id, score_rank[index], index, track))
         candidates.sort(key=lambda item: (item[0], item[1], item[2]))
 
-        used_tracks: Set[int] = set()
-        used_dets: Set[int] = set()
-        assigned: Dict[int, TrackedBall] = {}
+        used_tracks: set[int] = set()
+        used_dets: set[int] = set()
+        assigned: dict[int, TrackedBall] = {}
         for _distance, track_id, _rank, index, track in candidates:
             if track_id in used_tracks or index in used_dets:
                 continue
@@ -541,7 +540,7 @@ class FootballTracker:
         if cfg.max_missing_frames is not None:
             self.tracks = [track for track in self.tracks if track.missing_frames <= cfg.max_missing_frames]
 
-        rows: List[Dict[str, Any]] = []
+        rows: list[dict[str, Any]] = []
         for index, pred in enumerate(predictions):
             row = dict(pred)
             track = assigned.get(index)
@@ -561,14 +560,14 @@ class FootballTracker:
             rows.append(row)
         return rows
 
-    def confirmed_tracks(self) -> List[TrackedBall]:
+    def confirmed_tracks(self) -> list[TrackedBall]:
         """Tracks that have reached min_hits (used for rendering and summaries)."""
         return [track for track in self.tracks if track.hits >= self.cfg.min_hits]
 
 
-def build_tracking_summary(all_predictions: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+def build_tracking_summary(all_predictions: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """Aggregate per-(source, track_id) statistics from prediction rows."""
-    groups: Dict[Tuple[Any, int], Dict[str, Any]] = {}
+    groups: dict[tuple[Any, int], dict[str, Any]] = {}
     for row in all_predictions:
         track_id = row.get("track_id")
         if track_id is None:
@@ -597,7 +596,7 @@ def build_tracking_summary(all_predictions: Sequence[Mapping[str, Any]]) -> Dict
         group["hits"] = max(group["hits"], int(row.get("track_hits") or 0))
         group["confirmed"] = group["confirmed"] or bool(row.get("track_confirmed"))
 
-    tracks: List[Dict[str, Any]] = []
+    tracks: list[dict[str, Any]] = []
     for group in sorted(groups.values(), key=lambda item: (str(item["source"]), item["track_id"])):
         first, last = group["first_frame_index"], group["last_frame_index"]
         group["lifespan_frames"] = (last - first + 1) if first is not None and last is not None else None

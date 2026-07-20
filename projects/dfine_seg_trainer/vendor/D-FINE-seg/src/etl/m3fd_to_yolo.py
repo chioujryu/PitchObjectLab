@@ -1,4 +1,4 @@
-"""Convert the M3FD multi-modal detection dataset to this repo's YOLO + multi-channel
+r"""Convert the M3FD multi-modal detection dataset to this repo's YOLO + multi-channel
 ``.npy`` layout.
 
 M3FD ships as:
@@ -30,18 +30,17 @@ import xml.etree.ElementTree as ET
 import zipfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import List, Tuple
 
 import cv2
 import numpy as np
 from tqdm import tqdm
 
 # Canonical M3FD class ordering used by the dataset paper.
-CLASSES: Tuple[str, ...] = ("People", "Car", "Bus", "Lamp", "Motorcycle", "Truck")
+CLASSES: tuple[str, ...] = ("People", "Car", "Bus", "Lamp", "Motorcycle", "Truck")
 CLASS_TO_ID = {name: i for i, name in enumerate(CLASSES)}
 
 
-def _parse_voc_xml(xml_path: Path) -> Tuple[int, int, List[Tuple[int, float, float, float, float]]]:
+def _parse_voc_xml(xml_path: Path) -> tuple[int, int, list[tuple[int, float, float, float, float]]]:
     """Returns (width, height, [(cls, xc, yc, w, h), ...]) with normalized YOLO boxes."""
     root = ET.parse(xml_path).getroot()
     size = root.find("size")
@@ -75,7 +74,7 @@ def _parse_voc_xml(xml_path: Path) -> Tuple[int, int, List[Tuple[int, float, flo
     return width, height, boxes
 
 
-def _process_one(args) -> Tuple[str, str]:
+def _process_one(args) -> tuple[str, str]:
     """Worker: convert a single sample. Returns (stem, status)."""
     stem, src_dir, dst_dir = args
     src_dir = Path(src_dir)
@@ -116,7 +115,7 @@ def _process_one(args) -> Tuple[str, str]:
     return stem, "ok"
 
 
-def _resolve_src(src: Path) -> Tuple[Path, Path]:
+def _resolve_src(src: Path) -> tuple[Path, Path]:
     """Returns (src_root, temp_dir). temp_dir is None when src was already a directory."""
     if src.is_dir():
         return src, None
@@ -132,13 +131,9 @@ def _resolve_src(src: Path) -> Tuple[Path, Path]:
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     parser.add_argument("--src", type=Path, required=True, help="M3FD.zip or extracted root dir")
-    parser.add_argument(
-        "--dst", type=Path, required=True, help="Output dataset dir (gets images/ and labels/)"
-    )
+    parser.add_argument("--dst", type=Path, required=True, help="Output dataset dir (gets images/ and labels/)")
     parser.add_argument("--workers", type=int, default=0, help="0 = os.cpu_count()")
-    parser.add_argument(
-        "--keep-tmp", action="store_true", help="Don't delete extracted zip on exit"
-    )
+    parser.add_argument("--keep-tmp", action="store_true", help="Don't delete extracted zip on exit")
     args = parser.parse_args()
 
     src_root, tmp_dir = _resolve_src(args.src)

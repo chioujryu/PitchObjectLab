@@ -9,10 +9,10 @@ All notable changes to D-FINE-seg since the paper release will be documented in 
 
 #### Results (TACO dataset)
 
-| Metric | Before | After |
-|--------|--------|-------|
-| mIoU   | 0.096  | 0.107 (+11% relative) |
-| Latency | 4.0 ms | 4.1 ms (+2%) |
+| Metric  | Before | After                 |
+| ------- | ------ | --------------------- |
+| mIoU    | 0.096  | 0.107 (+11% relative) |
+| Latency | 4.0 ms | 4.1 ms (+2%)          |
 
 ## 2026-03-05 - Implement CoreML export and inference
 
@@ -23,7 +23,7 @@ All notable changes to D-FINE-seg since the paper release will be documented in 
 ## 2026-03-11 - CoreML int8
 
 - Add int8 quantzation for CoreML, ruexported by default alongside with fp32 versionduring `make export`
-- Adepted `make bench` to supprot macos and linux platforms automatically. Torch, OpenVINO, ONNX run for both. TensorRT - linux, CoreML - macos.
+- Adepted `make bench` to support macos and linux platforms automatically. Torch, OpenVINO, ONNX run for both. TensorRT - linux, CoreML - macos.
 
 ## 2026-04-05 - LiteRT export and COCO segmentation pretrained weights
 
@@ -36,12 +36,12 @@ All notable changes to D-FINE-seg since the paper release will be documented in 
 
 Although D-FINE doesn't require a NMS, it still helps to boost the accuracy with a tiny latency increase. TensorRT FP16, 5070ti, model D-FINEm, VisDrone dataset:
 
-| Metric | F1-score | Latency |
-|--------|--------|-------|
-| No NMS | 0.587 | 3.6 ms |
-| With NMS | 0.605 | 3.8 ms |
+| Metric   | F1-score | Latency |
+| -------- | -------- | ------- |
+| No NMS   | 0.587    | 3.6 ms  |
+| With NMS | 0.605    | 3.8 ms  |
 
-Same behaviour on TACO dataset for both detectin and segmentation models.
+Same behavior on TACO dataset for both detectin and segmentation models.
 
 ## 2026-05-01 - Optimize TensorRT inference class
 

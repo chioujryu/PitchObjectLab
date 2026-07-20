@@ -153,7 +153,7 @@ periodic_test:
   enabled: true
   split: test
   test_mode:
-    mode: full_image   # full_image, sahi, class_crop
+    mode: full_image # full_image, sahi, class_crop
   test_interval_epochs: 30
 run_final_test: true
 classwise: true
@@ -280,8 +280,8 @@ trajectory trails, and writes a `tracking_summary.json`. The tracker is selected
 inference:
   tracking:
     enabled: true
-    algorithm: circle     # default; or ocsort / deepocsort / botsort / bytetrack (via boxmot)
-    target_class_names: [football]   # which class(es) to track (default football)
+    algorithm: circle # default; or ocsort / deepocsort / botsort / bytetrack (via boxmot)
+    target_class_names: [football] # which class(es) to track (default football)
 ```
 
 - `circle` (**default**) — the built-in, dependency-free centroid/search-circle ball tracker
@@ -327,10 +327,10 @@ or use a motion-only tracker:
 ```yaml
 inference:
   tracking:
-    reid_weights: D:/weights/osnet_x0_25_msmt17.pt   # local file => no download
+    reid_weights: D:/weights/osnet_x0_25_msmt17.pt # local file => no download
     # or: algorithm: ocsort        # motion-only, no ReID
     botsort:
-      with_reid: false             # BoT-SORT without appearance (no download)
+      with_reid: false # BoT-SORT without appearance (no download)
 ```
 
 The ReID device follows `model.device` (override with `inference.tracking.reid_device`);

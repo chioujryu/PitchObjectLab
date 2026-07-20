@@ -1,4 +1,4 @@
-"""
+r"""
 Train any local Ultralytics model config with configurable per-epoch validation interval,
 periodic test-split evaluation on a schedule, and a final test evaluation after training.
 
@@ -13,9 +13,9 @@ This script is a configurable Python wrapper around the Ultralytics Python API. 
 6. Config snapshots inside every run/test output folder for reproducibility.
 7. Linux and Windows path support.
 
-Validation interval behaviour
+Validation interval behavior
 -------------------------------
-  val_interval=1 (default)  Run validation every epoch (Ultralytics default behaviour).
+  val_interval=1 (default)  Run validation every epoch (Ultralytics default behavior).
   val_interval=5             Run validation every 5th epoch. On non-val epochs the previous
                              val result is reused so early stopping patience and best.pt still
                              track real val performance without saving non-validated weights.
@@ -64,15 +64,15 @@ import argparse
 import csv
 import json
 import math
-import os
 import re
 import shutil
 import sys
 import time
+from collections.abc import Mapping, MutableMapping, Sequence
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+from typing import Any
 
 import colorama
 import yaml
@@ -96,8 +96,8 @@ TEMPLATE_PLACEHOLDER_RE = re.compile(r"\{([A-Za-z0-9_.-]+)\}")
 MODEL_YAML_SUFFIXES = {".yaml", ".yml"}
 MODEL_CONFIG_PREFIXES = ("ultralytics/cfg/models/", "cfg/models/", "models/")
 SUPPORTED_TASKS = {"auto", "detect", "segment", "classify", "pose", "obb"}
-_MODEL_CONFIG_INDEX: Optional[Dict[str, Path]] = None
-_MODEL_CONFIG_DUPLICATES: Optional[Dict[str, List[Path]]] = None
+_MODEL_CONFIG_INDEX: dict[str, Path] | None = None
+_MODEL_CONFIG_DUPLICATES: dict[str, list[Path]] | None = None
 PER_CLASS_METRIC_FIELDNAMES = [
     "class_id",
     "class",
@@ -148,7 +148,7 @@ def deep_update(base: MutableMapping[str, Any], updates: Mapping[str, Any]) -> M
     return base
 
 
-def load_yaml(path: Path) -> Dict[str, Any]:
+def load_yaml(path: Path) -> dict[str, Any]:
     """Load YAML into a dictionary."""
     with path.open("r", encoding="utf-8") as file:
         loaded = yaml.safe_load(file) or {}
@@ -202,12 +202,12 @@ def normalize_model_lookup_key(value: str) -> str:
     text = text.lower()
     for prefix in MODEL_CONFIG_PREFIXES:
         if text.startswith(prefix):
-            text = text[len(prefix):]
+            text = text[len(prefix) :]
             break
     return text
 
 
-def add_model_lookup_key(index: Dict[str, Path], duplicates: Dict[str, List[Path]], key: str, path: Path) -> None:
+def add_model_lookup_key(index: dict[str, Path], duplicates: dict[str, list[Path]], key: str, path: Path) -> None:
     """Add one model lookup key while tracking ambiguous aliases."""
     normalized = normalize_model_lookup_key(key)
     if not normalized:
@@ -220,14 +220,14 @@ def add_model_lookup_key(index: Dict[str, Path], duplicates: Dict[str, List[Path
         duplicates.setdefault(normalized, [existing]).append(path)
 
 
-def build_model_config_index() -> Tuple[Dict[str, Path], Dict[str, List[Path]]]:
+def build_model_config_index() -> tuple[dict[str, Path], dict[str, list[Path]]]:
     """Build a cached O(1) lookup table for ultralytics/cfg/models YAML files."""
     global _MODEL_CONFIG_INDEX, _MODEL_CONFIG_DUPLICATES
     if _MODEL_CONFIG_INDEX is not None and _MODEL_CONFIG_DUPLICATES is not None:
         return _MODEL_CONFIG_INDEX, _MODEL_CONFIG_DUPLICATES
 
-    index: Dict[str, Path] = {}
-    duplicates: Dict[str, List[Path]] = {}
+    index: dict[str, Path] = {}
+    duplicates: dict[str, list[Path]] = {}
     if MODEL_CONFIG_ROOT.exists():
         for path in sorted(MODEL_CONFIG_ROOT.rglob("*.yaml")) + sorted(MODEL_CONFIG_ROOT.rglob("*.yml")):
             rel = path.relative_to(MODEL_CONFIG_ROOT).as_posix()
@@ -253,7 +253,7 @@ def build_model_config_index() -> Tuple[Dict[str, Path], Dict[str, List[Path]]]:
     return index, duplicates
 
 
-def model_lookup_candidates(value: str) -> List[str]:
+def model_lookup_candidates(value: str) -> list[str]:
     """Return likely aliases for a model config name, preserving most-specific candidates first."""
     key = normalize_model_lookup_key(value)
     candidates = [key]
@@ -261,7 +261,7 @@ def model_lookup_candidates(value: str) -> List[str]:
     if suffix not in MODEL_YAML_SUFFIXES:
         candidates.extend([f"{key}.yaml", f"{key}.yml"])
     seen = set()
-    unique: List[str] = []
+    unique: list[str] = []
     for candidate in candidates:
         if candidate and candidate not in seen:
             seen.add(candidate)
@@ -319,7 +319,7 @@ def module_name_from_head_entry(entry: Any) -> str:
     return str(module).rsplit(".", 1)[-1].lower()
 
 
-def task_from_module_name(module_name: str) -> Optional[str]:
+def task_from_module_name(module_name: str) -> str | None:
     """Map a final model-head module name to an Ultralytics task."""
     module = module_name.lower()
     if module in {"classify", "classifier", "cls", "fc"}:
@@ -335,7 +335,7 @@ def task_from_module_name(module_name: str) -> Optional[str]:
     return None
 
 
-def task_from_model_name(value: Any) -> Optional[str]:
+def task_from_model_name(value: Any) -> str | None:
     """Infer task from a model filename/path when YAML inspection is unavailable."""
     path = Path(str(value).replace("\\", "/"))
     stem = path.stem.lower()
@@ -399,7 +399,7 @@ def is_rtdetr_model_source(model_source: Any) -> bool:
     return False
 
 
-def create_ultralytics_model(model_source: Any, task_override: str, verbose: bool) -> Tuple[Any, str]:
+def create_ultralytics_model(model_source: Any, task_override: str, verbose: bool) -> tuple[Any, str]:
     """Create the right Ultralytics model wrapper and return it with the detected task."""
     detected_task = infer_task_from_model_source(model_source, task_override)
     if is_rtdetr_model_source(model_source):
@@ -463,10 +463,10 @@ def path_stem_fragment(value: Any, default: str) -> str:
     return template_fragment(path.stem or path.name or normalized or default)
 
 
-def build_template_replacements(config: Mapping[str, Any], extra: Optional[Mapping[str, Any]] = None) -> Dict[str, str]:
+def build_template_replacements(config: Mapping[str, Any], extra: Mapping[str, Any] | None = None) -> dict[str, str]:
     """Build placeholder values from config dot-paths plus unambiguous leaf aliases."""
-    replacements: Dict[str, str] = {}
-    leaf_values: Dict[str, List[Any]] = {}
+    replacements: dict[str, str] = {}
+    leaf_values: dict[str, list[Any]] = {}
 
     def visit(node: Any, prefix: str = "") -> None:
         if isinstance(node, Mapping):
@@ -492,9 +492,9 @@ def build_template_replacements(config: Mapping[str, Any], extra: Optional[Mappi
 def build_output_template_replacements(
     config: Mapping[str, Any],
     timestamp: str,
-    train_args: Optional[Mapping[str, Any]] = None,
-    extra: Optional[Mapping[str, Any]] = None,
-) -> Dict[str, str]:
+    train_args: Mapping[str, Any] | None = None,
+    extra: Mapping[str, Any] | None = None,
+) -> dict[str, str]:
     """Build output folder placeholders from config, train args, and runtime aliases."""
     replacements = build_template_replacements(config)
     for key, value in (train_args or {}).items():
@@ -539,8 +539,8 @@ def render_output_template(
     value: Any,
     config: Mapping[str, Any],
     timestamp: str,
-    train_args: Optional[Mapping[str, Any]] = None,
-    extra: Optional[Mapping[str, Any]] = None,
+    train_args: Mapping[str, Any] | None = None,
+    extra: Mapping[str, Any] | None = None,
 ) -> Any:
     """Render an output path/name template using config-derived placeholders."""
     return render_config_template(value, build_output_template_replacements(config, timestamp, train_args, extra))
@@ -550,14 +550,14 @@ def render_output_dir_name(
     value: Any,
     config: Mapping[str, Any],
     timestamp: str,
-    train_args: Optional[Mapping[str, Any]] = None,
-    extra: Optional[Mapping[str, Any]] = None,
+    train_args: Mapping[str, Any] | None = None,
+    extra: Mapping[str, Any] | None = None,
 ) -> str:
     """Render and sanitize a single output directory name."""
     return sanitize_name(str(render_output_template(value, config, timestamp, train_args, extra)))
 
 
-def metrics_to_dict(metrics: Any) -> Dict[str, Any]:
+def metrics_to_dict(metrics: Any) -> dict[str, Any]:
     """Convert Ultralytics metric objects or dicts into a JSON-friendly dictionary."""
     if metrics is None:
         return {}
@@ -568,7 +568,7 @@ def metrics_to_dict(metrics: Any) -> Dict[str, Any]:
     else:
         raw = {"repr": repr(metrics)}
 
-    result: Dict[str, Any] = {}
+    result: dict[str, Any] = {}
     for key, value in raw.items():
         value = json_safe_value(value)
         if isinstance(value, (int, float, str, bool)) or value is None:
@@ -620,7 +620,7 @@ def class_name_from_metrics(metrics: Any, class_id: int) -> str:
     return str(class_id)
 
 
-def per_class_metrics_rows(metrics: Any) -> List[Dict[str, Any]]:
+def per_class_metrics_rows(metrics: Any) -> list[dict[str, Any]]:
     """Extract per-class detection metrics from an Ultralytics DetMetrics object."""
     if metrics is None or not hasattr(metrics, "ap_class_index"):
         return []
@@ -634,7 +634,7 @@ def per_class_metrics_rows(metrics: Any) -> List[Dict[str, Any]]:
     all_ap = json_safe_value(getattr(box_metrics, "all_ap", []))
     nt_per_image = getattr(metrics, "nt_per_image", [])
     nt_per_class = getattr(metrics, "nt_per_class", [])
-    rows: List[Dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
 
     for metric_index, raw_class_id in enumerate(class_indices):
         class_id = int(raw_class_id)
@@ -704,7 +704,7 @@ def write_per_class_metrics(output_dir: Path, metrics: Any, prefix: str = "test_
     write_rows(output_dir, per_class_metrics_rows(metrics), prefix, PER_CLASS_METRIC_FIELDNAMES)
 
 
-def copy_if_exists(src: Optional[Path], dst: Path) -> None:
+def copy_if_exists(src: Path | None, dst: Path) -> None:
     """Copy a file if it exists."""
     if src and src.exists():
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -716,8 +716,8 @@ def dump_config_snapshot(
     merged_config: Mapping[str, Any],
     train_args: Mapping[str, Any],
     metadata: Mapping[str, Any],
-    source_config: Optional[Path] = None,
-    generated_dataset_yaml: Optional[Path] = None,
+    source_config: Path | None = None,
+    generated_dataset_yaml: Path | None = None,
 ) -> None:
     """Save reproducibility config files inside an output folder."""
     config_dir = output_dir / "config"
@@ -730,7 +730,7 @@ def dump_config_snapshot(
     copy_if_exists(generated_dataset_yaml, config_dir / "dataset.yaml")
 
 
-def maybe_count_images(path: Optional[Path]) -> Optional[int]:
+def maybe_count_images(path: Path | None) -> int | None:
     """Count image files under a local directory, returning None if the path is unavailable."""
     if path is None or not path.exists():
         return None
@@ -749,7 +749,7 @@ def maybe_count_images(path: Optional[Path]) -> Optional[int]:
     return total
 
 
-def local_dataset_path(root: Any, split: Any) -> Optional[Path]:
+def local_dataset_path(root: Any, split: Any) -> Path | None:
     """Resolve a dataset split to a local Path when possible."""
     if split is None or split == "":
         return None
@@ -765,7 +765,7 @@ def local_dataset_path(root: Any, split: Any) -> Optional[Path]:
     return candidate
 
 
-def load_dataset_info_from_yaml(data_yaml: Any) -> Dict[str, Any]:
+def load_dataset_info_from_yaml(data_yaml: Any) -> dict[str, Any]:
     """Load basic dataset info from a YOLO data YAML when it is local."""
     resolved = resolve_existing_or_raw(data_yaml, [Path.cwd(), PROJECT_DIR, REPO_ROOT])
     path = Path(str(resolved)).expanduser()
@@ -779,7 +779,7 @@ def load_dataset_info_from_yaml(data_yaml: Any) -> Dict[str, Any]:
     return data
 
 
-def estimate_periodic_tests(train_args: Mapping[str, Any], periodic: Mapping[str, Any]) -> Tuple[Optional[int], str]:
+def estimate_periodic_tests(train_args: Mapping[str, Any], periodic: Mapping[str, Any]) -> tuple[int | None, str]:
     """Estimate how many scheduled test runs will be produced."""
     if not periodic.get("enabled", True):
         return 0, "disabled"
@@ -789,12 +789,12 @@ def estimate_periodic_tests(train_args: Mapping[str, Any], periodic: Mapping[str
     minute_interval = float(periodic.get("test_interval_minutes") or 0.0)
     time_hours = train_args.get("time")
 
-    by_epoch: Optional[int] = None
-    by_time: Optional[int] = None
+    by_epoch: int | None = None
+    by_time: int | None = None
     if epochs and epoch_interval > 0:
-        by_epoch = int(math.floor(float(epochs) / epoch_interval))
+        by_epoch = math.floor(float(epochs) / epoch_interval)
     if time_hours and minute_interval > 0:
-        by_time = int(math.floor((float(time_hours) * 60.0) / minute_interval))
+        by_time = math.floor((float(time_hours) * 60.0) / minute_interval)
 
     candidates = [x for x in (by_epoch, by_time) if x is not None]
     if candidates:
@@ -804,7 +804,7 @@ def estimate_periodic_tests(train_args: Mapping[str, Any], periodic: Mapping[str
     return 0, "no interval configured"
 
 
-def find_weight_size_bytes(model_value: Any, pretrained_value: Any) -> Optional[int]:
+def find_weight_size_bytes(model_value: Any, pretrained_value: Any) -> int | None:
     """Find a likely checkpoint size from model/pretrained paths."""
     for value in (pretrained_value, model_value):
         if not isinstance(value, str) or not value.endswith(".pt"):
@@ -816,7 +816,7 @@ def find_weight_size_bytes(model_value: Any, pretrained_value: Any) -> Optional[
     return None
 
 
-def format_bytes(num_bytes: Optional[float]) -> str:
+def format_bytes(num_bytes: float | None) -> str:
     """Format bytes for display."""
     if num_bytes is None:
         return "unknown"
@@ -833,13 +833,13 @@ def estimate_outputs(
     config: Mapping[str, Any],
     train_args: Mapping[str, Any],
     data_yaml: Any,
-    periodic_count: Optional[int],
-) -> Dict[str, Any]:
+    periodic_count: int | None,
+) -> dict[str, Any]:
     """Estimate output files and disk usage before training."""
     dataset_section = config.get("dataset", {})
     dataset_info = load_dataset_info_from_yaml(data_yaml) if data_yaml else {}
     dataset_root = dataset_info.get("path", dataset_section.get("path"))
-    split_counts: Dict[str, Optional[int]] = {}
+    split_counts: dict[str, int | None] = {}
     for split_name in ("train", "val", "test"):
         split_value = dataset_info.get(split_name, dataset_section.get(split_name))
         split_counts[split_name] = maybe_count_images(local_dataset_path(dataset_root, split_value))
@@ -867,7 +867,11 @@ def estimate_outputs(
     checkpoint_bytes = None
     if weight_size is not None:
         checkpoint_bytes = checkpoint_files * weight_size * 2.2
-    plot_count_estimate = (16 if plots else 0) + (periodic_count or 0) * (8 if test_plots else 0) + ((8 if test_plots else 0) if final_files else 0)
+    plot_count_estimate = (
+        (16 if plots else 0)
+        + (periodic_count or 0) * (8 if test_plots else 0)
+        + ((8 if test_plots else 0) if final_files else 0)
+    )
     plot_bytes = plot_count_estimate * 1.5 * 1024 * 1024
     total_bytes = None if checkpoint_bytes is None else checkpoint_bytes + plot_bytes
 
@@ -894,7 +898,7 @@ def confirm_or_exit(estimate: Mapping[str, Any], verbose: bool, assume_yes: bool
         raise SystemExit("Aborted by developer before heavy output was produced.")
 
 
-def make_generated_dataset_yaml(config: Mapping[str, Any], run_name: str) -> Optional[Path]:
+def make_generated_dataset_yaml(config: Mapping[str, Any], run_name: str) -> Path | None:
     """Create a YOLO dataset YAML from the dataset section when data_yaml is not provided."""
     dataset = config.get("dataset", {})
     if dataset.get("data_yaml"):
@@ -920,9 +924,9 @@ def make_generated_dataset_yaml(config: Mapping[str, Any], run_name: str) -> Opt
     return output_path
 
 
-def parse_extra_args(items: Optional[Sequence[str]]) -> Dict[str, Any]:
+def parse_extra_args(items: Sequence[str] | None) -> dict[str, Any]:
     """Parse --extra key=value items into Ultralytics training args."""
-    parsed: Dict[str, Any] = {}
+    parsed: dict[str, Any] = {}
     for item in items or []:
         if "=" not in item:
             raise ValueError(f"--extra must use key=value format, got {item!r}.")
@@ -1069,7 +1073,7 @@ def apply_demo_mode(config: MutableMapping[str, Any], timestamp: str, verbose: b
     blue("Demo mode enabled: epochs, fraction, batch, plots, and output folder were clamped.", verbose)
 
 
-def build_train_args(config: Mapping[str, Any], data_yaml: Any, timestamp: str) -> Dict[str, Any]:
+def build_train_args(config: Mapping[str, Any], data_yaml: Any, timestamp: str) -> dict[str, Any]:
     """Build Ultralytics train keyword arguments from config."""
     train = deepcopy(config.get("train", {}))
     extra = train.pop("extra_yolo_args", {}) or {}
@@ -1082,7 +1086,7 @@ def build_train_args(config: Mapping[str, Any], data_yaml: Any, timestamp: str) 
 
     model_value = resolve_model_source(config.get("model"), [Path.cwd(), PROJECT_DIR, REPO_ROOT])
 
-    train_args: Dict[str, Any] = {}
+    train_args: dict[str, Any] = {}
     train_args.update(train)
     train_args.update(extra)
     train_args["data"] = str(data_yaml)
@@ -1091,7 +1095,9 @@ def build_train_args(config: Mapping[str, Any], data_yaml: Any, timestamp: str) 
     train_args["mode"] = "train"
     train_args["name"] = render_output_template(train_args.get("name"), config, timestamp)
     train_args["project"] = render_output_template(train_args.get("project"), config, timestamp, train_args)
-    train_args["pretrained"] = resolve_existing_or_raw(train_args.get("pretrained"), [Path.cwd(), PROJECT_DIR, REPO_ROOT])
+    train_args["pretrained"] = resolve_existing_or_raw(
+        train_args.get("pretrained"), [Path.cwd(), PROJECT_DIR, REPO_ROOT]
+    )
 
     for key in ("cfg", "project"):
         train_args[key] = resolve_existing_or_raw(train_args.get(key), [Path.cwd(), PROJECT_DIR, REPO_ROOT])
@@ -1103,9 +1109,9 @@ def build_train_args(config: Mapping[str, Any], data_yaml: Any, timestamp: str) 
     return train_args
 
 
-def validate_requirements(config: Mapping[str, Any], train_args: Mapping[str, Any], data_yaml: Any) -> List[str]:
+def validate_requirements(config: Mapping[str, Any], train_args: Mapping[str, Any], data_yaml: Any) -> list[str]:
     """Check ambiguous or contradictory settings before training."""
-    warnings: List[str] = []
+    warnings: list[str] = []
     dataset = config.get("dataset", {})
     periodic = config.get("periodic_test", {})
     model_source = str(train_args.get("_model_source", ""))
@@ -1116,7 +1122,11 @@ def validate_requirements(config: Mapping[str, Any], train_args: Mapping[str, An
         warnings.append(f"Model config root was not found: {MODEL_CONFIG_ROOT}")
     if dataset.get("data_yaml") and any(dataset.get(k) for k in ("path", "train", "val", "test")):
         warnings.append("Both dataset.data_yaml and dataset path/split fields are set; data_yaml has priority.")
-    if periodic.get("enabled", True) and not periodic.get("test_interval_epochs") and not periodic.get("test_interval_minutes"):
+    if (
+        periodic.get("enabled", True)
+        and not periodic.get("test_interval_epochs")
+        and not periodic.get("test_interval_minutes")
+    ):
         warnings.append("periodic_test.enabled=true but no interval is configured; only final test can run.")
     if periodic.get("enabled", True) and data_info and not data_info.get("test"):
         warnings.append("The selected dataset YAML does not define a test split; periodic test will be skipped.")
@@ -1125,7 +1135,11 @@ def validate_requirements(config: Mapping[str, Any], train_args: Mapping[str, An
             "The repo contains ultralytics/cfg/models/26/yolo26-p2.yaml, while yolo26m-p2.yaml is resolved by "
             "Ultralytics scale inference. If resolution fails, use model=ultralytics/cfg/models/26/yolo26-p2.yaml."
         )
-    if model_source.endswith((".yaml", ".yml")) and not Path(model_source).expanduser().exists() and not is_url_like(model_source):
+    if (
+        model_source.endswith((".yaml", ".yml"))
+        and not Path(model_source).expanduser().exists()
+        and not is_url_like(model_source)
+    ):
         warnings.append(
             f"Model YAML {model_source!r} was not found by the wrapper index. Ultralytics will try its own resolver."
         )
@@ -1141,7 +1155,9 @@ def validate_requirements(config: Mapping[str, Any], train_args: Mapping[str, An
             "convert detection labels automatically."
         )
     if periodic.get("classwise", False) and task_value == "classify":
-        warnings.append("periodic_test.classwise is detection-style; classification metrics will still be saved normally.")
+        warnings.append(
+            "periodic_test.classwise is detection-style; classification metrics will still be saved normally."
+        )
     device = str(train_args.get("device", ""))
     if periodic.get("enabled", True) and "," in device and device.lower() not in {"cpu", "mps"}:
         warnings.append(
@@ -1149,7 +1165,9 @@ def validate_requirements(config: Mapping[str, Any], train_args: Mapping[str, An
             "run callbacks only inside subprocesses."
         )
     if train_args.get("save_txt") or train_args.get("save_json") or train_args.get("plots"):
-        warnings.append("Plots/json/txt outputs can grow with test image count; the confirmation step includes this risk.")
+        warnings.append(
+            "Plots/json/txt outputs can grow with test image count; the confirmation step includes this risk."
+        )
 
     val_interval = int(train_args.get("_val_interval") or 1)
     if val_interval > 1:
@@ -1167,28 +1185,26 @@ def validate_requirements(config: Mapping[str, Any], train_args: Mapping[str, An
 def _make_interval_val_trainer(val_interval: int, base_trainer_cls: type) -> type:
     """Return a task-specific Trainer subclass that runs validation only every val_interval epochs.
 
-    On skipped epochs the previous val result is returned unchanged so that Ultralytics early
-    stopping and best.pt selection track real val performance without saving non-validated weights.
+    On skipped epochs the previous val result is returned unchanged so that Ultralytics early stopping and best.pt
+    selection track real val performance without saving non-validated weights.
 
-    The returned fitness on skipped epochs is nudged one epsilon below best_fitness so that
-    save_model() never overwrites best.pt with weights that have not been validated this epoch.
+    The returned fitness on skipped epochs is nudged one epsilon below best_fitness so that save_model() never
+    overwrites best.pt with weights that have not been validated this epoch.
     """
+
     class IntervalValTrainer(base_trainer_cls):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
             self._val_interval: int = val_interval
-            self._cached_val_metrics: Optional[Dict[str, Any]] = None
-            self._cached_val_fitness: Optional[float] = None
+            self._cached_val_metrics: dict[str, Any] | None = None
+            self._cached_val_fitness: float | None = None
 
-        def validate(self) -> Tuple[Optional[Dict[str, Any]], Optional[float]]:
+        def validate(self) -> tuple[dict[str, Any] | None, float | None]:
             epoch_1 = getattr(self, "epoch", 0) + 1
             is_final = bool(getattr(self, "final_epoch", False))
             possible_stop = bool(getattr(getattr(self, "stopper", None), "possible_stop", False))
             must_run = (
-                self._cached_val_metrics is None
-                or is_final
-                or possible_stop
-                or epoch_1 % self._val_interval == 0
+                self._cached_val_metrics is None or is_final or possible_stop or epoch_1 % self._val_interval == 0
             )
             if must_run:
                 m, f = super().validate()
@@ -1222,7 +1238,7 @@ def copy_test_batch_aliases(output_dir: Path) -> None:
                 shutil.copy2(src, dst)
 
 
-def resolve_trainer_weight_path(trainer: Any, prefer_best: bool = False) -> Optional[Path]:
+def resolve_trainer_weight_path(trainer: Any, prefer_best: bool = False) -> Path | None:
     """Find a saved Ultralytics checkpoint for image-level evaluator tests."""
     candidates = []
     if prefer_best:
@@ -1246,7 +1262,7 @@ def build_yolo_evaluator_config(
     output_dir: Path,
     model_path: Path,
     mode: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Build a standalone evaluator config for YOLO non-full-image test modes."""
     max_det = get_with_fallback(periodic, "max_det", train_args.get("max_det", 300))
     conf = get_with_fallback(periodic, "conf", train_args.get("conf"))
@@ -1343,7 +1359,7 @@ def write_evaluator_metric_aliases(output_dir: Path, result: Mapping[str, Any]) 
 
 def run_yolo_image_level_test(
     config: Mapping[str, Any],
-    source_config: Optional[Path],
+    source_config: Path | None,
     train_args: Mapping[str, Any],
     periodic: Mapping[str, Any],
     output_dir: Path,
@@ -1364,8 +1380,8 @@ class PeriodicTestRunner:
     def __init__(
         self,
         config: Mapping[str, Any],
-        source_config: Optional[Path],
-        generated_dataset_yaml: Optional[Path],
+        source_config: Path | None,
+        generated_dataset_yaml: Path | None,
         train_args: Mapping[str, Any],
         verbose: bool,
     ) -> None:
@@ -1424,7 +1440,10 @@ class PeriodicTestRunner:
         if mode != shared_modes.FULL_IMAGE_MODE:
             model_path = resolve_trainer_weight_path(trainer, prefer_best=False)
             if model_path is None:
-                blue("Scheduled image-level test skipped because no saved last.pt/best.pt checkpoint was found.", force=True)
+                blue(
+                    "Scheduled image-level test skipped because no saved last.pt/best.pt checkpoint was found.",
+                    force=True,
+                )
                 self.tested_epochs.add(epoch_number)
                 return
             run_yolo_image_level_test(
@@ -1442,7 +1461,9 @@ class PeriodicTestRunner:
             return
 
         if self.test_loader is None or not periodic.get("reuse_test_loader", True):
-            batch_size = getattr(getattr(trainer, "test_loader", None), "batch_size", None) or int(trainer.batch_size) * 2
+            batch_size = (
+                getattr(getattr(trainer, "test_loader", None), "batch_size", None) or int(trainer.batch_size) * 2
+            )
             self.test_loader = trainer.get_dataloader(trainer.data["test"], batch_size=batch_size, rank=-1, mode="val")
 
         validator_args = deepcopy(vars(trainer.validator.args))
@@ -1505,8 +1526,8 @@ def run_final_test(
     model: Any,
     config: Mapping[str, Any],
     train_args: Mapping[str, Any],
-    source_config: Optional[Path],
-    generated_dataset_yaml: Optional[Path],
+    source_config: Path | None,
+    generated_dataset_yaml: Path | None,
     verbose: bool,
 ) -> None:
     """Run final test split evaluation with the trained model."""
@@ -1637,10 +1658,16 @@ Example usage:
     )
     parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="Path to the YAML config file.")
     parser.add_argument("--yes", action="store_true", help="Skip the interactive confirmation prompt.")
-    parser.add_argument("--dry-run", action="store_true", default=None, help="Validate config and estimate outputs only.")
-    parser.add_argument("--verbose", dest="verbose", action="store_true", default=None, help="Enable blue wrapper logs.")
+    parser.add_argument(
+        "--dry-run", action="store_true", default=None, help="Validate config and estimate outputs only."
+    )
+    parser.add_argument(
+        "--verbose", dest="verbose", action="store_true", default=None, help="Enable blue wrapper logs."
+    )
     parser.add_argument("--quiet", dest="verbose", action="store_false", help="Disable blue wrapper logs.")
-    parser.add_argument("--confirm-before-run", type=parse_bool, default=None, help="Ask before heavy output is created.")
+    parser.add_argument(
+        "--confirm-before-run", type=parse_bool, default=None, help="Ask before heavy output is created."
+    )
     parser.add_argument("--demo", action="store_true", default=None, help="Enable small demo output mode.")
     parser.add_argument("--no-demo", dest="demo", action="store_false", help="Disable demo output mode.")
 
@@ -1665,7 +1692,11 @@ Example usage:
     parser.add_argument("--patience", type=int, default=None, help="Early stopping patience in epochs.")
     parser.add_argument("--device", default=None, help="CUDA device ids like 0, 7, 0,1, or cpu.")
     parser.add_argument("--project", default=None, help="Ultralytics output project directory.")
-    parser.add_argument("--name", default=None, help="Run name. Supports {timestamp}, {date}, and config placeholders like {train.imgsz}.")
+    parser.add_argument(
+        "--name",
+        default=None,
+        help="Run name. Supports {timestamp}, {date}, and config placeholders like {train.imgsz}.",
+    )
     parser.add_argument("--workers", type=int, default=None, help="Dataloader workers.")
     parser.add_argument("--optimizer", default=None, help="Optimizer: auto, SGD, AdamW, etc.")
 
@@ -1696,10 +1727,12 @@ Example usage:
     parser.add_argument("--max-det", type=int, default=None, help="Maximum detections per image.")
 
     parser.add_argument(
-        "--val-interval", type=int, default=None,
+        "--val-interval",
+        type=int,
+        default=None,
         help="Run val every N epochs (1=every epoch, 5=every 5th, 0=disable). "
-             "Affects early stopping and best.pt. With N>1, patience counts every training epoch; "
-             "set patience=N*desired_val_evals for predictable early stopping.",
+        "Affects early stopping and best.pt. With N>1, patience counts every training epoch; "
+        "set patience=N*desired_val_evals for predictable early stopping.",
     )
     parser.add_argument("--save", type=parse_bool, default=None, help="Save checkpoints.")
     parser.add_argument("--cache", type=parse_scalar, default=None, help="Cache: false, true, ram, disk.")
@@ -1713,7 +1746,9 @@ Example usage:
     parser.add_argument("--deterministic", type=parse_bool, default=None, help="Use deterministic operations.")
     parser.add_argument("--half", type=parse_bool, default=None, help="Use FP16 for validation/test.")
 
-    parser.add_argument("--periodic-test", type=parse_bool, default=None, help="Enable scheduled test-split evaluation.")
+    parser.add_argument(
+        "--periodic-test", type=parse_bool, default=None, help="Enable scheduled test-split evaluation."
+    )
     parser.add_argument("--test-interval-epochs", type=int, default=None, help="Run test every N epochs.")
     parser.add_argument("--test-interval-minutes", type=float, default=None, help="Run test every N minutes.")
     parser.add_argument("--final-test", dest="final_test", action="store_true", default=None, help="Run final test.")
@@ -1741,77 +1776,70 @@ Example usage:
 
 
 def main() -> int:
-    """
-    Main entry point for YOLO training with configurable val interval and periodic test evaluation.
+    r"""Main entry point for YOLO training with configurable val interval and periodic test evaluation.
 
     Overview
     --------
     This script wraps the Ultralytics YOLO Python API to provide:
-      - Training from any YAML under ultralytics/cfg/models, resolved by filename or relative path.
-      - Configurable validation interval (val_interval): run val every N epochs instead of every
+    - Training from any YAML under ultralytics/cfg/models, resolved by filename or relative path.
+    - Configurable validation interval (val_interval): run val every N epochs instead of every
         epoch. On non-val epochs the previous result is reused, keeping early stopping and best.pt
         tracking valid without saving non-validated weights as best.
-      - Periodic test-split evaluation on a schedule (every N epochs or N minutes).
-      - Final test evaluation after training.
-      - Pre-run resource estimate + developer confirmation before large outputs are written.
-      - Config snapshots in every output directory for full reproducibility.
+    - Periodic test-split evaluation on a schedule (every N epochs or N minutes).
+    - Final test evaluation after training.
+    - Pre-run resource estimate + developer confirmation before large outputs are written.
+    - Config snapshots in every output directory for full reproducibility.
 
     Configuration
     -------------
-    Edit projects/yolo_trainer/config/yolo_train.yaml for persistent settings.
-    Set model to any YAML in ultralytics/cfg/models, for example rtdetr-l.yaml,
-    26/yolo26-p2.yaml, v8/yolov8-seg.yaml, or an absolute YAML path.
-    Set task=auto to infer detect/segment/classify/pose/obb from the model config.
-    Any YAML value can be overridden from the CLI (see --help for all flags).
-    Unknown Ultralytics arguments can be passed with --extra key=value.
+    Edit projects/yolo_trainer/config/yolo_train.yaml for persistent settings. Set model to any YAML in
+    ultralytics/cfg/models, for example rtdetr-l.yaml, 26/yolo26-p2.yaml, v8/yolov8-seg.yaml, or an absolute YAML path.
+    Set task=auto to infer detect/segment/classify/pose/obb from the model config. Any YAML value can be overridden from
+    the CLI (see --help for all flags). Unknown Ultralytics arguments can be passed with --extra key=value.
 
-    Val interval behaviour
+    Val interval behavior
     ----------------------
-    train.val_interval=1    Every epoch (default, identical to stock Ultralytics).
-    train.val_interval=5    Val runs on epochs 5, 10, 15 ... On other epochs the
+    train.val_interval=1 Every epoch (default, identical to stock Ultralytics). train.val_interval=5 Val runs on epochs
+    5, 10, 15 ... On other epochs the
                             previous val fitness is returned so that:
                               - best.pt is saved only when a real val epoch improves fitness.
                               - patience counts every training epoch (val and non-val).
                             Rule of thumb: patience = desired_val_count * val_interval.
                             Example: 30 val evaluations -> patience = 30 * 5 = 150.
-    train.val_interval=0    Val disabled entirely (same as val=false).
+    train.val_interval=0 Val disabled entirely (same as val=false).
 
     Usage examples
     --------------
-    # All settings from config/yolo_train.yaml
-    uv run python projects/yolo_trainer/train_ultralytics_model.py --yes
+    # All settings from config/yolo_train.yaml uv run python projects/yolo_trainer/train_ultralytics_model.py --yes
 
-    # Override device, epochs, batch
-    uv run python projects/yolo_trainer/train_ultralytics_model.py --device 7 --epochs 1000 --batch 32 --yes
+    # Override device, epochs, batch uv run python projects/yolo_trainer/train_ultralytics_model.py --device 7 --epochs
+    1000 --batch 32 --yes
 
-    # Use any bundled model config by filename or subfolder path
-    uv run python projects/yolo_trainer/train_ultralytics_model.py --model rtdetr-l.yaml --task auto --yes
-    uv run python projects/yolo_trainer/train_ultralytics_model.py --model v8/yolov8-seg.yaml --task auto --yes
+    # Use any bundled model config by filename or subfolder path uv run python
+    projects/yolo_trainer/train_ultralytics_model.py --model rtdetr-l.yaml --task auto --yes uv run python
+    projects/yolo_trainer/train_ultralytics_model.py --model v8/yolov8-seg.yaml --task auto --yes
 
-    # Val every 5 epochs, patience scaled to 30 val evaluations
-    uv run python projects/yolo_trainer/train_ultralytics_model.py --val-interval 5 --patience 150 --yes
+    # Val every 5 epochs, patience scaled to 30 val evaluations uv run python
+    projects/yolo_trainer/train_ultralytics_model.py --val-interval 5 --patience 150 --yes
 
-    # Val every 5 epochs + test-split check every 10 epochs
-    uv run python projects/yolo_trainer/train_ultralytics_model.py --val-interval 5 --test-interval-epochs 10 --yes
+    # Val every 5 epochs + test-split check every 10 epochs uv run python
+    projects/yolo_trainer/train_ultralytics_model.py --val-interval 5 --test-interval-epochs 10 --yes
 
-    # Disable val entirely
-    uv run python projects/yolo_trainer/train_ultralytics_model.py --val-interval 0 --yes
+    # Disable val entirely uv run python projects/yolo_trainer/train_ultralytics_model.py --val-interval 0 --yes
 
-    # Custom config file
-    uv run python projects/yolo_trainer/train_ultralytics_model.py \\
+    # Custom config file uv run python projects/yolo_trainer/train_ultralytics_model.py \\
         --config /path/to/my_experiment.yaml --yes
 
-    # Dry run: validate config and print resource estimate, do not train
-    uv run python projects/yolo_trainer/train_ultralytics_model.py --dry-run
+    # Dry run: validate config and print resource estimate, do not train uv run python
+    projects/yolo_trainer/train_ultralytics_model.py --dry-run
 
-    # Demo mode: clamp to tiny run (2 epochs, 5% data, batch 4)
-    uv run python projects/yolo_trainer/train_ultralytics_model.py --demo --yes
+    # Demo mode: clamp to tiny run (2 epochs, 5% data, batch 4) uv run python
+    projects/yolo_trainer/train_ultralytics_model.py --demo --yes
 
-    # Pass arbitrary Ultralytics args not exposed as first-class flags
-    uv run python projects/yolo_trainer/train_ultralytics_model.py --extra warmup_epochs=5 --extra nbs=64
+    # Pass arbitrary Ultralytics args not exposed as first-class flags uv run python
+    projects/yolo_trainer/train_ultralytics_model.py --extra warmup_epochs=5 --extra nbs=64
 
-    # Resume interrupted training
-    uv run python projects/yolo_trainer/train_ultralytics_model.py --resume true --yes
+    # Resume interrupted training uv run python projects/yolo_trainer/train_ultralytics_model.py --resume true --yes
     """
     parser = build_parser()
     args = parser.parse_args()
@@ -1831,7 +1859,9 @@ def main() -> int:
         bar.update(1)
 
         dataset = config.get("dataset", {})
-        run_name = str(render_output_template(config.get("train", {}).get("name", f"run_{timestamp}"), config, timestamp))
+        run_name = str(
+            render_output_template(config.get("train", {}).get("name", f"run_{timestamp}"), config, timestamp)
+        )
         generated_dataset_yaml = make_generated_dataset_yaml(config, run_name)
         data_yaml = generated_dataset_yaml or resolve_existing_or_raw(
             dataset.get("data_yaml"), [Path.cwd(), PROJECT_DIR, REPO_ROOT]
@@ -1917,21 +1947,24 @@ def main() -> int:
             train_args=train_args,
             verbose=verbose,
         )
-        model.add_callback("on_pretrain_routine_start", lambda trainer: dump_config_snapshot(
-            Path(trainer.save_dir),
-            config,
-            train_args,
-            {
-                "event": "train_start",
-                "created_at": datetime.now().isoformat(timespec="seconds"),
-                "argv": sys.argv,
-                "cwd": str(Path.cwd()),
-                "save_dir": str(trainer.save_dir),
-                "val_interval": val_interval,
-            },
-            source_config,
-            generated_dataset_yaml,
-        ))
+        model.add_callback(
+            "on_pretrain_routine_start",
+            lambda trainer: dump_config_snapshot(
+                Path(trainer.save_dir),
+                config,
+                train_args,
+                {
+                    "event": "train_start",
+                    "created_at": datetime.now().isoformat(timespec="seconds"),
+                    "argv": sys.argv,
+                    "cwd": str(Path.cwd()),
+                    "save_dir": str(trainer.save_dir),
+                    "val_interval": val_interval,
+                },
+                source_config,
+                generated_dataset_yaml,
+            ),
+        )
         model.add_callback("on_fit_epoch_end", snapshot_callback)
         bar.set_description("Training")
         bar.update(1)
