@@ -226,8 +226,10 @@ class RfDetrInferenceTest(unittest.TestCase):
         rf_model = SimpleNamespace(model=object())
         model_cls = unittest.mock.Mock(return_value=rf_model)
         attached = unittest.mock.Mock()
+        checkpoint_guard = unittest.mock.Mock()
         motion_module = ModuleType("rf_detr_motion")
         motion_module.attach_motion_module = attached
+        motion_module.assert_motion_checkpoint_compatible = checkpoint_guard
 
         with patch.object(inference_runner.trainer, "get_model_class", return_value=model_cls), patch.object(
             inference_runner.trainer, "build_model_kwargs", return_value={"device": "cpu"}
@@ -237,6 +239,7 @@ class RfDetrInferenceTest(unittest.TestCase):
         self.assertIs(result, rf_model)
         model_cls.assert_called_once_with(device="cpu")
         attached.assert_called_once_with(rf_model.model, {"enabled": True})
+        checkpoint_guard.assert_called_once()
 
     def test_load_model_skips_motion_attachment_when_disabled(self):
         rf_model = SimpleNamespace(model=object())
@@ -264,12 +267,21 @@ class RfDetrInferenceTest(unittest.TestCase):
                 self.assertIn("inference_optimization", model)
                 self.assertIn("enabled", model["p2"])
                 self.assertIn("enabled", model["motion"])
-                self.assertEqual(model["inference_optimization"]["backend"], "pytorch")
+                tracknet_tensorrt_example = (
+                    path.name == "rf_detr_inference_tracknet_tensorrt_fp16_example.yaml"
+                )
+                expected_backend = "tensorrt" if tracknet_tensorrt_example else "pytorch"
+                self.assertEqual(model["inference_optimization"]["backend"], expected_backend)
                 self.assertEqual(model["inference_optimization"]["pytorch"]["precision"], "fp32")
                 self.assertIn(model["inference_optimization"]["tensorrt"]["precision"], {"fp16", "bf16"})
                 if path.name == p2_video_preset:
                     self.assertTrue(model["p2"]["enabled"])
-                self.assertFalse(model["motion"]["enabled"])
+                if tracknet_tensorrt_example:
+                    self.assertFalse(model["p2"]["enabled"])
+                    self.assertTrue(model["motion"]["enabled"])
+                    self.assertEqual(model["motion"]["temporal"]["fallback_mode"], "identity")
+                else:
+                    self.assertFalse(model["motion"]["enabled"])
 
     @staticmethod
     def _cli_args(**overrides):

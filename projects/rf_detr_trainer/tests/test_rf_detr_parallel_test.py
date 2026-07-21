@@ -134,9 +134,20 @@ class ParallelConfigTests(unittest.TestCase):
                 config = test_runner.load_yaml(path)
                 self.assertEqual(config["test"]["parallel"]["chunks"], 1)
                 optimization = config["model"]["inference_optimization"]
-                self.assertEqual(optimization["backend"], "pytorch")
+                tracknet_tensorrt_example = (
+                    path.name == "rf_detr_test_tracknet_tensorrt_fp16_example.yaml"
+                )
+                expected_backend = "tensorrt" if tracknet_tensorrt_example else "pytorch"
+                self.assertEqual(optimization["backend"], expected_backend)
                 self.assertEqual(optimization["pytorch"]["precision"], "fp32")
                 self.assertIn(optimization["tensorrt"]["precision"], {"fp16", "bf16"})
+                if tracknet_tensorrt_example:
+                    self.assertFalse(config["model"]["p2"]["enabled"])
+                    self.assertTrue(config["model"]["motion"]["enabled"])
+                    self.assertEqual(
+                        config["model"]["motion"]["temporal"]["fallback_mode"],
+                        "identity",
+                    )
 
     def test_chunks_default_to_one_and_cli_override_is_nested(self):
         internal = test_runner.build_internal_test_config({"model": {}, "dataset": {}, "test": {}})
@@ -359,13 +370,22 @@ class SpawnFactoryTests(unittest.TestCase):
         merged["model"]["p2"] = {"enabled": True}
         merged["model"]["motion"] = {"enabled": True, "variant": "v5"}
         factory_model_cfg = {"factory_config": {"merged_config": merged, "output_dir": "/tmp/out"}}
-        motion_module = types.SimpleNamespace(attach_motion_module=MagicMock())
+        motion_module = types.SimpleNamespace(
+            attach_motion_module=MagicMock(),
+            assert_motion_checkpoint_compatible=MagicMock(),
+        )
+        p2_module = types.SimpleNamespace(assert_p2_checkpoint_compatible=MagicMock())
 
         with ExitStack() as stack:
             stack.enter_context(patch.object(rf_detr_runtime, "get_model_class", return_value=model_cls))
             stack.enter_context(patch.object(rf_detr_runtime, "build_model_kwargs", side_effect=model_kwargs))
             stack.enter_context(patch.object(rf_detr_runtime, "build_train_kwargs", side_effect=train_kwargs))
-            stack.enter_context(patch.dict(sys.modules, {"rf_detr_motion": motion_module}))
+            stack.enter_context(
+                patch.dict(
+                    sys.modules,
+                    {"rf_detr_motion": motion_module, "rf_detr_p2": p2_module},
+                )
+            )
             result = rf_detr_runtime.build_rfdetr_evaluator_model(factory_model_cfg, "cuda:2")
 
         self.assertIs(result, model)
@@ -374,6 +394,8 @@ class SpawnFactoryTests(unittest.TestCase):
         self.assertEqual(seen["output_dir"], Path("/tmp/out"))
         self.assertTrue(seen["p2"]["enabled"])
         motion_module.attach_motion_module.assert_called_once_with(model.model, merged["model"]["motion"])
+        motion_module.assert_motion_checkpoint_compatible.assert_called_once()
+        p2_module.assert_p2_checkpoint_compatible.assert_called_once()
         model.get_train_config.assert_called_once_with(dataset_dir="/tmp/materialized-dataset")
         model._align_num_classes_from_dataset.assert_called_once_with("/tmp/materialized-dataset")
         self.assertEqual(merged["model"]["device"], "0")
@@ -526,7 +548,10 @@ class StandaloneMainFlowTests(unittest.TestCase):
                 eval_max_dets=500,
             )
             model_cls = MagicMock(return_value=rf_model)
-            motion_module = types.SimpleNamespace(attach_motion_module=MagicMock())
+            motion_module = types.SimpleNamespace(
+                attach_motion_module=MagicMock(),
+                assert_motion_checkpoint_compatible=MagicMock(),
+            )
             with ExitStack() as stack:
                 started = [stack.enter_context(patcher) for patcher in common]
                 stack.enter_context(patch.object(test_runner.trainer, "get_model_class", return_value=model_cls))

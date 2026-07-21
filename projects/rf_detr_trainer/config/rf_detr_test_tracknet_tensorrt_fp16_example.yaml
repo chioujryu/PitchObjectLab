@@ -1,0 +1,104 @@
+# TrackNetV5-only FP16 TensorRT example for test_rf_detr_model.py.
+# Replace dataset_dir and pass the trained checkpoint with --checkpoint.
+runtime:
+  verbose: true
+  dry_run: false
+  confirm_before_run: true
+
+model:
+  size: medium
+  resolution: null
+  pretrain_weights: null
+  num_classes: null
+  device: auto
+  amp: true
+  extra_model_args: {}
+  inference_optimization:
+    backend: tensorrt
+    pytorch:
+      precision: fp32
+    tensorrt:
+      precision: fp16
+      engine_path: ''
+      manifest_path: ''
+      cache_dir: ''
+      workspace_gib: 4
+      force_rebuild: false
+      profile:
+        min_batch_size: 1
+        opt_batch_size: 4
+        max_batch_size: 4
+  p2:
+    enabled: false
+  # This complete architecture block must match the checkpoint used for test.
+  motion:
+    enabled: true
+    type: tracknet_v5
+    temporal:
+      num_frames: 3
+      frame_stride: 1
+      fallback_mode: identity
+      noise_std: 0.02
+    tracknet_v5:
+      mdd:
+        enabled: true
+        polarity_channels: 4
+        attention:
+          learnable: true
+          init_k: 1.0
+          init_m: 0.5
+      rstr:
+        enabled: true
+        num_blocks: 2
+        hidden_dim: 256
+        num_heads: 8
+        attention_mode: divided
+        dropout: 0.1
+        use_pixel_shuffle: true
+        context_mask_prob: 0.1
+    loss:
+      motion_attention_weight: 0.0
+    overrides:
+      resolution: null
+      num_queries: null
+      num_select: null
+      gradient_checkpointing: true
+
+dataset:
+  source_format: ultralytics_yolo
+  dataset_dir: /path/to/dataset
+  data_yaml: ''
+  coco_json: ''
+  image_dir: ''
+  cache_root: dataset_cache
+  refresh_cache: false
+  link_mode: auto
+  split_ratio: [8, 1, 1]
+  split_seed: 0
+  dataset_file: roboflow
+
+output:
+  output_dir: ''
+  root: runs/rf_detr/test
+  name: 'rfdetr_tracknet_tensorrt_fp16_{timestamp}'
+  exist_ok: false
+
+test:
+  split: test
+  max_images: all
+  batch_size: 4
+  num_workers: 2
+  parallel:
+    chunks: 1
+  test_mode:
+    mode: full_image
+  progress_bar: true
+  plots: true
+  visual_samples:
+    enabled: true
+    max_images: 25
+
+evaluation:
+  type: bbox
+  classwise: true
+  max_detections: [1, 10, 500]

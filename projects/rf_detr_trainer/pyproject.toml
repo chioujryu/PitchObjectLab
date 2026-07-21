@@ -8,7 +8,7 @@ dependencies = [
     "boxmot==13.0.0",
     "colorama>=0.4.6",
     "pyyaml>=6.0.0",
-    "rfdetr[loggers,train]>=1.8.1",
+    "rfdetr[loggers,train]==1.8.3",
     "sahi>=0.11.22",
     "torch==2.11.0",
     "torchvision==0.26.0",

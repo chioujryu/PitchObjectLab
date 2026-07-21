@@ -54,13 +54,16 @@ Public surface
 from __future__ import annotations
 
 import warnings
-from typing import Any, Dict, List, Optional
+from copy import deepcopy
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 __all__ = [
+    'assert_motion_checkpoint_compatible',
     "MOTION_SETTINGS",
     "ensure_motion_support",
     "attach_motion_module",
@@ -70,9 +73,9 @@ __all__ = [
     "MotionModule",
 ]
 
-_BASELINE_RFDETR_VERSION = "1.8.1"
-
 # Convenience overrides that map to real ModelConfig fields.
+_BASELINE_RFDETR_VERSION = '1.8.3'
+
 _MOTION_OVERRIDE_CASTS = {
     "resolution": int,
     "num_queries": int,
@@ -81,7 +84,7 @@ _MOTION_OVERRIDE_CASTS = {
 }
 
 # Global settings threaded from the YAML config to the patches (mirrors P2_SETTINGS).
-MOTION_SETTINGS: Dict[str, Any] = {
+_MOTION_DEFAULTS: Dict[str, Any] = {
     "enabled": False,
     "type": "tracknet_v5",
     "temporal": {
@@ -115,6 +118,8 @@ MOTION_SETTINGS: Dict[str, Any] = {
     },
     "overrides": {},
 }
+
+MOTION_SETTINGS: Dict[str, Any] = deepcopy(_MOTION_DEFAULTS)
 
 _LWDETR_PATCHED = False
 _CHANNEL_CHECK_PATCHED = False
@@ -238,7 +243,10 @@ class MotionFeatureGate(nn.Module):
     def forward(self, feat: torch.Tensor, motion: torch.Tensor) -> torch.Tensor:
         # Resize motion maps to match feature resolution.
         if motion.shape[-2:] != feat.shape[-2:]:
-            motion = F.interpolate(motion, size=feat.shape[-2:], mode="bilinear", align_corners=False)
+            target_size = feat.shape[-2:]
+            if torch.onnx.is_in_onnx_export():
+                target_size = (int(feat.shape[-2]), int(feat.shape[-1]))
+            motion = F.interpolate(motion, size=target_size, mode="bilinear", align_corners=False)
         return feat * (1.0 + self.gate(motion))
 
 
@@ -328,6 +336,8 @@ class RSTRHead(nn.Module):
     def forward(self, feat: torch.Tensor) -> torch.Tensor:
         # feat: [B, C, H, W]
         B, C, H, W = feat.shape
+        export_height = int(H) if torch.onnx.is_in_onnx_export() else H
+        export_width = int(W) if torch.onnx.is_in_onnx_export() else W
         # Project to hidden_dim.
         x = self.proj_in(feat)  # [B, D, H, W]
         D = x.shape[1]
@@ -340,7 +350,8 @@ class RSTRHead(nn.Module):
         for blk in self.blocks:
             x = blk(x)
         # Reshape back to spatial: [B, D, H, W]
-        x = x.transpose(1, 2).reshape(B, D, H, W)
+        # Keep only batch dynamic at this Conv boundary during ONNX export.
+        x = x.transpose(1, 2).reshape(-1, D, export_height, export_width)
         # Project to correction delta.
         delta = self.proj_out(x)  # [B, C, H, W]
         # Apply residual correction: sigmoid(Draft + Delta)
@@ -367,6 +378,9 @@ class MotionModule(nn.Module):
         motion_cfg: Dict[str, Any],
     ) -> None:
         super().__init__()
+        if not feature_channels_per_scale:
+            raise ValueError("MotionModule requires at least one backbone feature level.")
+        self.feature_channels_per_scale = [int(channel) for channel in feature_channels_per_scale]
         v5_cfg = motion_cfg.get("tracknet_v5", {}) or {}
         mdd_cfg = v5_cfg.get("mdd", {}) or {}
         rstr_cfg = v5_cfg.get("rstr", {}) or {}
@@ -492,6 +506,12 @@ class MotionModule(nn.Module):
         the exported graph numerically equivalent to the regular motion path
         while retaining RF-DETR's tensor-only export contract.
         """
+        if len(features) != len(self.feature_channels_per_scale):
+            raise RuntimeError(
+                "RF-DETR motion feature-level mismatch: the backbone returned "
+                f"{len(features)} level(s), but motion_module was built for "
+                f"{len(self.feature_channels_per_scale)} level(s)."
+            )
         # Build frame window for MDD.
         frames = self._make_frame_window(images)  # [B, T, 3, H, W]
 
@@ -505,6 +525,13 @@ class MotionModule(nn.Module):
         modulated = []
         for i, feature in enumerate(features):
             src = feature  # [B, C, H_i, W_i]
+            if torch.onnx.is_in_onnx_export():
+                src = src.reshape(
+                    -1,
+                    self.feature_channels_per_scale[i],
+                    int(src.shape[-2]),
+                    int(src.shape[-1]),
+                )
 
             # Motion-guided feature gate.
             if motion_maps is not None and i < len(self.gates):
@@ -595,8 +622,19 @@ def _patch_lwdetr_motion_forward() -> None:
         except ImportError:
             from rfdetr.util.misc import nested_tensor_from_tensor_list  # rfdetr < 1.6
 
+        original_init = lwdetr_module.LWDETR.__init__
         original_forward = lwdetr_module.LWDETR.forward
         original_forward_export = lwdetr_module.LWDETR.forward_export
+
+        def _motion_init(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            active_config = MOTION_SETTINGS
+            if bool(active_config.get("enabled", False)) and resolve_motion_type(active_config) != "none":
+                # LWDETR is now fully constructed, while RF-DETR's facade and
+                # Lightning loaders have not restored checkpoint weights yet.
+                attach_motion_module(self, active_config)
+
+        _motion_init._motion_patched = True
 
         def _motion_forward(self, samples, targets=None):
             # Normalise input to NestedTensor then extract raw pixels for motion.
@@ -668,6 +706,8 @@ def _patch_lwdetr_motion_forward() -> None:
                 self.backbone.forward = original_backbone_forward
 
         _motion_forward_export._motion_patched = True
+        if not getattr(original_init, "_motion_patched", False):
+            lwdetr_module.LWDETR.__init__ = _motion_init
         if not getattr(original_forward, "_motion_patched", False):
             lwdetr_module.LWDETR.forward = _motion_forward
         if not getattr(original_forward_export, "_motion_patched", False):
@@ -699,8 +739,7 @@ def _deep_merge(base: dict, override: dict) -> dict:
 def _record_motion_settings(motion_cfg: Dict[str, Any]) -> None:
     """Write the caller's motion config into the global MOTION_SETTINGS dict."""
     global MOTION_SETTINGS
-    if motion_cfg:
-        MOTION_SETTINGS = _deep_merge(MOTION_SETTINGS, motion_cfg)
+    MOTION_SETTINGS = _deep_merge(deepcopy(_MOTION_DEFAULTS), motion_cfg or {})
 
 
 def resolve_motion_type(motion_cfg: Optional[Dict[str, Any]]) -> str:
@@ -755,6 +794,71 @@ def ensure_motion_support(motion_cfg: Optional[Dict[str, Any]] = None) -> None:
     _patch_lwdetr_motion_forward()
 
 
+def _infer_motion_feature_channels(lwdetr: nn.Module) -> List[int]:
+    """Read projector output widths from the actual RF-DETR backbone."""
+    backbone_container = getattr(lwdetr, "backbone", None)
+    backbone = backbone_container
+    if backbone is not None and not hasattr(backbone, "projector"):
+        try:
+            backbone = backbone[0]
+        except (IndexError, KeyError, TypeError):
+            backbone = None
+    projector = getattr(backbone, "projector", None)
+    scales = list(getattr(backbone, "projector_scale", []) or [])
+    stages = getattr(projector, "stages", None)
+    encoder_channels = getattr(getattr(backbone, "encoder", None), "_out_feature_channels", None)
+    if projector is None or stages is None or not scales:
+        raise RuntimeError(
+            "Could not inspect RF-DETR backbone[0].projector/projector_scale while "
+            "building the motion module."
+        )
+    if not isinstance(encoder_channels, (list, tuple)) or not encoder_channels:
+        raise RuntimeError(
+            "Could not inspect RF-DETR backbone[0].encoder._out_feature_channels while "
+            "building the motion module."
+        )
+    stage_count = len(stages)
+    uses_extra_pool = bool(getattr(projector, "use_extra_pool", False))
+    pooled_last_level = (
+        uses_extra_pool
+        and scales[-1] == "P6"
+        and stage_count == len(scales) - 1
+    )
+    if stage_count != len(scales) and not pooled_last_level:
+        raise RuntimeError(
+            "RF-DETR projector metadata is inconsistent: "
+            f"{len(scales)} scale(s), {stage_count} learned output stage(s), "
+            f"use_extra_pool={uses_extra_pool}."
+        )
+
+    transformer_width = int(getattr(getattr(lwdetr, "transformer", None), "d_model", 0) or 0)
+    feature_channels: List[int] = []
+    for index, stage in enumerate(stages):
+        output_width = 0
+        children = list(stage.children()) if isinstance(stage, nn.Module) else []
+        for candidate in reversed(children):
+            normalized_shape = getattr(candidate, "normalized_shape", None)
+            if isinstance(normalized_shape, int):
+                output_width = int(normalized_shape)
+                break
+            if isinstance(normalized_shape, (list, tuple)) and normalized_shape:
+                output_width = int(normalized_shape[0])
+                break
+        if output_width <= 0:
+            output_width = transformer_width
+        if output_width <= 0:
+            raise RuntimeError(
+                f"Could not infer output channels for RF-DETR projector stage {index}."
+            )
+        feature_channels.append(output_width)
+    if pooled_last_level:
+        if not feature_channels:
+            raise RuntimeError("RF-DETR P6 extra-pool level has no preceding projector output.")
+        # P6 is max-pooled from the last learned feature and preserves channels.
+        feature_channels.append(feature_channels[-1])
+    return feature_channels
+
+
 def attach_motion_module(model: nn.Module, motion_cfg: Optional[Dict[str, Any]] = None) -> None:
     """Build a MotionModule and attach it to the LWDETR model instance.
 
@@ -792,23 +896,160 @@ def attach_motion_module(model: nn.Module, motion_cfg: Optional[Dict[str, Any]] 
         )
         return
 
-    # Infer feature channel counts from the projector's output channels.
-    try:
-        out_ch = lwdetr.backbone.projector.out_channels
-        num_levels = len(lwdetr.backbone.projector_scale)
-        feature_channels = [out_ch] * num_levels
-    except AttributeError:
-        # Fallback: assume 256 channels per level (stock RF-DETR default).
-        warnings.warn(
-            "[rf_detr_motion] Could not read backbone.projector.out_channels; "
-            "assuming 256 channels per scale.",
-            stacklevel=2,
-        )
-        feature_channels = [256, 256, 256]
+    existing = getattr(lwdetr, "motion_module", None)
+    if existing is not None:
+        # The LWDETR.__init__ patch attaches before checkpoint restore. Calls at
+        # legacy entrypoint sites are retained as safe, idempotent verification.
+        lwdetr._motion_export_required = True  # type: ignore[attr-defined]
+        return
 
+    feature_channels = _infer_motion_feature_channels(lwdetr)
     motion_module = MotionModule(feature_channels, motion_cfg)
+    reference_parameter = next(lwdetr.parameters(), None)
+    if reference_parameter is not None:
+        if reference_parameter.is_floating_point():
+            motion_module.to(device=reference_parameter.device, dtype=reference_parameter.dtype)
+        else:
+            motion_module.to(device=reference_parameter.device)
     lwdetr.motion_module = motion_module  # type: ignore[assignment]
     lwdetr._motion_export_required = True  # type: ignore[attr-defined]
+
+
+def _motion_state_from_checkpoint(checkpoint: Mapping[str, Any]) -> Dict[str, torch.Tensor]:
+    """Return normalized ``motion_module.*`` tensors from RF-DETR checkpoint formats."""
+    if isinstance(checkpoint.get("model"), Mapping):
+        state = checkpoint["model"]
+    elif isinstance(checkpoint.get("state_dict"), Mapping):
+        state = checkpoint["state_dict"]
+    elif checkpoint and all(torch.is_tensor(value) for value in checkpoint.values()):
+        state = checkpoint
+    else:
+        raise RuntimeError(
+            "Motion checkpoint must contain an RF-DETR 'model' mapping or a Lightning 'state_dict' mapping."
+        )
+
+    motion_state: Dict[str, torch.Tensor] = {}
+    for raw_key, value in state.items():
+        if not torch.is_tensor(value):
+            continue
+        key = str(raw_key)
+        changed = True
+        while changed:
+            changed = False
+            for prefix in ("module.", "model.", "_orig_mod."):
+                if key.startswith(prefix):
+                    key = key[len(prefix):]
+                    changed = True
+        if key.startswith("motion_module."):
+            motion_state[key] = value
+    return motion_state
+
+
+def _checkpoint_architecture_metadata(checkpoint: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
+    metadata = checkpoint.get('pitchobjectlab_architecture')
+    if metadata is None and isinstance(checkpoint.get('args'), Mapping):
+        metadata = checkpoint['args'].get('pitchobjectlab_architecture')
+    if metadata is None:
+        return None
+    if not isinstance(metadata, Mapping):
+        raise RuntimeError('Checkpoint pitchobjectlab_architecture metadata must be a mapping.')
+    return metadata
+
+
+def _assert_motion_metadata_compatible(
+    checkpoint: Mapping[str, Any],
+    expected_architecture: Optional[Mapping[str, Any]],
+) -> None:
+    metadata = _checkpoint_architecture_metadata(checkpoint)
+    if metadata is None or expected_architecture is None:
+        return
+    if metadata.get('schema_version') != expected_architecture.get('schema_version'):
+        raise RuntimeError(
+            'Checkpoint architecture metadata schema does not match this runtime: '
+            f"checkpoint={metadata.get('schema_version')!r}, "
+            f"runtime={expected_architecture.get('schema_version')!r}."
+        )
+    saved_size = str(metadata.get('model_size', '')).strip().lower()
+    expected_size = str(expected_architecture.get('model_size', '')).strip().lower()
+    if saved_size != expected_size:
+        raise RuntimeError(
+            'Checkpoint model size does not match the configured runtime: '
+            f'checkpoint={saved_size!r}, runtime={expected_size!r}.'
+        )
+    saved_motion = metadata.get('motion')
+    expected_motion = expected_architecture.get('motion')
+    if saved_motion != expected_motion:
+        raise RuntimeError(
+            'Checkpoint TrackNet architecture metadata does not match model.motion in the runtime config: '
+            f'checkpoint={saved_motion!r}, runtime={expected_motion!r}.'
+        )
+
+
+def assert_motion_checkpoint_compatible(
+    model: nn.Module,
+    checkpoint_path: Any,
+    expected_architecture: Optional[Mapping[str, Any]] = None,
+) -> None:
+    """Require a complete, shape-exact TrackNet state before test/inference."""
+    lwdetr = _find_lwdetr(model)
+    if lwdetr is None or getattr(lwdetr, "motion_module", None) is None:
+        raise RuntimeError(
+            "Motion-enabled RF-DETR runtime has no attached motion_module. Ensure motion support "
+            "is applied before constructing the model."
+        )
+    if checkpoint_path is None or not str(checkpoint_path).strip():
+        raise RuntimeError(
+            "Motion-enabled RF-DETR test/inference requires a checkpoint containing "
+            "motion_module.* weights; pretrain_weights is empty."
+        )
+    path = Path(str(checkpoint_path)).expanduser()
+    if not path.is_file():
+        raise RuntimeError(f"Motion checkpoint does not exist: {path}")
+    try:
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(path, map_location="cpu")
+    if not isinstance(checkpoint, Mapping):
+        raise RuntimeError(f"Motion checkpoint must be a mapping: {path}")
+
+    _assert_motion_metadata_compatible(checkpoint, expected_architecture)
+
+    checkpoint_state = _motion_state_from_checkpoint(checkpoint)
+    expected_state = {
+        key: value
+        for key, value in lwdetr.state_dict().items()
+        if key.startswith("motion_module.")
+    }
+    if not checkpoint_state:
+        raise RuntimeError(
+            f"Checkpoint {path} contains no motion_module.* weights. Refusing to run "
+            "test/inference with randomly initialized TrackNet weights."
+        )
+
+    missing = sorted(set(expected_state) - set(checkpoint_state))
+    unexpected = sorted(set(checkpoint_state) - set(expected_state))
+    mismatched = sorted(
+        key
+        for key in set(expected_state) & set(checkpoint_state)
+        if tuple(expected_state[key].shape) != tuple(checkpoint_state[key].shape)
+    )
+    if missing or unexpected or mismatched:
+        details = []
+        if missing:
+            details.append(f"missing={missing[:5]}")
+        if unexpected:
+            details.append(f"unexpected={unexpected[:5]}")
+        if mismatched:
+            shape_details = [
+                f"{key}: checkpoint={tuple(checkpoint_state[key].shape)}, "
+                f"model={tuple(expected_state[key].shape)}"
+                for key in mismatched[:5]
+            ]
+            details.append(f"shape_mismatch={shape_details}")
+        raise RuntimeError(
+            f"Checkpoint {path} is incompatible with the configured TrackNet motion module: "
+            + "; ".join(details)
+        )
 
 
 def assert_motion_export_ready(
@@ -853,6 +1094,13 @@ def assert_motion_export_ready(
         raise RuntimeError(
             "The attached RF-DETR motion module does not support tensor-only ONNX export."
         )
+    fallback_mode = getattr(lwdetr.motion_module, "fallback_mode", None)
+    if fallback_mode is not None and str(fallback_mode).strip().lower() != "identity":
+        raise RuntimeError(
+            "TensorRT still-image motion export requires "
+            "model.motion.temporal.fallback_mode='identity' for deterministic tracing; "
+            f"got {fallback_mode!r}."
+        )
     export_forward = getattr(type(lwdetr), "forward_export", None)
     if not getattr(export_forward, "_motion_patched", False):
         raise RuntimeError(
@@ -870,15 +1118,21 @@ def _find_lwdetr(model: nn.Module) -> Optional[nn.Module]:
         LWDETR_cls = None
 
     candidates = [model]
-    if hasattr(model, "model"):
-        candidates.append(model.model)
-    if hasattr(model, "model") and hasattr(model.model, "model"):
-        candidates.append(model.model.model)
-
-    for candidate in candidates:
+    seen: set[int] = set()
+    while candidates and len(seen) < 12:
+        candidate = candidates.pop(0)
+        if candidate is None or id(candidate) in seen:
+            continue
+        seen.add(id(candidate))
         if LWDETR_cls is not None and isinstance(candidate, LWDETR_cls):
             return candidate
         # Name-based fallback for version skew.
         if type(candidate).__name__ == "LWDETR":
             return candidate
+        optimized = getattr(candidate, "_orig_mod", None)
+        wrapped = getattr(candidate, "model", None)
+        if optimized is not None:
+            candidates.append(optimized)
+        if wrapped is not None:
+            candidates.append(wrapped)
     return None

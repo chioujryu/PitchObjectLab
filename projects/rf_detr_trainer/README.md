@@ -16,6 +16,8 @@ Config-first RF-DETR training project with an Ultralytics-style workflow:
 ## Environment
 
 This subproject has its own `pyproject.toml`, `uv.lock`, and `.venv`.
+RF-DETR is pinned to `rfdetr==1.8.3`; keep `pyproject.toml` and the local
+`uv.lock` together when reproducing TensorRT exports.
 
 ```bash
 cd projects/rf_detr_trainer
@@ -334,6 +336,75 @@ class recheck, and class crop. Standalone full-image segmentation keeps true
 bbox+mask evaluation and requires `test.parallel.chunks: 1`; SAHI and class-crop
 segmentation modes continue to evaluate bounding boxes only. Training-time
 periodic/final tests are unchanged.
+
+#### P2 and TrackNetV5 TensorRT
+
+TensorRT FP16 is the required compatibility baseline for custom P2 and TrackNetV5 models.
+BF16 is optional and should be attempted only after FP16 passes and the
+installed TensorRT/GPU report BF16 support. Keep the complete `model.p2` and
+`model.motion` blocks identical to training; the fragments below show only the
+relevant switches.
+
+For P2-only test and inference, start from
+`config/rf_detr_test_sahi_medium.yaml` and
+`config/rf_detr_inference_medium_p2_video_1984090152231178242_003.yaml`:
+update their dataset/source and device fields for the target machine.
+
+```yaml
+model:
+  inference_optimization:
+    backend: tensorrt
+    tensorrt:
+      precision: fp16
+  p2:
+    enabled: true
+    projector_scale: [P2, P3, P4]
+  motion:
+    enabled: false
+```
+
+```bash
+uv run python test_rf_detr_model.py --config config/rf_detr_test_sahi_medium.yaml --checkpoint /path/to/p2_checkpoint.pth --inference-backend tensorrt --inference-precision fp16 --tensorrt-force-rebuild --yes
+uv run python inference_rf_detr_model.py --config config/rf_detr_inference_medium_p2_video_1984090152231178242_003.yaml --checkpoint /path/to/p2_checkpoint.pth --source /path/to/media --inference-backend tensorrt --inference-precision fp16 --tensorrt-force-rebuild --yes
+```
+
+For TrackNetV5-only runs, start from the ready-to-edit example configs
+config/rf_detr_test_tracknet_tensorrt_fp16_example.yaml and
+config/rf_detr_inference_tracknet_tensorrt_fp16_example.yaml. Update the
+dataset path and keep their complete motion block identical to the checkpoint:
+
+```yaml
+model:
+  inference_optimization:
+    backend: tensorrt
+    tensorrt:
+      precision: fp16
+  p2:
+    enabled: false
+  motion:
+    enabled: true
+    type: tracknet_v5
+    temporal:
+      fallback_mode: identity
+```
+
+```bash
+uv run python test_rf_detr_model.py --config config/rf_detr_test_tracknet_tensorrt_fp16_example.yaml --checkpoint /path/to/tracknet_checkpoint.pth --tensorrt-force-rebuild --yes
+uv run python inference_rf_detr_model.py --config config/rf_detr_inference_tracknet_tensorrt_fp16_example.yaml --checkpoint /path/to/tracknet_checkpoint.pth --source /path/to/media --tensorrt-force-rebuild --yes
+```
+
+Legacy P2 checkpoints need no conversion. They must use the same model size,
+resolution, `projector_scale`, and projector options used for training;
+test/inference rejects incompatible tensor shapes instead of silently replacing
+weights. Checkpoints without architecture metadata use the YAML architecture
+plus state-dict shapes for validation.
+
+P2+TrackNetV5 is best effort because stride-4 tokens make global motion
+attention memory-intensive. Enable both blocks only with the exact combined
+training architecture and begin with batch size 1 (`--batch-size 1`, plus
+`--sahi-batch-size 1` for SAHI test). An out-of-memory result for this combined
+mode does not imply that either required P2-only or TrackNetV5-only path is
+unsupported.
 
 Prediction visuals and football diagnostics are controlled in the test config:
 

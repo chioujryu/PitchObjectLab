@@ -336,12 +336,30 @@ def build_rfdetr_evaluator_runtime(
     output_dir = Path(output_dir).expanduser()
     model_cls = get_model_class(str(model_settings.get("size", "medium")))
     rf_model = model_cls(**build_model_kwargs(merged_config))
+    p2_config = model_settings.get('p2', {}) or {}
+    if bool(p2_config.get('enabled', False)):
+        from rf_detr_p2 import assert_p2_checkpoint_compatible
+
+        assert_p2_checkpoint_compatible(
+            rf_model.model,
+            getattr(rf_model.model_config, 'pretrain_weights', None),
+            build_pitchobjectlab_architecture(merged_config),
+        )
 
     motion_config = model_settings.get("motion", {}) or {}
     if bool(motion_config.get("enabled", False)):
         from rf_detr_motion import attach_motion_module
 
         attach_motion_module(rf_model.model, motion_config)
+        model_config = getattr(rf_model, "model_config", None)
+        checkpoint_path = getattr(model_config, "pretrain_weights", None)
+        from rf_detr_motion import assert_motion_checkpoint_compatible
+
+        assert_motion_checkpoint_compatible(
+            rf_model.model,
+            checkpoint_path,
+            build_pitchobjectlab_architecture(merged_config),
+        )
 
     train_kwargs = build_train_kwargs(merged_config, output_dir)
     train_kwargs.pop("_device", None)

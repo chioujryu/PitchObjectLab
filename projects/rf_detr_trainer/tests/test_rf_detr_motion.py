@@ -14,8 +14,11 @@ All tests run with CPU-only torch; no rfdetr install required for the pure-modul
 tests.  Tests that need rfdetr are guarded with unittest.skipIf.
 """
 
+from copy import deepcopy
 from pathlib import Path
 import sys
+import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -46,6 +49,61 @@ def _make_nested_tensor(B: int, C: int, H: int, W: int):
         tensors=torch.zeros(B, C, H, W),
         mask=torch.zeros(B, H, W, dtype=torch.bool),
     )
+
+
+def _small_motion_config(fallback_mode="identity"):
+    return {
+        "enabled": True,
+        "type": "tracknet_v5",
+        "temporal": {"num_frames": 3, "fallback_mode": fallback_mode},
+        "tracknet_v5": {
+            "mdd": {"enabled": True, "polarity_channels": 4},
+            "rstr": {"enabled": False},
+        },
+    }
+
+
+class _FakeProjector(nn.Module):
+    def __init__(self, levels, width):
+        super().__init__()
+        self.stages = nn.ModuleList(
+            [nn.Sequential(nn.Identity(), nn.LayerNorm(width)) for _ in range(levels)]
+        )
+
+
+class _FakeBackboneLevel(nn.Module):
+    def __init__(self, scales, width):
+        super().__init__()
+        self.projector_scale = list(scales)
+        self.projector = _FakeProjector(len(scales), width)
+        self.encoder = nn.Identity()
+        self.encoder._out_feature_channels = [384, 384, 384, 384]
+
+    def forward(self, tensors):
+        feature = tensors[:, :1]
+        mask = torch.zeros(
+            tensors.shape[0], tensors.shape[2], tensors.shape[3], dtype=torch.bool
+        )
+        position = torch.zeros_like(feature)
+        return [feature], [mask], [position], None
+
+
+class _FakeLWDETR(nn.Module):
+    def __init__(self, scales=("P4",), width=24):
+        super().__init__()
+        self.backbone = nn.ModuleList([_FakeBackboneLevel(scales, width)])
+        self.transformer = nn.Module()
+        self.transformer.d_model = width
+        self.anchor = nn.Parameter(torch.zeros(1))
+
+    def forward(self, samples, targets=None):
+        return self.backbone[0](samples)
+
+    def forward_export(self, tensors):
+        return tensors
+
+
+_FakeLWDETR.forward_export._motion_patched = True
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +456,35 @@ class EnsureMotionSupportTest(unittest.TestCase):
 
         self.assertTrue(getattr(LWDETR.forward_export, "_motion_patched", False))
 
+    def test_enabled_config_does_not_leak_into_later_disabled_model(self):
+        import rfdetr.models.lwdetr as lwdetr_module
+
+        saved_settings = deepcopy(motion.MOTION_SETTINGS)
+        saved_patched = motion._LWDETR_PATCHED
+        saved_methods = (
+            _FakeLWDETR.__init__,
+            _FakeLWDETR.forward,
+            _FakeLWDETR.forward_export,
+        )
+        try:
+            with patch.object(lwdetr_module, "LWDETR", _FakeLWDETR):
+                motion._LWDETR_PATCHED = False
+                motion.ensure_motion_support(_small_motion_config())
+                enabled_model = _FakeLWDETR()
+                self.assertIsInstance(enabled_model.motion_module, motion.MotionModule)
+
+                motion.ensure_motion_support({"enabled": False})
+                disabled_model = _FakeLWDETR()
+                self.assertFalse(hasattr(disabled_model, "motion_module"))
+                self.assertFalse(motion.MOTION_SETTINGS["enabled"])
+                self.assertEqual(
+                    motion.MOTION_SETTINGS["temporal"]["fallback_mode"], "identity"
+                )
+        finally:
+            _FakeLWDETR.__init__, _FakeLWDETR.forward, _FakeLWDETR.forward_export = saved_methods
+            motion.MOTION_SETTINGS = saved_settings
+            motion._LWDETR_PATCHED = saved_patched
+
     def test_export_wrapper_applies_motion_to_tensor_features(self):
         import rfdetr.models.lwdetr as lwdetr_module
 
@@ -488,6 +575,152 @@ class MotionExportValidationTest(unittest.TestCase):
                 {"enabled": True, "type": "tracknet_v5"},
             )
 
+    def test_tensor_rt_export_requires_identity_fallback(self):
+        import rfdetr.models.lwdetr as lwdetr_module
+
+        with patch.object(lwdetr_module, "LWDETR", _FakeLWDETR):
+            model = _FakeLWDETR()
+            config = _small_motion_config("identity")
+            motion.attach_motion_module(model, config)
+            motion.assert_motion_export_ready(model, config)
+
+            model.motion_module.fallback_mode = "noise"
+            with self.assertRaisesRegex(RuntimeError, "requires.*identity"):
+                motion.assert_motion_export_ready(model, config)
+
+
+class MotionCheckpointCompatibilityTest(unittest.TestCase):
+    @staticmethod
+    def _metadata(motion_config):
+        return {
+            "schema_version": 1,
+            "model_size": "medium",
+            "motion": motion_config,
+        }
+
+    def test_checkpoint_accepts_exact_motion_state(self):
+        import rfdetr.models.lwdetr as lwdetr_module
+
+        with patch.object(lwdetr_module, "LWDETR", _FakeLWDETR):
+            model = _FakeLWDETR(scales=("P4",), width=24)
+            motion.attach_motion_module(model, _small_motion_config())
+            with tempfile.TemporaryDirectory() as directory:
+                checkpoint = Path(directory) / "motion_exact.pth"
+                torch.save({"model": model.state_dict()}, checkpoint)
+
+                motion.assert_motion_checkpoint_compatible(model, checkpoint)
+
+    def test_optimizer_step_checkpoint_round_trip_preserves_updated_motion_state(self):
+        import rfdetr.models.lwdetr as lwdetr_module
+
+        config = _small_motion_config()
+        with patch.object(lwdetr_module, "LWDETR", _FakeLWDETR):
+            model = _FakeLWDETR(scales=("P4",), width=24)
+            motion.attach_motion_module(model, config)
+            before = {
+                key: value.detach().clone()
+                for key, value in model.motion_module.state_dict().items()
+            }
+
+            optimizer = torch.optim.SGD(model.motion_module.parameters(), lr=0.1)
+            frames = torch.stack(
+                [
+                    torch.zeros(1, 3, 8, 8),
+                    torch.ones(1, 3, 8, 8),
+                    torch.ones(1, 3, 8, 8),
+                ],
+                dim=1,
+            )
+            features = [torch.ones(1, 24, 4, 4)]
+            optimizer.zero_grad(set_to_none=True)
+            loss = model.motion_module.forward_export(frames, features)[0].sum()
+            loss.backward()
+            optimizer.step()
+
+            updated = {
+                key: value.detach().clone()
+                for key, value in model.motion_module.state_dict().items()
+            }
+            changed = [key for key in before if not torch.equal(before[key], updated[key])]
+            self.assertTrue(changed, "One optimizer step must update motion_module weights")
+            self.assertIn("gates.0.gate.0.weight", changed)
+
+            with tempfile.TemporaryDirectory() as directory:
+                checkpoint = Path(directory) / "motion_trained.pth"
+                saved_state = model.state_dict()
+                torch.save({"model": saved_state}, checkpoint)
+                self.assertTrue(
+                    any(key.startswith("motion_module.") for key in saved_state),
+                    "Training checkpoints must contain motion_module.* tensors",
+                )
+
+                reloaded = _FakeLWDETR(scales=("P4",), width=24)
+                motion.attach_motion_module(reloaded, config)
+                payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+                reloaded.load_state_dict(payload["model"], strict=True)
+
+                restored = reloaded.motion_module.state_dict()
+                self.assertEqual(set(restored), set(updated))
+                for key, expected in updated.items():
+                    self.assertTrue(
+                        torch.equal(restored[key], expected),
+                        f"Motion checkpoint tensor changed during save/reload: {key}",
+                    )
+                motion.assert_motion_checkpoint_compatible(reloaded, checkpoint)
+
+    def test_checkpoint_rejects_missing_motion_weights(self):
+        import rfdetr.models.lwdetr as lwdetr_module
+
+        with patch.object(lwdetr_module, "LWDETR", _FakeLWDETR):
+            model = _FakeLWDETR()
+            motion.attach_motion_module(model, _small_motion_config())
+            with tempfile.TemporaryDirectory() as directory:
+                checkpoint = Path(directory) / "motion_missing.pth"
+                torch.save({"model": {"anchor": torch.zeros(1)}}, checkpoint)
+
+                with self.assertRaisesRegex(RuntimeError, "no motion_module"):
+                    motion.assert_motion_checkpoint_compatible(model, checkpoint)
+
+    def test_checkpoint_rejects_motion_shape_mismatch(self):
+        import rfdetr.models.lwdetr as lwdetr_module
+
+        with patch.object(lwdetr_module, "LWDETR", _FakeLWDETR):
+            model = _FakeLWDETR()
+            motion.attach_motion_module(model, _small_motion_config())
+            state = {key: value.clone() for key, value in model.state_dict().items()}
+            state["motion_module.gates.0.gate.0.weight"] = torch.zeros(1)
+            with tempfile.TemporaryDirectory() as directory:
+                checkpoint = Path(directory) / "motion_shape.pth"
+                torch.save({"model": state}, checkpoint)
+
+                with self.assertRaisesRegex(RuntimeError, "shape_mismatch"):
+                    motion.assert_motion_checkpoint_compatible(model, checkpoint)
+
+    def test_checkpoint_rejects_motion_metadata_mismatch(self):
+        import rfdetr.models.lwdetr as lwdetr_module
+
+        expected_config = _small_motion_config("identity")
+        saved_config = _small_motion_config("noise")
+        with patch.object(lwdetr_module, "LWDETR", _FakeLWDETR):
+            model = _FakeLWDETR()
+            motion.attach_motion_module(model, expected_config)
+            with tempfile.TemporaryDirectory() as directory:
+                checkpoint = Path(directory) / "motion_metadata.pth"
+                torch.save(
+                    {
+                        "model": model.state_dict(),
+                        "pitchobjectlab_architecture": self._metadata(saved_config),
+                    },
+                    checkpoint,
+                )
+
+                with self.assertRaisesRegex(RuntimeError, "TrackNet architecture metadata"):
+                    motion.assert_motion_checkpoint_compatible(
+                        model,
+                        checkpoint,
+                        expected_architecture=self._metadata(expected_config),
+                    )
+
 
 # ---------------------------------------------------------------------------
 # attach_motion_module guard
@@ -506,6 +739,45 @@ class AttachMotionModuleTest(unittest.TestCase):
         with self.assertWarns(UserWarning):
             motion.attach_motion_module(model, {"enabled": True, "type": "tracknet_v5"})
         self.assertFalse(hasattr(model, "motion_module"))
+
+    def test_actual_projector_levels_and_channels_are_used_idempotently(self):
+        import rfdetr.models.lwdetr as lwdetr_module
+
+        model = _FakeLWDETR(scales=("P2", "P3", "P4"), width=32)
+        config = _small_motion_config()
+        with patch.object(lwdetr_module, "LWDETR", _FakeLWDETR):
+            motion.attach_motion_module(model, config)
+            attached = model.motion_module
+
+            self.assertEqual(attached.feature_channels_per_scale, [32, 32, 32])
+            self.assertEqual(len(attached.gates), 3)
+            self.assertEqual(attached.gates[0].gate[0].out_channels, 32)
+
+            motion.attach_motion_module(model, config)
+            self.assertIs(model.motion_module, attached)
+
+    def test_p6_extra_pool_reuses_last_projector_channel_width(self):
+        import rfdetr.models.lwdetr as lwdetr_module
+
+        model = _FakeLWDETR(scales=("P4", "P6"), width=32)
+        projector = model.backbone[0].projector
+        projector.stages = nn.ModuleList([projector.stages[0]])
+        projector.use_extra_pool = True
+        with patch.object(lwdetr_module, "LWDETR", _FakeLWDETR):
+            motion.attach_motion_module(model, _small_motion_config())
+
+        self.assertEqual(model.motion_module.feature_channels_per_scale, [32, 32])
+        self.assertEqual(len(model.motion_module.gates), 2)
+
+    def test_compiled_wrapper_is_unwrapped_before_motion_attachment(self):
+        import rfdetr.models.lwdetr as lwdetr_module
+
+        model = _FakeLWDETR(scales=("P4",), width=24)
+        compiled = SimpleNamespace(_orig_mod=model)
+        with patch.object(lwdetr_module, "LWDETR", _FakeLWDETR):
+            motion.attach_motion_module(compiled, _small_motion_config())
+
+        self.assertTrue(hasattr(model, "motion_module"))
 
 
 if __name__ == "__main__":

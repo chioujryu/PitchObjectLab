@@ -757,11 +757,29 @@ def summarize_inference_timing_rows(model: Any) -> Dict[str, Any]:
 def load_rfdetr_model(config: Mapping[str, Any]) -> Any:
     model_cls = trainer.get_model_class(str(config.get("model", {}).get("size", "medium")))
     rf_model = model_cls(**trainer.build_model_kwargs(config))
+    p2_config = config.get('model', {}).get('p2', {}) or {}
+    if bool(p2_config.get('enabled', False)):
+        from rf_detr_p2 import assert_p2_checkpoint_compatible
+
+        assert_p2_checkpoint_compatible(
+            rf_model.model,
+            getattr(rf_model.model_config, 'pretrain_weights', None),
+            trainer.build_pitchobjectlab_architecture(config),
+        )
     motion_config = config.get("model", {}).get("motion", {}) or {}
     if bool(motion_config.get("enabled", False)):
         from rf_detr_motion import attach_motion_module
 
         attach_motion_module(rf_model.model, motion_config)
+        model_config = getattr(rf_model, "model_config", None)
+        checkpoint_path = getattr(model_config, "pretrain_weights", None)
+        from rf_detr_motion import assert_motion_checkpoint_compatible
+
+        assert_motion_checkpoint_compatible(
+            rf_model.model,
+            checkpoint_path,
+            trainer.build_pitchobjectlab_architecture(config),
+        )
     accelerated_model, _ = trainer.configure_rfdetr_inference_acceleration(
         rf_model,
         config,

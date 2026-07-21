@@ -20,6 +20,7 @@ import math
 import os
 import re
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -31,7 +32,9 @@ from typing import Any
 import torch
 
 
-_MANIFEST_SCHEMA_VERSION = 1
+_MANIFEST_SCHEMA_VERSION = 2
+_TENSORRT_EXPORT_ABI_VERSION = 3
+_TENSORRT_EXPORT_SHAPE_CONTRACT = "dynamic-batch-static-nchw"
 _ACCELERATION_MARKER = "_pitch_object_lab_inference_acceleration"
 _FORWARD_RECORDER_MARKER = "_pitch_object_lab_forward_timing_recorder"
 _POSTPROCESS_RECORDER_MARKER = "_pitch_object_lab_postprocess_timing_recorder"
@@ -781,6 +784,92 @@ def _model_num_logit_slots(model: Any) -> int:
     return _model_num_classes(model) + 1
 
 
+def _qualified_type(value: Any) -> str | None:
+    if value is None:
+        return None
+    value_type = type(value)
+    return f"{value_type.__module__}.{value_type.__qualname__}"
+
+
+def _module_state_shapes(module: Any) -> dict[str, list[int]]:
+    """Return a weight-free structural signature for cache provenance."""
+
+    callback = getattr(module, "state_dict", None)
+    if not callable(callback):
+        return {}
+    return {
+        str(name): [int(dimension) for dimension in value.shape]
+        for name, value in sorted(callback().items())
+        if isinstance(value, torch.Tensor)
+    }
+
+
+def _model_architecture_identity(model: Any) -> dict[str, Any]:
+    """Fingerprint the graph-affecting P2/TrackNet structure actually attached."""
+
+    context = getattr(model, "model", None)
+    module = getattr(context, "model", None)
+    if module is None:
+        module = context if context is not None else model
+
+    backbone_collection = getattr(module, "backbone", None)
+    if isinstance(backbone_collection, (list, tuple, torch.nn.ModuleList, torch.nn.Sequential)):
+        backbone = backbone_collection[0] if len(backbone_collection) else None
+    else:
+        backbone = backbone_collection
+    encoder = getattr(backbone, "encoder", None)
+    projector = getattr(backbone, "projector", None)
+    cross_attn_projector = getattr(backbone, "cross_attn_projector", None)
+    projector_scale = list(getattr(backbone, "projector_scale", []) or [])
+
+    motion = getattr(module, "motion_module", None)
+    motion_identity: dict[str, Any] = {"attached": motion is not None}
+    if motion is not None:
+        rstr_heads = getattr(motion, "rstr_heads", None)
+        motion_identity.update(
+            {
+                "class": _qualified_type(motion),
+                "num_frames": getattr(motion, "num_frames", None),
+                "fallback_mode": getattr(motion, "fallback_mode", None),
+                "noise_std": getattr(motion, "noise_std", None),
+                "mdd_enabled": getattr(motion, "mdd_enabled", None),
+                "rstr_enabled": getattr(motion, "rstr_enabled", None),
+                "gate_count": len(getattr(motion, "gates", []) or []),
+                "rstr_head_count": len(rstr_heads) if rstr_heads is not None else 0,
+                "state_shapes": _module_state_shapes(motion),
+            }
+        )
+
+    return {
+        "module_class": _qualified_type(module),
+        "backbone_class": _qualified_type(backbone),
+        "p2_enabled": "P2" in projector_scale,
+        "projector_scale": projector_scale,
+        "encoder": {
+            "class": _qualified_type(encoder),
+            "out_feature_channels": list(getattr(encoder, "_out_feature_channels", []) or []),
+            "shape": getattr(encoder, "shape", None),
+            "patch_size": getattr(encoder, "patch_size", None),
+            "num_windows": getattr(encoder, "num_windows", None),
+        },
+        "projector": {
+            "class": _qualified_type(projector),
+            "scale_factors": list(getattr(projector, "scale_factors", []) or []),
+            "survival_prob": getattr(projector, "survival_prob", None),
+            "force_drop_last_n_features": getattr(projector, "force_drop_last_n_features", None),
+            "use_extra_pool": getattr(projector, "use_extra_pool", None),
+            "stage_count": len(getattr(projector, "stages", []) or []),
+            "state_shapes": _module_state_shapes(projector),
+        },
+        "cross_attn_projector": {
+            "attached": cross_attn_projector is not None,
+            "class": _qualified_type(cross_attn_projector),
+            "state_shapes": _module_state_shapes(cross_attn_projector),
+        },
+        "motion": motion_identity,
+    }
+
+
 def _model_manifest_identity(model: Any, supplied: Mapping[str, Any] | None) -> Any:
     config = getattr(model, "model_config", None)
     if hasattr(config, "model_dump"):
@@ -861,8 +950,14 @@ def _build_identity(
     resolution = _model_resolution(model, settings)
     output_names = ["dets", "labels", "masks"] if segmentation else ["dets", "labels"]
     return {
+        "export_abi": {
+            "version": _TENSORRT_EXPORT_ABI_VERSION,
+            "shape_contract": _TENSORRT_EXPORT_SHAPE_CONTRACT,
+            "dynamic_axes": ["batch"],
+        },
         "checkpoint": _checkpoint_identity(model, checkpoint_path),
         "model": _model_manifest_identity(model, model_identity),
+        "architecture": _model_architecture_identity(model),
         "resolution": [resolution, resolution],
         "num_channels": _model_num_channels(model),
         "num_classes": _model_num_classes(model),
@@ -888,9 +983,11 @@ def _build_identity(
         "profile": asdict(settings.tensorrt.profile),
         "runtime": {
             "rfdetr": _package_version("rfdetr"),
+            "onnx": _package_version("onnx"),
             "tensorrt": str(getattr(trt, "__version__", "unknown")),
             "torch": str(torch.__version__),
             "cuda": str(torch.version.cuda),
+            "python": sys.version.split()[0],
         },
         "gpu": {
             "name": gpu_name,
@@ -1112,8 +1209,244 @@ def build_tensorrt_engine(
     return destination
 
 
+def _onnx_dimension_value(dimension: Any) -> int | None:
+    '''Return a positive static ONNX dimension, or None when symbolic/unknown.'''
+
+    has_field = getattr(dimension, 'HasField', None)
+    if callable(has_field):
+        with contextlib.suppress(ValueError):
+            if not has_field('dim_value'):
+                return None
+    value = getattr(dimension, 'dim_value', None)
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _onnx_dimension_text(dimension: Any) -> str:
+    value = _onnx_dimension_value(dimension)
+    if value is not None:
+        return str(value)
+    symbolic = str(getattr(dimension, 'dim_param', '') or '').strip()
+    return symbolic or 'unknown'
+
+
+def _onnx_value_dimensions(value_info: Any) -> list[Any]:
+    tensor_type = getattr(getattr(value_info, 'type', None), 'tensor_type', None)
+    shape = getattr(tensor_type, 'shape', None)
+    dimensions = getattr(shape, 'dim', None)
+    return list(dimensions) if dimensions is not None else []
+
+
+def _onnx_io_contract_issues(
+    graph: Any,
+    *,
+    resolution: int,
+    num_channels: int,
+    segmentation: bool,
+    num_queries: int | None = None,
+    num_logit_slots: int | None = None,
+    mask_downsample_ratio: int | None = None,
+) -> list[str]:
+    initializer_names = {str(initializer.name) for initializer in graph.initializer}
+    graph_inputs = [value for value in graph.input if str(value.name) not in initializer_names]
+    graph_outputs = list(graph.output)
+    expected_outputs = ['dets', 'labels', *(['masks'] if segmentation else [])]
+    issues: list[str] = []
+
+    actual_inputs = [str(value.name) for value in graph_inputs]
+    actual_outputs = [str(value.name) for value in graph_outputs]
+    if actual_inputs != ['input']:
+        issues.append(f'graph inputs must be [input], got {actual_inputs}')
+    if actual_outputs != expected_outputs:
+        issues.append(f'graph outputs must be {expected_outputs}, got {actual_outputs}')
+
+    expected_ranks = {'input': 4, 'dets': 3, 'labels': 3, 'masks': 4}
+    for value_info in [*graph_inputs, *graph_outputs]:
+        name = str(value_info.name)
+        tensor_type = getattr(getattr(value_info, 'type', None), 'tensor_type', None)
+        element_type = getattr(tensor_type, 'elem_type', None)
+        if element_type is not None and int(element_type) != 1:
+            issues.append(f'{name!r} must use ONNX FLOAT tensors, got elem_type={element_type!r}')
+        dimensions = _onnx_value_dimensions(value_info)
+        expected_rank = expected_ranks.get(name)
+        if expected_rank is not None and len(dimensions) != expected_rank:
+            issues.append(f'{name!r} must be rank {expected_rank}, got rank {len(dimensions)}')
+            continue
+        for axis, dimension in enumerate(dimensions):
+            static_value = _onnx_dimension_value(dimension)
+            if axis == 0:
+                if static_value is not None:
+                    issues.append(
+                        f'{name!r} batch axis must be dynamic, got {_onnx_dimension_text(dimension)}'
+                    )
+                elif not str(getattr(dimension, 'dim_param', '') or '').strip():
+                    issues.append(f'{name!r} batch axis must be symbolic, got unknown')
+            elif static_value is None:
+                issues.append(
+                    f'{name!r} axis {axis} must be static, got {_onnx_dimension_text(dimension)}'
+                )
+    expected_output_shapes: dict[str, list[int | None]] = {
+        'dets': [None, num_queries, 4],
+        'labels': [None, num_queries, num_logit_slots],
+    }
+    if segmentation:
+        mask_size = None
+        if mask_downsample_ratio is not None:
+            mask_size = int(resolution) // int(mask_downsample_ratio)
+        expected_output_shapes['masks'] = [None, num_queries, mask_size, mask_size]
+    for value_info in graph_outputs:
+        name = str(value_info.name)
+        expected_shape = expected_output_shapes.get(name)
+        dimensions = _onnx_value_dimensions(value_info)
+        if expected_shape is None or len(dimensions) != len(expected_shape):
+            continue
+        for axis, expected_value in enumerate(expected_shape):
+            if expected_value is None:
+                continue
+            actual_value = _onnx_dimension_value(dimensions[axis])
+            if actual_value != int(expected_value):
+                issues.append(
+                    f'{name!r} axis {axis} must be {expected_value}, '
+                    f'got {_onnx_dimension_text(dimensions[axis])}'
+                )
+
+    input_info = next((value for value in graph_inputs if str(value.name) == 'input'), None)
+    if input_info is not None:
+        dimensions = _onnx_value_dimensions(input_info)
+        if len(dimensions) == 4:
+            expected_nchw = [None, int(num_channels), int(resolution), int(resolution)]
+            for axis, expected_value in enumerate(expected_nchw[1:], start=1):
+                actual_value = _onnx_dimension_value(dimensions[axis])
+                if actual_value != expected_value:
+                    issues.append(
+                        f'input axis {axis} must be {expected_value}, '
+                        f'got {_onnx_dimension_text(dimensions[axis])}'
+                    )
+    return issues
+
+
+def _onnx_convolution_contract_issues(graph: Any) -> list[str]:
+    value_infos = {
+        str(value.name): value
+        for value in [*graph.input, *graph.output, *graph.value_info]
+    }
+    issues: list[str] = []
+    for node in graph.node:
+        operation = str(node.op_type)
+        if operation not in {'Conv', 'ConvTranspose'} or not node.input:
+            continue
+        tensor_name = str(node.input[0])
+        value_info = value_infos.get(tensor_name)
+        node_name = str(node.name or '<unnamed>')
+        if value_info is None:
+            issues.append(
+                f'{operation} node {node_name!r} input tensor {tensor_name!r} has no inferred shape'
+            )
+            continue
+        dimensions = _onnx_value_dimensions(value_info)
+        if len(dimensions) != 4:
+            issues.append(
+                f'{operation} node {node_name!r} input tensor {tensor_name!r} '
+                f'must be rank 4 NCHW, got rank {len(dimensions)}'
+            )
+            continue
+        for axis, label in ((1, 'channel'), (2, 'height'), (3, 'width')):
+            if _onnx_dimension_value(dimensions[axis]) is None:
+                issues.append(
+                    f'{operation} node {node_name!r} input tensor {tensor_name!r} {label} axis '
+                    f'must be static, got {_onnx_dimension_text(dimensions[axis])}'
+                )
+    return issues
+
+
+def _onnx_shape_tensor_contract_issues(graph: Any) -> list[str]:
+    """Reject the pre-1.8.3 dynamic shape rewrite unsupported by TensorRT."""
+
+    issues: list[str] = []
+    for node in graph.node:
+        if str(node.op_type) != 'ScatterND':
+            continue
+        node_name = str(node.name or '<unnamed>')
+        inputs = [str(value) for value in node.input]
+        outputs = [str(value) for value in node.output]
+        issues.append(
+            f'ScatterND node {node_name!r} is not allowed in the RF-DETR TensorRT '
+            f'shape contract; inputs={inputs}, outputs={outputs}. '
+            'Use the rfdetr==1.8.3 export path.'
+        )
+    return issues
+
+
+def _validate_onnx_export_contract(
+    path: str | Path,
+    *,
+    resolution: int,
+    num_channels: int,
+    segmentation: bool,
+    num_queries: int | None = None,
+    num_logit_slots: int | None = None,
+    mask_downsample_ratio: int | None = None,
+    onnx_module: Any | None = None,
+) -> Path:
+    '''Validate and persist TensorRT-safe dynamic-batch/static-NCHW shapes.'''
+
+    onnx = onnx_module or _import_onnx()
+    source = Path(path)
+    try:
+        model_proto = onnx.load(str(source))
+        onnx.checker.check_model(model_proto)
+    except Exception as exc:
+        raise RuntimeError(f'Unable to load/check exported ONNX model {source}: {exc}') from exc
+    try:
+        inferred = onnx.shape_inference.infer_shapes(
+            model_proto,
+            check_type=True,
+            strict_mode=True,
+            data_prop=True,
+        )
+        onnx.checker.check_model(inferred)
+    except Exception as exc:
+        raise RuntimeError(f'Unable to infer/check exported ONNX shapes for {source}: {exc}') from exc
+
+    issues = _onnx_io_contract_issues(
+        inferred.graph,
+        resolution=resolution,
+        num_channels=num_channels,
+        segmentation=segmentation,
+        num_queries=num_queries,
+        num_logit_slots=num_logit_slots,
+        mask_downsample_ratio=mask_downsample_ratio,
+    )
+    issues.extend(_onnx_convolution_contract_issues(inferred.graph))
+    issues.extend(_onnx_shape_tensor_contract_issues(inferred.graph))
+    if issues:
+        raise RuntimeError(
+            'TensorRT ONNX export contract validation failed:\n- ' + '\n- '.join(issues)
+        )
+
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f'.{source.name}.',
+        suffix='.shape-inferred.tmp',
+        dir=source.parent,
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        onnx.save_model(inferred, str(temporary))
+        os.replace(temporary, source)
+    except Exception as exc:
+        temporary.unlink(missing_ok=True)
+        raise RuntimeError(f'Unable to persist inferred ONNX shapes for {source}: {exc}') from exc
+    return source
+
+
 def _export_dynamic_onnx(model: Any, output_dir: Path, settings: InferenceOptimizationConfig) -> Path:
-    _import_onnx()
+    onnx = _import_onnx()
     from rf_detr_motion import assert_motion_export_ready
 
     assert_motion_export_ready(model)
@@ -1136,7 +1469,23 @@ def _export_dynamic_onnx(model: Any, output_dir: Path, settings: InferenceOptimi
     path = Path(exported)
     if not path.is_file():
         raise RuntimeError(f"RF-DETR export did not produce an ONNX file: {path}")
-    return path
+    return _validate_onnx_export_contract(
+        path,
+        resolution=resolution,
+        num_channels=_model_num_channels(model),
+        segmentation=_infer_segmentation(model),
+        num_queries=_model_num_queries(model),
+        num_logit_slots=_model_num_logit_slots(model),
+        mask_downsample_ratio=(
+            _positive_int(
+                getattr(getattr(model, 'model_config', None), 'mask_downsample_ratio', 4),
+                'model mask_downsample_ratio',
+            )
+            if _infer_segmentation(model)
+            else None
+        ),
+        onnx_module=onnx,
+    )
 
 
 def _infer_segmentation(model: Any) -> bool:
@@ -1160,6 +1509,30 @@ def _release_pytorch_cuda_weights(model: Any) -> None:
     context.model = module.to("cpu")
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+def _combined_p2_motion_diagnostic(model: Any, resolution: int) -> str | None:
+    """Describe the quadratic attention pressure of a P2+TrackNet graph."""
+
+    architecture = _model_architecture_identity(model)
+    levels = list(architecture.get("projector_scale", []) or [])
+    motion = architecture.get("motion", {}) or {}
+    if "P2" not in levels or not bool(motion.get("attached", False)):
+        return None
+    stride_by_level = {"P2": 4, "P3": 8, "P4": 16, "P5": 32, "P6": 64}
+    tokens_by_level = {
+        level: max(1, int(resolution) // stride_by_level[level]) ** 2
+        for level in levels
+        if level in stride_by_level
+    }
+    total_tokens = sum(tokens_by_level.values())
+    return (
+        "P2+TrackNet TensorRT diagnostic: "
+        f"resolution={resolution}x{resolution}, tokens_by_level={tokens_by_level}, "
+        f"total_feature_tokens={total_tokens}. TrackNet R-STR uses global feature attention, "
+        "whose memory grows quadratically with each level's token count. Retry with P2 disabled "
+        "or a lower model resolution."
+    )
 
 
 def prepare_tensorrt_engine(
@@ -1309,6 +1682,11 @@ def prepare_tensorrt_engine(
                 export_seconds=export_seconds,
                 build_seconds=build_seconds,
             )
+        except Exception as exc:
+            diagnostic = _combined_p2_motion_diagnostic(model, _model_resolution(model, settings))
+            if diagnostic is not None:
+                raise RuntimeError(f"{exc}\n{diagnostic}") from exc
+            raise
         finally:
             shutil.rmtree(temporary_dir, ignore_errors=True)
 

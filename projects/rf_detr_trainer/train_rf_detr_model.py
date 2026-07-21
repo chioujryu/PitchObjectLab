@@ -55,6 +55,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from copy import deepcopy
 from datetime import datetime
@@ -85,6 +86,9 @@ DDP_OUTPUT_DIR_ENV = "RF_DETR_TRAIN_OUTPUT_DIR"
 DDP_DATASET_DIR_ENV = "RF_DETR_TRAIN_DATASET_DIR"
 DDP_DATASET_FILE_ENV = "RF_DETR_TRAIN_DATASET_FILE"
 IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
+PITCHOBJECTLAB_ARCHITECTURE_KEY = 'pitchobjectlab_architecture'
+PITCHOBJECTLAB_ARCHITECTURE_SCHEMA_VERSION = 1
+PITCHOBJECTLAB_TENSORRT_EXPORT_ABI = 3
 DATASET_SOURCE_FORMATS = {
     "auto",
     "rfdetr",
@@ -3043,6 +3047,119 @@ def normalize_pretrain_weights(value: Any) -> Tuple[bool, Optional[str]]:
     return True, str(resolved)
 
 
+def build_pitchobjectlab_architecture(config: Mapping[str, Any]) -> Dict[str, Any]:
+    '''Serialize only graph-affecting project architecture settings.'''
+
+    model = config.get('model', {})
+    if not isinstance(model, Mapping):
+        model = {}
+    p2 = model.get('p2', {}) or {}
+    motion = model.get('motion', {}) or {}
+    projector = p2.get('projector', {}) or {}
+    p2_enabled = bool(p2.get('enabled', False))
+    projector_scale = list(
+        p2.get('projector_scale', ['P2', 'P3', 'P4'] if p2_enabled else [])
+        or []
+    )
+    return {
+        'schema_version': PITCHOBJECTLAB_ARCHITECTURE_SCHEMA_VERSION,
+        'model_size': str(model.get('size', 'medium')),
+        'p2': {
+            'enabled': p2_enabled,
+            'projector_scale': projector_scale,
+            'overrides': deepcopy(dict(p2.get('overrides', {}) or {})),
+            'projector': {
+                key: deepcopy(projector.get(key))
+                for key in (
+                    'num_blocks',
+                    'survival_prob',
+                    'force_drop_last_n_features',
+                    'layer_norm',
+                    'rms_norm',
+                )
+                if projector.get(key) is not None
+            },
+        },
+        'motion': {
+            'enabled': bool(motion.get('enabled', False)),
+            'type': str(motion.get('type', 'tracknet_v5')),
+            'temporal': deepcopy(dict(motion.get('temporal', {}) or {})),
+            'tracknet_v5': deepcopy(dict(motion.get('tracknet_v5', {}) or {})),
+            'overrides': deepcopy(dict(motion.get('overrides', {}) or {})),
+        },
+        'tensorrt_export_abi': PITCHOBJECTLAB_TENSORRT_EXPORT_ABI,
+    }
+
+
+def install_best_checkpoint_metadata(trainer: Any, metadata: Mapping[str, Any]) -> None:
+    '''Inject architecture metadata into regular and EMA checkpoint payloads.'''
+
+    installed = False
+    for callback in getattr(trainer, 'callbacks', []):
+        if type(callback).__name__ != 'BestModelCallback':
+            continue
+        original = callback._build_checkpoint_payload
+        frozen_metadata = deepcopy(dict(metadata))
+
+        def build_payload(*args: Any, _original: Any = original, **kwargs: Any) -> Dict[str, Any]:
+            payload = dict(_original(*args, **kwargs))
+            payload[PITCHOBJECTLAB_ARCHITECTURE_KEY] = deepcopy(frozen_metadata)
+            args_payload = payload.get('args')
+            if isinstance(args_payload, Mapping):
+                nested_args = dict(args_payload)
+                nested_args[PITCHOBJECTLAB_ARCHITECTURE_KEY] = deepcopy(frozen_metadata)
+                payload['args'] = nested_args
+            return payload
+
+        callback._build_checkpoint_payload = build_payload
+        installed = True
+    if not installed:
+        raise RuntimeError(
+            'RF-DETR trainer has no BestModelCallback; cannot preserve project architecture metadata.'
+        )
+
+
+def enrich_best_checkpoint_metadata(output_dir: Path) -> None:
+    '''Restore top-level metadata after RF-DETR strips the total checkpoint.'''
+
+    import torch
+
+    for name in (
+        'checkpoint_best_regular.pth',
+        'checkpoint_best_ema.pth',
+        'checkpoint_best_total.pth',
+    ):
+        path = output_dir / name
+        if not path.is_file():
+            continue
+        try:
+            checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+        except TypeError:
+            checkpoint = torch.load(path, map_location='cpu')
+        if not isinstance(checkpoint, MutableMapping):
+            continue
+        metadata = checkpoint.get(PITCHOBJECTLAB_ARCHITECTURE_KEY)
+        args_payload = checkpoint.get('args')
+        if metadata is None and isinstance(args_payload, Mapping):
+            metadata = args_payload.get(PITCHOBJECTLAB_ARCHITECTURE_KEY)
+        if not isinstance(metadata, Mapping):
+            continue
+        checkpoint[PITCHOBJECTLAB_ARCHITECTURE_KEY] = deepcopy(dict(metadata))
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f'.{path.name}.',
+            suffix='.metadata.tmp',
+            dir=path.parent,
+        )
+        os.close(descriptor)
+        temporary = Path(temporary_name)
+        try:
+            torch.save(checkpoint, temporary)
+            os.replace(temporary, path)
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
+
+
 def build_model_kwargs(config: Mapping[str, Any]) -> Dict[str, Any]:
     """Build RF-DETR model constructor kwargs."""
     model_cfg = deepcopy(config.get("model", {}))
@@ -3061,21 +3178,27 @@ def build_model_kwargs(config: Mapping[str, Any]) -> Dict[str, Any]:
     # backbone P2=4.0); projector_scale + overrides become real ModelConfig kwargs. This is the
     # shared model-build choke point, so this also covers test/inference/tracking entrypoints.
     p2_cfg = model_cfg.get("p2", {}) or {}
-    if bool(p2_cfg.get("enabled", False)):
-        from rf_detr_p2 import apply_p2_overrides, ensure_p2_support, resolve_p2_projector_scale
+    from rf_detr_p2 import apply_p2_overrides, ensure_p2_support, resolve_p2_projector_scale
 
-        ensure_p2_support(p2_cfg)
+    # Install the version-pinned Backbone export path for every architecture.
+    # Stock/TrackNet models also need the static DINO -> projector reshape
+    # boundary; P2 scale and mismatch behavior remain conditional below.
+    ensure_p2_support(p2_cfg)
+    if bool(p2_cfg.get("enabled", False)):
         kwargs["projector_scale"] = resolve_p2_projector_scale(p2_cfg)
         apply_p2_overrides(kwargs, p2_cfg)
     # Optional pluggable TrackNetV5 motion module. Fully inert unless model.motion.enabled.
-    # ensure_motion_support patches LWDETR.forward in-process (wraps backbone output for MDD
-    # feature-gating and R-STR refinement). attach_motion_module() must be called separately
-    # after the model object is constructed (see _attach_motion_module_if_enabled below).
-    motion_cfg = model_cfg.get("motion", {}) or {}
-    if bool(motion_cfg.get("enabled", False)):
-        from rf_detr_motion import apply_motion_overrides, ensure_motion_support
+    # ensure_motion_support patches LWDETR construction/forward in-process. The constructor
+    # hook attaches motion after the backbone exists and before RF-DETR restores checkpoint
+    # weights, covering both facade and Lightning model construction.
+    motion_cfg = model_cfg.get("motion", {}) or {"enabled": False}
+    from rf_detr_motion import apply_motion_overrides, ensure_motion_support
 
-        ensure_motion_support(motion_cfg)
+    # Record disabled configs too. The LWDETR constructor hook reads the active
+    # process setting, so this prevents an enabled build from leaking motion into
+    # a later stock model in the same worker process.
+    ensure_motion_support(motion_cfg)
+    if bool(motion_cfg.get("enabled", False)):
         apply_motion_overrides(kwargs, motion_cfg)
     should_pass, pretrain = normalize_pretrain_weights(model_cfg.get("pretrain_weights", "default"))
     if should_pass:
@@ -5085,6 +5208,18 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
 
             attach_motion_module(rf_model.model, _motion_cfg)
             blue("TrackNetV5 motion module (MDD + R-STR) attached to LWDETR.", verbose)
+        _p2_cfg = config.get('model', {}).get('p2', {}) or {}
+        if bool(_p2_cfg.get('enabled', False)):
+            from rf_detr_p2 import assert_p2_training_checkpoint_compatible
+
+            pretrain_path = getattr(rf_model.model_config, 'pretrain_weights', None)
+            if pretrain_path is not None and Path(str(pretrain_path)).is_file():
+                assert_p2_training_checkpoint_compatible(
+                    rf_model.model,
+                    pretrain_path,
+                    build_pitchobjectlab_architecture(config),
+                    allow_stock_initialization=True,
+                )
         train_config = rf_model.get_train_config(**train_kwargs)
         if train_config.batch_size == "auto":
             from rfdetr.detr import _ensure_model_on_device
@@ -5104,9 +5239,34 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
 
         rf_model._align_num_classes_from_dataset(train_config.dataset_dir)
         module = RFDETRModelModule(rf_model.model_config, train_config)
+        if bool(_motion_cfg.get("enabled", False)):
+            # ensure_motion_support patches LWDETR.__init__, so the actual
+            # Lightning model already owns motion_module before its constructor
+            # restores pretrained weights. This idempotent call verifies the
+            # live training module before optimizer/EMA setup.
+            attach_motion_module(module.model, _motion_cfg)
+            if train_config.resume:
+                from rf_detr_motion import assert_motion_checkpoint_compatible
+
+                assert_motion_checkpoint_compatible(
+                    module.model,
+                    train_config.resume,
+                    build_pitchobjectlab_architecture(config),
+                )
+        if bool(_p2_cfg.get('enabled', False)) and train_config.resume:
+            assert_p2_training_checkpoint_compatible(
+                module.model,
+                train_config.resume,
+                build_pitchobjectlab_architecture(config),
+                allow_stock_initialization=False,
+            )
         datamodule = RFDETRDataModule(rf_model.model_config, train_config)
 
         trainer = build_trainer(train_config, rf_model.model_config, **trainer_kwargs)
+        install_best_checkpoint_metadata(
+            trainer,
+            build_pitchobjectlab_architecture(config),
+        )
         trainer.callbacks.append(
             PeriodicManualTestCallback(
                 merged_config=config,
@@ -5155,6 +5315,8 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
 
         blue("Starting RF-DETR training.", verbose)
         trainer.fit(module, datamodule, ckpt_path=train_config.resume or None)
+        if bool(getattr(trainer, 'is_global_zero', True)):
+            enrich_best_checkpoint_metadata(output_dir)
         rf_model.model.model = module.model
         if getattr(datamodule, "class_names", None) is not None:
             rf_model.model.class_names = datamodule.class_names
