@@ -258,6 +258,15 @@ class RfDetrInferenceTest(unittest.TestCase):
 
         config_dir = PROJECT_DIR / "config"
         p2_video_preset = "rf_detr_inference_medium_p2_video_1984090152231178242_003.yaml"
+        tensorrt_presets = {
+            "rf_detr_inference_tracknet_tensorrt_fp16_example.yaml",
+            "rf_detr_inference_large_p2_tensorrt_fp16_smoke.yaml",
+        }
+        tracknet_presets = {
+            "rf_detr_inference_tracknet_tensorrt_fp16_example.yaml",
+            "rf_detr_inference_small_tracknet_v5.yaml",
+            "rf_detr_inference_small_p2_tracknet_v5.yaml",
+        }
         for path in sorted(config_dir.glob("rf_detr_inference*.yaml")):
             with self.subTest(config=path.name):
                 config = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -267,17 +276,15 @@ class RfDetrInferenceTest(unittest.TestCase):
                 self.assertIn("inference_optimization", model)
                 self.assertIn("enabled", model["p2"])
                 self.assertIn("enabled", model["motion"])
-                tracknet_tensorrt_example = (
-                    path.name == "rf_detr_inference_tracknet_tensorrt_fp16_example.yaml"
-                )
-                expected_backend = "tensorrt" if tracknet_tensorrt_example else "pytorch"
+                expected_backend = "tensorrt" if path.name in tensorrt_presets else "pytorch"
                 self.assertEqual(model["inference_optimization"]["backend"], expected_backend)
                 self.assertEqual(model["inference_optimization"]["pytorch"]["precision"], "fp32")
                 self.assertIn(model["inference_optimization"]["tensorrt"]["precision"], {"fp16", "bf16"})
                 if path.name == p2_video_preset:
                     self.assertTrue(model["p2"]["enabled"])
-                if tracknet_tensorrt_example:
+                if path.name == "rf_detr_inference_tracknet_tensorrt_fp16_example.yaml":
                     self.assertFalse(model["p2"]["enabled"])
+                if path.name in tracknet_presets:
                     self.assertTrue(model["motion"]["enabled"])
                     self.assertEqual(model["motion"]["temporal"]["fallback_mode"], "identity")
                 else:

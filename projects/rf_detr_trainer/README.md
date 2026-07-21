@@ -2,7 +2,9 @@
 
 Config-first RF-DETR training project with an Ultralytics-style workflow:
 
-1. Custom output directory using `output.output_dir` or `output.root` + `output.name`.
+1. Project-anchored output directory using `output.output_dir` or
+   `output.root` + `output.name`, with explicit paths still able to leave the
+   project when needed.
 2. Validation every epoch by default through RF-DETR `eval_interval`.
 3. Scheduled test-set evaluation every N epochs or minutes.
 4. Final test-set evaluation after training.
@@ -172,6 +174,34 @@ Detection: base, nano, small, medium, large
 Segmentation: seg-preview, seg-nano, seg-small, seg-medium, seg-large, seg-xlarge, seg-2xlarge
 ```
 
+### Small architecture presets
+
+Small detection keeps the official RF-DETR 512 x 512 default and is provided
+as a complete Stock/P2/TrackNetV5 matrix for training, standalone test, and
+inference:
+
+| Architecture | Train | Test | Inference |
+| --- | --- | --- | --- |
+| Stock | `config/rf_detr_train_small.yaml` | `config/rf_detr_test_small.yaml` | `config/rf_detr_inference_small.yaml` |
+| P2 only | `config/rf_detr_train_small_p2.yaml` | `config/rf_detr_test_small_p2.yaml` | `config/rf_detr_inference_small_p2.yaml` |
+| TrackNetV5 only | `config/rf_detr_train_small_tracknet_v5.yaml` | `config/rf_detr_test_small_tracknet_v5.yaml` | `config/rf_detr_inference_small_tracknet_v5.yaml` |
+| P2 + TrackNetV5 | `config/rf_detr_train_small_p2_tracknet_v5.yaml` | `config/rf_detr_test_small_p2_tracknet_v5.yaml` | `config/rf_detr_inference_small_p2_tracknet_v5.yaml` |
+
+Stock uses the official Small initialization. P2 presets use
+`projector_scale: [P2, P3, P4]`; TrackNetV5 presets use
+`model.motion.type: tracknet_v5`. TrackNetV5 here is the model motion module,
+not `inference.tracking`. Test and inference with P2, TrackNetV5, or their
+combination require a checkpoint trained with that exact architecture.
+
+```bash
+# Stock Small uses the checkpoint/pretrain configured by the preset.
+uv run python inference_rf_detr_model.py --config config/rf_detr_inference_small.yaml --source PATH/TO/media --yes
+
+# Custom Small architectures require a matching checkpoint.
+uv run python test_rf_detr_model.py --config config/rf_detr_test_small_p2.yaml --checkpoint PATH/TO/small_p2_checkpoint.pth --yes
+uv run python inference_rf_detr_model.py --config config/rf_detr_inference_small_p2_tracknet_v5.yaml --checkpoint PATH/TO/small_p2_tracknet_v5_checkpoint.pth --source PATH/TO/media --yes
+```
+
 `train.device` options:
 
 ```text
@@ -285,7 +315,7 @@ model:
       precision: fp16      # fp16, bf16
       engine_path: ""      # empty => build/load the automatic cache
       manifest_path: ""    # explicit engine: empty derives <engine>.manifest.json
-      cache_dir: ""        # empty => OS user cache
+      cache_dir: "runs/rf_detr/tensorrt_cache"  # relative => projects/rf_detr_trainer/...
       workspace_gib: 4
       force_rebuild: false
       profile:
@@ -303,8 +333,12 @@ never silently falls back to PyTorch or another precision.
 
 Without `engine_path`, the runner exports dynamic-batch ONNX, builds an engine,
 and reuses a cache keyed by the checkpoint/model, TensorRT/CUDA versions, GPU,
-precision, output type, and batch profile. An explicit trusted engine must be
-paired with its project-generated JSON manifest (an empty `manifest_path`
+precision, output type, and batch profile. The shipped presets use the
+project-local `runs/rf_detr/tensorrt_cache/`; an empty `cache_dir` has the same
+fallback, and every relative cache path is resolved from
+`projects/rf_detr_trainer`. An absolute path or a path
+beginning with `../` can intentionally place it elsewhere. An explicit trusted
+engine must be paired with its project-generated JSON manifest (an empty `manifest_path`
 derives `<engine>.manifest.json`); a checkpoint, GPU, precision,
 I/O, class-count, or profile mismatch is rejected. Engine build time is reported
 separately from steady-state inference time.
@@ -364,8 +398,8 @@ model:
 ```
 
 ```bash
-uv run python test_rf_detr_model.py --config config/rf_detr_test_sahi_medium.yaml --checkpoint /path/to/p2_checkpoint.pth --inference-backend tensorrt --inference-precision fp16 --tensorrt-force-rebuild --yes
-uv run python inference_rf_detr_model.py --config config/rf_detr_inference_medium_p2_video_1984090152231178242_003.yaml --checkpoint /path/to/p2_checkpoint.pth --source /path/to/media --inference-backend tensorrt --inference-precision fp16 --tensorrt-force-rebuild --yes
+uv run python test_rf_detr_model.py --config config/rf_detr_test_sahi_medium.yaml --checkpoint PATH/TO/p2_checkpoint.pth --inference-backend tensorrt --inference-precision fp16 --tensorrt-force-rebuild --yes
+uv run python inference_rf_detr_model.py --config config/rf_detr_inference_medium_p2_video_1984090152231178242_003.yaml --checkpoint PATH/TO/p2_checkpoint.pth --source PATH/TO/media --inference-backend tensorrt --inference-precision fp16 --tensorrt-force-rebuild --yes
 ```
 
 For TrackNetV5-only runs, start from the ready-to-edit example configs
@@ -389,8 +423,8 @@ model:
 ```
 
 ```bash
-uv run python test_rf_detr_model.py --config config/rf_detr_test_tracknet_tensorrt_fp16_example.yaml --checkpoint /path/to/tracknet_checkpoint.pth --tensorrt-force-rebuild --yes
-uv run python inference_rf_detr_model.py --config config/rf_detr_inference_tracknet_tensorrt_fp16_example.yaml --checkpoint /path/to/tracknet_checkpoint.pth --source /path/to/media --tensorrt-force-rebuild --yes
+uv run python test_rf_detr_model.py --config config/rf_detr_test_tracknet_tensorrt_fp16_example.yaml --checkpoint PATH/TO/tracknet_checkpoint.pth --tensorrt-force-rebuild --yes
+uv run python inference_rf_detr_model.py --config config/rf_detr_inference_tracknet_tensorrt_fp16_example.yaml --checkpoint PATH/TO/tracknet_checkpoint.pth --source PATH/TO/media --tensorrt-force-rebuild --yes
 ```
 
 Legacy P2 checkpoints need no conversion. They must use the same model size,
@@ -418,6 +452,44 @@ test:
     target_class_names: [football]
     max_images: 25
 ```
+
+#### Large-P2 FP16 smoke test
+
+`config/rf_detr_inference_large_p2_tensorrt_fp16_smoke.yaml` is the fixed
+compatibility preset for a Large detection checkpoint trained at 704 x 704
+with one class, P2 `[P2, P3, P4]`, gradient checkpointing enabled, and no
+TrackNetV5 module. It uses TensorRT FP16, a fixed batch-1 profile, a 4 GiB
+workspace, full-image inference, and disabled video tracking.
+
+The preset validates and exports the checkpoint; it does not convert a Medium,
+Stock, TrackNetV5, or otherwise incompatible checkpoint into this architecture.
+Use placeholders or machine-local CLI arguments for inputs rather than storing
+workstation paths in the config:
+
+```bash
+# First run: build a fresh engine and infer a short video segment.
+uv run python inference_rf_detr_model.py \
+  --config config/rf_detr_inference_large_p2_tensorrt_fp16_smoke.yaml \
+  --checkpoint PATH/TO/checkpoint_best_ema.pth \
+  --source PATH/TO/input.mp4 \
+  --max-seconds 0.2 \
+  --tensorrt-force-rebuild \
+  --yes
+
+# Second run: omit force-rebuild and confirm acceleration.cache_hit: true in run_timing.json.
+uv run python inference_rf_detr_model.py \
+  --config config/rf_detr_inference_large_p2_tensorrt_fp16_smoke.yaml \
+  --checkpoint PATH/TO/checkpoint_best_ema.pth \
+  --source PATH/TO/input.mp4 \
+  --max-seconds 0.2 \
+  --yes
+```
+
+TensorRT engines are tied to their build-time GPU and TensorRT/CUDA/runtime
+compatibility envelope. Rebuild on the target machine when the generated
+manifest rejects a mismatch; do not copy an unverified engine between systems.
+If the 4 GiB workspace cannot be allocated, retry with `workspace_gib: 2` in a
+local copy of the preset without changing Large, 704, P2, or FP16.
 
 The saved diagnostic images include ground-truth boxes, predicted boxes, class
 labels, and prediction scores. Error cases cover missed football, football
@@ -461,7 +533,7 @@ Custom output address:
 
 ```yaml
 output:
-  output_dir: "/runs/rf_detr/{dataset_name}/{model_size}_e{epochs}_b{batch_size}_{timestamp}"
+  output_dir: "runs/rf_detr/{dataset_name}/{model_size}_e{epochs}_b{batch_size}_{timestamp}"
 ```
 
 Or use Ultralytics-style root/name:
@@ -485,6 +557,14 @@ Output folder fields can be pure strings or placeholder templates. Supported pla
 
 The same placeholders also work in `periodic_test.output_dir_name`,
 `periodic_test.final_output_dir_name`, and `demo.output_dir`.
+
+All relative training, standalone-test, inference, demo, and TensorRT cache
+output paths are resolved from `projects/rf_detr_trainer`, independent of the
+shell's current working directory and whether a same-named directory already
+exists. For example, `runs/rf_detr/example` stays inside this project, while
+`../shared-runs/example` intentionally escapes to the parent directory.
+Absolute paths are honored unchanged. Scheduled and final tests remain nested
+under the main training output directory.
 
 ## Inference
 
@@ -717,4 +797,4 @@ under `epoch_results/`.
 - Scheduled in-training test is designed for single-process training. If you use `train.device: "0,1"` or another multi-process strategy, scheduled test is skipped during fit to avoid distributed synchronization issues; final test still runs after training.
 - Every output folder includes the config snapshot that created it.
 - Output-producing runs also write `run.log` in the output folder by mirroring console/stderr output after confirmation. Dry runs only print estimates and do not create output folders.
-- Demo mode writes to `projects/rf_detr_trainer/demo_runs/` and clamps epochs, batch size, logging, and checkpoint interval.
+- Demo mode defaults to `demo_runs/` under `projects/rf_detr_trainer` and clamps epochs, batch size, logging, and checkpoint interval; an absolute or `../` output override may place it elsewhere.

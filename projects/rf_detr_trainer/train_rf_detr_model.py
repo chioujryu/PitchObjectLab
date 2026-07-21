@@ -473,19 +473,28 @@ def resolve_existing_or_raw(value: Any, bases: Sequence[Path]) -> Any:
     return value
 
 
-def resolve_path_for_output(value: Any, bases: Sequence[Path]) -> Path:
-    """Resolve an output path from config/CLI without requiring it to exist."""
+def resolve_path_for_output(value: Any, bases: Sequence[Path] = ()) -> Path:
+    """Resolve relative output paths from the RF-DETR trainer project directory.
+
+    ``bases`` is retained for compatibility with older callers, but output
+    location no longer depends on the process CWD or whether a candidate path
+    already exists. Absolute paths remain unchanged, while ``..`` components
+    in relative paths intentionally allow an explicit project-external target.
+    """
+    del bases
     text = str(value).strip()
     if not text:
         raise ValueError("Output path cannot be empty.")
     path = Path(text).expanduser()
     if is_abs_any_os(text):
         return path
-    for base in bases:
-        candidate = (base / text).expanduser()
-        if base == REPO_ROOT or candidate.exists():
-            return candidate.resolve()
-    return (Path.cwd() / text).resolve()
+    windows_path = PureWindowsPath(text)
+    if windows_path.drive or (windows_path.root and not PurePosixPath(text).is_absolute()):
+        raise ValueError(
+            "Output paths must be project-relative, fully absolute, or start with '../'; "
+            f"ambiguous Windows path is not supported: {text}"
+        )
+    return (PROJECT_DIR / path).resolve()
 
 
 def render_timestamped(value: Any, timestamp: str) -> Any:
@@ -3023,10 +3032,10 @@ def build_output_dir(config: Mapping[str, Any], timestamp: str) -> Path:
     output = config.get("output", {})
     exact = render_output_template(output.get("output_dir", ""), config, timestamp)
     if exact:
-        return resolve_path_for_output(exact, [Path.cwd(), PROJECT_DIR, REPO_ROOT])
+        return resolve_path_for_output(exact)
     root = render_output_template(output.get("root", "runs/rf_detr"), config, timestamp)
     name = render_output_template(output.get("name", "rf_detr_{timestamp}"), config, timestamp)
-    return resolve_path_for_output(root, [Path.cwd(), PROJECT_DIR, REPO_ROOT]) / sanitize_name(str(name))
+    return resolve_path_for_output(root) / sanitize_name(str(name))
 
 
 def normalize_pretrain_weights(value: Any) -> Tuple[bool, Optional[str]]:

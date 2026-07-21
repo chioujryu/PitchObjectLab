@@ -1,0 +1,551 @@
+# RF-DETR Small Stock training preset for train_rf_detr_model.py.
+# Small uses the official 512x512 model default because model.resolution is null.
+# Architecture switches: P2=off, TrackNetV5=off.
+# Override dataset inputs and output paths as needed; relative outputs stay under rf_detr_trainer.
+
+# Runtime controls for dry-run, prompts, verbosity, seeds, and estimates. Options: mapping.
+runtime:
+  # Print detailed console progress/status output. Options: true, false.
+  verbose: true
+  # Validate config and print estimates without running heavy work. Options: true, false.
+  dry_run: false
+  # Require confirmation before output-producing work starts. Options: true, false.
+  confirm_before_run: true
+  # Runtime-estimate settings. Options: mapping.
+  time_estimate:
+    # Enable this feature/block. Options: true, false.
+    enabled: true
+    # Use latest sibling run_timing.json for runtime estimates. Options: true, false.
+    use_history: true
+    # Fallback train runtime estimate rate. Options: positive number.
+    default_train_seconds_per_batch: 0.85
+    # Fallback test runtime estimate rate. Options: positive number.
+    default_test_seconds_per_image: 0.25
+    # Fallback image inference runtime estimate rate. Options: positive number.
+    default_inference_seconds_per_image: 0.25
+    # Fallback video render runtime estimate rate. Options: positive number.
+    default_video_render_seconds_per_frame: 0.005
+
+# Model construction settings. Options: mapping.
+model:
+  # RF-DETR model size. Options: medium, large, seg-medium, seg-large, or other supported RF-DETR aliases.
+  size: small
+  # Input image resolution. Options: positive integer compatible with RF-DETR.
+  resolution: null
+  # Checkpoint/pretrained weights selector. Options: default, null/empty, or local .pth path.
+  pretrain_weights: default
+  # Number of classes. Options: positive integer or null to infer from dataset.
+  num_classes: null
+  # Compute device selector. Options: auto, cpu, cuda, cuda:N, N, comma-separated GPU IDs, mps, -1.
+  device: auto
+  # amp setting for this config block. Options: documented value for this RF-DETR config section.
+  amp: true
+  # extra_model_args setting for this config block. Options: documented value for this RF-DETR config section.
+  extra_model_args: {}
+  # P2 stride-4 feature-level settings. Options: mapping.
+  p2:
+    # Enable this feature/block. Options: true, false.
+    enabled: false
+    # projector_scale setting for this config block. Options: documented value for this RF-DETR config section.
+    projector_scale: [P2, P3, P4]
+    # P2 projector implementation settings. Options: mapping.
+    projector:
+      # num_blocks setting for this config block. Options: documented value for this RF-DETR config section.
+      num_blocks: null
+      # survival_prob setting for this config block. Options: documented value for this RF-DETR config section.
+      survival_prob: null
+      # force_drop_last_n_features setting for this config block. Options: documented value for this RF-DETR config section.
+      force_drop_last_n_features: null
+      # layer_norm setting for this config block. Options: documented value for this RF-DETR config section.
+      layer_norm: null
+      # rms_norm setting for this config block. Options: documented value for this RF-DETR config section.
+      rms_norm: null
+    # Pretrained-weight loading compatibility settings. Options: mapping.
+    weights:
+      # suppress_compat_warning setting for this config block. Options: documented value for this RF-DETR config section.
+      suppress_compat_warning: true
+    # Validated RF-DETR model override keys. Options: mapping.
+    overrides:
+      # Input image resolution. Options: positive integer compatible with RF-DETR.
+      resolution: null
+      # num_queries setting for this config block. Options: documented value for this RF-DETR config section.
+      num_queries: null
+      # Number of selected predictions. Options: positive integer.
+      num_select: null
+      # dec_n_points setting for this config block. Options: documented value for this RF-DETR config section.
+      dec_n_points: null
+      # gradient_checkpointing setting for this config block. Options: documented value for this RF-DETR config section.
+      gradient_checkpointing: null
+
+  # ---- TrackNetV5 motion module ----
+  # Applied after the DINOv2 backbone, before the Deformable-DETR decoder.
+  # Patches LWDETR.forward in-process; survives uv sync.
+  motion:
+    # Master switch. Options: true, false.
+    enabled: false
+    # Motion module type. Options: tracknet_v5, none.
+    type: tracknet_v5
+
+    # Temporal frame-context settings. Options: mapping.
+    temporal:
+      # Number of frames in the temporal window. Options: positive integer (3 recommended).
+      num_frames: 3
+      # Stride between frames when using real video data. Options: positive integer.
+      frame_stride: 1
+      # How to synthesise multi-frame input for single-frame datasets.
+      # Options:
+      #   identity 鈥?all T frames identical (螖=0, zero motion maps, identity gate).
+      #   noise    鈥?add Gaussian noise (noise_std) to produce synthetic deltas.
+      #   zero     鈥?same as identity but explicitly zeroes delta tensors.
+      fallback_mode: identity
+      # Standard deviation of synthetic Gaussian noise when fallback_mode: noise.
+      # Options: non-negative float. ~0.02 simulates minor camera shake.
+      noise_std: 0.02
+
+    # TrackNetV5 motion submodule settings. Options: mapping.
+    tracknet_v5:
+      # Motion difference decomposition settings. Options: mapping.
+      mdd:
+        # Enable Motion Direction Decoupling polarity fields. Options: true, false.
+        enabled: true
+        # Output channels *per polarity field* (P鈦?and P鈦?each). Must be even.
+        # Total motion_channels = 2 * polarity_channels, fed to feature gates.
+        # Options: positive even integer. 4 = 2 per polarity, 8 = 4 per polarity.
+        polarity_channels: 4
+        # attention nested configuration block. Options: mapping.
+        attention:
+          # Learn sigmoid steepness (k) and midpoint (m) per channel. Options: true, false.
+          learnable: true
+          # Initial k (steepness). Options: positive float. 1.0 = gentle sigmoid.
+          init_k: 1.0
+          # Initial m (midpoint). Options: float. 0.5 = threshold at 0.5 polarity intensity.
+          init_m: 0.5
+
+      # R-STR refinement settings. Options: mapping.
+      rstr:
+        # Enable R-STR spatial refinement head. Options: true, false.
+        enabled: true
+        # Number of stacked spatial self-attention blocks per scale. Options: positive integer.
+        num_blocks: 2
+        # Internal projection dimension for attention. Options: positive integer.
+        hidden_dim: 256
+        # Multi-head attention heads. Must divide hidden_dim evenly. Options: positive integer.
+        num_heads: 8
+        # Factorised attention mode (spatial only for Phase-1 T=1).
+        # Options: divided (factorised), joint.
+        attention_mode: divided
+        # Dropout inside attention and FFN. Options: 0.0-0.5.
+        dropout: 0.1
+        # Use PixelShuffle upsampling on the refinement delta. Options: true, false.
+        use_pixel_shuffle: true
+        # Stochastic context masking probability during training (paper: 蟻=0.1).
+        # Randomly zeros spatial tokens to prevent over-reliance on any one region.
+        # Options: 0.0-0.3. 0.0 disables.
+        context_mask_prob: 0.1
+
+    # loss nested configuration block. Options: mapping.
+    loss:
+      # Motion attention auxiliary loss weight (reserved for future regularisation).
+      # Options: non-negative float. 0.0 disables (recommended until real motion data).
+      motion_attention_weight: 0.0
+
+    # Validated RF-DETR model override keys. Options: mapping.
+    overrides:
+      # Convenience overrides applied only when motion is enabled.
+      # resolution, num_queries, num_select, gradient_checkpointing 鈥?same semantics
+      # as model.p2.overrides. null leaves the model default.
+      resolution: null
+      # num_queries setting for this config block. Options: documented value for this RF-DETR config section.
+      num_queries: null
+      # Number of selected predictions. Options: positive integer.
+      num_select: null
+      # gradient_checkpointing setting for this config block. Options: documented value for this RF-DETR config section.
+      gradient_checkpointing: true
+
+# Dataset discovery and limiting settings. Options: mapping.
+dataset:
+  # Dataset source format. Options: auto, rfdetr, roboflow, ultralytics_yolo, coco_json, pascal_voc, dota, labelme_json.
+  source_format: ultralytics_yolo
+  # Dataset root directory. Options: local Windows/Linux path.
+  dataset_dir: "/home/new_users/zhiyu/datasets/soccer/spatial_perception/Xbotgo/soccer_ball_merged_v1/outputs/yolo_reviewed_sam3_augmented_320-1921_sahi_1280"
+  # Dataset YAML path for class names/splits. Options: local YAML path or null.
+  data_yaml: "/home/new_users/zhiyu/datasets/soccer/spatial_perception/Xbotgo/soccer_ball_merged_v1/outputs/yolo_reviewed_sam3_augmented_320-1921_sahi_1280/dataset.yaml"
+  # coco_json setting for this config block. Options: documented value for this RF-DETR config section.
+  coco_json: ""
+  # image_dir setting for this config block. Options: documented value for this RF-DETR config section.
+  image_dir: ""
+  # Maximum images to process. Options: all/null for full data or positive integer.
+  max_images: all
+  # Maximum train images. Options: all/null for full split or positive integer.
+  max_train_images: null
+  # Maximum validation images. Options: all/null for full split or positive integer.
+  max_val_images: null
+  # Maximum test images. Options: all/null for full split or positive integer.
+  max_test_images: null
+  # Dataset cache root directory. Options: local path.
+  cache_root: dataset_cache
+  # refresh_cache setting for this config block. Options: documented value for this RF-DETR config section.
+  refresh_cache: false
+  # split_ratio setting for this config block. Options: documented value for this RF-DETR config section.
+  split_ratio: [8, 1, 1]
+  # split_seed setting for this config block. Options: documented value for this RF-DETR config section.
+  split_seed: 0
+  # Dataset cache link/copy strategy. Options: auto, symlink, hardlink, copy.
+  link_mode: auto
+  # prepared_dir_name setting for this config block. Options: documented value for this RF-DETR config section.
+  prepared_dir_name: prepared_dataset
+  # overwrite_prepared_dataset setting for this config block. Options: documented value for this RF-DETR config section.
+  overwrite_prepared_dataset: false
+  # RF-DETR dataset file/source selector. Options: roboflow or dataset YAML/relative file name.
+  dataset_file: roboflow
+
+# Output directory settings and naming templates. Options: mapping.
+output:
+  # Exact output directory override. Options: empty string, local path, or placeholder template.
+  output_dir: ""
+  # Output root directory. Options: local path or placeholder template.
+  root: runs/rf_detr/train
+  # Output run folder name. Options: plain string or placeholder template.
+  name: "rfdetr_small_stock_e{epochs}_b{batch_size}_{timestamp}"
+  # Allow writing into an existing output directory. Options: true, false.
+  exist_ok: false
+
+# Training hyperparameters and runtime settings. Options: mapping.
+train:
+  # Dataset root directory. Options: local Windows/Linux path.
+  dataset_dir: "/home/new_users/zhiyu/datasets/soccer/spatial_perception/Xbotgo/soccer_ball_merged_v1/outputs/yolo_reviewed_sam3_augmented_320-1921_sahi_1280"
+  # RF-DETR dataset file/source selector. Options: roboflow or dataset YAML/relative file name.
+  dataset_file: roboflow
+  # Compute device selector. Options: auto, cpu, cuda, cuda:N, N, comma-separated GPU IDs, mps, -1.
+  device: auto
+  # Training epoch count. Options: positive integer.
+  epochs: 40
+  # Reduced from 4 鈫?2 to accommodate R-STR memory overhead per scale.
+  batch_size: 4
+  # Raised from 4 鈫?8 to keep effective batch = 16.
+  grad_accum_steps: 8
+  # Auto-batch target effective batch size. Options: positive integer.
+  auto_batch_target_effective: 16
+  # Auto-batch target-density guard. Options: positive integer.
+  auto_batch_max_targets_per_image: 100
+  # Auto-batch EMA memory headroom. Options: 0.0-1.0.
+  auto_batch_ema_headroom: 0.7
+  # Main learning rate. Options: positive number.
+  lr: 0.0001
+  # Backbone/encoder learning rate. Options: positive number.
+  lr_encoder: 0.00015
+  # Weight decay coefficient. Options: non-negative number.
+  weight_decay: 0.0001
+  # Epoch for step LR drop. Options: positive integer.
+  lr_drop: 100
+  # LR scheduler type. Options: RF-DETR-supported scheduler name.
+  lr_scheduler: step
+  # Minimum LR factor. Options: non-negative number.
+  lr_min_factor: 0.0
+  # Warmup duration in epochs. Options: non-negative number.
+  warmup_epochs: 0.0
+  # ViT layer-wise LR decay. Options: 0.0-1.0.
+  lr_vit_layer_decay: 0.8
+  # Component-wise LR decay. Options: 0.0-1.0.
+  lr_component_decay: 0.7
+  # Gradient clipping max norm. Options: non-negative number.
+  clip_max_norm: 0.1
+  # Checkpoint save interval in epochs. Options: positive integer.
+  checkpoint_interval: 1
+  # Resume checkpoint path. Options: null or local checkpoint path.
+  resume: null
+  # Use exponential moving average weights. Options: true, false.
+  use_ema: true
+  # EMA decay. Options: 0.0-1.0.
+  ema_decay: 0.993
+  # EMA tau parameter. Options: positive number.
+  ema_tau: 100
+  # EMA update interval. Options: positive integer.
+  ema_update_interval: 1
+  # DataLoader worker count. Options: 2 by project rule.
+  num_workers: 2
+  # Enable early stopping. Options: true, false.
+  early_stopping: true
+  # Early-stopping patience. Options: positive integer.
+  early_stopping_patience: 10
+  # Minimum improvement for early stopping. Options: non-negative number.
+  early_stopping_min_delta: 0.001
+  # Use EMA metrics for early stopping. Options: true, false.
+  early_stopping_use_ema: false
+  # Validation interval in epochs. Options: positive integer.
+  eval_interval: 1
+  # Maximum detections for validation metrics. Options: positive integer.
+  eval_max_dets: 500
+  # Log per-class metrics during validation. Options: true, false.
+  log_per_class_metrics: true
+  # Progress-bar style/visibility. Options: tqdm, rich, true, false, null.
+  progress_bar: tqdm
+  # Enable TensorBoard logging. Options: true, false.
+  tensorboard: true
+  # Enable Weights & Biases logging. Options: true, false.
+  wandb: false
+  # Enable MLflow logging. Options: true, false.
+  mlflow: false
+  # External logger project name. Options: null or string.
+  project: rf_detr
+  # External logger run name. Options: null or string.
+  run: null
+  # Run RF-DETR built-in test during training. Options: true, false.
+  run_test: false
+  # Enable RF-DETR multi-scale training. Options: true, false.
+  multi_scale: true
+  # Use expanded scale set for multi-scale training. Options: true, false.
+  expanded_scales: true
+  # Use padding-based random resize. Options: true, false.
+  do_random_resize_via_padding: false
+  # Force square resize divisible by 64. Options: true, false.
+  square_resize_div_64: true
+  # Drop-path rate. Options: 0.0-1.0.
+  drop_path: 0.0
+  # Group-DETR query grouping. Options: positive integer.
+  group_detr: 13
+  # Use IA-BCE loss. Options: true, false.
+  ia_bce_loss: true
+  # Class loss coefficient. Options: positive number.
+  cls_loss_coef: 1.0
+  # Number of selected predictions. Options: positive integer.
+  num_select: 300
+  # Lightning accelerator. Options: auto, cpu, gpu, cuda, mps.
+  accelerator: auto
+  # Lightning devices. Options: auto, positive integer, or comma-separated GPU IDs.
+  devices: auto
+  # Lightning distributed strategy. Options: auto or supported Lightning strategy name.
+  strategy: auto
+  # Lightning node count. Options: positive integer.
+  num_nodes: 1
+  # Synchronize batch norm across devices. Options: true, false.
+  sync_bn: false
+  # Use FP16 during evaluation. Options: true, false.
+  fp16_eval: false
+  # Disable weight checkpoint saving. Options: true, false.
+  dont_save_weights: false
+  # Compute validation loss. Options: true, false.
+  compute_val_loss: true
+  # Compute test loss. Options: true, false.
+  compute_test_loss: true
+  # DataLoader pin_memory. Options: null for auto, true, false.
+  pin_memory: null
+  # DataLoader persistent_workers. Options: null for auto, true, false.
+  persistent_workers: null
+  # DataLoader prefetch_factor. Options: null for auto or positive integer.
+  prefetch_factor: null
+  # Albumentations augmentation config. Options: null or transform mapping.
+  aug_config:
+    # Affine image-scale augmentation. Options: mapping accepted by Albumentations Affine.
+    Affine:
+      # Random content scale range. Options: [min, max]; [0.6, 1.0] only shrinks, similar to Ultralytics zoom-out scale.
+      # Random x/y translation range as image fraction. Options: [min, max].
+      translate_percent: [-0.05, 0.05]
+      # Rotation angle range in degrees. Options: number or [min, max].
+      rotate: 0
+      # Shear angle range in degrees. Options: number, [min, max], or x/y mapping.
+      shear: 0
+      # Border fill mode. Options: 0 for constant border, or other OpenCV border mode ints.
+      border_mode: 0
+      # Constant border fill color. Options: number or RGB list; [114, 114, 114] matches common YOLO gray padding.
+      fill: [114, 114, 114]
+      # Probability of applying this transform. Options: 0.0-1.0.
+      p: 0.5
+    # HorizontalFlip nested configuration block. Options: mapping.
+    HorizontalFlip:
+      # p setting for this config block. Options: documented value for this RF-DETR config section.
+      p: 0.5
+    # RandomBrightnessContrast nested configuration block. Options: mapping.
+    RandomBrightnessContrast:
+      # brightness_limit setting for this config block. Options: documented value for this RF-DETR config section.
+      brightness_limit: 0.3
+      # contrast_limit setting for this config block. Options: documented value for this RF-DETR config section.
+      contrast_limit: 0.3
+      # p setting for this config block. Options: documented value for this RF-DETR config section.
+      p: 0.5
+    # GaussianBlur nested configuration block. Options: mapping.
+    GaussianBlur:
+      # blur_limit setting for this config block. Options: documented value for this RF-DETR config section.
+      blur_limit: 3
+      # p setting for this config block. Options: documented value for this RF-DETR config section.
+      p: 0.3
+  # Extra RF-DETR TrainConfig arguments. Options: mapping.
+  extra_train_args: {}
+
+# Scheduled and final test settings. Options: mapping.
+periodic_test:
+  # Enable this feature/block. Options: true, false.
+  enabled: false
+  # Test mode selector block. Options: mapping.
+  test_mode:
+    # Execution/test/inference mode. Options: full_image, sahi, class_crop, or block-specific values.
+    mode: full_image
+  # Class-crop/object-crop test settings. Options: mapping.
+  crop:
+    # class_ids setting for this config block. Options: documented value for this RF-DETR config section.
+    class_ids: []
+    # class_names setting for this config block. Options: documented value for this RF-DETR config section.
+    class_names: []
+    # source setting for this config block. Options: documented value for this RF-DETR config section.
+    source: prediction
+    # source_conf setting for this config block. Options: documented value for this RF-DETR config section.
+    source_conf: 0.25
+    # padding_pixels setting for this config block. Options: documented value for this RF-DETR config section.
+    padding_pixels: 0
+    # padding_ratio setting for this config block. Options: documented value for this RF-DETR config section.
+    padding_ratio: 0.05
+    # fallback setting for this config block. Options: documented value for this RF-DETR config section.
+    fallback: full_image
+  # SAHI sliced-inference settings. Options: mapping.
+  sahi:
+    # slice_height setting for this config block. Options: documented value for this RF-DETR config section.
+    slice_height: 640
+    # slice_width setting for this config block. Options: documented value for this RF-DETR config section.
+    slice_width: 640
+    # overlap_height_ratio setting for this config block. Options: documented value for this RF-DETR config section.
+    overlap_height_ratio: 0.2
+    # overlap_width_ratio setting for this config block. Options: documented value for this RF-DETR config section.
+    overlap_width_ratio: 0.2
+    # standard_prediction setting for this config block. Options: documented value for this RF-DETR config section.
+    standard_prediction: true
+    # postprocess_type setting for this config block. Options: documented value for this RF-DETR config section.
+    postprocess_type: GREEDYNMM
+    # postprocess_match_metric setting for this config block. Options: documented value for this RF-DETR config section.
+    postprocess_match_metric: IOS
+    # postprocess_match_threshold setting for this config block. Options: documented value for this RF-DETR config section.
+    postprocess_match_threshold: 0.5
+    # postprocess_class_agnostic setting for this config block. Options: documented value for this RF-DETR config section.
+    postprocess_class_agnostic: false
+    # Batch size. Options: positive integer or auto where supported.
+    batch_size: 4
+    # recheck nested configuration block. Options: mapping.
+    recheck:
+      # Enable this feature/block. Options: true, false.
+      enabled: false
+      # Target class IDs. Options: list of integers or empty to use names/default.
+      target_class_ids: []
+      # Target class names. Options: list of strings or empty for defaults.
+      target_class_names:
+        - football
+      # crop_size setting for this config block. Options: documented value for this RF-DETR config section.
+      crop_size: 960
+      # second_confidence_threshold setting for this config block. Options: documented value for this RF-DETR config section.
+      second_confidence_threshold: 0.25
+      # first_weight setting for this config block. Options: documented value for this RF-DETR config section.
+      first_weight: 0.5
+      # second_weight setting for this config block. Options: documented value for this RF-DETR config section.
+      second_weight: 0.5
+      # fused_confidence_threshold setting for this config block. Options: documented value for this RF-DETR config section.
+      fused_confidence_threshold: 0.25
+      # center_padding_ratio setting for this config block. Options: documented value for this RF-DETR config section.
+      center_padding_ratio: 0.0
+      # max_rechecks_per_image setting for this config block. Options: documented value for this RF-DETR config section.
+      max_rechecks_per_image: 50
+  # Visual sample filtering/rendering settings. Options: mapping.
+  visual_samples:
+    # Enable this feature/block. Options: true, false.
+    enabled: false
+    # Maximum images to process. Options: all/null for full data or positive integer.
+    max_images: 300
+    # output_subdir setting for this config block. Options: documented value for this RF-DETR config section.
+    output_subdir: visuals
+    # sampling_mode setting for this config block. Options: documented value for this RF-DETR config section.
+    sampling_mode: first
+    # random_seed setting for this config block. Options: documented value for this RF-DETR config section.
+    random_seed: null
+    # filter_source setting for this config block. Options: documented value for this RF-DETR config section.
+    filter_source: either
+    # filter_match setting for this config block. Options: documented value for this RF-DETR config section.
+    filter_match: any
+    # class_ids setting for this config block. Options: documented value for this RF-DETR config section.
+    class_ids: []
+    # class_names setting for this config block. Options: documented value for this RF-DETR config section.
+    class_names: []
+    # Rendered class IDs. Options: list of integers or empty for all.
+    render_class_ids: []
+    # Rendered class names. Options: list of strings or empty for all.
+    render_class_names: []
+    # min_gt_instances setting for this config block. Options: documented value for this RF-DETR config section.
+    min_gt_instances: 0
+    # min_predictions setting for this config block. Options: documented value for this RF-DETR config section.
+    min_predictions: 0
+    # Minimum score for candidate filtering. Options: null or 0.0-1.0.
+    filter_min_score: 0.25
+    # Minimum score to draw. Options: null or 0.0-1.0.
+    draw_min_score: null
+  # Saved model-input grid batch size. Options: positive integer.
+  model_input_batch_size: 9
+  # Dataset/evaluation split. Options: train, val, valid, test, test-original, or dataset-defined split.
+  split: test
+  # Maximum images to process. Options: all/null for full data or positive integer.
+  max_images: all
+  # Scheduled test interval in epochs. Options: 0 to disable or positive integer.
+  test_interval_epochs: 10
+  # Scheduled test interval in minutes. Options: 0 to disable or positive number.
+  test_interval_minutes: 0
+  # output_dir_name setting for this config block. Options: documented value for this RF-DETR config section.
+  output_dir_name: periodic_tests
+  # Run final test after training. Options: true, false.
+  run_final_test: true
+  # final_output_dir_name setting for this config block. Options: documented value for this RF-DETR config section.
+  final_output_dir_name: final_test
+  # Write per-class metrics. Options: true, false.
+  classwise: true
+  # Batch size. Options: positive integer or auto where supported.
+  batch_size: 4
+  # Error-case diagnostic settings. Options: mapping.
+  error_cases:
+    # Enable this feature/block. Options: true, false.
+    enabled: true
+    # Target class IDs. Options: list of integers or empty to use names/default.
+    target_class_ids: []
+    # Target class names. Options: list of strings or empty for defaults.
+    target_class_names:
+      - football
+    # Rendered class IDs. Options: list of integers or empty for all.
+    render_class_ids: []
+    # Rendered class names. Options: list of strings or empty for all.
+    render_class_names: []
+    # Maximum images to process. Options: all/null for full data or positive integer.
+    max_images: 300
+    # max_missed_images setting for this config block. Options: documented value for this RF-DETR config section.
+    max_missed_images: 300
+    # max_false_positive_images setting for this config block. Options: documented value for this RF-DETR config section.
+    max_false_positive_images: 300
+    # Prediction confidence threshold. Options: 0.0-1.0.
+    confidence_threshold: null
+    # IoU threshold for matching. Options: 0.0-1.0.
+    match_iou_threshold: null
+    # output_subdir setting for this config block. Options: documented value for this RF-DETR config section.
+    output_subdir: error_cases
+    # format setting for this config block. Options: documented value for this RF-DETR config section.
+    format: jpg
+    # jpeg_quality setting for this config block. Options: documented value for this RF-DETR config section.
+    jpeg_quality: 92
+  # Progress-bar style/visibility. Options: tqdm, rich, true, false, null.
+  progress_bar: true
+
+# PyTorch Lightning trainer override settings. Options: mapping.
+trainer:
+  # Extra PyTorch Lightning Trainer arguments. Options: mapping.
+  extra_trainer_args: {}
+
+# Small demo/smoke-run overrides. Options: mapping.
+demo:
+  # Enable this feature/block. Options: true, false.
+  enabled: false
+  # Exact output directory override. Options: empty string, local path, or placeholder template.
+  output_dir: "demo_runs/demo_small_stock_e{epochs}_{timestamp}"
+  # max_epochs setting for this config block. Options: documented value for this RF-DETR config section.
+  max_epochs: 2
+  # max_batch_size setting for this config block. Options: documented value for this RF-DETR config section.
+  max_batch_size: 2
+  # max_grad_accum_steps setting for this config block. Options: documented value for this RF-DETR config section.
+  max_grad_accum_steps: 1
+  # Checkpoint save interval in epochs. Options: positive integer.
+  checkpoint_interval: 1
+  # Scheduled test interval in epochs. Options: 0 to disable or positive integer.
+  test_interval_epochs: 1
+  # Progress-bar style/visibility. Options: tqdm, rich, true, false, null.
+  progress_bar: tqdm
+

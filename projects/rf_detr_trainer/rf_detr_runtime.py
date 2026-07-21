@@ -17,6 +17,32 @@ from train_rf_detr_model import *  # noqa: F401,F403
 get_model_class = _trainer_runtime.get_model_class
 build_model_kwargs = _trainer_runtime.build_model_kwargs
 build_train_kwargs = _trainer_runtime.build_train_kwargs
+build_pitchobjectlab_architecture = _trainer_runtime.build_pitchobjectlab_architecture
+
+
+def _require_custom_architecture_checkpoint(config: Mapping[str, Any], operation: str) -> None:
+    """Reject P2/TrackNetV5 test or inference without an explicit checkpoint."""
+    model = config.get("model", {})
+    if not isinstance(model, Mapping):
+        return
+    p2 = model.get("p2", {})
+    motion = model.get("motion", {})
+    p2_enabled = bool(p2.get("enabled", False)) if isinstance(p2, Mapping) else False
+    motion_enabled = bool(motion.get("enabled", False)) if isinstance(motion, Mapping) else False
+    if not p2_enabled and not motion_enabled:
+        return
+    should_pass, checkpoint = _trainer_runtime.normalize_pretrain_weights(
+        model.get("pretrain_weights", "default")
+    )
+    if should_pass and checkpoint not in {None, "default"}:
+        return
+    architecture = " + ".join(
+        name for name, enabled in (("P2", p2_enabled), ("TrackNetV5", motion_enabled)) if enabled
+    )
+    raise ValueError(
+        f"{operation} with the custom {architecture} architecture requires an explicit matching "
+        "checkpoint via model.pretrain_weights or --checkpoint."
+    )
 
 
 def inference_acceleration_batch_sizes(config: Mapping[str, Any]) -> list[int]:
@@ -191,7 +217,7 @@ def estimate_tensorrt_cache_artifacts(config: Mapping[str, Any]) -> dict[str, An
     return {
         "file_count": 4,
         "bytes": estimated_bytes,
-        "cache_dir": str(tensorrt.get("cache_dir") or "OS user cache"),
+        "cache_dir": str(_acceleration.resolve_tensorrt_cache_dir(tensorrt.get("cache_dir"))),
         "build_required": True,
         "estimated_build_seconds": estimated_build_seconds,
         "estimated_build_hms": _trainer_runtime.format_duration_hms(estimated_build_seconds),

@@ -1,0 +1,168 @@
+# Large P2-only FP16 TensorRT smoke configuration for inference_rf_detr_model.py.
+# Supply the trained checkpoint and image/video source with --checkpoint and --source.
+# This architecture is intentionally fixed to the inspected one-class 704px Large P2 checkpoint.
+runtime:
+  # Print preparation, acceleration, and output summaries. Options: true, false.
+  verbose: true
+  # Validate and estimate without creating the engine or inference outputs. Options: true, false.
+  dry_run: false
+  # Ask before creating ONNX/engine/media files unless --yes is supplied. Options: true, false.
+  confirm_before_run: true
+
+model:
+  # RF-DETR detection variant. This checkpoint is Large, not Medium. Options: large.
+  size: large
+  # Fixed checkpoint resolution; changing it makes the positional embedding incompatible. Options: 704.
+  resolution: 704
+  # Checkpoint supplied by --checkpoint. Options: null here, or a local .pth/.pt/.ckpt path.
+  pretrain_weights: null
+  # The inspected checkpoint contains one soccer-ball class. Options: 1 for this smoke config.
+  num_classes: 1
+  # Construction/inference device. Options: auto, cpu, cuda, cuda:N, or integer GPU ID.
+  device: auto
+  # RF-DETR construction AMP switch, separate from TensorRT precision. Options: true, false.
+  amp: true
+  # Minimum score retained in rendered/persisted predictions. Options: 0.0 through 1.0.
+  confidence_threshold: 0.25
+  # Optional output-category remapping. Options: empty mapping or source_id: target_id pairs.
+  category_remapping: {}
+  # Additional validated RF-DETR ModelConfig arguments. Options: mapping.
+  extra_model_args: {}
+
+  inference_optimization:
+    # Runtime backend. Options: pytorch, tensorrt.
+    backend: tensorrt
+    pytorch:
+      # Used only when backend is overridden to pytorch. Options: fp32, bf16.
+      precision: fp32
+    tensorrt:
+      # FP16 is the compatibility baseline for the custom P2 export. Options: fp16, bf16.
+      precision: fp16
+      # Trusted prebuilt engine input. Empty builds/loads the keyed project-local cache.
+      engine_path: ""
+      # Manifest for engine_path. Empty derives the adjacent manifest for an explicit engine.
+      manifest_path: ""
+      # Automatic artifact cache. Empty uses rf_detr_trainer/runs/rf_detr/tensorrt_cache.
+      cache_dir: "runs/rf_detr/tensorrt_cache"
+      # TensorRT builder workspace ceiling in GiB. Retry with 2 only if the 4 GiB build OOMs.
+      workspace_gib: 4
+      # Ignore a valid cache entry. Prefer the CLI flag for the first smoke build. Options: true, false.
+      force_rebuild: false
+      profile:
+        # Dynamic batch profile; batch one keeps the 8 GB smoke build conservative.
+        min_batch_size: 1
+        opt_batch_size: 1
+        max_batch_size: 1
+
+  p2:
+    # This checkpoint was trained with the project P2 patch. Options: true only for this config.
+    enabled: true
+    # Exact saved feature pyramid. Changing the list makes the checkpoint incompatible.
+    projector_scale: [P2, P3, P4]
+    projector:
+      # null preserves the project defaults used by the checkpoint.
+      num_blocks: null
+      survival_prob: null
+      force_drop_last_n_features: null
+      layer_norm: null
+      rms_norm: null
+    weights:
+      # Suppress the expected stock-to-P2 compatibility warning after strict validation succeeds.
+      suppress_compat_warning: true
+    overrides:
+      # Graph/config overrides must match the trained Large P2 checkpoint.
+      resolution: null
+      num_queries: null
+      num_select: null
+      dec_n_points: null
+      gradient_checkpointing: true
+
+  motion:
+    # The inspected checkpoint has no TrackNetV5/motion weights. Options: false only for this config.
+    enabled: false
+    # Retained schema value; ignored while motion is disabled. Options: tracknet_v5, none.
+    type: tracknet_v5
+    temporal:
+      num_frames: 3
+      frame_stride: 1
+      fallback_mode: identity
+      noise_std: 0.02
+    tracknet_v5:
+      mdd:
+        enabled: true
+        polarity_channels: 4
+        attention:
+          learnable: true
+          init_k: 1.0
+          init_m: 0.5
+      rstr:
+        enabled: true
+        num_blocks: 2
+        hidden_dim: 256
+        num_heads: 8
+        attention_mode: divided
+        dropout: 0.1
+        use_pixel_shuffle: true
+        context_mask_prob: 0.1
+    loss:
+      motion_attention_weight: 0.0
+    overrides:
+      resolution: null
+      num_queries: null
+      num_select: null
+      gradient_checkpointing: true
+
+dataset:
+  # Class names embedded in rendered outputs. Must match num_classes. Options: ordered list.
+  class_names: [soccer_ball]
+  # Optional Ultralytics dataset YAML used only for class-name lookup. Options: empty or path.
+  data_yaml: ""
+
+output:
+  # Exact output override. Empty uses root/name; relative paths are project-local.
+  output_dir: ""
+  # Default inference result root inside rf_detr_trainer. Absolute paths may target outside it.
+  root: runs/rf_detr/inference
+  # Run folder template. Supported placeholder here: {timestamp}.
+  name: "rfdetr_large_p2_tensorrt_fp16_smoke_{timestamp}"
+  # Refuse to overwrite an existing run directory. Options: true, false.
+  exist_ok: false
+
+inference:
+  # Media supplied by --source. Options: image/video path, folder, URL, or list.
+  sources: []
+  # Recursively discover media under folder sources. Options: true, false.
+  recursive: true
+  # Source limits. Options: all/null or positive integer.
+  max_sources: all
+  max_images: all
+  max_videos: all
+  # Direct full-frame prediction for the smoke validation. Options: full_image, sahi, class_crop.
+  mode: full_image
+  # Image-source model batch. The TensorRT profile for this smoke config is batch one.
+  batch_size: 1
+  # Supported discovery suffixes.
+  image_extensions: [.bmp, .jpeg, .jpg, .png, .tif, .tiff, .webp]
+  video_extensions: [.avi, .m4v, .mkv, .mov, .mp4, .mpeg, .mpg, .webm]
+  # Empty render filters draw every predicted class. Options: integer/name lists.
+  render_class_ids: []
+  render_class_names: []
+  # Persist machine-readable predictions beside rendered media. Options: true, false.
+  save_predictions_jsonl: true
+  video:
+    # null processes every source frame. Options: null or positive FPS.
+    detection_fps: null
+    # Must remain one for this TensorRT profile. Options: 1.
+    batch_size: 1
+    # Selected source interval. Times accept seconds, MM:SS, or HH:MM:SS.
+    start_time: 0
+    end_time: all
+    # Short compatibility smoke; override to all for a complete video.
+    max_seconds: 0.2
+    # null preserves source FPS in the rendered result. Options: null or positive FPS.
+    output_fps: null
+    # Include frames skipped by detection_fps in the rendered video. Options: true, false.
+    render_skipped_frames: true
+  tracking:
+    # Tracking is outside this engine compatibility smoke. Options: true, false.
+    enabled: false

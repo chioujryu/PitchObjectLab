@@ -444,10 +444,10 @@ def build_output_dir(config: Mapping[str, Any], timestamp: str) -> Path:
     output = config.get("output", {})
     exact = str(output.get("output_dir") or "").strip()
     if exact:
-        return trainer.resolve_path_for_output(trainer.render_timestamped(exact, timestamp), [Path.cwd(), PROJECT_DIR])
+        return trainer.resolve_path_for_output(trainer.render_timestamped(exact, timestamp))
     root = trainer.render_timestamped(output.get("root", "runs/rf_detr/inference"), timestamp)
     name = trainer.render_timestamped(output.get("name", "rfdetr_inference_{timestamp}"), timestamp)
-    return trainer.resolve_path_for_output(str(Path(str(root)) / str(name)), [Path.cwd(), PROJECT_DIR])
+    return trainer.resolve_path_for_output(str(Path(str(root)) / str(name)))
 
 
 def estimate_outputs(items: Sequence[SourceItem], output_dir: Path, config: Mapping[str, Any]) -> Dict[str, Any]:
@@ -486,7 +486,7 @@ def estimate_outputs(items: Sequence[SourceItem], output_dir: Path, config: Mapp
         "tensorrt_cache": tensorrt_artifacts,
         "estimated_total_files": output_files,
         "estimated_disk_usage": trainer.format_bytes(estimated_bytes),
-        "note": "URL/rendered-video sizes and first-run TensorRT artifacts are conservative estimates.",
+        "note": "URL/rendered-video sizes and first-run TensorRT artifacts in the configured cache are conservative estimates.",
     }
     settings = trainer.runtime_time_estimate_settings(config)
     render_seconds = output_frames * trainer.positive_float_setting(settings, "default_video_render_seconds_per_frame")
@@ -1362,6 +1362,7 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
         source_config = (Path.cwd() / source_config).resolve()
     config = load_yaml(source_config)
     apply_cli_overrides(config, args)
+    trainer._require_custom_architecture_checkpoint(config, "Inference")
     trainer.validate_inference_acceleration_config(config)
     verbose = bool(config.get("runtime", {}).get("verbose", True))
     if timing_context is not None:

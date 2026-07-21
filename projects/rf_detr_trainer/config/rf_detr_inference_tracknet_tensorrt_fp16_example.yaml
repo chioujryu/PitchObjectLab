@@ -23,7 +23,8 @@ model:
       precision: fp16
       engine_path: ''
       manifest_path: ''
-      cache_dir: ''
+      # Empty resolves to runs/rf_detr/tensorrt_cache under rf_detr_trainer; absolute paths remain supported.
+      cache_dir: 'runs/rf_detr/tensorrt_cache'
       workspace_gib: 4
       force_rebuild: false
       profile:

@@ -64,8 +64,8 @@ model:
       engine_path: ""
       # Project manifest paired with engine_path. Empty derives <engine>.manifest.json for an explicit engine. Options: empty string or manifest JSON path.
       manifest_path: ""
-      # Engine/ONNX cache. Options: empty string for the OS user cache, or a writable directory path.
-      cache_dir: ""
+      # Engine/ONNX cache. Empty resolves to runs/rf_detr/tensorrt_cache under rf_detr_trainer; absolute paths remain supported.
+      cache_dir: "runs/rf_detr/tensorrt_cache"
       # TensorRT builder workspace limit in GiB. Options: positive number.
       workspace_gib: 4
       # Ignore a valid cache entry and rebuild its artifacts. Options: true, false.
@@ -234,7 +234,7 @@ output:
   # Exact output directory. Options: empty string to use root/name, absolute path, or relative path.
   output_dir: ""
   # Output root when output_dir is empty. Options: pure string path.
-  root: /home/new_users/zhiyu/projects/PitchObjectLab/runs/detect/站立運動員_足球_球門檢測數據集2025/predict
+  root: runs/rf_detr/inference
   # Run folder name when output_dir is empty. Supports {timestamp}. Options: string.
   name: "rfdetr_inference_sahi320_football_recheck640_video_1984090152231178242_000000_000100_{timestamp}"
   # Allow writing into an existing output directory. Options: true, false.

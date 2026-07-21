@@ -538,6 +538,7 @@ class StandaloneMainFlowTests(unittest.TestCase):
             output_dir = Path(tmp) / "single-output"
             config = _config(chunks=1, evaluation_type="bbox")
             config["model"]["motion"] = {"enabled": True, "variant": "v5"}
+            config["model"]["pretrain_weights"] = "matching_motion_checkpoint.pth"
             config["runtime"].update({"yes": True, "confirm_before_run": False, "verbose": False})
             evaluator_result = {"summary": {}, "per_class": []}
             common = self._main_patches(config, output_dir, evaluator_result)

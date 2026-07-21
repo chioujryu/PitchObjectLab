@@ -155,7 +155,7 @@ output:
   output_dir: ""
   # Output root when output_dir is empty. Options: runs/rf_detr, D:/runs/{dataset_name}, /mnt/runs/rf_detr.
   # Supports the same placeholders as output_dir.
-  root: /home/new_users/zhiyu/projects/PitchObjectLab/runs/detect/站立運動員_足球_球門檢測數據集2025/train
+  root: runs/rf_detr/train
   # Run folder name when output_dir is empty. Options: pure string or placeholder template.
   # Supports the same placeholders as output_dir.
   name: "rfdetr_{model_size}_e{epochs}_b{batch_size}_val{eval_interval}_test{test_interval_epochs}_{timestamp}"

@@ -32,6 +32,33 @@ Use this skill when editing `projects/rf_detr_trainer` or related object-detecti
 13. Update `README.md` whenever entrypoint usage, config options, setup steps, or output behavior changes.
 14. Every runnable script must produce useful console logs. For output-producing runs, write logs or a log summary inside the output folder when practical.
 
+## Output Paths
+
+- Resolve relative `output.output_dir`, `output.root`, standalone-test output,
+  inference output, `demo.output_dir`, and TensorRT cache paths from
+  `projects/rf_detr_trainer`, never from the caller's CWD or based on whether a
+  same-named directory already exists.
+- Preserve absolute paths unchanged. Treat `../...` as a project-anchored path
+  that intentionally escapes the project, so developers can opt into external
+  storage without restoring CWD-dependent behavior.
+- Keep periodic and final tests nested under the main training output.
+- An empty TensorRT `cache_dir` means the project-local
+  `runs/rf_detr/tensorrt_cache`; it must not fall back to an OS user cache.
+
+## Small Preset Matrix
+
+- Maintain Stock, P2-only, TrackNetV5-only, and P2+TrackNetV5 presets for each
+  of train, test, and inference. Use
+  `rf_detr_{train|test|inference}_small.yaml`, then the `_small_p2.yaml`,
+  `_small_tracknet_v5.yaml`, and `_small_p2_tracknet_v5.yaml` suffix variants.
+- Stock Small uses the official 512 x 512 architecture and initialization. P2
+  uses `[P2, P3, P4]`; TrackNetV5 uses
+  `model.motion.type: tracknet_v5` and is separate from inference video
+  tracking.
+- Custom-architecture test and inference runs must receive a checkpoint trained
+  with the exact matching architecture. Do not silently load official Stock
+  weights for P2 or TrackNetV5 variants.
+
 ## Test Diagnostics
 
 - `test_rf_detr_model.py` supports `full_image`, `sahi`, and `class_crop`.
@@ -60,6 +87,26 @@ Use this skill when editing `projects/rf_detr_trainer` or related object-detecti
 - Each boxmot tracker's params live in its own nested sub-block (`inference.tracking.ocsort`/`deepocsort`/`botsort`/`bytetrack`); shared ReID/CMC and circle/rendering keys stay at the `tracking` top level. The parser maps the nested blocks onto flat `TrackingConfig` fields, so the adapter is unaffected.
 - The tracked class is configurable for all algorithms via `inference.tracking.target_class_ids`/`target_class_names` (default football). `predictions.jsonl` track fields and `tracking_summary.json` are identical across algorithms.
 - For `deepocsort`/`botsort`, prefer a local `inference.tracking.reid_weights` path; the default ReID weights auto-download from Google Drive (unreliable in CN/HK/MO/TW, rule 8). `ocsort`/`bytetrack` need no weights, and `botsort.with_reid: false` disables BoT-SORT appearance. ReID device follows `model.device`; `reid_half` is GPU-only.
+
+## TensorRT Compatibility
+
+- Use FP16 as the compatibility baseline for P2 and TrackNetV5 models. Model
+  size, resolution, class count, `model.p2`, and `model.motion` must match the
+  checkpoint; exporting does not convert one architecture into another.
+- Keep `config/rf_detr_inference_large_p2_tensorrt_fp16_smoke.yaml` fixed to
+  Large 704 x 704, one class, P2 `[P2, P3, P4]`, gradient checkpointing, no
+  TrackNetV5, TensorRT FP16, batch profile 1/1/1, 4 GiB workspace, full-image
+  inference, and tracking disabled.
+- Run the smoke preset once with force rebuild, then again without it to verify
+  `cache_hit: true`. Compare the same short segment against PyTorch FP32. If
+  workspace allocation fails at 4 GiB, retry 2 GiB without changing Large,
+  704, P2, or FP16.
+- Treat ONNX, engines, manifests, timing caches, and inference runs as generated
+  project-local artifacts excluded from git. TensorRT engines are tied to their
+  build GPU and runtime compatibility envelope; validate the manifest and
+  rebuild on the target machine when it rejects a mismatch.
+- Never commit workstation-local checkpoint or media paths. Pass them through
+  CLI arguments or use documentation placeholders such as `PATH/TO/...`.
 
 ## Dataset Limits
 

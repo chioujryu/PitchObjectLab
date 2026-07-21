@@ -26,7 +26,7 @@ import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import asdict, dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 import torch
@@ -38,6 +38,8 @@ _TENSORRT_EXPORT_SHAPE_CONTRACT = "dynamic-batch-static-nchw"
 _ACCELERATION_MARKER = "_pitch_object_lab_inference_acceleration"
 _FORWARD_RECORDER_MARKER = "_pitch_object_lab_forward_timing_recorder"
 _POSTPROCESS_RECORDER_MARKER = "_pitch_object_lab_postprocess_timing_recorder"
+PROJECT_DIR = Path(__file__).resolve().parent
+DEFAULT_TENSORRT_CACHE_DIR = PROJECT_DIR / "runs" / "rf_detr" / "tensorrt_cache"
 _OUTPUT_NAME_MAP = {
     "dets": "pred_boxes",
     "labels": "pred_logits",
@@ -329,6 +331,23 @@ def _optional_path(value: Any) -> Path | None:
     return Path(str(value)).expanduser()
 
 
+def resolve_tensorrt_cache_dir(value: Any = None) -> Path:
+    """Resolve an optional TensorRT cache path from the trainer project root."""
+    text = str(value or "").strip()
+    if not text:
+        return DEFAULT_TENSORRT_CACHE_DIR.resolve()
+    path = Path(text).expanduser()
+    if PureWindowsPath(text).is_absolute() or PurePosixPath(text).is_absolute():
+        return path
+    windows_path = PureWindowsPath(text)
+    if windows_path.drive or (windows_path.root and not PurePosixPath(text).is_absolute()):
+        raise ValueError(
+            "TensorRT cache paths must be project-relative, fully absolute, or start with '../'; "
+            f"ambiguous Windows path is not supported: {text}"
+        )
+    return (PROJECT_DIR / path).resolve()
+
+
 def _optimization_source(config: Mapping[str, Any]) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
     """Return ``(optimization block, model block)`` for root/model/direct inputs."""
 
@@ -436,7 +455,7 @@ def resolve_acceleration_config(
             precision=trt_precision,
             engine_path=engine_path,
             manifest_path=manifest_path,
-            cache_dir=_optional_path(trt_source.get("cache_dir")),
+            cache_dir=resolve_tensorrt_cache_dir(trt_source.get("cache_dir")),
             workspace_gib=workspace_gib,
             force_rebuild=force_rebuild,
             profile=TensorRTProfile(min_batch, opt_batch, max_batch),
@@ -723,13 +742,7 @@ def _package_version(name: str) -> str | None:
 
 
 def _default_cache_dir() -> Path:
-    if os.name == "nt" and os.getenv("LOCALAPPDATA"):
-        root = Path(os.environ["LOCALAPPDATA"])
-    elif os.getenv("XDG_CACHE_HOME"):
-        root = Path(os.environ["XDG_CACHE_HOME"])
-    else:
-        root = Path.home() / ".cache"
-    return root / "PitchObjectLab" / "rf_detr" / "tensorrt"
+    return DEFAULT_TENSORRT_CACHE_DIR.resolve()
 
 
 def _model_resolution(model: Any, settings: InferenceOptimizationConfig) -> int:

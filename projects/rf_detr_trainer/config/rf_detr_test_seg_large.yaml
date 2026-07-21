@@ -67,8 +67,8 @@ model:
       engine_path: ""
       # Project manifest paired with engine_path. Empty derives <engine>.manifest.json for an explicit engine. Options: empty string or manifest JSON path.
       manifest_path: ""
-      # Engine/ONNX cache. Options: empty string for the OS user cache, or a writable directory path.
-      cache_dir: ""
+      # Engine/ONNX cache. Empty resolves to runs/rf_detr/tensorrt_cache under rf_detr_trainer; absolute paths remain supported.
+      cache_dir: "runs/rf_detr/tensorrt_cache"
       # TensorRT builder workspace limit in GiB. Options: positive number.
       workspace_gib: 4
       # Ignore a valid cache entry and rebuild its artifacts. Options: true, false.

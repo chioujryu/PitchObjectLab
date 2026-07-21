@@ -589,7 +589,7 @@ def estimate_standalone_test_outputs(
         "tensorrt_cache": tensorrt_artifacts,
         "estimated_total_files": file_count,
         "estimated_disk_usage": trainer.format_bytes(approx_bytes),
-        "note": "Test outputs and first-run TensorRT cache artifacts are estimated conservatively.",
+        "note": "Test outputs and first-run TensorRT artifacts in the configured cache are estimated conservatively.",
     }
     trainer.add_runtime_estimate(
         estimate=estimate,
@@ -755,6 +755,7 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
         config = load_yaml(source_config)
         apply_cli_overrides(config, args)
         internal_config = build_internal_test_config(config)
+        trainer._require_custom_architecture_checkpoint(internal_config, "Standalone test")
         validate_parallel_test_compatibility(internal_config)
         acceleration_settings = trainer.validate_inference_acceleration_config(internal_config)
         parallel_chunks = standalone_parallel_chunks(internal_config)
