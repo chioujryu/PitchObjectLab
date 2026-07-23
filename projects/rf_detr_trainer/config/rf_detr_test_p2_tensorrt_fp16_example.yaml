@@ -42,7 +42,7 @@ model:
   # Class count override. Options: null to infer from dataset, or positive integer.
   num_classes: null
   # Device selector. Options: auto, cpu, cuda, cuda:0, 0, 1, "0,1" for round-robin multi-GPU, mps, -1.
-  device: auto
+  device: cuda:2
   # RF-DETR AMP construction setting; separate from standalone inference_optimization. Options: true, false.
   amp: true
   # Prediction confidence threshold used by inference and operating metrics. Options: 0.0-1.0.
@@ -256,9 +256,9 @@ test:
   # SAHI sliced-inference settings. Options: mapping.
   sahi:
     # Slice height for sahi mode. Options: positive integer.
-    slice_height: 160
+    slice_height: 320
     # Slice width for sahi mode. Options: positive integer.
-    slice_width: 160
+    slice_width: 320
     # Height overlap between adjacent slices. Options: 0.0-0.9.
     overlap_height_ratio: 0.2
     # Width overlap between adjacent slices. Options: 0.0-0.9.
@@ -278,14 +278,14 @@ test:
     # Recheck nested configuration block. Options: mapping.
     recheck:
       # Run a second centered B*B verification pass for selected SAHI target-class boxes. Options: true, false.
-      enabled: false
+      enabled: true
       # Target category IDs for SAHI recheck. Empty means use target_class_names; if both empty and enabled, default is football.
       target_class_ids: []
       # Target category names for SAHI recheck. Empty with enabled defaults to football. Options: category names such as [football].
       target_class_names:
         - football
       # B*B centered crop size for the second pass. Options: positive integer pixels.
-      crop_size: 160
+      crop_size: 80
       # Confidence threshold for the second pass. Options: 0.0-1.0.
       second_confidence_threshold: 0.25
       # Weight applied to the first-stage confidence. Options: non-negative float.

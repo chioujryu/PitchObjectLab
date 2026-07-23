@@ -37,7 +37,7 @@ model:
   # Number of classes. Options: positive integer or null to infer from dataset.
   num_classes: null
   # Compute device selector. Options: auto, cpu, cuda, cuda:N, N, comma-separated GPU IDs, mps, -1.
-  device: auto
+  device: cuda:6
   # amp setting for this config block. Options: documented value for this RF-DETR config section.
   amp: true
   # extra_model_args setting for this config block. Options: documented value for this RF-DETR config section.
