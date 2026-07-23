@@ -219,7 +219,7 @@ output:
   # Output root when output_dir is empty. Options: pure string or placeholder template.
   root: runs/rf_detr/test
   # Run folder name when output_dir is empty. Options: pure string or placeholder template.
-  name: "rfdetr_tracknet_tensorrt_fp16_{timestamp}"
+  name: "rfdetr_p2_tensorrt_fp16_{timestamp}"
   # Allow writing into an existing output directory. Options: true, false.
   exist_ok: false
 
@@ -285,7 +285,7 @@ test:
       target_class_names:
         - football
       # B*B centered crop size for the second pass. Options: positive integer pixels.
-      crop_size: 80
+      crop_size: 160
       # Confidence threshold for the second pass. Options: 0.0-1.0.
       second_confidence_threshold: 0.25
       # Weight applied to the first-stage confidence. Options: non-negative float.
