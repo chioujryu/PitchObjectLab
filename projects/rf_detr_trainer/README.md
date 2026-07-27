@@ -99,60 +99,83 @@ uv run python train_rf_detr_model.py --yes
 Training and evaluation DataLoader workers are standardized at `2` in configs
 and defaults for stable Windows/Linux behavior.
 
-## P2 / TrackNetV5 Smoke Checks
+## RF-DETR + TrackNetV5-inspired temporal training
 
-These configs verify that the custom RF-DETR P2 head, TrackNetV5-style motion
-module, and combined P2+motion stack can reach the training preflight on the
-local dataset:
+This project implements a TrackNetV5-inspired temporal head around RF-DETR; it
+is not the original TrackNet U-Net. RF-DETR remains the detector and may use
+the optional `[P2, P3, P4]` feature graph. The temporal branch adds
+paper-derived MDD attention, divided spatial/temporal R-STR attention,
+factorized positional encoding, PixelShuffle residuals, three-frame Gaussian
+heatmaps, context dropout, and class-balanced focal BCE.
 
-```bash
-uv run python train_rf_detr_model.py --config config/rf_detr_train_smoke_p2_medium.yaml --dry-run --yes
-uv run python train_rf_detr_model.py --config config/rf_detr_train_smoke_motion_v5_medium.yaml --dry-run --yes
-uv run python train_rf_detr_model.py --config config/rf_detr_train_smoke_motion_v5_p2_medium.yaml --dry-run --yes
-```
-
-The target dataset path is:
-
-```text
-C:\Users\XBOT\Documents\Datasets\all_parameters_SAHI_640_classesall_max_samples2000
-```
-
-Remove `--dry-run` only after accepting the printed file-count, disk-usage, and
-HH:MM:SS runtime estimate. Each real run writes a config snapshot,
-`run_timing.json`, and `run.log` into the output folder.
-
-## Real-temporal TrackNetV5 micro smoke
-
-The bounded micro smoke uses one real three-frame training window at 128 x 128,
-batch size 1, and zero DataLoader workers. It freezes the detector and optimizes
-only the TrackNet heatmap branch. Acceptance is intentionally limited to finite
-forward/backward results, non-zero finite gradients, lower final total and
-heatmap losses, and a reloadable checkpoint; it is not an accuracy benchmark.
-
-Run the two focus modes from `projects/rf_detr_trainer`:
+The six supported training presets use official RF-DETR resolutions
+Small/Medium/Large = 512/576/704:
 
 ```bash
-uv run --frozen python run_temporal_micro_smoke.py --focus all --steps 8 --max-minutes 20
-uv run --frozen python run_temporal_micro_smoke.py --focus single --steps 4 --max-minutes 20
+uv run python train_rf_detr_model.py --config config/rf_detr_train_small_tracknet_v5.yaml --yes
+uv run python train_rf_detr_model.py --config config/rf_detr_train_small_p2_tracknet_v5.yaml --yes
+uv run python train_rf_detr_model.py --config config/rf_detr_train_medium_tracknet_v5.yaml --yes
+uv run python train_rf_detr_model.py --config config/rf_detr_train_medium_p2_tracknet_v5.yaml --yes
+uv run python train_rf_detr_model.py --config config/rf_detr_train_large_tracknet_v5.yaml --yes
+uv run python train_rf_detr_model.py --config config/rf_detr_train_large_p2_tracknet_v5.yaml --yes
 ```
 
-The normal command launches a hidden worker under a parent watchdog. If the
-worker exceeds the wall-clock limit, the parent terminates its complete process
-tree and exits with code 124. Results and checkpoints are written beneath
-`runs/rf_detr/micro_smoke/<focus>/`.
+The defaults target an 8 GB GPU: BF16/AMP and gradient checkpointing are on,
+`model.motion.temporal.backbone_grad_mode: center_only` retains backbone
+activations only for the centre frame, Small uses batch 4, and Medium/Large
+use batch 1. Context frames still use the same updated backbone weights, but
+their feature extraction runs sequentially under `no_grad`.
 
-The `all` checkpoint can then exercise one test and inference window:
+All six presets use `grad_accum_steps: 1` and disable early stopping. Before
+training, the estimate prints micro-batches/epoch, optimizer steps/epoch, total
+optimizer steps, and effective batch size. Fewer than five updates per epoch or
+100 total updates produces a warning. With 20 windows and batch 4, for example,
+`grad_accum_steps: 8` yields only one optimizer update per epoch; `Epoch 5:
+0/5` then means the first slow batch of the next epoch has not finished, not
+that training is deadlocked.
+
+Each epoch summary records `global_step`, detector and heatmap loss, best-box
+IoU, top-query score, and first-batch duration. Early mAP can remain zero while
+the newly initialized single-class/P2 heads calibrate, so use optimizer-step
+count and these diagnostics to distinguish slow learning from a stalled run.
+
+The old `rf_detr_train_motion_v5_*` filenames are deprecated aliases. Custom
+checkpoints now use architecture metadata schema v3 with a stable fingerprint
+covering resolved model size, resolution, queries/classes, P2 graph, TrackNet
+graph, and RF-DETR version. Resume/test/inference require exact graph and state
+shapes. Legacy custom TrackNet checkpoints must be retrained; official stock
+RF-DETR checkpoints remain valid training initialization.
+
+### Temporal smoke checks
+
+The bounded smoke uses one real three-frame window. At 25 steps it requires
+both detector and TrackNet gradients/parameter changes, heatmap loss reduction
+of at least 20%, total loss reduction of at least 10%, and either a 0.05
+best-box IoU gain or a failed-to-successful match transition:
 
 ```bash
-uv run --frozen python test_rf_detr_model.py --config config/rf_detr_test_smoke_temporal_tracknet_v5.yaml --checkpoint runs/rf_detr/micro_smoke/all/checkpoint_micro_smoke.pth --yes
-uv run --frozen python inference_rf_detr_model.py --config config/rf_detr_inference_smoke_temporal_tracknet_v5.yaml --checkpoint runs/rf_detr/micro_smoke/all/checkpoint_micro_smoke.pth --yes
+uv run --frozen python run_temporal_micro_smoke.py --model-size small --p2 on --steps 25 --reload
+uv run --frozen python run_temporal_micro_smoke.py --matrix --steps 1 --official-resolution --reload --max-minutes 30
 ```
 
-Real-temporal TrackNetV5 (`temporal.mode: real`) is PyTorch-only. ONNX and
-TensorRT requests intentionally fail rather than silently using a single-frame
-graph. Full fine-tuning, accuracy claims, the complete P2/TrackNet architecture
-matrix, video boundary/look-ahead handling, temporal SAHI, and multi-process
-inference are deferred; none is part of this bounded smoke contract.
+`--matrix` covers Small/Medium/Large with P2 off/on and reports loss, separate
+gradient norms, parameter deltas, peak VRAM, checkpoint path, and fresh-model
+reload status. The parent watchdog terminates the complete worker process tree
+with exit code 124 if `--max-minutes` is exceeded.
+
+The formal Small P2 smoke checkpoint can exercise matching test and inference
+graphs:
+
+```bash
+uv run python train_rf_detr_model.py --config config/rf_detr_train_smoke_temporal_tracknet_v5.yaml --yes
+uv run python test_rf_detr_model.py --config config/rf_detr_test_smoke_temporal_tracknet_v5.yaml --checkpoint PATH/TO/checkpoint_best_regular.pth --yes
+uv run python inference_rf_detr_model.py --config config/rf_detr_inference_smoke_temporal_tracknet_v5.yaml --checkpoint PATH/TO/checkpoint_best_regular.pth --yes
+```
+
+The inference smoke writes detections and TrackNet peaks to
+`temporal_predictions.jsonl` plus one heatmap PNG per frame. Real-temporal
+TrackNet (`temporal.mode: real`) is PyTorch-only; ONNX/TensorRT requests fail
+instead of silently switching to a single-frame graph.
 
 ## Common CLI Examples
 
@@ -466,12 +489,10 @@ test/inference rejects incompatible tensor shapes instead of silently replacing
 weights. Checkpoints without architecture metadata use the YAML architecture
 plus state-dict shapes for validation.
 
-P2+TrackNetV5 is best effort because stride-4 tokens make global motion
-attention memory-intensive. Enable both blocks only with the exact combined
-training architecture and begin with batch size 1 (`--batch-size 1`, plus
-`--sahi-batch-size 1` for SAHI test). An out-of-memory result for this combined
-mode does not imply that either required P2-only or TrackNetV5-only path is
-unsupported.
+P2+TrackNet uses patch-16 R-STR attention rather than global attention over
+stride-4 pixels. The provided Medium/Large presets start at batch 1 and use
+centre-only backbone gradients for an 8 GB GPU. Keep the checkpoint fingerprint
+and state graph exact when enabling both blocks.
 
 Prediction visuals and football diagnostics are controlled in the test config:
 

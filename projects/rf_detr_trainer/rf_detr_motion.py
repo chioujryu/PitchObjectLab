@@ -1,11 +1,14 @@
-"""Optional three-frame TrackNetV5 branch for RF-DETR.
+"""Optional three-frame TrackNetV5-inspired branch for RF-DETR.
 
-The enabled path runs the shared RF-DETR backbone over ``B*T`` real RGB frames,
-keeps all three temporal feature maps for TrackNet, and sends only the centre
-frame through the RF-DETR transformer/decoder. TrackNet provides:
+The enabled path keeps all three temporal feature maps for TrackNet and sends
+only the centre frame through the RF-DETR transformer/decoder. The default
+``center_only`` backbone gradient mode runs context frames sequentially without
+activation gradients while the shared backbone remains trainable through the
+centre frame. TrackNet provides:
 
 * four luminance Motion Direction Decoupling maps for both adjacent pairs;
-* per-frame draft heatmaps and factorised spatial/temporal R-STR refinement;
+* paper-parameterised MDD attention maps and motion-aware draft heatmaps;
+* factorised spatial/temporal R-STR refinement with patch/PixelShuffle decode;
 * bbox-Gaussian targets, weighted focal BCE, and single/all peak extraction;
 * a zero-initialised heatmap residual fused into the highest-resolution centre
   feature, preserving stock detector behaviour at initialisation.
@@ -49,7 +52,7 @@ __all__ = [
 
 # Convenience overrides that map to real ModelConfig fields.
 _BASELINE_RFDETR_VERSION = '1.8.3'
-_TRACKNET_ARCHITECTURE_SCHEMA_VERSION = 2
+_TRACKNET_ARCHITECTURE_SCHEMA_VERSION = 3
 
 _MOTION_OVERRIDE_CASTS = {
     "resolution": int,
@@ -69,6 +72,7 @@ _MOTION_DEFAULTS: Dict[str, Any] = {
         "anchor": "center",
         "boundary_policy": "drop",
         "allow_single_frame_fallback": False,
+        "backbone_grad_mode": "center_only",
         # Kept for old configs; real temporal input is the default.
         "fallback_mode": "real",
         "noise_std": 0.02,
@@ -85,8 +89,9 @@ _MOTION_DEFAULTS: Dict[str, Any] = {
             "polarity_channels": 4,
             "attention": {
                 "learnable": True,
-                "init_k": 1.0,
-                "init_m": 0.5,
+                "init_alpha": 0.2,
+                "init_beta": 0.15,
+                "epsilon": 1.0e-6,
             },
         },
         "heatmap": {
@@ -103,7 +108,7 @@ _MOTION_DEFAULTS: Dict[str, Any] = {
             "num_heads": 8,
             "attention_mode": "divided",
             "dropout": 0.1,
-            "use_pixel_shuffle": True,
+            "patch_size": 16,
             "context_mask_prob": 0.1,
         },
         "fusion": {"mode": "zero_init_residual"},
@@ -141,6 +146,28 @@ def _check_version() -> None:
 def _validated_motion_config(motion_cfg: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     """Merge defaults and reject temporal graph options not implemented here."""
 
+    raw_attention = (
+        (((motion_cfg or {}).get("tracknet_v5", {}) or {}).get("mdd", {}) or {}).get(
+            "attention", {}
+        )
+        or {}
+    )
+    legacy_attention = sorted(
+        key for key in ("init_k", "init_m") if key in raw_attention
+    )
+    if legacy_attention:
+        raise ValueError(
+            "TrackNetV5 MDD now uses paper parameters init_alpha/init_beta; "
+            f"remove legacy {legacy_attention!r}."
+        )
+    raw_rstr = (
+        ((motion_cfg or {}).get("tracknet_v5", {}) or {}).get("rstr", {}) or {}
+    )
+    if "use_pixel_shuffle" in raw_rstr:
+        raise ValueError(
+            "TrackNetV5 R-STR always decodes with PixelShuffle; replace "
+            "use_pixel_shuffle with the positive integer patch_size."
+        )
     merged = _deep_merge(deepcopy(_MOTION_DEFAULTS), dict(motion_cfg or {}))
     temporal = merged["temporal"]
     tracknet = merged["tracknet_v5"]
@@ -178,6 +205,19 @@ def _validated_motion_config(motion_cfg: Optional[Mapping[str, Any]]) -> Dict[st
                 f"{field} must be {expected!r} for the current TrackNetV5 "
                 f"temporal graph, got {value!r}."
             )
+    backbone_grad_mode = str(
+        temporal.get("backbone_grad_mode", "center_only")
+    ).lower()
+    if backbone_grad_mode not in {"center_only", "all_frames"}:
+        raise ValueError(
+            "model.motion.temporal.backbone_grad_mode must be 'center_only' "
+            f"or 'all_frames', got {backbone_grad_mode!r}."
+        )
+    patch_size = int(rstr.get("patch_size", 16))
+    if patch_size <= 0:
+        raise ValueError(
+            "model.motion.tracknet_v5.rstr.patch_size must be a positive integer."
+        )
     return merged
 
 
@@ -186,20 +226,38 @@ def _validated_motion_config(motion_cfg: Optional[Mapping[str, Any]]) -> Dict[st
 # ---------------------------------------------------------------------------
 
 class LearnableSigmoidAttention(nn.Module):
-    """Per-channel learnable sigmoid gating: A = σ(k * (|x| − m)).
+    """TrackNetV5 attention mapping from the published alpha/beta equations."""
 
-    k controls steepness, m controls the midpoint threshold. Both are learnable
-    scalars initialised from config. Operates channel-wise on any spatial map.
-    """
-
-    def __init__(self, num_channels: int, init_k: float = 1.0, init_m: float = 0.5) -> None:
+    def __init__(
+        self,
+        num_channels: int,
+        init_alpha: float = 0.2,
+        init_beta: float = 0.15,
+        epsilon: float = 1.0e-6,
+        *,
+        learnable: bool = True,
+    ) -> None:
         super().__init__()
-        self.k = nn.Parameter(torch.full((1, num_channels, 1, 1), init_k))
-        self.m = nn.Parameter(torch.full((1, num_channels, 1, 1), init_m))
+        if num_channels <= 0:
+            raise ValueError("num_channels must be positive.")
+        if epsilon <= 0:
+            raise ValueError("epsilon must be positive.")
+        alpha = torch.full((1, num_channels, 1, 1), float(init_alpha))
+        beta = torch.full((1, num_channels, 1, 1), float(init_beta))
+        if learnable:
+            self.alpha = nn.Parameter(alpha)
+            self.beta = nn.Parameter(beta)
+        else:
+            self.register_buffer("alpha", alpha)
+            self.register_buffer("beta", beta)
+        self.epsilon = float(epsilon)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, C, H, W] — the polarity field (already non-negative after ReLU)
-        return torch.sigmoid(self.k * (x - self.m))
+        k = 5.0 / (
+            0.45 * torch.abs(torch.tanh(self.alpha)) + self.epsilon
+        )
+        m = 0.6 * torch.tanh(self.beta)
+        return torch.sigmoid(k * (torch.abs(x) - m))
 
 
 class MotionDirectionDecoupling(nn.Module):
@@ -207,8 +265,7 @@ class MotionDirectionDecoupling(nn.Module):
 
     The four output planes are, in order, positive and negative luminance
     changes for ``previous -> centre`` followed by positive and negative
-    changes for ``centre -> next``. Multiplicative learnable attention keeps
-    exact zero motion at zero instead of turning it into a sigmoid constant.
+    changes for ``centre -> next``. The outputs are four bounded attention maps.
     """
 
     LUMA_WEIGHTS: Tuple[float, float, float] = (0.299, 0.587, 0.114)
@@ -217,8 +274,9 @@ class MotionDirectionDecoupling(nn.Module):
         self,
         in_channels: int = 3,
         polarity_channels: int = 4,
-        init_k: float = 1.0,
-        init_m: float = 0.5,
+        init_alpha: float = 0.2,
+        init_beta: float = 0.15,
+        epsilon: float = 1.0e-6,
         learnable: bool = True,
     ) -> None:
         super().__init__()
@@ -236,10 +294,12 @@ class MotionDirectionDecoupling(nn.Module):
             torch.tensor(self.LUMA_WEIGHTS, dtype=torch.float32).view(1, 1, 3, 1, 1),
             persistent=False,
         )
-        self.attention = (
-            LearnableSigmoidAttention(4, init_k, init_m)
-            if self.learnable
-            else nn.Identity()
+        self.attention = LearnableSigmoidAttention(
+            4,
+            init_alpha=init_alpha,
+            init_beta=init_beta,
+            epsilon=epsilon,
+            learnable=self.learnable,
         )
 
     def raw_polarities(self, frames: torch.Tensor) -> torch.Tensor:
@@ -270,9 +330,7 @@ class MotionDirectionDecoupling(nn.Module):
 
     def forward(self, frames: torch.Tensor) -> torch.Tensor:
         raw = self.raw_polarities(frames)
-        if not self.learnable:
-            return raw
-        return raw * self.attention(raw)
+        return self.attention(raw)
 
 
 class RSTRSpatialAttention(nn.Module):
@@ -345,9 +403,9 @@ class TemporalRSTRHead(nn.Module):
     """Factorised spatial/temporal refinement of three draft heatmaps.
 
     The final correction projection is zero-initialised, so the module begins
-    as the exact identity in logit space. With PixelShuffle enabled the patch
-    embedding downsamples by two and the residual projection restores the
-    original resolution.
+    as the exact identity in logit space when context masking is disabled.
+    Non-overlapping patches bound attention memory and PixelShuffle restores
+    the original draft resolution.
     """
 
     def __init__(
@@ -357,7 +415,7 @@ class TemporalRSTRHead(nn.Module):
         num_heads: int = 8,
         num_blocks: int = 2,
         dropout: float = 0.1,
-        use_pixel_shuffle: bool = True,
+        patch_size: int = 16,
         context_mask_prob: float = 0.1,
     ) -> None:
         super().__init__()
@@ -365,29 +423,68 @@ class TemporalRSTRHead(nn.Module):
             raise ValueError(f"TrackNetV5 R-STR requires exactly three frames, got {num_frames}.")
         if not 0.0 <= context_mask_prob < 1.0:
             raise ValueError("context_mask_prob must be in [0, 1).")
+        if patch_size <= 0:
+            raise ValueError("patch_size must be a positive integer.")
+        if hidden_dim % 4 != 0:
+            raise ValueError("R-STR hidden_dim must be divisible by 4 for 2-D positions.")
         self.num_frames = num_frames
         self.context_mask_prob = float(context_mask_prob)
-        self.use_pixel_shuffle = bool(use_pixel_shuffle)
-        self.patch_scale = 2 if self.use_pixel_shuffle else 1
+        self.patch_size = int(patch_size)
         self.draft_embed = nn.Conv2d(
             1,
             hidden_dim,
-            kernel_size=self.patch_scale,
-            stride=self.patch_scale,
+            kernel_size=self.patch_size,
+            stride=self.patch_size,
         )
         self.motion_embed = nn.Conv2d(4, hidden_dim, 3, padding=1)
+        self.temporal_position = nn.Parameter(
+            torch.zeros(1, self.num_frames, hidden_dim, 1, 1)
+        )
+        nn.init.trunc_normal_(self.temporal_position, std=0.02)
         self.spatial_blocks = nn.ModuleList(
             [RSTRSpatialAttention(hidden_dim, num_heads, dropout) for _ in range(num_blocks)]
         )
         self.temporal_blocks = nn.ModuleList(
             [RSTRSpatialAttention(hidden_dim, num_heads, dropout) for _ in range(num_blocks)]
         )
-        output_channels = self.patch_scale * self.patch_scale
+        output_channels = self.patch_size * self.patch_size
         self.residual_projection = nn.Conv2d(
             hidden_dim, output_channels, 3, padding=1
         )
         nn.init.zeros_(self.residual_projection.weight)
         nn.init.zeros_(self.residual_projection.bias)
+
+    @staticmethod
+    def _spatial_position(
+        hidden_dim: int,
+        height: int,
+        width: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Return dynamic factorised 2-D sine/cosine positions."""
+
+        quarter = hidden_dim // 4
+        frequency = torch.arange(quarter, device=device, dtype=torch.float32)
+        frequency = torch.pow(
+            torch.tensor(10000.0, device=device),
+            -frequency / max(1, quarter),
+        )
+        y = torch.arange(height, device=device, dtype=torch.float32)
+        x = torch.arange(width, device=device, dtype=torch.float32)
+        y_phase = y[:, None] * frequency[None, :]
+        x_phase = x[:, None] * frequency[None, :]
+        y_embedding = torch.cat((y_phase.sin(), y_phase.cos()), dim=1)
+        x_embedding = torch.cat((x_phase.sin(), x_phase.cos()), dim=1)
+        position = torch.cat(
+            (
+                y_embedding[:, None, :].expand(height, width, -1),
+                x_embedding[None, :, :].expand(height, width, -1),
+            ),
+            dim=2,
+        )
+        return position.permute(2, 0, 1).unsqueeze(0).unsqueeze(0).to(dtype=dtype)
 
     def forward(
         self,
@@ -402,9 +499,18 @@ class TemporalRSTRHead(nn.Module):
         batch, frames, height, width = draft_logits.shape
         if frames != self.num_frames:
             raise ValueError(f"Expected T={self.num_frames}, got T={frames}.")
-        pad_height = (-height) % self.patch_scale
-        pad_width = (-width) % self.patch_scale
-        padded = F.pad(draft_logits, (0, pad_width, 0, pad_height))
+        base_logits = (
+            F.dropout(
+                draft_logits,
+                p=self.context_mask_prob,
+                training=True,
+            )
+            if self.training and self.context_mask_prob > 0.0
+            else draft_logits
+        )
+        pad_height = (-height) % self.patch_size
+        pad_width = (-width) % self.patch_size
+        padded = F.pad(base_logits, (0, pad_width, 0, pad_height))
         padded_height, padded_width = padded.shape[-2:]
         embedded = self.draft_embed(
             padded.reshape(batch * frames, 1, padded_height, padded_width)
@@ -426,16 +532,19 @@ class TemporalRSTRHead(nn.Module):
             mode="bilinear",
             align_corners=False,
         )
-        embedded = embedded + motion_context.unsqueeze(1)
-
-        if self.training and self.context_mask_prob > 0.0:
-            keep = (
-                torch.rand(batch, frames, 1, 1, 1, device=embedded.device)
-                >= self.context_mask_prob
-            )
-            # Always retain the centre draft; only temporal context is dropped.
-            keep[:, frames // 2] = True
-            embedded = embedded * keep.to(embedded.dtype)
+        spatial_position = self._spatial_position(
+            embedded.shape[2],
+            token_height,
+            token_width,
+            device=embedded.device,
+            dtype=embedded.dtype,
+        )
+        embedded = (
+            embedded
+            + motion_context.unsqueeze(1)
+            + spatial_position
+            + self.temporal_position.to(dtype=embedded.dtype)
+        )
 
         hidden_dim = embedded.shape[2]
         for spatial, temporal in zip(self.spatial_blocks, self.temporal_blocks):
@@ -458,18 +567,10 @@ class TemporalRSTRHead(nn.Module):
         residual = self.residual_projection(
             embedded.reshape(batch * frames, hidden_dim, token_height, token_width)
         )
-        if self.use_pixel_shuffle:
-            residual = F.pixel_shuffle(residual, self.patch_scale)
-        elif residual.shape[-2:] != (padded_height, padded_width):
-            residual = F.interpolate(
-                residual,
-                size=(padded_height, padded_width),
-                mode="bilinear",
-                align_corners=False,
-            )
+        residual = F.pixel_shuffle(residual, self.patch_size)
         residual = residual.reshape(batch, frames, padded_height, padded_width)
         residual = residual[..., :height, :width]
-        return draft_logits + residual
+        return base_logits + residual
 
 
 class RSTRHead(TemporalRSTRHead):
@@ -487,7 +588,7 @@ class RSTRHead(TemporalRSTRHead):
         num_heads: int = 8,
         num_blocks: int = 2,
         dropout: float = 0.1,
-        use_pixel_shuffle: bool = True,
+        patch_size: int = 16,
         context_mask_prob: float = 0.1,
     ) -> None:
         if in_channels != 3:
@@ -501,7 +602,7 @@ class RSTRHead(TemporalRSTRHead):
             num_heads=num_heads,
             num_blocks=num_blocks,
             dropout=dropout,
-            use_pixel_shuffle=use_pixel_shuffle,
+            patch_size=patch_size,
             context_mask_prob=context_mask_prob,
         )
 
@@ -836,6 +937,9 @@ class MotionModule(nn.Module):
             temporal_cfg.get("allow_single_frame_fallback", False)
             or self.fallback_mode in {"identity", "zero", "noise"}
         )
+        self.backbone_grad_mode = str(
+            temporal_cfg.get("backbone_grad_mode", "center_only")
+        ).lower()
 
         self.focus_mode = str(focus_cfg.get("mode", "all")).lower()
         if self.focus_mode not in {"single", "all"}:
@@ -856,8 +960,9 @@ class MotionModule(nn.Module):
             MotionDirectionDecoupling(
                 in_channels=3,
                 polarity_channels=int(mdd_cfg.get("polarity_channels", 4)),
-                init_k=float(attention_cfg.get("init_k", 1.0)),
-                init_m=float(attention_cfg.get("init_m", 0.5)),
+                init_alpha=float(attention_cfg.get("init_alpha", 0.2)),
+                init_beta=float(attention_cfg.get("init_beta", 0.15)),
+                epsilon=float(attention_cfg.get("epsilon", 1.0e-6)),
                 learnable=bool(attention_cfg.get("learnable", True)),
             )
             if self.mdd_enabled
@@ -883,7 +988,7 @@ class MotionModule(nn.Module):
                 num_heads=int(rstr_cfg.get("num_heads", 8)),
                 num_blocks=int(rstr_cfg.get("num_blocks", 2)),
                 dropout=float(rstr_cfg.get("dropout", 0.1)),
-                use_pixel_shuffle=bool(rstr_cfg.get("use_pixel_shuffle", True)),
+                patch_size=int(rstr_cfg.get("patch_size", 16)),
                 context_mask_prob=float(rstr_cfg.get("context_mask_prob", 0.1)),
             )
             if self.rstr_enabled
@@ -1107,10 +1212,10 @@ def run_temporal_lwdetr(
     """Run a three-frame batch through one attached LWDETR instance.
 
     ``frames`` may be a tensor or a batch object exposing ``.frames`` and
-    optionally ``.padding_masks``. The backbone sees all ``B*T`` frames in one
-    call, the TrackNet branch receives reshaped temporal features, and stock
-    LWDETR continuation receives only centre-frame features. No class-level or
-    process-global method is patched.
+    optionally ``.padding_masks``. ``center_only`` runs the centre backbone
+    pass with gradients and the context passes sequentially under ``no_grad``;
+    ``all_frames`` retains the original ``B*T`` behavior. Stock LWDETR
+    continuation always receives only centre-frame features.
     """
     mdd_frames = frames if torch.is_tensor(frames) else None
     if not torch.is_tensor(frames):
@@ -1155,22 +1260,71 @@ def run_temporal_lwdetr(
             f"got {tuple(padding_masks.shape)}."
         )
     padding_masks = padding_masks.to(device=frames.device, dtype=torch.bool)
-    flattened_samples = _rebuild_nested_tensor(
-        frames.reshape(batch_size * num_frames, channels, height, width),
-        padding_masks.reshape(batch_size * num_frames, height, width),
-    )
-    backbone_result = lwdetr.backbone(flattened_samples)
-    if not isinstance(backbone_result, tuple) or len(backbone_result) != 3:
-        raise RuntimeError(
-            "rfdetr==1.8.3 backbone must return (features, positions, cross_attn_features)."
+    backbone_grad_mode = motion_module.backbone_grad_mode
+    batched_backbone = backbone_grad_mode == "all_frames"
+    if batched_backbone:
+        flattened_samples = _rebuild_nested_tensor(
+            frames.reshape(batch_size * num_frames, channels, height, width),
+            padding_masks.reshape(batch_size * num_frames, height, width),
         )
-    features, positions, cross_attn_features = backbone_result
-    temporal_features = [
-        feature.tensors.reshape(
-            batch_size, num_frames, *feature.tensors.shape[1:]
-        )
-        for feature in features
-    ]
+        backbone_result = lwdetr.backbone(flattened_samples)
+        if not isinstance(backbone_result, tuple) or len(backbone_result) != 3:
+            raise RuntimeError(
+                "rfdetr==1.8.3 backbone must return "
+                "(features, positions, cross_attn_features)."
+            )
+        features, positions, cross_attn_features = backbone_result
+        temporal_features = [
+            feature.tensors.reshape(
+                batch_size, num_frames, *feature.tensors.shape[1:]
+            )
+            for feature in features
+        ]
+    else:
+        temporal_feature_frames: List[List[torch.Tensor]] = []
+        centre_result = None
+        for frame_index in range(num_frames):
+            frame_samples = _rebuild_nested_tensor(
+                frames[:, frame_index],
+                padding_masks[:, frame_index],
+            )
+            if frame_index == motion_module.anchor_index:
+                result = lwdetr.backbone(frame_samples)
+                centre_result = result
+            else:
+                with torch.no_grad():
+                    result = lwdetr.backbone(frame_samples)
+            if not isinstance(result, tuple) or len(result) != 3:
+                raise RuntimeError(
+                    "rfdetr==1.8.3 backbone must return "
+                    "(features, positions, cross_attn_features)."
+                )
+            temporal_feature_frames.append(
+                [feature.tensors for feature in result[0]]
+            )
+            if frame_index != motion_module.anchor_index:
+                # Context positions and cross-attention features never reach
+                # the detector. Drop their references immediately.
+                del result
+        if centre_result is None:
+            raise RuntimeError("Temporal centre backbone result was not produced.")
+        features, positions, cross_attn_features = centre_result
+        feature_levels = len(features)
+        if any(
+            len(frame_features) != feature_levels
+            for frame_features in temporal_feature_frames
+        ):
+            raise RuntimeError("Temporal backbone feature-level count changed by frame.")
+        temporal_features = [
+            torch.stack(
+                [
+                    temporal_feature_frames[frame_index][level_index]
+                    for frame_index in range(num_frames)
+                ],
+                dim=1,
+            )
+            for level_index in range(feature_levels)
+        ]
     motion_output = motion_module.forward_temporal(mdd_frames, temporal_features)
     anchor = motion_module.anchor_index
 
@@ -1178,27 +1332,43 @@ def run_temporal_lwdetr(
     for modulated, original in zip(motion_output.features, features):
         centre_mask = None
         if original.mask is not None:
-            centre_mask = _select_temporal_tensor(
-                original.mask, batch_size, num_frames, anchor
+            centre_mask = (
+                _select_temporal_tensor(
+                    original.mask, batch_size, num_frames, anchor
+                )
+                if batched_backbone
+                else original.mask
             )
         centre_features.append(_rebuild_nested_tensor(modulated, centre_mask))
-    centre_positions = [
-        _select_temporal_tensor(position, batch_size, num_frames, anchor)
-        for position in positions
-    ]
+    centre_positions = (
+        [
+            _select_temporal_tensor(position, batch_size, num_frames, anchor)
+            for position in positions
+        ]
+        if batched_backbone
+        else positions
+    )
     centre_cross_attn_features = None
     if cross_attn_features is not None:
         centre_cross_attn_features = []
         for feature in cross_attn_features:
             centre_mask = None
             if feature.mask is not None:
-                centre_mask = _select_temporal_tensor(
-                    feature.mask, batch_size, num_frames, anchor
+                centre_mask = (
+                    _select_temporal_tensor(
+                        feature.mask, batch_size, num_frames, anchor
+                    )
+                    if batched_backbone
+                    else feature.mask
                 )
             centre_cross_attn_features.append(
                 _rebuild_nested_tensor(
-                    _select_temporal_tensor(
-                        feature.tensors, batch_size, num_frames, anchor
+                    (
+                        _select_temporal_tensor(
+                            feature.tensors, batch_size, num_frames, anchor
+                        )
+                        if batched_backbone
+                        else feature.tensors
                     ),
                     centre_mask,
                 )
@@ -1578,6 +1748,21 @@ def _assert_motion_metadata_compatible(
             f"checkpoint={metadata.get('schema_version')!r}, "
             f"runtime={expected_architecture.get('schema_version')!r}."
         )
+    if int(metadata.get('schema_version', 0) or 0) >= 3:
+        checkpoint_fingerprint = metadata.get('architecture_fingerprint')
+        expected_fingerprint = expected_architecture.get('architecture_fingerprint')
+        if not checkpoint_fingerprint or not expected_fingerprint:
+            raise RuntimeError(
+                "TrackNet schema v3 checkpoint/runtime metadata must contain an "
+                "architecture_fingerprint."
+            )
+        if checkpoint_fingerprint != expected_fingerprint:
+            raise RuntimeError(
+                "Checkpoint TrackNet architecture fingerprint does not match the "
+                "configured runtime: "
+                f"checkpoint={checkpoint_fingerprint!r}, "
+                f"runtime={expected_fingerprint!r}."
+            )
     saved_size = str(metadata.get('model_size', '')).strip().lower()
     expected_size = str(expected_architecture.get('model_size', '')).strip().lower()
     if saved_size != expected_size:

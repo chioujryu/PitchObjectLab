@@ -374,7 +374,7 @@ def build_rfdetr_evaluator_runtime(
         assert_p2_checkpoint_compatible(
             rf_model.model,
             getattr(rf_model.model_config, 'pretrain_weights', None),
-            build_pitchobjectlab_architecture(merged_config),
+            build_pitchobjectlab_architecture(merged_config, rf_model.model_config),
         )
 
     motion_config = model_settings.get("motion", {}) or {}
@@ -391,7 +391,7 @@ def build_rfdetr_evaluator_runtime(
         assert_motion_checkpoint_compatible(
             rf_model.model,
             checkpoint_path,
-            build_pitchobjectlab_architecture(merged_config),
+            build_pitchobjectlab_architecture(merged_config, rf_model.model_config),
         )
         load_motion_checkpoint_weights(rf_model.model, checkpoint_path)
 

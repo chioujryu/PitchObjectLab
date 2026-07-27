@@ -763,7 +763,7 @@ def load_rfdetr_model(config: Mapping[str, Any]) -> Any:
         assert_p2_checkpoint_compatible(
             rf_model.model,
             getattr(rf_model.model_config, 'pretrain_weights', None),
-            trainer.build_pitchobjectlab_architecture(config),
+            trainer.build_pitchobjectlab_architecture(config, rf_model.model_config),
         )
     motion_config = config.get("model", {}).get("motion", {}) or {}
     if trainer.motion_module_enabled(config):
@@ -779,7 +779,7 @@ def load_rfdetr_model(config: Mapping[str, Any]) -> Any:
         assert_motion_checkpoint_compatible(
             rf_model.model,
             checkpoint_path,
-            trainer.build_pitchobjectlab_architecture(config),
+            trainer.build_pitchobjectlab_architecture(config, model_config),
         )
         load_motion_checkpoint_weights(rf_model.model, checkpoint_path)
     accelerated_model, _ = trainer.configure_rfdetr_inference_acceleration(

@@ -7,6 +7,7 @@ import yaml
 
 import rf_detr_acceleration
 import rf_detr_runtime
+import train_rf_detr_model
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -95,6 +96,33 @@ class SmallConfigPresetTests(unittest.TestCase):
                 self.assertEqual(tensorrt["cache_dir"], "runs/rf_detr/tensorrt_cache")
                 resolved = rf_detr_acceleration.resolve_tensorrt_cache_dir(tensorrt["cache_dir"])
                 self.assertEqual(resolved, expected)
+
+    def test_temporal_training_matrix_uses_memory_safe_optimizer_defaults(self):
+        for size in ("small", "medium", "large"):
+            for p2 in (False, True):
+                suffix = "_p2_tracknet_v5" if p2 else "_tracknet_v5"
+                path = CONFIG_DIR / f"rf_detr_train_{size}{suffix}.yaml"
+                with self.subTest(size=size, p2=p2):
+                    config = train_rf_detr_model.load_yaml(path)
+                    model = config["model"]
+                    motion = model["motion"]
+                    self.assertEqual(model["size"], size)
+                    self.assertIsNone(model["resolution"])
+                    self.assertEqual(model["p2"]["enabled"], p2)
+                    self.assertTrue(motion["enabled"])
+                    self.assertEqual(
+                        motion["temporal"]["backbone_grad_mode"],
+                        "center_only",
+                    )
+                    self.assertEqual(
+                        motion["tracknet_v5"]["rstr"]["patch_size"],
+                        16,
+                    )
+                    self.assertTrue(motion["overrides"]["gradient_checkpointing"])
+                    self.assertEqual(config["train"]["grad_accum_steps"], 1)
+                    self.assertFalse(config["train"]["early_stopping"])
+                    self.assertEqual(config["train"]["num_workers"], 2)
+                    self.assertEqual(config["train"]["batch_size"], 4 if size == "small" else 1)
 
 
 if __name__ == "__main__":

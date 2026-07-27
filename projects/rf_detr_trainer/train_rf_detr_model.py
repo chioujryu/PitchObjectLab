@@ -88,8 +88,17 @@ DDP_DATASET_DIR_ENV = "RF_DETR_TRAIN_DATASET_DIR"
 DDP_DATASET_FILE_ENV = "RF_DETR_TRAIN_DATASET_FILE"
 IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 PITCHOBJECTLAB_ARCHITECTURE_KEY = 'pitchobjectlab_architecture'
-PITCHOBJECTLAB_ARCHITECTURE_SCHEMA_VERSION = 2
+PITCHOBJECTLAB_ARCHITECTURE_SCHEMA_VERSION = 3
 PITCHOBJECTLAB_TENSORRT_EXPORT_ABI = 3
+LEGACY_TRACKNET_CONFIG_ALIASES = {
+    "rf_detr_train_motion_v5_medium.yaml": "rf_detr_train_medium_p2_tracknet_v5.yaml",
+    "rf_detr_train_motion_v5_medium_no-p2.yaml": "rf_detr_train_medium_tracknet_v5.yaml",
+    "rf_detr_train_motion_v5_large.yaml": "rf_detr_train_large_p2_tracknet_v5.yaml",
+    "rf_detr_train_motion_v5_large_no-p2.yaml": "rf_detr_train_large_tracknet_v5.yaml",
+    "rf_detr_train_motion_v5_large_v2.yaml": "rf_detr_train_large_p2_tracknet_v5.yaml",
+    "rf_detr_train_smoke_motion_v5_medium.yaml": "rf_detr_train_smoke_temporal_tracknet_v5.yaml",
+    "rf_detr_train_smoke_motion_v5_p2_medium.yaml": "rf_detr_train_smoke_temporal_tracknet_v5.yaml",
+}
 DATASET_SOURCE_FORMATS = {
     "auto",
     "rfdetr",
@@ -367,6 +376,13 @@ def deep_update(base: MutableMapping[str, Any], updates: Mapping[str, Any]) -> M
 def load_yaml(path: Path, _seen: Optional[set[Path]] = None) -> Dict[str, Any]:
     """Load a YAML mapping, resolving an optional relative ``extends`` chain."""
     path = path.expanduser().resolve()
+    if _seen is None and path.name in LEGACY_TRACKNET_CONFIG_ALIASES:
+        warnings.warn(
+            f"{path.name} is deprecated; use "
+            f"{LEGACY_TRACKNET_CONFIG_ALIASES[path.name]} instead.",
+            FutureWarning,
+            stacklevel=2,
+        )
     seen = set() if _seen is None else set(_seen)
     if path in seen:
         chain = " -> ".join(str(item) for item in (*seen, path))
@@ -679,7 +695,7 @@ def metric_scalar_value(value: Any) -> Optional[Any]:
 
 
 class EpochValidationResultsCallback(Callback):
-    """Persist validation metrics for every training epoch."""
+    """Persist and print detector/TrackNet diagnostics for every training epoch."""
 
     def __init__(self, output_dir: Path, verbose: bool) -> None:
         self.output_dir = output_dir
@@ -687,6 +703,10 @@ class EpochValidationResultsCallback(Callback):
         self.results_dir = output_dir / "epoch_results"
         self.rows: List[Dict[str, Any]] = self._load_existing_rows()
         self.written_epochs: set[int] = set()
+        self._first_batch_started_at: Optional[float] = None
+        self._first_batch_seconds: Dict[int, float] = {}
+        self._train_diagnostic_sums: Dict[int, Dict[str, float]] = {}
+        self._train_diagnostic_counts: Dict[int, int] = {}
 
     def _load_existing_rows(self) -> List[Dict[str, Any]]:
         """Load existing epoch metric rows so resumed runs preserve earlier results."""
@@ -708,19 +728,56 @@ class EpochValidationResultsCallback(Callback):
         except (TypeError, ValueError):
             return -1
 
-    def _collect_val_metrics(self, trainer: Any) -> Dict[str, Any]:
+    def _collect_epoch_metrics(self, trainer: Any) -> Dict[str, Any]:
         metrics: Dict[str, Any] = {}
         for source in (getattr(trainer, "callback_metrics", {}), getattr(trainer, "logged_metrics", {})):
             if not isinstance(source, Mapping):
                 continue
             for key, value in source.items():
                 metric_name = str(key)
-                if not metric_name.startswith("val/"):
+                if not metric_name.startswith(("train/", "val/")):
                     continue
                 scalar = metric_scalar_value(value)
                 if scalar is not None:
                     metrics[metric_name] = scalar
         return dict(sorted(metrics.items()))
+
+    def on_train_batch_start(
+        self,
+        trainer: Any,
+        pl_module: Any,
+        batch: Any,
+        batch_idx: int,
+    ) -> None:
+        """Start timing the first complete temporal micro-batch of each epoch."""
+        del trainer, pl_module, batch
+        if batch_idx == 0:
+            self._first_batch_started_at = time.perf_counter()
+
+    def on_train_batch_end(
+        self,
+        trainer: Any,
+        pl_module: Any,
+        outputs: Any,
+        batch: Any,
+        batch_idx: int,
+    ) -> None:
+        """Record first-batch latency so a slow batch is not mistaken for a hang."""
+        del outputs, batch
+        epoch_number = int(getattr(trainer, "current_epoch", -1)) + 1
+        if batch_idx == 0 and self._first_batch_started_at is not None:
+            self._first_batch_seconds[epoch_number] = time.perf_counter() - self._first_batch_started_at
+            self._first_batch_started_at = None
+        diagnostics = getattr(pl_module, "_pitchobjectlab_last_train_diagnostics", {})
+        if isinstance(diagnostics, Mapping) and diagnostics:
+            sums = self._train_diagnostic_sums.setdefault(epoch_number, {})
+            for key, value in diagnostics.items():
+                scalar = metric_scalar_value(value)
+                if isinstance(scalar, (int, float)):
+                    sums[str(key)] = sums.get(str(key), 0.0) + float(scalar)
+            self._train_diagnostic_counts[epoch_number] = (
+                self._train_diagnostic_counts.get(epoch_number, 0) + 1
+            )
 
     def on_validation_epoch_end(self, trainer: Any, pl_module: Any) -> None:
         """Write per-epoch validation metrics after RF-DETR logs them."""
@@ -734,12 +791,23 @@ class EpochValidationResultsCallback(Callback):
         if epoch_number <= 0 or epoch_number in self.written_epochs:
             return
 
-        metrics = self._collect_val_metrics(trainer)
+        metrics = self._collect_epoch_metrics(trainer)
+        diagnostic_count = self._train_diagnostic_counts.get(epoch_number, 0)
+        if diagnostic_count:
+            metrics.update(
+                {
+                    f"train/{key}": value / diagnostic_count
+                    for key, value in self._train_diagnostic_sums[epoch_number].items()
+                }
+            )
         if not metrics:
             return
 
         created_at = datetime.now().isoformat(timespec="seconds")
         global_step = int(getattr(trainer, "global_step", 0) or 0)
+        first_batch_seconds = self._first_batch_seconds.get(epoch_number)
+        if first_batch_seconds is not None:
+            metrics["train/first_batch_seconds"] = first_batch_seconds
         payload = {
             "epoch": epoch_number,
             "global_step": global_step,
@@ -768,6 +836,25 @@ class EpochValidationResultsCallback(Callback):
         write_json(self.results_dir / "latest_val_metrics.json", payload)
         self.written_epochs.add(epoch_number)
         blue(f"Saved epoch {epoch_number} validation metrics to {epoch_dir}.", verbose=self.verbose)
+        summary_keys = (
+            "train/loss",
+            "train/detector_loss",
+            "train/heatmap_loss",
+            "train/best_box_iou",
+            "train/top_query_score",
+            "train/first_batch_seconds",
+        )
+        summary = ", ".join(
+            f"{key.removeprefix('train/')}={metrics[key]:.6g}"
+            for key in summary_keys
+            if isinstance(metrics.get(key), (int, float))
+        )
+        blue(
+            f"Epoch {epoch_number} summary: global_step={global_step}"
+            + (f", {summary}" if summary else ""),
+            verbose=self.verbose,
+            force=True,
+        )
 
 
 def copy_if_exists(src: Optional[Path], dst: Path) -> None:
@@ -3061,6 +3148,30 @@ def estimate_outputs(
         batch_size = int(train.get("auto_batch_target_effective", 1) or 1)
     batch_size = max(1, batch_size)
     train_batches = max(1, int(math.ceil(float(train_images or 0) / batch_size))) if train_images else 1
+    try:
+        grad_accum_steps = max(1, int(train.get("grad_accum_steps", 1) or 1))
+    except (TypeError, ValueError):
+        grad_accum_steps = 1
+    optimizer_steps_per_epoch = int(
+        math.ceil(float(train_batches) / grad_accum_steps)
+    )
+    total_optimizer_steps = epochs * optimizer_steps_per_epoch
+    training_sanity_warnings: List[str] = []
+    if grad_accum_steps > train_batches:
+        training_sanity_warnings.append(
+            "grad_accum_steps exceeds train batches per epoch; this produces "
+            "only one optimizer update per epoch."
+        )
+    if optimizer_steps_per_epoch < 5:
+        training_sanity_warnings.append(
+            "Fewer than five optimizer updates are expected per epoch; "
+            "loss/mAP may appear stationary for many epochs."
+        )
+    if total_optimizer_steps < 100:
+        training_sanity_warnings.append(
+            "Fewer than 100 total optimizer updates are expected; this is "
+            "appropriate only for a smoke test or a deliberate micro-run."
+        )
     runtime_units = float(epochs * train_batches)
 
     estimate = {
@@ -3083,6 +3194,12 @@ def estimate_outputs(
         "final_test_files": final_files,
         "estimated_total_files": total_known,
         "estimated_disk_usage": format_bytes(approx_bytes),
+        "micro_batches_per_epoch": train_batches,
+        "grad_accum_steps": grad_accum_steps,
+        "effective_batch_size": batch_size * grad_accum_steps,
+        "optimizer_steps_per_epoch": optimizer_steps_per_epoch,
+        "total_optimizer_steps": total_optimizer_steps,
+        "training_sanity_warnings": training_sanity_warnings,
         "note": "Estimates are conservative approximations. Batch grid images overwrite fixed filenames.",
     }
     if dataset_plan and dataset_plan.get("action") == "temporal_direct":
@@ -3102,6 +3219,9 @@ def estimate_outputs(
             "train_images": train_images,
             "batch_size": batch_size,
             "train_batches_per_epoch": train_batches,
+            "grad_accum_steps": grad_accum_steps,
+            "optimizer_steps_per_epoch": optimizer_steps_per_epoch,
+            "total_optimizer_steps": total_optimizer_steps,
         },
     )
     return estimate
@@ -3230,7 +3350,10 @@ def temporal_dataset_manifest_sha256(config: Mapping[str, Any]) -> Optional[str]
     return digest.hexdigest()
 
 
-def build_pitchobjectlab_architecture(config: Mapping[str, Any]) -> Dict[str, Any]:
+def build_pitchobjectlab_architecture(
+    config: Mapping[str, Any],
+    model_config: Optional[Any] = None,
+) -> Dict[str, Any]:
     '''Serialize only graph-affecting project architecture settings.'''
 
     model = config.get('model', {})
@@ -3241,43 +3364,94 @@ def build_pitchobjectlab_architecture(config: Mapping[str, Any]) -> Dict[str, An
     projector = p2.get('projector', {}) or {}
     p2_enabled = bool(p2.get('enabled', False))
     motion_enabled = motion_module_enabled(config)
+    resolved_resolution = (
+        getattr(model_config, 'resolution', None)
+        if model_config is not None
+        else model.get('resolution')
+    )
+    resolved_num_classes = (
+        getattr(model_config, 'num_classes', None)
+        if model_config is not None
+        else model.get('num_classes')
+    )
+    resolved_num_queries = (
+        getattr(model_config, 'num_queries', None)
+        if model_config is not None
+        else (
+            (motion.get('overrides', {}) or {}).get('num_queries')
+            or (p2.get('overrides', {}) or {}).get('num_queries')
+            or (model.get('extra_model_args', {}) or {}).get('num_queries')
+        )
+    )
+    resolved_num_select = (
+        getattr(model_config, 'num_select', None)
+        if model_config is not None
+        else (
+            (motion.get('overrides', {}) or {}).get('num_select')
+            or (p2.get('overrides', {}) or {}).get('num_select')
+            or (model.get('extra_model_args', {}) or {}).get('num_select')
+        )
+    )
+    resolved_dec_n_points = (
+        getattr(model_config, 'dec_n_points', None)
+        if model_config is not None
+        else (p2.get('overrides', {}) or {}).get('dec_n_points')
+    )
     projector_scale = (
         list(p2.get('projector_scale', ['P2', 'P3', 'P4']) or [])
         if p2_enabled
         else []
     )
+    p2_metadata = {
+        'enabled': p2_enabled,
+        'projector_scale': projector_scale,
+        'projector': {
+            key: deepcopy(projector.get(key))
+            for key in (
+                'num_blocks',
+                'survival_prob',
+                'force_drop_last_n_features',
+                'layer_norm',
+                'rms_norm',
+            )
+            if projector.get(key) is not None
+        },
+    }
+    motion_metadata = {
+        'enabled': motion_enabled,
+        'type': str(motion.get('type', 'tracknet_v5')),
+        'temporal': deepcopy(dict(motion.get('temporal', {}) or {})),
+        'focus': deepcopy(dict(motion.get('focus', {}) or {})),
+        'tracknet_v5': deepcopy(dict(motion.get('tracknet_v5', {}) or {})),
+        'loss': deepcopy(dict(motion.get('loss', {}) or {})),
+    }
+    graph = {
+        'model_size': str(model.get('size', 'medium')).strip().lower(),
+        'resolution': resolved_resolution,
+        'num_queries': resolved_num_queries,
+        'num_select': resolved_num_select,
+        'num_classes': resolved_num_classes,
+        'dec_n_points': resolved_dec_n_points,
+        'p2': p2_metadata,
+        'motion': motion_metadata,
+    }
+    graph_json = json.dumps(
+        graph,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(',', ':'),
+        default=str,
+    )
     return {
         'schema_version': PITCHOBJECTLAB_ARCHITECTURE_SCHEMA_VERSION,
         'model_size': str(model.get('size', 'medium')),
-        'p2': {
-            'enabled': p2_enabled,
-            'projector_scale': projector_scale,
-            'overrides': (
-                deepcopy(dict(p2.get('overrides', {}) or {}))
-                if p2_enabled
-                else {}
-            ),
-            'projector': {
-                key: deepcopy(projector.get(key))
-                for key in (
-                    'num_blocks',
-                    'survival_prob',
-                    'force_drop_last_n_features',
-                    'layer_norm',
-                    'rms_norm',
-                )
-                if projector.get(key) is not None
-            },
-        },
-        'motion': {
-            'enabled': motion_enabled,
-            'type': str(motion.get('type', 'tracknet_v5')),
-            'temporal': deepcopy(dict(motion.get('temporal', {}) or {})),
-            'focus': deepcopy(dict(motion.get('focus', {}) or {})),
-            'tracknet_v5': deepcopy(dict(motion.get('tracknet_v5', {}) or {})),
-            'loss': deepcopy(dict(motion.get('loss', {}) or {})),
-            'overrides': deepcopy(dict(motion.get('overrides', {}) or {})),
-        },
+        'rf_detr_version': '1.8.3',
+        'graph': graph,
+        'architecture_fingerprint': hashlib.sha256(
+            graph_json.encode('utf-8')
+        ).hexdigest(),
+        'p2': p2_metadata,
+        'motion': motion_metadata,
         'dataset_manifest_sha256': temporal_dataset_manifest_sha256(config),
         'tensorrt_export_abi': PITCHOBJECTLAB_TENSORRT_EXPORT_ABI,
     }
@@ -5408,7 +5582,7 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
                 assert_p2_training_checkpoint_compatible(
                     rf_model.model,
                     pretrain_path,
-                    build_pitchobjectlab_architecture(config),
+                    build_pitchobjectlab_architecture(config, rf_model.model_config),
                     allow_stock_initialization=True,
                 )
         # Attach the TrackNetV5 motion module after the backbone is built so that
@@ -5461,20 +5635,20 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
             assert_motion_checkpoint_compatible(
                 module.model,
                 train_config.resume,
-                build_pitchobjectlab_architecture(config),
+                build_pitchobjectlab_architecture(config, rf_model.model_config),
             )
         if bool(_p2_cfg.get('enabled', False)) and train_config.resume:
             assert_p2_training_checkpoint_compatible(
                 module.model,
                 train_config.resume,
-                build_pitchobjectlab_architecture(config),
+                build_pitchobjectlab_architecture(config, rf_model.model_config),
                 allow_stock_initialization=False,
             )
 
         trainer = build_trainer(train_config, rf_model.model_config, **trainer_kwargs)
         install_best_checkpoint_metadata(
             trainer,
-            build_pitchobjectlab_architecture(config),
+            build_pitchobjectlab_architecture(config, rf_model.model_config),
         )
         trainer.callbacks.append(
             PeriodicManualTestCallback(

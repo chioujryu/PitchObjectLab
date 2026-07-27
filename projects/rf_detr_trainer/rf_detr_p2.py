@@ -480,6 +480,7 @@ def _patch_pretrain_weight_filter() -> None:
         except (IndexError, KeyError, TypeError):
             pass
         projector_scale = list(getattr(backbone, 'projector_scale', []) or [])
+        report = None
         if not strict and 'P2' in projector_scale:
             model_state = self.state_dict()
             mismatched = [
@@ -499,7 +500,30 @@ def _patch_pretrain_weight_filter() -> None:
                     f"feature-level count); e.g. {mismatched[0]}.",
                     stacklevel=2,
                 )
-        return base_load_state_dict(self, state_dict, strict, *args, **kwargs)
+            report = {
+                'schema_version': 1,
+                'projector_scale': projector_scale,
+                'source_tensor_count': len(state_dict),
+                'dropped_p2_mismatches': list(mismatched),
+                'loaded': False,
+            }
+        try:
+            result = base_load_state_dict(
+                self, state_dict, strict, *args, **kwargs
+            )
+        except Exception as error:
+            if report is not None:
+                report['error'] = f'{type(error).__name__}: {error}'
+                self._pitchobjectlab_p2_load_report = report
+            raise
+        if report is not None:
+            report['loaded'] = True
+            report['missing_keys'] = list(getattr(result, 'missing_keys', []))
+            report['unexpected_keys'] = list(
+                getattr(result, 'unexpected_keys', [])
+            )
+            self._pitchobjectlab_p2_load_report = report
+        return result
 
     load_state_dict._p2_drops_mismatch = True
     model_cls.load_state_dict = load_state_dict
@@ -582,6 +606,21 @@ def _assert_p2_metadata_compatible(
             f"checkpoint={metadata.get('schema_version')!r}, "
             f"runtime={expected_architecture.get('schema_version')!r}."
         )
+    if int(metadata.get('schema_version', 0) or 0) >= 3:
+        checkpoint_fingerprint = metadata.get('architecture_fingerprint')
+        expected_fingerprint = expected_architecture.get('architecture_fingerprint')
+        if not checkpoint_fingerprint or not expected_fingerprint:
+            raise RuntimeError(
+                'P2 schema v3 checkpoint/runtime metadata must contain an '
+                'architecture_fingerprint.'
+            )
+        if checkpoint_fingerprint != expected_fingerprint:
+            raise RuntimeError(
+                'Checkpoint P2 architecture fingerprint does not match the '
+                'configured runtime: '
+                f'checkpoint={checkpoint_fingerprint!r}, '
+                f'runtime={expected_fingerprint!r}.'
+            )
     saved_size = str(metadata.get('model_size', '')).strip().lower()
     expected_size = str(expected_architecture.get('model_size', '')).strip().lower()
     if saved_size != expected_size:
@@ -657,7 +696,13 @@ def assert_p2_checkpoint_compatible(
         for key, value in lwdetr.state_dict().items()
         if torch.is_tensor(value)
     }
-    checkpoint_architecture = dict(checkpoint_state)
+    # TrackNet is attached only after this P2 validation in test/inference.
+    # Its state is validated independently by assert_motion_checkpoint_compatible.
+    checkpoint_architecture = {
+        key: value
+        for key, value in checkpoint_state.items()
+        if not key.startswith('motion_module.')
+    }
     missing = sorted(set(expected_state) - set(checkpoint_architecture))
     unexpected = sorted(set(checkpoint_architecture) - set(expected_state))
     mismatched = sorted(
@@ -758,54 +803,42 @@ def assert_p2_training_checkpoint_compatible(
         assert_p2_checkpoint_compatible(model, checkpoint_path, expected_architecture)
         return
 
-    # Only the known feature-level tensors may differ for stock -> P2
-    # initialization. Resolution, class heads, queries, encoder width, and all
-    # other architecture tensors must remain shape-exact so the patched
-    # non-strict loader cannot silently discard an unrelated incompatibility.
-    # RF-DETR 1.8.3 derives an empty detection-only keypoint mask at runtime;
-    # older official stock checkpoints predate that persistent buffer.
-    missing = sorted(
-        key
-        for key in set(model_state) - set(checkpoint_state)
-        if not _is_p2_architecture_tensor(key)
-        and not (
-            key == '_kp_active_mask'
-            and torch.is_tensor(model_state[key])
-            and model_state[key].dtype == torch.bool
-            and model_state[key].numel() == 0
-        )
-    )
-    unexpected = sorted(
-        key
-        for key in set(checkpoint_state) - set(model_state)
-        if not _is_p2_architecture_tensor(key)
-    )
-    mismatched = sorted(
-        key
-        for key in set(model_state) & set(checkpoint_state)
-        if tuple(model_state[key].shape) != tuple(checkpoint_state[key].shape)
-        and not _is_p2_architecture_tensor(key)
-    )
-    if missing or unexpected or mismatched:
-        details: List[str] = []
-        if missing:
-            details.append(f'missing_non_p2={missing[:5]}')
-        if unexpected:
-            details.append(f'unexpected_non_p2={unexpected[:5]}')
-        if mismatched:
-            details.append(
-                'shape_mismatch_non_p2='
-                + repr(
-                    [
-                        f'{key}: checkpoint={tuple(checkpoint_state[key].shape)}, '
-                        f'model={tuple(model_state[key].shape)}'
-                        for key in mismatched[:5]
-                    ]
-                )
-            )
+    # Trust the state that actually reached LWDETR.load_state_dict after
+    # upstream RF-DETR normalized resolution, class-head, and query changes.
+    # The wrapper itself removes only known P2 feature-level tensors. Any other
+    # size mismatch still raises inside torch.load_state_dict before a
+    # successful report can be recorded.
+    report = getattr(lwdetr, '_pitchobjectlab_p2_load_report', None)
+    if not isinstance(report, Mapping):
         raise RuntimeError(
-            f'Checkpoint {path} is not a compatible stock initialization for P2: '
-            + '; '.join(details)
+            f'Checkpoint {path} was not accompanied by a P2 pretrained-load '
+            'report. Refusing to infer compatibility from the raw checkpoint.'
+        )
+    if not bool(report.get('loaded', False)) or report.get('error'):
+        raise RuntimeError(
+            f'Checkpoint {path} did not complete the normalized P2 pretrained '
+            f'load: {report.get("error")!r}.'
+        )
+    reported_scale = list(report.get('projector_scale', []) or [])
+    runtime_scale = list(getattr(backbone, 'projector_scale', []) or [])
+    if reported_scale != runtime_scale:
+        raise RuntimeError(
+            'P2 pretrained-load report projector scale does not match the '
+            f'runtime: report={reported_scale}, runtime={runtime_scale}.'
+        )
+    dropped = list(report.get('dropped_p2_mismatches', []) or [])
+    invalid_drops = sorted(
+        key for key in dropped if not _is_p2_architecture_tensor(str(key))
+    )
+    if invalid_drops:
+        raise RuntimeError(
+            'P2 pretrained-load report contains non-P2 filtered tensors: '
+            f'{invalid_drops[:5]}.'
+        )
+    if not dropped:
+        raise RuntimeError(
+            f'Checkpoint {path} looked like single-level stock weights but the '
+            'normalized loader reported no P2 feature-level adaptation.'
         )
 
 

@@ -1,0 +1,24 @@
+# Canonical RF-DETR Large + P2 + TrackNetV5-inspired temporal-head preset.
+# Official Large resolution is selected by leaving model.resolution null (704).
+extends: rf_detr_train_small_p2_tracknet_v5.yaml
+
+model:
+  size: large
+  resolution: null
+  p2:
+    enabled: true
+  motion:
+    temporal:
+      backbone_grad_mode: center_only
+    overrides:
+      resolution: null
+      gradient_checkpointing: true
+
+train:
+  batch_size: 1
+  grad_accum_steps: 1
+  num_workers: 2
+  early_stopping: false
+
+output:
+  name: "rfdetr_large_p2_tracknet_v5_e{epochs}_b{batch_size}_{timestamp}"

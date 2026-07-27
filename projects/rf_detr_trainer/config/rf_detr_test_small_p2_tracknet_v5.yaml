@@ -135,6 +135,7 @@ model:
       anchor: center
       boundary_policy: drop
       allow_single_frame_fallback: false
+      backbone_grad_mode: center_only
       # Synthetic fallback for still images. Options: identity, noise, real.
       fallback_mode: real
       # Noise standard deviation when fallback_mode=noise. Options: non-negative float.
@@ -159,9 +160,10 @@ model:
           # Learn attention parameters. Options: true, false.
           learnable: true
           # Initial sigmoid sharpness. Options: positive float.
-          init_k: 1.0
+          init_alpha: 0.2
           # Initial sigmoid midpoint. Options: float.
-          init_m: 0.5
+          init_beta: 0.15
+          epsilon: 0.000001
       # Regional Spatio-Temporal Refinement settings. Options: mapping.
       heatmap:
         target: bbox_gaussian
@@ -184,7 +186,7 @@ model:
         # Dropout probability. Options: 0.0-1.0.
         dropout: 0.1
         # Use pixel shuffle in refinement. Options: true, false.
-        use_pixel_shuffle: true
+        patch_size: 16
         # Context mask probability. Options: 0.0-1.0.
         context_mask_prob: 0.1
       fusion:

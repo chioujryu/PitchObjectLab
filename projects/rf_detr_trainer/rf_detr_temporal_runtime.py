@@ -36,6 +36,41 @@ from rf_detr_temporal_data import TemporalBatch, TemporalRFDETRDataModule
 HEATMAP_LOSS_KEY = "loss_tracknet_heatmap"
 
 
+def _box_cxcywh_to_xyxy(boxes: torch.Tensor) -> torch.Tensor:
+    """Convert normalized centre-size boxes without torchvision."""
+
+    centre = boxes[..., :2]
+    half_size = boxes[..., 2:] / 2
+    return torch.cat((centre - half_size, centre + half_size), dim=-1)
+
+
+def _best_box_iou(
+    outputs: Mapping[str, torch.Tensor],
+    targets: Sequence[Mapping[str, torch.Tensor]],
+) -> torch.Tensor:
+    """Return mean per-image best IoU as a cheap calibration diagnostic."""
+
+    predicted = outputs.get("pred_boxes")
+    if predicted is None:
+        return torch.tensor(0.0)
+    image_scores = []
+    for pred_boxes, target in zip(predicted, targets):
+        target_boxes = target.get("boxes")
+        if target_boxes is None or pred_boxes.numel() == 0 or target_boxes.numel() == 0:
+            image_scores.append(pred_boxes.new_zeros(()))
+            continue
+        pred_xyxy = _box_cxcywh_to_xyxy(pred_boxes)
+        target_xyxy = _box_cxcywh_to_xyxy(target_boxes.to(pred_boxes))
+        top_left = torch.maximum(pred_xyxy[:, None, :2], target_xyxy[None, :, :2])
+        bottom_right = torch.minimum(pred_xyxy[:, None, 2:], target_xyxy[None, :, 2:])
+        intersection = (bottom_right - top_left).clamp_min(0).prod(dim=-1)
+        pred_area = (pred_xyxy[:, 2:] - pred_xyxy[:, :2]).clamp_min(0).prod(dim=-1)
+        target_area = (target_xyxy[:, 2:] - target_xyxy[:, :2]).clamp_min(0).prod(dim=-1)
+        union = pred_area[:, None] + target_area[None, :] - intersection
+        image_scores.append((intersection / union.clamp_min(1e-8)).amax())
+    return torch.stack(image_scores).mean() if image_scores else predicted.new_zeros(())
+
+
 def _motion_config(config: Mapping[str, Any]) -> Mapping[str, Any]:
     model = config.get("model", {})
     if not isinstance(model, Mapping):
@@ -88,6 +123,7 @@ class TemporalCriterion(nn.Module):
         self.weight_dict = dict(getattr(base, "weight_dict", {}))
         self.weight_dict[HEATMAP_LOSS_KEY] = self.heatmap_weight
         self.supports_loss_normalizer_override = bool(getattr(base, "supports_loss_normalizer_override", False))
+        self.last_diagnostics: dict[str, torch.Tensor] = {}
 
     def forward(
         self,
@@ -96,12 +132,18 @@ class TemporalCriterion(nn.Module):
         **kwargs: Any,
     ) -> MutableMapping[str, torch.Tensor]:
         loss_dict = dict(self.base(outputs, targets, **kwargs))
+        detector_terms = [
+            loss_dict[key] * self.weight_dict[key]
+            for key in loss_dict
+            if key in self.weight_dict and key != HEATMAP_LOSS_KEY
+        ]
         logits = outputs.get("pred_heatmap_logits")
         if logits is None:
             raise RuntimeError(
                 "Temporal RF-DETR output is missing pred_heatmap_logits; "
                 "the instance-bound TrackNet adapter was not used."
             )
+        detector_loss = sum(detector_terms, logits.new_zeros(()))
         heatmaps = []
         for target in targets:
             value = target.get("temporal_heatmaps")
@@ -115,11 +157,24 @@ class TemporalCriterion(nn.Module):
                     f"Heatmap target/logit shape mismatch: {tuple(expected.shape)} vs {tuple(logits.shape)}"
                 )
             expected = F.interpolate(expected, size=logits.shape[-2:], mode="bilinear", align_corners=False)
-        loss_dict[HEATMAP_LOSS_KEY] = weighted_heatmap_bce(
+        heatmap_loss = weighted_heatmap_bce(
             logits,
             expected,
             gamma=self.gamma,
         )
+        loss_dict[HEATMAP_LOSS_KEY] = heatmap_loss
+        pred_logits = outputs.get("pred_logits")
+        top_query_score = (
+            pred_logits.sigmoid().amax()
+            if pred_logits is not None and pred_logits.numel()
+            else logits.new_zeros(())
+        )
+        self.last_diagnostics = {
+            "detector_loss": detector_loss.detach(),
+            "heatmap_loss": heatmap_loss.detach(),
+            "best_box_iou": _best_box_iou(outputs, targets).detach(),
+            "top_query_score": top_query_score.detach(),
+        }
         return loss_dict
 
 
@@ -167,6 +222,19 @@ def build_temporal_model_module(model_config: Any, train_config: Any, config: Ma
     motion = dict(_motion_config(config))
 
     class _TemporalRFDETRModelModule(RFDETRModelModule):
+        def _log_tracknet_diagnostics(self, prefix: str, *, batch_size: int) -> None:
+            diagnostics = getattr(self.criterion, "last_diagnostics", {})
+            if not diagnostics:
+                return
+            on_step = prefix == "train" and bool(self.train_config.train_log_on_step)
+            self.log_dict(
+                {f"{prefix}/{key}": value for key, value in diagnostics.items()},
+                on_step=on_step,
+                on_epoch=True,
+                sync_dist=prefix == "val" or bool(self.train_config.train_log_sync_dist),
+                batch_size=batch_size,
+            )
+
         def on_train_batch_start(self, batch: tuple[Any, Any], batch_idx: int) -> None:
             samples, _ = batch
             if isinstance(samples, TemporalBatch):
@@ -223,7 +291,28 @@ def build_temporal_model_module(model_config: Any, train_config: Any, config: Ma
                     padding_masks=resized_masks,
                 )
                 batch = (samples, targets)
-            return super().training_step(batch, batch_idx)
+            result = super().training_step(batch, batch_idx)
+            self._log_tracknet_diagnostics("train", batch_size=len(targets))
+            diagnostics = getattr(self.criterion, "last_diagnostics", {})
+            if diagnostics:
+                total = diagnostics["detector_loss"] + (
+                    diagnostics["heatmap_loss"] * self.criterion.heatmap_weight
+                )
+                self._pitchobjectlab_last_train_diagnostics = {
+                    "loss": total.detach(),
+                    **{key: value.detach() for key, value in diagnostics.items()},
+                }
+            return result
+
+        def validation_step(
+            self,
+            batch: tuple[Any, Any],
+            batch_idx: int,
+        ) -> dict[str, Any]:
+            result = super().validation_step(batch, batch_idx)
+            if bool(self.train_config.compute_val_loss):
+                self._log_tracknet_diagnostics("val", batch_size=len(batch[1]))
+            return result
 
     module = _TemporalRFDETRModelModule(model_config, train_config)
     attach_motion_module(module.model, motion)

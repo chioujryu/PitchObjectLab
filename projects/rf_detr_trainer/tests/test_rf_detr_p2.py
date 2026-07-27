@@ -313,6 +313,18 @@ class P2CheckpointCompatibilityTest(unittest.TestCase):
             },
         }
 
+    @staticmethod
+    def _record_successful_stock_load(model, *, dropped=None):
+        model._pitchobjectlab_p2_load_report = {
+            "schema_version": 1,
+            "projector_scale": ["P2", "P3", "P4"],
+            "dropped_p2_mismatches": dropped
+            or ["transformer.cross_attn.sampling_offsets.weight"],
+            "loaded": True,
+            "missing_keys": [],
+            "unexpected_keys": [],
+        }
+
     def test_legacy_checkpoint_loads_when_p2_shapes_are_exact(self):
         model = self._LWDETR()
         with tempfile.TemporaryDirectory() as directory:
@@ -362,6 +374,7 @@ class P2CheckpointCompatibilityTest(unittest.TestCase):
 
     def test_training_guard_allows_single_level_stock_initialization(self):
         model = self._LWDETR()
+        self._record_successful_stock_load(model)
         state = {key: value.clone() for key, value in model.state_dict().items()}
         state["transformer.cross_attn.sampling_offsets.weight"] = torch.zeros(4, 4)
         with tempfile.TemporaryDirectory() as directory:
@@ -376,6 +389,7 @@ class P2CheckpointCompatibilityTest(unittest.TestCase):
 
     def test_training_guard_allows_missing_empty_keypoint_mask_in_stock_initialization(self):
         model = self._LWDETR()
+        self._record_successful_stock_load(model)
         model.register_buffer("_kp_active_mask", torch.zeros((0, 0), dtype=torch.bool))
         state = {
             key: value.clone()
@@ -393,8 +407,17 @@ class P2CheckpointCompatibilityTest(unittest.TestCase):
                 allow_stock_initialization=True,
             )
 
-    def test_training_guard_rejects_missing_nonempty_keypoint_mask(self):
+    def test_training_guard_rejects_unsuccessful_normalized_load_report(self):
         model = self._LWDETR()
+        model._pitchobjectlab_p2_load_report = {
+            "schema_version": 1,
+            "projector_scale": ["P2", "P3", "P4"],
+            "dropped_p2_mismatches": [
+                "transformer.cross_attn.sampling_offsets.weight"
+            ],
+            "loaded": False,
+            "error": "RuntimeError: simulated non-P2 shape mismatch",
+        }
         model.register_buffer("_kp_active_mask", torch.ones((1, 1), dtype=torch.bool))
         state = {
             key: value.clone()
@@ -406,7 +429,7 @@ class P2CheckpointCompatibilityTest(unittest.TestCase):
             checkpoint = Path(directory) / "stock_without_nonempty_keypoint_mask.pth"
             torch.save({"model": state}, checkpoint)
 
-            with self.assertRaisesRegex(RuntimeError, "missing_non_p2"):
+            with self.assertRaisesRegex(RuntimeError, "did not complete"):
                 rf_detr_p2.assert_p2_training_checkpoint_compatible(
                     model,
                     checkpoint,
@@ -443,8 +466,12 @@ class P2CheckpointCompatibilityTest(unittest.TestCase):
                     allow_stock_initialization=True,
                 )
 
-    def test_training_guard_rejects_non_p2_shape_mismatch_in_stock_checkpoint(self):
+    def test_training_guard_rejects_non_p2_filtered_tensor_report(self):
         model = self._LWDETR()
+        self._record_successful_stock_load(
+            model,
+            dropped=["class_embed.weight"],
+        )
         state = {key: value.clone() for key, value in model.state_dict().items()}
         state["transformer.cross_attn.sampling_offsets.weight"] = torch.zeros(4, 4)
         state["class_embed.weight"] = torch.zeros(9, 4)
@@ -452,7 +479,7 @@ class P2CheckpointCompatibilityTest(unittest.TestCase):
             checkpoint = Path(directory) / "wrong_class_stock.pth"
             torch.save({"model": state}, checkpoint)
 
-            with self.assertRaisesRegex(RuntimeError, "shape_mismatch_non_p2"):
+            with self.assertRaisesRegex(RuntimeError, "non-P2 filtered tensors"):
                 rf_detr_p2.assert_p2_training_checkpoint_compatible(
                     model,
                     checkpoint,

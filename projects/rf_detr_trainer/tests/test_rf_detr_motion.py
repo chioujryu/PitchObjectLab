@@ -1,7 +1,7 @@
 """Tests for the pluggable TrackNetV5 motion module in rf_detr_motion.py.
 
 These cover:
-* MotionDirectionDecoupling forward (shape + zero-delta identity).
+* MotionDirectionDecoupling forward (shape + paper alpha/beta mapping).
 * MotionFeatureGate forward (shape + zero-init identity).
 * RSTRHead forward (shape + residual skip).
 * MotionModule forward (shape, fallback modes).
@@ -124,12 +124,27 @@ class LearnableSigmoidAttentionTest(unittest.TestCase):
         self.assertTrue((out >= 0).all() and (out <= 1).all())
 
     def test_zero_input_gives_constant_output(self):
-        """σ(k*(0 − m)) is constant for all spatial positions."""
+        """The paper mapping is constant for equal polarity intensity."""
         attn = motion.LearnableSigmoidAttention(num_channels=3)
         x = torch.zeros(1, 3, 5, 5)
         out = attn(x)
         # All spatial positions should be equal.
         self.assertTrue(torch.allclose(out[:, :, 0:1, 0:1].expand_as(out), out))
+
+    def test_matches_published_alpha_beta_equation(self):
+        attn = motion.LearnableSigmoidAttention(
+            num_channels=1,
+            init_alpha=0.2,
+            init_beta=0.15,
+            epsilon=1.0e-6,
+        )
+        x = torch.tensor([[[[0.0, 0.25]]]])
+        alpha = torch.tensor(0.2)
+        beta = torch.tensor(0.15)
+        k = 5.0 / (0.45 * torch.abs(torch.tanh(alpha)) + 1.0e-6)
+        midpoint = 0.6 * torch.tanh(beta)
+        expected = torch.sigmoid(k * (torch.abs(x) - midpoint))
+        torch.testing.assert_close(attn(x), expected)
 
 
 # ---------------------------------------------------------------------------
@@ -150,22 +165,28 @@ class MDDTest(unittest.TestCase):
         out = mdd(frames)
         self.assertEqual(out.shape, (2, 4, 16, 16))
 
-    def test_identical_frames_produce_exact_zero(self):
+    def test_identical_frames_produce_low_equal_attention(self):
         mdd = self._make_mdd(learnable=True)
         image = torch.rand(2, 3, 8, 8)
         frames = image.unsqueeze(1).expand(-1, 3, -1, -1, -1)
-        self.assertTrue(torch.equal(mdd(frames), torch.zeros(2, 4, 8, 8)))
+        output = mdd(frames)
+        self.assertTrue(torch.all(output > 0.0))
+        self.assertTrue(torch.all(output < 0.01))
+        torch.testing.assert_close(
+            output,
+            output[:, :, :1, :1].expand_as(output),
+        )
 
     def test_uses_luminance_and_both_adjacent_pairs(self):
         mdd = self._make_mdd()
         frames = torch.zeros(1, 3, 3, 2, 2)
         frames[:, 1, 0] = 1.0  # red increases from previous to centre
         frames[:, 2, 0] = 0.25  # red decreases from centre to next
-        out = mdd(frames)
-        self.assertTrue(torch.allclose(out[:, 0], torch.full_like(out[:, 0], 0.299)))
-        self.assertTrue(torch.equal(out[:, 1], torch.zeros_like(out[:, 1])))
-        self.assertTrue(torch.equal(out[:, 2], torch.zeros_like(out[:, 2])))
-        self.assertTrue(torch.allclose(out[:, 3], torch.full_like(out[:, 3], 0.299 * 0.75)))
+        raw = mdd.raw_polarities(frames)
+        self.assertTrue(torch.allclose(raw[:, 0], torch.full_like(raw[:, 0], 0.299)))
+        self.assertTrue(torch.equal(raw[:, 1], torch.zeros_like(raw[:, 1])))
+        self.assertTrue(torch.equal(raw[:, 2], torch.zeros_like(raw[:, 2])))
+        self.assertTrue(torch.allclose(raw[:, 3], torch.full_like(raw[:, 3], 0.299 * 0.75)))
 
     def test_polarity_fields_are_non_negative(self):
         out = self._make_mdd(learnable=True)(torch.randn(2, 3, 3, 16, 16))
@@ -193,7 +214,7 @@ class RSTRHeadTest(unittest.TestCase):
             "num_heads": 2,
             "num_blocks": 1,
             "dropout": 0.0,
-            "use_pixel_shuffle": True,
+            "patch_size": 4,
             "context_mask_prob": 0.0,
         }
         kwargs.update(overrides)
@@ -231,6 +252,21 @@ class RSTRHeadTest(unittest.TestCase):
         self.assertTrue(torch.equal(head(drafts, motion_maps), head(drafts, motion_maps)))
         head.train()
         self.assertEqual(head(drafts, motion_maps).shape, drafts.shape)
+
+    def test_training_mask_changes_residual_base_but_eval_uses_clean_draft(self):
+        head = self._make_head(
+            context_mask_prob=0.5,
+            num_blocks=0,
+        )
+        drafts = torch.ones(1, 3, 8, 8)
+        motion_maps = torch.zeros(1, 4, 8, 8)
+        head.eval()
+        torch.testing.assert_close(head(drafts, motion_maps), drafts)
+        head.train()
+        torch.manual_seed(7)
+        masked = head(drafts, motion_maps)
+        self.assertFalse(torch.equal(masked, drafts))
+        self.assertTrue(bool((masked == 0).any()))
 
 
 class HeatmapUtilitiesTest(unittest.TestCase):
@@ -297,8 +333,8 @@ class MotionModuleTest(unittest.TestCase):
         "type": "tracknet_v5",
         "temporal": {"num_frames": 3, "fallback_mode": "identity", "noise_std": 0.02},
         "tracknet_v5": {
-            "mdd": {"enabled": True, "polarity_channels": 4, "attention": {"learnable": True, "init_k": 1.0, "init_m": 0.5}},
-            "rstr": {"enabled": True, "num_blocks": 1, "hidden_dim": 32, "num_heads": 4, "dropout": 0.0, "use_pixel_shuffle": True, "context_mask_prob": 0.0},
+            "mdd": {"enabled": True, "polarity_channels": 4, "attention": {"learnable": True, "init_alpha": 0.2, "init_beta": 0.15, "epsilon": 1.0e-6}},
+            "rstr": {"enabled": True, "num_blocks": 1, "hidden_dim": 32, "num_heads": 4, "dropout": 0.0, "patch_size": 4, "context_mask_prob": 0.0},
         },
         "loss": {"motion_attention_weight": 0.0},
     }
@@ -626,6 +662,7 @@ class InstanceTemporalForwardTest(unittest.TestCase):
                 super().__init__()
                 self.level = _FakeBackboneLevel(("P4",), 8)
                 self.seen_tensors = []
+                self.seen_grad_enabled = []
 
             def __getitem__(self, index):
                 if index != 0:
@@ -635,6 +672,7 @@ class InstanceTemporalForwardTest(unittest.TestCase):
             def forward(self, samples):
                 tensors, masks = samples.decompose()
                 self.seen_tensors.append(tensors.detach().clone())
+                self.seen_grad_enabled.append(torch.is_grad_enabled())
                 pooled = torch.nn.functional.avg_pool2d(tensors.mean(1, keepdim=True), 2)
                 feature = pooled.expand(-1, 8, -1, -1).contiguous()
                 feature_mask = torch.nn.functional.interpolate(
@@ -696,11 +734,28 @@ class InstanceTemporalForwardTest(unittest.TestCase):
         torch.testing.assert_close(mdd_inputs[1], frames)
         torch.testing.assert_close(
             model.backbone.seen_tensors[0],
-            frames.reshape(6, 3, 16, 20),
+            frames[:, 0],
         )
         torch.testing.assert_close(
             model.backbone.seen_tensors[1],
-            normalized_frames.reshape(6, 3, 16, 20),
+            frames[:, 1],
+        )
+        torch.testing.assert_close(model.backbone.seen_tensors[2], frames[:, 2])
+        torch.testing.assert_close(
+            model.backbone.seen_tensors[3],
+            normalized_frames[:, 0],
+        )
+        torch.testing.assert_close(
+            model.backbone.seen_tensors[4],
+            normalized_frames[:, 1],
+        )
+        torch.testing.assert_close(
+            model.backbone.seen_tensors[5],
+            normalized_frames[:, 2],
+        )
+        self.assertEqual(
+            model.backbone.seen_grad_enabled,
+            [False, True, False, False, True, False],
         )
         for output in (raw_output, batch_output):
             self.assertEqual(output["pred_logits"].shape[0], 2)
@@ -725,9 +780,10 @@ class MotionCheckpointCompatibilityTest(unittest.TestCase):
     @staticmethod
     def _metadata(motion_config):
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "model_size": "medium",
             "motion": motion_config,
+            "architecture_fingerprint": repr(motion_config),
         }
 
     def test_checkpoint_accepts_exact_motion_state(self):
@@ -889,7 +945,7 @@ class MotionCheckpointCompatibilityTest(unittest.TestCase):
                     checkpoint,
                 )
 
-                with self.assertRaisesRegex(RuntimeError, "TrackNet architecture metadata"):
+                with self.assertRaisesRegex(RuntimeError, "TrackNet architecture fingerprint"):
                     motion.assert_motion_checkpoint_compatible(
                         model,
                         checkpoint,

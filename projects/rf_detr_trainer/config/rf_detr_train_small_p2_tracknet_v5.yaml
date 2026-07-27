@@ -96,6 +96,8 @@ model:
       anchor: center
       boundary_policy: drop
       allow_single_frame_fallback: false
+      # Context frames retain real features without storing backbone activations.
+      backbone_grad_mode: center_only
       # How to synthesise multi-frame input for single-frame datasets.
       # Options:
       #   identity 鈥?all T frames identical (螖=0, zero motion maps, identity gate).
@@ -119,18 +121,18 @@ model:
       mdd:
         # Enable Motion Direction Decoupling polarity fields. Options: true, false.
         enabled: true
-        # Output channels *per polarity field* (P鈦?and P鈦?each). Must be even.
-        # Total motion_channels = 2 * polarity_channels, fed to feature gates.
-        # Options: positive even integer. 4 = 2 per polarity, 8 = 4 per polarity.
+        # Exactly four maps: positive/negative motion for both adjacent pairs.
         polarity_channels: 4
         # attention nested configuration block. Options: mapping.
         attention:
-          # Learn sigmoid steepness (k) and midpoint (m) per channel. Options: true, false.
+          # Learn paper alpha/beta parameters used to derive k/m per channel.
           learnable: true
-          # Initial k (steepness). Options: positive float. 1.0 = gentle sigmoid.
-          init_k: 1.0
-          # Initial m (midpoint). Options: float. 0.5 = threshold at 0.5 polarity intensity.
-          init_m: 0.5
+          # Initial alpha controlling the derived sigmoid steepness k.
+          init_alpha: 0.2
+          # Initial beta controlling the derived sigmoid midpoint m.
+          init_beta: 0.15
+          # Numerical-stability epsilon in the alpha-to-k mapping.
+          epsilon: 0.000001
 
       # R-STR refinement settings. Options: mapping.
       heatmap:
@@ -149,15 +151,14 @@ model:
         hidden_dim: 256
         # Multi-head attention heads. Must divide hidden_dim evenly. Options: positive integer.
         num_heads: 8
-        # Factorised attention mode (spatial only for Phase-1 T=1).
-        # Options: divided (factorised), joint.
+        # Factorised spatial then temporal attention. Options: divided.
         attention_mode: divided
         # Dropout inside attention and FFN. Options: 0.0-0.5.
         dropout: 0.1
-        # Use PixelShuffle upsampling on the refinement delta. Options: true, false.
-        use_pixel_shuffle: true
+        # R-STR patch size; residual is restored with PixelShuffle.
+        patch_size: 16
         # Stochastic context masking probability during training (paper: 蟻=0.1).
-        # Randomly zeros spatial tokens to prevent over-reliance on any one region.
+        # Element-wise dropout on the motion-aware draft before residual addition.
         # Options: 0.0-0.3. 0.0 disables.
         context_mask_prob: 0.1
       fusion:
@@ -245,7 +246,7 @@ train:
   # Reduced from 4 鈫?2 to accommodate R-STR memory overhead per scale.
   batch_size: 4
   # Raised from 4 鈫?8 to keep effective batch = 16.
-  grad_accum_steps: 8
+  grad_accum_steps: 1
   # Auto-batch target effective batch size. Options: positive integer.
   auto_batch_target_effective: 16
   # Auto-batch target-density guard. Options: positive integer.
@@ -287,7 +288,7 @@ train:
   # DataLoader worker count. Options: 2 by project rule.
   num_workers: 2
   # Enable early stopping. Options: true, false.
-  early_stopping: true
+  early_stopping: false
   # Early-stopping patience. Options: positive integer.
   early_stopping_patience: 10
   # Minimum improvement for early stopping. Options: non-negative number.

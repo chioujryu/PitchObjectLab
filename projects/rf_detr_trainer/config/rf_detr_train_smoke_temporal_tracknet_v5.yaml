@@ -24,6 +24,7 @@ model:
       anchor: center
       boundary_policy: drop
       allow_single_frame_fallback: false
+      backbone_grad_mode: center_only
     focus:
       # Override with --tracknet-focus single when validating primary-ball mode.
       mode: all
@@ -36,8 +37,9 @@ model:
         polarity_channels: 4
         attention:
           learnable: true
-          init_k: 1.0
-          init_m: 0.5
+          init_alpha: 0.2
+          init_beta: 0.15
+          epsilon: 0.000001
       heatmap:
         target: bbox_gaussian
         min_sigma: 1.0
@@ -51,7 +53,7 @@ model:
         num_heads: 4
         attention_mode: divided
         dropout: 0.0
-        use_pixel_shuffle: true
+        patch_size: 16
         context_mask_prob: 0.0
       fusion:
         mode: zero_init_residual
