@@ -57,6 +57,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import warnings
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -87,12 +88,13 @@ DDP_DATASET_DIR_ENV = "RF_DETR_TRAIN_DATASET_DIR"
 DDP_DATASET_FILE_ENV = "RF_DETR_TRAIN_DATASET_FILE"
 IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 PITCHOBJECTLAB_ARCHITECTURE_KEY = 'pitchobjectlab_architecture'
-PITCHOBJECTLAB_ARCHITECTURE_SCHEMA_VERSION = 1
+PITCHOBJECTLAB_ARCHITECTURE_SCHEMA_VERSION = 2
 PITCHOBJECTLAB_TENSORRT_EXPORT_ABI = 3
 DATASET_SOURCE_FORMATS = {
     "auto",
     "rfdetr",
     "roboflow",
+    "spatiotemporal_yolo",
     "ultralytics_yolo",
     "coco_json",
     "pascal_voc",
@@ -362,12 +364,25 @@ def deep_update(base: MutableMapping[str, Any], updates: Mapping[str, Any]) -> M
     return base
 
 
-def load_yaml(path: Path) -> Dict[str, Any]:
-    """Load a YAML mapping."""
+def load_yaml(path: Path, _seen: Optional[set[Path]] = None) -> Dict[str, Any]:
+    """Load a YAML mapping, resolving an optional relative ``extends`` chain."""
+    path = path.expanduser().resolve()
+    seen = set() if _seen is None else set(_seen)
+    if path in seen:
+        chain = " -> ".join(str(item) for item in (*seen, path))
+        raise ValueError(f"Config extends cycle detected: {chain}")
+    seen.add(path)
     with path.open("r", encoding="utf-8") as file:
         data = yaml.safe_load(file) or {}
     if not isinstance(data, dict):
         raise ValueError(f"Config must be a YAML mapping: {path}")
+    parent = data.pop("extends", None)
+    if parent not in (None, ""):
+        parent_path = Path(str(parent)).expanduser()
+        if not parent_path.is_absolute():
+            parent_path = (path.parent / parent_path).resolve()
+        base = load_yaml(parent_path, seen)
+        return dict(deep_update(base, data))
     return data
 
 
@@ -556,6 +571,10 @@ def build_output_template_context(config: Mapping[str, Any], timestamp: str) -> 
         "time": timestamp[8:],
         "model_size": model.get("size", "model"),
         "resolution": model.get("resolution") or "default",
+        "tracknet_focus": (
+            ((model.get("motion", {}) or {}).get("focus", {}) or {}).get("mode", "disabled")
+            if bool((model.get("motion", {}) or {}).get("enabled", False)) else "disabled"
+        ),
         "pretrain": path_name_or_default(model.get("pretrain_weights", "default"), "default"),
         "num_classes": model.get("num_classes") or "auto",
         "dataset_name": path_name_or_default(dataset_dir, "dataset"),
@@ -2527,6 +2546,55 @@ def build_rfdetr_limited_dataset_plan(
     }
 
 
+def motion_module_enabled(config: Mapping[str, Any]) -> bool:
+    """Return whether the optional TrackNet module is actually requested."""
+    model = config.get("model", {})
+    motion = model.get("motion", {}) if isinstance(model, Mapping) else {}
+    if not isinstance(motion, Mapping) or not bool(motion.get("enabled", False)):
+        return False
+    return str(motion.get("type", "tracknet_v5")).strip().lower() != "none"
+
+
+def temporal_motion_enabled(config: Mapping[str, Any]) -> bool:
+    """Return whether this run requires real indexed temporal windows."""
+
+    if not motion_module_enabled(config):
+        return False
+    motion = config["model"]["motion"]
+    temporal = motion.get("temporal", {}) or {}
+    mode = str(temporal.get("mode", temporal.get("fallback_mode", "real"))).strip().lower()
+    return mode == "real"
+
+
+def _align_temporal_num_classes(rf_model: Any, class_names: Sequence[str]) -> None:
+    """Align an unset RF-DETR class head to the temporal dataset vocabulary."""
+
+    if not class_names:
+        raise ValueError("Temporal training requires at least one dataset class name.")
+    model_config = rf_model.model_config
+    dataset_num_classes = len(class_names)
+    model_num_classes = int(model_config.num_classes)
+    user_overrode = "num_classes" in getattr(model_config, "model_fields_set", set())
+    model_args = getattr(getattr(rf_model, "model", None), "args", None)
+
+    if dataset_num_classes == model_num_classes:
+        if model_args is not None:
+            model_args.num_classes = dataset_num_classes
+        return
+    if not user_overrode:
+        model_config.num_classes = dataset_num_classes
+        if model_args is not None:
+            model_args.num_classes = dataset_num_classes
+        return
+    warnings.warn(
+        "Temporal dataset has "
+        f"{dataset_num_classes} classes but model.num_classes was explicitly set to "
+        f"{model_num_classes}; preserving the explicit model setting.",
+        UserWarning,
+        stacklevel=2,
+    )
+
+
 def build_dataset_plan(
     config: Mapping[str, Any],
     output_dir: Path,
@@ -2543,6 +2611,66 @@ def build_dataset_plan(
             "dataset.dataset_dir/train.dataset_dir",
         )
     data_yaml = find_dataset_yaml(config, source_config)
+    if temporal_motion_enabled(config):
+        if dataset_dir is None:
+            raise ValueError("Real TrackNet temporal mode requires dataset.dataset_dir.")
+        if data_yaml is None:
+            raise ValueError("Real TrackNet temporal mode requires dataset.data_yaml or dataset.yaml.")
+        temporal = ((config.get("model", {}) or {}).get("motion", {}) or {}).get("temporal", {}) or {}
+        num_frames = int(temporal.get("num_frames", 3))
+        frame_stride = int(temporal.get("frame_stride", 1))
+        from rf_detr_temporal_data import temporal_split_window_counts
+
+        split_counts = temporal_split_window_counts(
+            data_yaml,
+            num_frames=num_frames,
+            stride=frame_stride,
+        )
+        complete_split_counts = dict(split_counts)
+        temporal_dataset = (config.get("dataset", {}) or {}).get("temporal", {}) or {}
+        max_windows = (
+            temporal_dataset.get("max_windows_per_split", {})
+            if isinstance(temporal_dataset, Mapping)
+            else {}
+        )
+        if isinstance(max_windows, int):
+            max_windows = {
+                "train": max_windows,
+                "val": max_windows,
+                "test": max_windows,
+            }
+        if not isinstance(max_windows, Mapping):
+            raise ValueError(
+                "dataset.temporal.max_windows_per_split must be an integer or mapping"
+            )
+        normalised_limits: Dict[str, int] = {}
+        for raw_split, raw_limit in max_windows.items():
+            split = str(raw_split).strip().lower()
+            if split == "valid":
+                split = "val"
+            limit = int(raw_limit)
+            if limit < 1:
+                raise ValueError(
+                    "dataset.temporal.max_windows_per_split values must be positive"
+                )
+            normalised_limits[split] = limit
+        split_counts = {
+            split: min(int(count), normalised_limits.get(split, int(count)))
+            for split, count in complete_split_counts.items()
+        }
+        return {
+            "source_format": "spatiotemporal_yolo",
+            "action": "temporal_direct",
+            "dataset_dir": dataset_dir,
+            "data_yaml": data_yaml,
+            "temporal_index": dataset_dir / "metadata" / "temporal_index.jsonl",
+            "split_counts": split_counts,
+            "complete_split_counts": complete_split_counts,
+            "copy_file_count": 0,
+            "copy_bytes": 0,
+            "num_frames": num_frames,
+            "frame_stride": frame_stride,
+        }
     source_format = resolve_dataset_source_format(config, dataset_dir, data_yaml, source_config)
     if source_format != "rfdetr":
         return build_cache_dataset_plan(config, source_format, dataset_dir, data_yaml, source_config)
@@ -2843,6 +2971,16 @@ def materialize_dataset_plan(
     """Create any dataset adapter outputs required by the plan."""
     if plan.get("action") == "prepare_cache":
         return materialize_cache_dataset_plan(plan, config, output_dir, verbose)
+    if plan.get("action") == "temporal_direct":
+        return {
+            "source_format": "spatiotemporal_yolo",
+            "dataset_dir": str(plan.get("dataset_dir")),
+            "data_yaml": str(plan.get("data_yaml")),
+            "temporal_index": str(plan.get("temporal_index")),
+            "split_window_counts": dict(plan.get("split_counts", {})),
+            "num_frames": int(plan.get("num_frames", 3)),
+            "frame_stride": int(plan.get("frame_stride", 1)),
+        }
     return {}
 
 
@@ -2947,6 +3085,11 @@ def estimate_outputs(
         "estimated_disk_usage": format_bytes(approx_bytes),
         "note": "Estimates are conservative approximations. Batch grid images overwrite fixed filenames.",
     }
+    if dataset_plan and dataset_plan.get("action") == "temporal_direct":
+        estimate["split_window_counts"] = split_counts
+        estimate["complete_temporal_window_counts"] = dict(
+            dataset_plan.get("complete_split_counts", split_counts)
+        )
     add_runtime_estimate(
         estimate=estimate,
         config=config,
@@ -3056,6 +3199,37 @@ def normalize_pretrain_weights(value: Any) -> Tuple[bool, Optional[str]]:
     return True, str(resolved)
 
 
+def temporal_dataset_manifest_sha256(config: Mapping[str, Any]) -> Optional[str]:
+    """Hash the canonical temporal index for checkpoint provenance."""
+
+    if not temporal_motion_enabled(config):
+        return None
+    dataset = config.get("dataset", {})
+    if not isinstance(dataset, Mapping):
+        return None
+    yaml_value = str(dataset.get("data_yaml") or "").strip()
+    if yaml_value:
+        yaml_path = Path(yaml_value).expanduser()
+        if not yaml_path.is_absolute():
+            yaml_path = (Path.cwd() / yaml_path).resolve()
+        dataset_root = yaml_path.parent
+    else:
+        root_value = str(dataset.get("dataset_dir") or "").strip()
+        if not root_value:
+            return None
+        dataset_root = Path(root_value).expanduser()
+        if not dataset_root.is_absolute():
+            dataset_root = (Path.cwd() / dataset_root).resolve()
+    manifest = dataset_root / "metadata" / "temporal_index.jsonl"
+    if not manifest.is_file():
+        return None
+    digest = hashlib.sha256()
+    with manifest.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def build_pitchobjectlab_architecture(config: Mapping[str, Any]) -> Dict[str, Any]:
     '''Serialize only graph-affecting project architecture settings.'''
 
@@ -3066,9 +3240,11 @@ def build_pitchobjectlab_architecture(config: Mapping[str, Any]) -> Dict[str, An
     motion = model.get('motion', {}) or {}
     projector = p2.get('projector', {}) or {}
     p2_enabled = bool(p2.get('enabled', False))
-    projector_scale = list(
-        p2.get('projector_scale', ['P2', 'P3', 'P4'] if p2_enabled else [])
-        or []
+    motion_enabled = motion_module_enabled(config)
+    projector_scale = (
+        list(p2.get('projector_scale', ['P2', 'P3', 'P4']) or [])
+        if p2_enabled
+        else []
     )
     return {
         'schema_version': PITCHOBJECTLAB_ARCHITECTURE_SCHEMA_VERSION,
@@ -3076,7 +3252,11 @@ def build_pitchobjectlab_architecture(config: Mapping[str, Any]) -> Dict[str, An
         'p2': {
             'enabled': p2_enabled,
             'projector_scale': projector_scale,
-            'overrides': deepcopy(dict(p2.get('overrides', {}) or {})),
+            'overrides': (
+                deepcopy(dict(p2.get('overrides', {}) or {}))
+                if p2_enabled
+                else {}
+            ),
             'projector': {
                 key: deepcopy(projector.get(key))
                 for key in (
@@ -3090,12 +3270,15 @@ def build_pitchobjectlab_architecture(config: Mapping[str, Any]) -> Dict[str, An
             },
         },
         'motion': {
-            'enabled': bool(motion.get('enabled', False)),
+            'enabled': motion_enabled,
             'type': str(motion.get('type', 'tracknet_v5')),
             'temporal': deepcopy(dict(motion.get('temporal', {}) or {})),
+            'focus': deepcopy(dict(motion.get('focus', {}) or {})),
             'tracknet_v5': deepcopy(dict(motion.get('tracknet_v5', {}) or {})),
+            'loss': deepcopy(dict(motion.get('loss', {}) or {})),
             'overrides': deepcopy(dict(motion.get('overrides', {}) or {})),
         },
+        'dataset_manifest_sha256': temporal_dataset_manifest_sha256(config),
         'tensorrt_export_abi': PITCHOBJECTLAB_TENSORRT_EXPORT_ABI,
     }
 
@@ -3196,18 +3379,13 @@ def build_model_kwargs(config: Mapping[str, Any]) -> Dict[str, Any]:
     if bool(p2_cfg.get("enabled", False)):
         kwargs["projector_scale"] = resolve_p2_projector_scale(p2_cfg)
         apply_p2_overrides(kwargs, p2_cfg)
-    # Optional pluggable TrackNetV5 motion module. Fully inert unless model.motion.enabled.
-    # ensure_motion_support patches LWDETR construction/forward in-process. The constructor
-    # hook attaches motion after the backbone exists and before RF-DETR restores checkpoint
-    # weights, covering both facade and Lightning model construction.
+    # Optional TrackNet integration is imported and installed only for enabled models.
+    # A disabled build therefore remains the exact upstream LWDETR path.
     motion_cfg = model_cfg.get("motion", {}) or {"enabled": False}
-    from rf_detr_motion import apply_motion_overrides, ensure_motion_support
+    if motion_module_enabled(config):
+        from rf_detr_motion import apply_motion_overrides, ensure_motion_support
 
-    # Record disabled configs too. The LWDETR constructor hook reads the active
-    # process setting, so this prevents an enabled build from leaking motion into
-    # a later stock model in the same worker process.
-    ensure_motion_support(motion_cfg)
-    if bool(motion_cfg.get("enabled", False)):
+        ensure_motion_support(motion_cfg)
         apply_motion_overrides(kwargs, motion_cfg)
     should_pass, pretrain = normalize_pretrain_weights(model_cfg.get("pretrain_weights", "default"))
     if should_pass:
@@ -4877,6 +5055,10 @@ def apply_cli_overrides(config: MutableMapping[str, Any], args: argparse.Namespa
         model["pretrain_weights"] = args.pretrain_weights
     if args.num_classes is not None:
         model["num_classes"] = args.num_classes
+    tracknet_focus = getattr(args, "tracknet_focus", None)
+    if tracknet_focus is not None:
+        motion = model.setdefault("motion", {})
+        motion.setdefault("focus", {})["mode"] = tracknet_focus
     if args.dataset_dir is not None:
         dataset["dataset_dir"] = args.dataset_dir
         train["dataset_dir"] = args.dataset_dir
@@ -4997,6 +5179,12 @@ Example usage:
     parser.add_argument("--resolution", type=int, default=None, help="Input resolution override.")
     parser.add_argument("--pretrain-weights", default=None, help="default, null/false, hosted key, or local .pth path.")
     parser.add_argument("--num-classes", type=int, default=None, help="Optional class count override.")
+    parser.add_argument(
+        "--tracknet-focus",
+        choices=("single", "all"),
+        default=None,
+        help="Override model.motion.focus.mode for TrackNet heatmap supervision.",
+    )
 
     parser.add_argument("--dataset-dir", default=None, help="Dataset root or RF-DETR dataset root.")
     parser.add_argument("--data-yaml", default=None, help="Ultralytics YOLO dataset YAML path.")
@@ -5209,14 +5397,8 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
 
         blue(f"Creating RF-DETR model: {model_cls.__name__}.", verbose)
         rf_model = model_cls(**model_kwargs)
-        # Attach the TrackNetV5 motion module after the backbone is built so that
-        # the projector output channel count is available for MotionModule sizing.
-        _motion_cfg = config.get("model", {}).get("motion", {}) or {}
-        if bool(_motion_cfg.get("enabled", False)):
-            from rf_detr_motion import attach_motion_module
-
-            attach_motion_module(rf_model.model, _motion_cfg)
-            blue("TrackNetV5 motion module (MDD + R-STR) attached to LWDETR.", verbose)
+        # Validate stock -> P2 before project-owned modules add their own state.
+        # TrackNet is intentionally absent from the official RF-DETR checkpoint.
         _p2_cfg = config.get('model', {}).get('p2', {}) or {}
         if bool(_p2_cfg.get('enabled', False)):
             from rf_detr_p2 import assert_p2_training_checkpoint_compatible
@@ -5229,6 +5411,15 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
                     build_pitchobjectlab_architecture(config),
                     allow_stock_initialization=True,
                 )
+        # Attach the TrackNetV5 motion module after the backbone is built so that
+        # the projector output channel count is available for MotionModule sizing.
+        _motion_cfg = config.get("model", {}).get("motion", {}) or {}
+        _motion_enabled = motion_module_enabled(config)
+        if _motion_enabled:
+            from rf_detr_motion import attach_motion_module
+
+            attach_motion_module(rf_model.model, _motion_cfg)
+            blue("TrackNetV5 motion module (MDD + R-STR) attached to LWDETR.", verbose)
         train_config = rf_model.get_train_config(**train_kwargs)
         if train_config.batch_size == "auto":
             from rfdetr.detr import _ensure_model_on_device
@@ -5246,22 +5437,32 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
                 verbose,
             )
 
-        rf_model._align_num_classes_from_dataset(train_config.dataset_dir)
-        module = RFDETRModelModule(rf_model.model_config, train_config)
-        if bool(_motion_cfg.get("enabled", False)):
-            # ensure_motion_support patches LWDETR.__init__, so the actual
-            # Lightning model already owns motion_module before its constructor
-            # restores pretrained weights. This idempotent call verifies the
-            # live training module before optimizer/EMA setup.
-            attach_motion_module(module.model, _motion_cfg)
-            if train_config.resume:
-                from rf_detr_motion import assert_motion_checkpoint_compatible
+        _temporal_enabled = temporal_motion_enabled(config)
+        if not _temporal_enabled:
+            rf_model._align_num_classes_from_dataset(train_config.dataset_dir)
 
-                assert_motion_checkpoint_compatible(
-                    module.model,
-                    train_config.resume,
-                    build_pitchobjectlab_architecture(config),
-                )
+        if _temporal_enabled:
+            from rf_detr_temporal_runtime import (
+                build_temporal_datamodule,
+                build_temporal_model_module,
+            )
+
+            datamodule = build_temporal_datamodule(config, rf_model.model_config, train_config)
+            _align_temporal_num_classes(rf_model, datamodule.class_names)
+            module = build_temporal_model_module(rf_model.model_config, train_config, config)
+            blue("Using complete three-frame temporal windows and TrackNet heatmap loss.", verbose)
+        else:
+            module = RFDETRModelModule(rf_model.model_config, train_config)
+            datamodule = RFDETRDataModule(rf_model.model_config, train_config)
+
+        if _motion_enabled and train_config.resume:
+            from rf_detr_motion import assert_motion_checkpoint_compatible
+
+            assert_motion_checkpoint_compatible(
+                module.model,
+                train_config.resume,
+                build_pitchobjectlab_architecture(config),
+            )
         if bool(_p2_cfg.get('enabled', False)) and train_config.resume:
             assert_p2_training_checkpoint_compatible(
                 module.model,
@@ -5269,7 +5470,6 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
                 build_pitchobjectlab_architecture(config),
                 allow_stock_initialization=False,
             )
-        datamodule = RFDETRDataModule(rf_model.model_config, train_config)
 
         trainer = build_trainer(train_config, rf_model.model_config, **trainer_kwargs)
         install_best_checkpoint_metadata(
@@ -5342,25 +5542,36 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
                 timestamp,
             )
             final_dir = output_dir / sanitize_name(str(final_output_name))
-            manual_test_evaluation(
-                trainer=trainer,
-                pl_module=module,
-                datamodule=datamodule,
-                model_config=rf_model.model_config,
-                train_config=train_config,
-                output_dir=final_dir,
-                split=str(periodic.get("split", "test")),
-                event="final_test",
-                metadata={
-                    "created_at": datetime.now().isoformat(timespec="seconds"),
-                    "best_checkpoint": str(best_checkpoint) if best_checkpoint else None,
-                    "global_step": int(getattr(trainer, "global_step", 0) or 0),
-                },
-                merged_config=config,
-                source_config=source_config,
-                verbose=verbose,
-                progress_bar=bool(periodic.get("progress_bar", True)),
-            )
+            if _temporal_enabled:
+                from rf_detr_temporal_runtime import run_temporal_split
+
+                run_temporal_split(
+                    rf_model=rf_model,
+                    config=config,
+                    output_dir=final_dir,
+                    split=str(periodic.get("split", "test")),
+                    save_heatmaps=True,
+                )
+            else:
+                manual_test_evaluation(
+                    trainer=trainer,
+                    pl_module=module,
+                    datamodule=datamodule,
+                    model_config=rf_model.model_config,
+                    train_config=train_config,
+                    output_dir=final_dir,
+                    split=str(periodic.get("split", "test")),
+                    event="final_test",
+                    metadata={
+                        "created_at": datetime.now().isoformat(timespec="seconds"),
+                        "best_checkpoint": str(best_checkpoint) if best_checkpoint else None,
+                        "global_step": int(getattr(trainer, "global_step", 0) or 0),
+                    },
+                    merged_config=config,
+                    source_config=source_config,
+                    verbose=verbose,
+                    progress_bar=bool(periodic.get("progress_bar", True)),
+                )
         elif is_global_zero:
             blue("Final test skipped by config.", verbose)
 

@@ -227,9 +227,11 @@ class RfDetrInferenceTest(unittest.TestCase):
         model_cls = unittest.mock.Mock(return_value=rf_model)
         attached = unittest.mock.Mock()
         checkpoint_guard = unittest.mock.Mock()
+        checkpoint_loader = unittest.mock.Mock()
         motion_module = ModuleType("rf_detr_motion")
         motion_module.attach_motion_module = attached
         motion_module.assert_motion_checkpoint_compatible = checkpoint_guard
+        motion_module.load_motion_checkpoint_weights = checkpoint_loader
 
         with patch.object(inference_runner.trainer, "get_model_class", return_value=model_cls), patch.object(
             inference_runner.trainer, "build_model_kwargs", return_value={"device": "cpu"}
@@ -240,6 +242,7 @@ class RfDetrInferenceTest(unittest.TestCase):
         model_cls.assert_called_once_with(device="cpu")
         attached.assert_called_once_with(rf_model.model, {"enabled": True})
         checkpoint_guard.assert_called_once()
+        checkpoint_loader.assert_called_once_with(rf_model.model, None)
 
     def test_load_model_skips_motion_attachment_when_disabled(self):
         rf_model = SimpleNamespace(model=object())
@@ -254,22 +257,21 @@ class RfDetrInferenceTest(unittest.TestCase):
         model_cls.assert_called_once_with()
 
     def test_all_inference_configs_declare_optional_architecture_blocks(self):
-        import yaml
-
         config_dir = PROJECT_DIR / "config"
         p2_video_preset = "rf_detr_inference_medium_p2_video_1984090152231178242_003.yaml"
         tensorrt_presets = {
             "rf_detr_inference_tracknet_tensorrt_fp16_example.yaml",
             "rf_detr_inference_large_p2_tensorrt_fp16_smoke.yaml",
         }
-        tracknet_presets = {
-            "rf_detr_inference_tracknet_tensorrt_fp16_example.yaml",
+        real_temporal_tracknet_presets = {
             "rf_detr_inference_small_tracknet_v5.yaml",
             "rf_detr_inference_small_p2_tracknet_v5.yaml",
+            "rf_detr_inference_smoke_temporal_tracknet_v5.yaml",
         }
+        legacy_tracknet_preset = "rf_detr_inference_tracknet_tensorrt_fp16_example.yaml"
         for path in sorted(config_dir.glob("rf_detr_inference*.yaml")):
             with self.subTest(config=path.name):
-                config = yaml.safe_load(path.read_text(encoding="utf-8"))
+                config = inference_runner.load_yaml(path)
                 model = config["model"]
                 self.assertIn("p2", model)
                 self.assertIn("motion", model)
@@ -284,7 +286,11 @@ class RfDetrInferenceTest(unittest.TestCase):
                     self.assertTrue(model["p2"]["enabled"])
                 if path.name == "rf_detr_inference_tracknet_tensorrt_fp16_example.yaml":
                     self.assertFalse(model["p2"]["enabled"])
-                if path.name in tracknet_presets:
+                if path.name in real_temporal_tracknet_presets:
+                    self.assertTrue(model["motion"]["enabled"])
+                    self.assertEqual(model["motion"]["temporal"]["fallback_mode"], "real")
+                    self.assertEqual(model["motion"]["temporal"]["mode"], "real")
+                elif path.name == legacy_tracknet_preset:
                     self.assertTrue(model["motion"]["enabled"])
                     self.assertEqual(model["motion"]["temporal"]["fallback_mode"], "identity")
                 else:

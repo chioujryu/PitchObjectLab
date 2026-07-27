@@ -127,16 +127,27 @@ model:
     type: tracknet_v5
     # Temporal frame-context settings. Options: mapping.
     temporal:
+      mode: real
       # Number of frames in the temporal window. Options: positive odd integer.
       num_frames: 3
       # Temporal stride between frames. Options: positive integer.
       frame_stride: 1
+      anchor: center
+      boundary_policy: drop
+      allow_single_frame_fallback: false
       # Synthetic fallback for still images. Options: identity, noise, real.
-      fallback_mode: identity
+      fallback_mode: real
       # Noise standard deviation when fallback_mode=noise. Options: non-negative float.
       noise_std: 0.02
+    focus:
+      # Only TrackNet heatmap supervision/peaks; RF-DETR keeps every box.
+      mode: all
+      primary_field: primary_label_index
+
     # TrackNetV5 motion submodule settings. Options: mapping.
     tracknet_v5:
+      feature_source: all_frames
+      feature_level: highest_resolution
       # Motion Direction Decoupling settings. Options: mapping.
       mdd:
         # Enable MDD polarity fields. Options: true, false.
@@ -152,6 +163,13 @@ model:
           # Initial sigmoid midpoint. Options: float.
           init_m: 0.5
       # Regional Spatio-Temporal Refinement settings. Options: mapping.
+      heatmap:
+        target: bbox_gaussian
+        min_sigma: 1.0
+        peak_threshold: 0.5
+        peak_nms_kernel: 3
+        max_peaks: 20
+
       rstr:
         # Enable R-STR refinement. Options: true, false.
         enabled: true
@@ -169,10 +187,14 @@ model:
         use_pixel_shuffle: true
         # Context mask probability. Options: 0.0-1.0.
         context_mask_prob: 0.1
+      fusion:
+        mode: zero_init_residual
+
     # Motion auxiliary-loss settings. Options: mapping.
     loss:
       # Motion attention auxiliary loss weight. Options: non-negative float; 0.0 disables.
-      motion_attention_weight: 0.0
+      heatmap_weight: 1.0
+      gamma: 2.0
     # Validated RF-DETR model override keys for motion models. Options: mapping.
     overrides:
       # Input resolution override. Options: null to use model.resolution, or a valid integer.

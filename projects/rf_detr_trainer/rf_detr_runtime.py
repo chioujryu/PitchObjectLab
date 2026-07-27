@@ -26,9 +26,8 @@ def _require_custom_architecture_checkpoint(config: Mapping[str, Any], operation
     if not isinstance(model, Mapping):
         return
     p2 = model.get("p2", {})
-    motion = model.get("motion", {})
     p2_enabled = bool(p2.get("enabled", False)) if isinstance(p2, Mapping) else False
-    motion_enabled = bool(motion.get("enabled", False)) if isinstance(motion, Mapping) else False
+    motion_enabled = _trainer_runtime.motion_module_enabled(config)
     if not p2_enabled and not motion_enabled:
         return
     should_pass, checkpoint = _trainer_runtime.normalize_pretrain_weights(
@@ -116,11 +115,17 @@ def validate_inference_acceleration_config(
             configured_resolution = model_settings.get("resolution")
             if isinstance(configured_resolution, int) and not isinstance(configured_resolution, bool):
                 resolution = configured_resolution
-    return _acceleration.resolve_acceleration_config(
+    settings = _acceleration.resolve_acceleration_config(
         config,
         batch_sizes=inference_acceleration_batch_sizes(config),
         resolution=resolution,
     )
+    if _trainer_runtime.temporal_motion_enabled(config) and settings.backend != "pytorch":
+        raise ValueError(
+            "Real temporal TrackNet input is currently supported only by the PyTorch backend; "
+            "TensorRT/ONNX still-image export is intentionally disabled."
+        )
+    return settings
 
 
 def preflight_rfdetr_inference_acceleration(
@@ -373,24 +378,28 @@ def build_rfdetr_evaluator_runtime(
         )
 
     motion_config = model_settings.get("motion", {}) or {}
-    if bool(motion_config.get("enabled", False)):
-        from rf_detr_motion import attach_motion_module
+    if _trainer_runtime.motion_module_enabled(merged_config):
+        from rf_detr_motion import (
+            assert_motion_checkpoint_compatible,
+            attach_motion_module,
+            load_motion_checkpoint_weights,
+        )
 
         attach_motion_module(rf_model.model, motion_config)
         model_config = getattr(rf_model, "model_config", None)
         checkpoint_path = getattr(model_config, "pretrain_weights", None)
-        from rf_detr_motion import assert_motion_checkpoint_compatible
-
         assert_motion_checkpoint_compatible(
             rf_model.model,
             checkpoint_path,
             build_pitchobjectlab_architecture(merged_config),
         )
+        load_motion_checkpoint_weights(rf_model.model, checkpoint_path)
 
     train_kwargs = build_train_kwargs(merged_config, output_dir)
     train_kwargs.pop("_device", None)
     train_config = rf_model.get_train_config(**train_kwargs)
-    rf_model._align_num_classes_from_dataset(train_config.dataset_dir)
+    if not _trainer_runtime.temporal_motion_enabled(merged_config):
+        rf_model._align_num_classes_from_dataset(train_config.dataset_dir)
     rf_model, _ = configure_rfdetr_inference_acceleration(
         rf_model,
         merged_config,

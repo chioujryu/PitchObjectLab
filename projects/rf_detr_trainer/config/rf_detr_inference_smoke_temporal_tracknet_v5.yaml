@@ -1,0 +1,86 @@
+# Real-temporal TrackNet inference preset; pass the matching smoke checkpoint.
+extends: rf_detr_inference_small_tracknet_v5.yaml
+
+runtime:
+  verbose: true
+  dry_run: false
+  confirm_before_run: true
+
+model:
+  size: small
+  resolution: 128
+  pretrain_weights: null
+  num_classes: 1
+  inference_optimization:
+    backend: pytorch
+  motion:
+    enabled: true
+    type: tracknet_v5
+    temporal:
+      mode: real
+      fallback_mode: real
+      num_frames: 3
+      frame_stride: 1
+      anchor: center
+      boundary_policy: drop
+      allow_single_frame_fallback: false
+    focus:
+      mode: all
+      primary_field: primary_label_index
+    tracknet_v5:
+      feature_source: all_frames
+      feature_level: highest_resolution
+      mdd:
+        enabled: true
+        polarity_channels: 4
+        attention:
+          learnable: true
+          init_k: 1.0
+          init_m: 0.5
+      heatmap:
+        target: bbox_gaussian
+        min_sigma: 1.0
+        peak_threshold: 0.5
+        peak_nms_kernel: 3
+        max_peaks: 20
+      rstr:
+        enabled: true
+        num_blocks: 1
+        hidden_dim: 64
+        num_heads: 4
+        attention_mode: divided
+        dropout: 0.0
+        use_pixel_shuffle: true
+        context_mask_prob: 0.0
+      fusion:
+        mode: zero_init_residual
+    loss:
+      heatmap_weight: 1.0
+      gamma: 2.0
+    overrides:
+      num_queries: 50
+      num_select: 50
+      gradient_checkpointing: false
+
+dataset:
+  source_format: spatiotemporal_yolo
+  dataset_dir: "C:/Users/XBOT/Documents/Datasets/soccer_ball_merged_v1/datasets/spatiotemporal/frame_label_process_result_smoke"
+  data_yaml: "C:/Users/XBOT/Documents/Datasets/soccer_ball_merged_v1/datasets/spatiotemporal/frame_label_process_result_smoke/dataset.yaml"
+  temporal:
+    max_windows_per_split: {train: 1, val: 1, test: 1}
+
+inference:
+  temporal_split: test
+  save_predictions_jsonl: true
+  save_heatmaps: true
+  batch_size: 1
+  num_workers: 0
+  sources:
+    - "C:/Users/XBOT/Documents/Datasets/soccer_ball_merged_v1/datasets/spatiotemporal/frame_label_process_result_smoke/images/test"
+  video:
+    batch_size: 1
+
+output:
+  root: runs/rf_detr/inference
+  name: "rfdetr_small_temporal_tracknet_{tracknet_focus}_smoke_inference_{timestamp}"
+  exist_ok: false

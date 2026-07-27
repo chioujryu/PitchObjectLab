@@ -128,26 +128,46 @@ class ParallelConfigTests(unittest.TestCase):
     def test_all_standalone_test_configs_document_parallel_default(self):
         config_dir = Path(test_runner.__file__).resolve().parent / "config"
         paths = sorted(config_dir.glob("rf_detr_test*.yaml"))
+        tensorrt_presets = {
+            "rf_detr_test_p2_tensorrt_fp16_example.yaml",
+            "rf_detr_test_tracknet_tensorrt_fp16_example.yaml",
+        }
+        real_temporal_tracknet_presets = {
+            "rf_detr_test_small_tracknet_v5.yaml",
+            "rf_detr_test_small_p2_tracknet_v5.yaml",
+            "rf_detr_test_smoke_temporal_tracknet_v5.yaml",
+        }
+        legacy_tracknet_preset = "rf_detr_test_tracknet_tensorrt_fp16_example.yaml"
         self.assertTrue(paths)
         for path in paths:
             with self.subTest(path=path.name):
                 config = test_runner.load_yaml(path)
                 self.assertEqual(config["test"]["parallel"]["chunks"], 1)
                 optimization = config["model"]["inference_optimization"]
-                tracknet_tensorrt_example = (
-                    path.name == "rf_detr_test_tracknet_tensorrt_fp16_example.yaml"
-                )
-                expected_backend = "tensorrt" if tracknet_tensorrt_example else "pytorch"
+                expected_backend = "tensorrt" if path.name in tensorrt_presets else "pytorch"
                 self.assertEqual(optimization["backend"], expected_backend)
                 self.assertEqual(optimization["pytorch"]["precision"], "fp32")
                 self.assertIn(optimization["tensorrt"]["precision"], {"fp16", "bf16"})
-                if tracknet_tensorrt_example:
+                if path.name == legacy_tracknet_preset:
                     self.assertFalse(config["model"]["p2"]["enabled"])
                     self.assertTrue(config["model"]["motion"]["enabled"])
                     self.assertEqual(
                         config["model"]["motion"]["temporal"]["fallback_mode"],
                         "identity",
                     )
+                elif path.name in real_temporal_tracknet_presets:
+                    self.assertTrue(config["model"]["motion"]["enabled"])
+                    self.assertEqual(
+                        config["model"]["motion"]["temporal"]["fallback_mode"],
+                        "real",
+                    )
+                    self.assertEqual(
+                        config["model"]["motion"]["temporal"]["mode"],
+                        "real",
+                    )
+                elif path.name == "rf_detr_test_p2_tensorrt_fp16_example.yaml":
+                    self.assertTrue(config["model"]["p2"]["enabled"])
+                    self.assertFalse(config["model"]["motion"]["enabled"])
 
     def test_chunks_default_to_one_and_cli_override_is_nested(self):
         internal = test_runner.build_internal_test_config({"model": {}, "dataset": {}, "test": {}})
@@ -351,6 +371,7 @@ class SpawnFactoryTests(unittest.TestCase):
     def test_factory_overrides_devices_attaches_motion_and_aligns_classes(self):
         model = MagicMock()
         model.model = object()
+        model.model_config = types.SimpleNamespace(pretrain_weights="matching_motion_checkpoint.pth")
         model_cls = MagicMock(return_value=model)
         train_config = types.SimpleNamespace(dataset_dir="/tmp/materialized-dataset")
         model.get_train_config.return_value = train_config
@@ -368,11 +389,16 @@ class SpawnFactoryTests(unittest.TestCase):
 
         merged = _config()
         merged["model"]["p2"] = {"enabled": True}
-        merged["model"]["motion"] = {"enabled": True, "variant": "v5"}
+        merged["model"]["motion"] = {
+            "enabled": True,
+            "variant": "v5",
+            "temporal": {"fallback_mode": "identity"},
+        }
         factory_model_cfg = {"factory_config": {"merged_config": merged, "output_dir": "/tmp/out"}}
         motion_module = types.SimpleNamespace(
             attach_motion_module=MagicMock(),
             assert_motion_checkpoint_compatible=MagicMock(),
+            load_motion_checkpoint_weights=MagicMock(),
         )
         p2_module = types.SimpleNamespace(assert_p2_checkpoint_compatible=MagicMock())
 
@@ -395,6 +421,10 @@ class SpawnFactoryTests(unittest.TestCase):
         self.assertTrue(seen["p2"]["enabled"])
         motion_module.attach_motion_module.assert_called_once_with(model.model, merged["model"]["motion"])
         motion_module.assert_motion_checkpoint_compatible.assert_called_once()
+        motion_module.load_motion_checkpoint_weights.assert_called_once_with(
+            model.model,
+            "matching_motion_checkpoint.pth",
+        )
         p2_module.assert_p2_checkpoint_compatible.assert_called_once()
         model.get_train_config.assert_called_once_with(dataset_dir="/tmp/materialized-dataset")
         model._align_num_classes_from_dataset.assert_called_once_with("/tmp/materialized-dataset")
@@ -537,13 +567,21 @@ class StandaloneMainFlowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             output_dir = Path(tmp) / "single-output"
             config = _config(chunks=1, evaluation_type="bbox")
-            config["model"]["motion"] = {"enabled": True, "variant": "v5"}
+            config["model"]["motion"] = {
+                "enabled": True,
+                "variant": "v5",
+                "temporal": {"fallback_mode": "identity"},
+            }
             config["model"]["pretrain_weights"] = "matching_motion_checkpoint.pth"
             config["runtime"].update({"yes": True, "confirm_before_run": False, "verbose": False})
             evaluator_result = {"summary": {}, "per_class": []}
             common = self._main_patches(config, output_dir, evaluator_result)
             rf_model = MagicMock()
-            rf_model.model_config = types.SimpleNamespace(resolution=576, segmentation_head=False)
+            rf_model.model_config = types.SimpleNamespace(
+                resolution=576,
+                segmentation_head=False,
+                pretrain_weights="matching_motion_checkpoint.pth",
+            )
             rf_model.get_train_config.return_value = types.SimpleNamespace(
                 dataset_dir="/tmp/materialized-dataset",
                 eval_max_dets=500,
@@ -552,6 +590,7 @@ class StandaloneMainFlowTests(unittest.TestCase):
             motion_module = types.SimpleNamespace(
                 attach_motion_module=MagicMock(),
                 assert_motion_checkpoint_compatible=MagicMock(),
+                load_motion_checkpoint_weights=MagicMock(),
             )
             with ExitStack() as stack:
                 started = [stack.enter_context(patcher) for patcher in common]
@@ -580,6 +619,11 @@ class StandaloneMainFlowTests(unittest.TestCase):
             motion_module.attach_motion_module.assert_called_once_with(
                 rf_model.model,
                 config["model"]["motion"],
+            )
+            motion_module.assert_motion_checkpoint_compatible.assert_called_once()
+            motion_module.load_motion_checkpoint_weights.assert_called_once_with(
+                rf_model.model,
+                "matching_motion_checkpoint.pth",
             )
             self.assertIs(started[7].call_args.kwargs["prebuilt_model"], rf_model)
 

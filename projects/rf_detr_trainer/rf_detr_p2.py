@@ -762,10 +762,18 @@ def assert_p2_training_checkpoint_compatible(
     # initialization. Resolution, class heads, queries, encoder width, and all
     # other architecture tensors must remain shape-exact so the patched
     # non-strict loader cannot silently discard an unrelated incompatibility.
+    # RF-DETR 1.8.3 derives an empty detection-only keypoint mask at runtime;
+    # older official stock checkpoints predate that persistent buffer.
     missing = sorted(
         key
         for key in set(model_state) - set(checkpoint_state)
         if not _is_p2_architecture_tensor(key)
+        and not (
+            key == '_kp_active_mask'
+            and torch.is_tensor(model_state[key])
+            and model_state[key].dtype == torch.bool
+            and model_state[key].numel() == 0
+        )
     )
     unexpected = sorted(
         key

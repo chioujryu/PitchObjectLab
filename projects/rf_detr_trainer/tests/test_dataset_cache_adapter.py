@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from PIL import Image
 
@@ -53,6 +54,76 @@ def annotation_count(cache_dir: Path, split: str) -> int:
 
 
 class DatasetCacheAdapterTest(unittest.TestCase):
+    def test_temporal_plan_and_estimate_apply_micro_window_limits(self):
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as temp:
+            root = Path(temp) / "temporal"
+            root.mkdir(parents=True)
+            data_yaml = root / "dataset.yaml"
+            data_yaml.write_text(
+                "path: .\ntrain: images/train\nval: images/val\ntest: images/test\nnames: [ball]\n",
+                encoding="utf-8",
+            )
+            config = {
+                "model": {
+                    "size": "small",
+                    "motion": {
+                        "enabled": True,
+                        "type": "tracknet_v5",
+                        "temporal": {
+                            "mode": "real",
+                            "num_frames": 3,
+                            "frame_stride": 1,
+                        },
+                    },
+                },
+                "dataset": {
+                    "source_format": "spatiotemporal_yolo",
+                    "dataset_dir": str(root),
+                    "data_yaml": str(data_yaml),
+                    "temporal": {
+                        "max_windows_per_split": {
+                            "train": 1,
+                            "val": 1,
+                            "test": 1,
+                        }
+                    },
+                },
+                "train": {
+                    "dataset_dir": str(root),
+                    "epochs": 1,
+                    "batch_size": 1,
+                    "checkpoint_interval": 1,
+                },
+                "periodic_test": {"enabled": False, "run_final_test": False},
+            }
+
+            with patch(
+                "rf_detr_temporal_data.temporal_split_window_counts",
+                return_value={"train": 20, "val": 10, "test": 10},
+            ):
+                plan = trainer.build_dataset_plan(config, Path(temp) / "run", None)
+            estimate = trainer.estimate_outputs(
+                config,
+                Path(temp) / "run",
+                periodic_count=0,
+                dataset_plan=plan,
+            )
+
+            self.assertEqual(plan["split_counts"], {"train": 1, "val": 1, "test": 1})
+            self.assertEqual(
+                plan["complete_split_counts"],
+                {"train": 20, "val": 10, "test": 10},
+            )
+            self.assertEqual(
+                estimate["split_window_counts"],
+                {"train": 1, "val": 1, "test": 1},
+            )
+            self.assertEqual(
+                estimate["complete_temporal_window_counts"],
+                {"train": 20, "val": 10, "test": 10},
+            )
+            self.assertEqual(estimate["runtime_units"], 1.0)
+
     def test_ultralytics_yolo_auto_detects_and_caches(self):
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as temp:
             root = Path(temp) / "yolo"

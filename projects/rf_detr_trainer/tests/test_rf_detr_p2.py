@@ -16,11 +16,13 @@ faithful Backbone.__init__ copy that reproduces upstream for P3/P4/P5), so it do
 not affect other test modules in the same session.
 """
 
+from contextlib import ExitStack
 from pathlib import Path
 import sys
 import tempfile
 import unittest
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import torch
 from torch import nn
@@ -372,6 +374,45 @@ class P2CheckpointCompatibilityTest(unittest.TestCase):
                 allow_stock_initialization=True,
             )
 
+    def test_training_guard_allows_missing_empty_keypoint_mask_in_stock_initialization(self):
+        model = self._LWDETR()
+        model.register_buffer("_kp_active_mask", torch.zeros((0, 0), dtype=torch.bool))
+        state = {
+            key: value.clone()
+            for key, value in model.state_dict().items()
+            if key != "_kp_active_mask"
+        }
+        state["transformer.cross_attn.sampling_offsets.weight"] = torch.zeros(4, 4)
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "stock_without_empty_keypoint_mask.pth"
+            torch.save({"model": state}, checkpoint)
+
+            rf_detr_p2.assert_p2_training_checkpoint_compatible(
+                model,
+                checkpoint,
+                allow_stock_initialization=True,
+            )
+
+    def test_training_guard_rejects_missing_nonempty_keypoint_mask(self):
+        model = self._LWDETR()
+        model.register_buffer("_kp_active_mask", torch.ones((1, 1), dtype=torch.bool))
+        state = {
+            key: value.clone()
+            for key, value in model.state_dict().items()
+            if key != "_kp_active_mask"
+        }
+        state["transformer.cross_attn.sampling_offsets.weight"] = torch.zeros(4, 4)
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "stock_without_nonempty_keypoint_mask.pth"
+            torch.save({"model": state}, checkpoint)
+
+            with self.assertRaisesRegex(RuntimeError, "missing_non_p2"):
+                rf_detr_p2.assert_p2_training_checkpoint_compatible(
+                    model,
+                    checkpoint,
+                    allow_stock_initialization=True,
+                )
+
     def test_training_guard_rejects_stock_checkpoint_for_resume(self):
         model = self._LWDETR()
         state = {key: value.clone() for key, value in model.state_dict().items()}
@@ -417,6 +458,149 @@ class P2CheckpointCompatibilityTest(unittest.TestCase):
                     checkpoint,
                     allow_stock_initialization=True,
                 )
+
+
+class TrainingMainFlowOrderTest(unittest.TestCase):
+    def test_p2_stock_guard_runs_before_motion_attach(self):
+        class StopAfterMotionAttach(Exception):
+            pass
+
+        events = []
+        motion_config = {"enabled": True, "type": "tracknet_v5"}
+        config = {
+            "runtime": {"verbose": False},
+            "model": {
+                "size": "small",
+                "p2": {"enabled": True},
+                "motion": motion_config,
+            },
+            "train": {},
+            "trainer": {},
+        }
+        core_model = SimpleNamespace()
+
+        with tempfile.TemporaryDirectory() as directory:
+            directory_path = Path(directory)
+            checkpoint = directory_path / "stock.pth"
+            checkpoint.touch()
+            rf_model = SimpleNamespace(
+                model=core_model,
+                model_config=SimpleNamespace(pretrain_weights=checkpoint),
+            )
+            model_cls = MagicMock(return_value=rf_model)
+            model_cls.__name__ = "FakeRFDETR"
+
+            def guard_side_effect(
+                model,
+                checkpoint_path,
+                expected_architecture,
+                *,
+                allow_stock_initialization,
+            ):
+                self.assertIs(model, core_model)
+                self.assertFalse(hasattr(model, "motion_module"))
+                self.assertEqual(checkpoint_path, checkpoint)
+                self.assertEqual(expected_architecture, {})
+                self.assertTrue(allow_stock_initialization)
+                events.append("guard")
+
+            def attach_side_effect(model, received_config):
+                self.assertIs(model, core_model)
+                self.assertIs(received_config, motion_config)
+                model.motion_module = object()
+                events.append("attach")
+                raise StopAfterMotionAttach
+
+            p2_module = ModuleType("rf_detr_p2")
+            p2_module.assert_p2_training_checkpoint_compatible = MagicMock(
+                side_effect=guard_side_effect
+            )
+            motion_module = ModuleType("rf_detr_motion")
+            motion_module.attach_motion_module = MagicMock(side_effect=attach_side_effect)
+            training_module = ModuleType("rfdetr.training")
+            training_module.RFDETRDataModule = object
+            training_module.RFDETRModelModule = object
+            training_module.build_trainer = MagicMock()
+            auto_batch_module = ModuleType("rfdetr.training.auto_batch")
+            auto_batch_module.resolve_auto_batch_config = MagicMock()
+
+            with ExitStack() as stack:
+                stack.enter_context(
+                    patch.object(
+                        sys,
+                        "argv",
+                        ["train_rf_detr_model.py", "--config", str(Path(__file__).resolve())],
+                    )
+                )
+                stack.enter_context(
+                    patch.dict(
+                        sys.modules,
+                        {
+                            "rf_detr_p2": p2_module,
+                            "rf_detr_motion": motion_module,
+                            "rfdetr.training": training_module,
+                            "rfdetr.training.auto_batch": auto_batch_module,
+                        },
+                    )
+                )
+                stack.enter_context(
+                    patch.object(trainer, "is_nonzero_distributed_process", return_value=True)
+                )
+                stack.enter_context(patch.object(trainer, "load_yaml", return_value=config))
+                stack.enter_context(
+                    patch.object(
+                        trainer,
+                        "apply_distributed_child_runtime_overrides",
+                        return_value={},
+                    )
+                )
+                stack.enter_context(
+                    patch.object(trainer, "build_output_dir", return_value=directory_path / "out")
+                )
+                stack.enter_context(
+                    patch.object(trainer, "ensure_rfdetr_detection_hflip_support")
+                )
+                stack.enter_context(
+                    patch.object(trainer, "get_model_class", return_value=model_cls)
+                )
+                stack.enter_context(
+                    patch.object(trainer, "build_model_kwargs", return_value={})
+                )
+                stack.enter_context(
+                    patch.object(
+                        trainer,
+                        "build_train_kwargs",
+                        return_value={"_device": "cpu"},
+                    )
+                )
+                stack.enter_context(
+                    patch.object(
+                        trainer,
+                        "parse_device_to_trainer_kwargs",
+                        return_value={},
+                    )
+                )
+                stack.enter_context(
+                    patch.object(trainer, "apply_validation_interval_to_trainer_kwargs")
+                )
+                stack.enter_context(patch.object(trainer, "apply_multigpu_ddp_strategy"))
+                stack.enter_context(
+                    patch.object(trainer, "apply_multigpu_validation_safety")
+                )
+                stack.enter_context(
+                    patch.object(
+                        trainer,
+                        "build_pitchobjectlab_architecture",
+                        return_value={},
+                    )
+                )
+
+                with self.assertRaises(StopAfterMotionAttach):
+                    trainer._main_impl()
+
+        self.assertEqual(events, ["guard", "attach"])
+        p2_module.assert_p2_training_checkpoint_compatible.assert_called_once()
+        motion_module.attach_motion_module.assert_called_once_with(core_model, motion_config)
 
 
 class CheckpointArchitectureMetadataTest(unittest.TestCase):

@@ -1,62 +1,29 @@
-"""Pluggable TrackNetV5 motion modules for RF-DETR.
+"""Optional three-frame TrackNetV5 branch for RF-DETR.
 
-Adds a config-toggled ``model.motion`` block (parallel to ``model.p2``) that
-attaches a TrackNetV5-inspired motion processing pipeline to RF-DETR without
-touching the installed ``rfdetr`` package (survives ``uv sync``).
+The enabled path runs the shared RF-DETR backbone over ``B*T`` real RGB frames,
+keeps all three temporal feature maps for TrackNet, and sends only the centre
+frame through the RF-DETR transformer/decoder. TrackNet provides:
 
-Architecture summary
---------------------
-Two innovations from the TrackNetV5 paper are ported as feature-space modules
-that insert *between* the DINOv2 backbone and the Deformable-DETR decoder:
+* four luminance Motion Direction Decoupling maps for both adjacent pairs;
+* per-frame draft heatmaps and factorised spatial/temporal R-STR refinement;
+* bbox-Gaussian targets, weighted focal BCE, and single/all peak extraction;
+* a zero-initialised heatmap residual fused into the highest-resolution centre
+  feature, preserving stock detector behaviour at initialisation.
 
-1. **Motion Direction Decoupling (MDD)** — decompose signed inter-frame deltas
-   into arrival (P⁺) and departure (P⁻) polarity fields, weighted by a
-   per-channel learnable sigmoid attention:
-       A = sigmoid(k * (|Δ| − m))
-   Each polarity field is then used to gate the corresponding backbone feature
-   maps with a learned residual: ``features × (1 + gate(motion_maps))``.
-   Gates are zero-initialised so the model starts as identity and learns to
-   exploit motion progressively.
-
-2. **Residual-driven Spatio-Temporal Refinement (R-STR)** — a lightweight
-   per-scale spatial self-attention block (factorised à la TimeSformer, but
-   with T=1 for Phase-1 single-frame data) that treats decoder features as a
-   draft prediction and estimates a correction residual Δ applied via:
-       H_final = σ(Draft + Δ)
-
-Phase-1 single-frame fallback
-------------------------------
-Current training datasets are SAHI crops of still images with no temporal
-neighbours.  ``motion.temporal.fallback_mode`` controls how the T-frame window
-is synthesised:
-
-* ``identity``  — all T frames are identical copies of the input (Δ=0,
-  motion maps are zero, module acts as identity until real motion is seen).
-* ``noise``     — Gaussian noise is added to the copies to produce synthetic
-  deltas (regularises the attention branches during training).
-* ``zero``      — same as identity but explicitly zeroes the delta tensors
-  before any computation (guarantees no information leak).
-
-Phase-2 multi-frame support
-----------------------------
-When a temporal-sequence DataLoader is wired in, set
-``motion.temporal.fallback_mode: real`` and pass a [B, T, 3, H, W] input
-tensor.  The module detects the extra temporal dimension automatically.
-
-Public surface
---------------
-    ensure_motion_support(motion_cfg)   – idempotent; patches LWDETR in-process.
-    attach_motion_module(model, motion_cfg) – build + attach MotionModule to model.
-    apply_motion_overrides(kwargs, motion_cfg) – merge convenience overrides.
-    MOTION_SETTINGS                     – global config dict read by patches.
+Integration is instance-bound. ``attach_motion_module`` adds the module and a
+5-D/TemporalBatch dispatcher only to the requested LWDETR instance; disabled
+models import and execute stock RF-DETR without process-global patches or
+settings. The implementation is hard-pinned to ``rfdetr==1.8.3``.
 """
 
 from __future__ import annotations
 
 import warnings
 from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional
+from types import MethodType
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -64,17 +31,25 @@ import torch.nn.functional as F
 
 __all__ = [
     'assert_motion_checkpoint_compatible',
-    "MOTION_SETTINGS",
     "ensure_motion_support",
     "attach_motion_module",
+    "load_motion_checkpoint_weights",
     "assert_motion_export_ready",
     "apply_motion_overrides",
     "is_patched",
     "MotionModule",
+    "MotionOutput",
+    "MotionDirectionDecoupling",
+    "TemporalRSTRHead",
+    "build_gaussian_heatmap_targets",
+    "weighted_heatmap_bce",
+    "extract_heatmap_peaks",
+    "run_temporal_lwdetr",
 ]
 
 # Convenience overrides that map to real ModelConfig fields.
 _BASELINE_RFDETR_VERSION = '1.8.3'
+_TRACKNET_ARCHITECTURE_SCHEMA_VERSION = 2
 
 _MOTION_OVERRIDE_CASTS = {
     "resolution": int,
@@ -88,12 +63,23 @@ _MOTION_DEFAULTS: Dict[str, Any] = {
     "enabled": False,
     "type": "tracknet_v5",
     "temporal": {
+        "mode": "real",
         "num_frames": 3,
         "frame_stride": 1,
-        "fallback_mode": "identity",
+        "anchor": "center",
+        "boundary_policy": "drop",
+        "allow_single_frame_fallback": False,
+        # Kept for old configs; real temporal input is the default.
+        "fallback_mode": "real",
         "noise_std": 0.02,
     },
+    "focus": {
+        "mode": "all",
+        "primary_field": "primary_label_index",
+    },
     "tracknet_v5": {
+        "feature_source": "all_frames",
+        "feature_level": "highest_resolution",
         "mdd": {
             "enabled": True,
             "polarity_channels": 4,
@@ -103,6 +89,13 @@ _MOTION_DEFAULTS: Dict[str, Any] = {
                 "init_m": 0.5,
             },
         },
+        "heatmap": {
+            "target": "bbox_gaussian",
+            "min_sigma": 1.0,
+            "peak_threshold": 0.5,
+            "peak_nms_kernel": 3,
+            "max_peaks": 20,
+        },
         "rstr": {
             "enabled": True,
             "num_blocks": 2,
@@ -111,18 +104,16 @@ _MOTION_DEFAULTS: Dict[str, Any] = {
             "attention_mode": "divided",
             "dropout": 0.1,
             "use_pixel_shuffle": True,
+            "context_mask_prob": 0.1,
         },
+        "fusion": {"mode": "zero_init_residual"},
     },
     "loss": {
-        "motion_attention_weight": 0.0,
+        "heatmap_weight": 1.0,
+        "gamma": 2.0,
     },
     "overrides": {},
 }
-
-MOTION_SETTINGS: Dict[str, Any] = deepcopy(_MOTION_DEFAULTS)
-
-_LWDETR_PATCHED = False
-_CHANNEL_CHECK_PATCHED = False
 
 
 # ---------------------------------------------------------------------------
@@ -140,11 +131,54 @@ def _check_version() -> None:
     except Exception:
         version = "unknown"
     if version != _BASELINE_RFDETR_VERSION:
-        warnings.warn(
-            f"[rf_detr_motion] Motion patch was written against rfdetr=={_BASELINE_RFDETR_VERSION} "
-            f"but found {version}. Verify rfdetr/models/lwdetr.py line ~465 still matches.",
-            stacklevel=2,
+        raise RuntimeError(
+            "TrackNet temporal integration is version-pinned to "
+            f"rfdetr=={_BASELINE_RFDETR_VERSION}, but found {version}. "
+            "Refusing to run against an unverified LWDETR forward contract."
         )
+
+
+def _validated_motion_config(motion_cfg: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Merge defaults and reject temporal graph options not implemented here."""
+
+    merged = _deep_merge(deepcopy(_MOTION_DEFAULTS), dict(motion_cfg or {}))
+    temporal = merged["temporal"]
+    tracknet = merged["tracknet_v5"]
+    rstr = tracknet["rstr"]
+    supported = (
+        (
+            "model.motion.temporal.anchor",
+            str(temporal.get("anchor", "")).lower(),
+            "center",
+        ),
+        (
+            "model.motion.temporal.boundary_policy",
+            str(temporal.get("boundary_policy", "")).lower(),
+            "drop",
+        ),
+        (
+            "model.motion.tracknet_v5.feature_source",
+            str(tracknet.get("feature_source", "")).lower(),
+            "all_frames",
+        ),
+        (
+            "model.motion.tracknet_v5.feature_level",
+            str(tracknet.get("feature_level", "")).lower(),
+            "highest_resolution",
+        ),
+        (
+            "model.motion.tracknet_v5.rstr.attention_mode",
+            str(rstr.get("attention_mode", "")).lower(),
+            "divided",
+        ),
+    )
+    for field, value, expected in supported:
+        if value != expected:
+            raise ValueError(
+                f"{field} must be {expected!r} for the current TrackNetV5 "
+                f"temporal graph, got {value!r}."
+            )
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -169,104 +203,91 @@ class LearnableSigmoidAttention(nn.Module):
 
 
 class MotionDirectionDecoupling(nn.Module):
-    """TrackNetV5 MDD: decompose inter-frame delta into P⁺ / P⁻ polarity fields.
+    """TrackNetV5 luminance MDD for a three-frame window.
 
-    For Phase-1 single-frame data (delta == 0) both P⁺ and P⁻ are zero; the
-    attention maps are 0.5 (mid-point of sigmoid) and the output motion tensor
-    is all zeros, so gated features reduce to identity.
-
-    Args:
-        polarity_channels: Number of output channels per polarity field (P⁺ and
-            P⁻ each emit this many channels via a 1×1 conv).
-        init_k, init_m: Initial sigmoid steepness / midpoint.
+    The four output planes are, in order, positive and negative luminance
+    changes for ``previous -> centre`` followed by positive and negative
+    changes for ``centre -> next``. Multiplicative learnable attention keeps
+    exact zero motion at zero instead of turning it into a sigmoid constant.
     """
+
+    LUMA_WEIGHTS: Tuple[float, float, float] = (0.299, 0.587, 0.114)
 
     def __init__(
         self,
         in_channels: int = 3,
-        polarity_channels: int = 2,
+        polarity_channels: int = 4,
         init_k: float = 1.0,
         init_m: float = 0.5,
+        learnable: bool = True,
     ) -> None:
         super().__init__()
-        if polarity_channels <= 0:
+        if in_channels != 3:
+            raise ValueError(f"MDD requires RGB input (3 channels), got {in_channels}.")
+        if polarity_channels != 4:
             raise ValueError(
-                f"polarity_channels must be a positive integer, got {polarity_channels}."
+                "TrackNetV5 MDD emits exactly four polarity maps "
+                f"(two adjacent pairs x two polarities), got {polarity_channels}."
             )
-        self.polarity_channels = polarity_channels
-        # Project each polarity field to polarity_channels feature maps.
-        self.proj_plus = nn.Conv2d(in_channels, polarity_channels, 1, bias=False)
-        self.proj_minus = nn.Conv2d(in_channels, polarity_channels, 1, bias=False)
-        nn.init.zeros_(self.proj_plus.weight)
-        nn.init.zeros_(self.proj_minus.weight)
-        self.attn_plus = LearnableSigmoidAttention(polarity_channels, init_k, init_m)
-        self.attn_minus = LearnableSigmoidAttention(polarity_channels, init_k, init_m)
+        self.polarity_channels = 4
+        self.learnable = bool(learnable)
+        self.register_buffer(
+            "luma_weights",
+            torch.tensor(self.LUMA_WEIGHTS, dtype=torch.float32).view(1, 1, 3, 1, 1),
+            persistent=False,
+        )
+        self.attention = (
+            LearnableSigmoidAttention(4, init_k, init_m)
+            if self.learnable
+            else nn.Identity()
+        )
+
+    def raw_polarities(self, frames: torch.Tensor) -> torch.Tensor:
+        """Return unnormalised ``[B, 4, H, W]`` luminance polarity fields."""
+        if frames.ndim != 5:
+            raise ValueError(
+                "MDD expects [B, 3, 3, H, W] frames, "
+                f"received shape {tuple(frames.shape)}."
+            )
+        if frames.shape[1] != 3 or frames.shape[2] != 3:
+            raise ValueError(
+                "MDD requires exactly three RGB frames, "
+                f"received shape {tuple(frames.shape)}."
+            )
+        weights = self.luma_weights.to(device=frames.device, dtype=frames.dtype)
+        luminance = (frames * weights).sum(dim=2)
+        previous_to_centre = luminance[:, 1] - luminance[:, 0]
+        centre_to_next = luminance[:, 2] - luminance[:, 1]
+        return torch.stack(
+            (
+                F.relu(previous_to_centre),
+                F.relu(-previous_to_centre),
+                F.relu(centre_to_next),
+                F.relu(-centre_to_next),
+            ),
+            dim=1,
+        )
 
     def forward(self, frames: torch.Tensor) -> torch.Tensor:
-        """Compute MDD motion maps from a [B, T, 3, H, W] frame sequence.
-
-        Returns: [B, 2*polarity_channels, H, W] — concatenated P⁺ and P⁻
-            attention maps (zero-initialised projections → zero maps for
-            identity fallback).
-        """
-        # Use first two frames for delta: I_t − I_{t−1}
-        f0, f1 = frames[:, 0], frames[:, 1]  # [B, 3, H, W]
-        delta = f1 - f0                        # signed difference
-        p_plus = F.relu(delta)                 # arrival regions (brightening)
-        p_minus = F.relu(-delta)               # departure regions (darkening)
-        attn_p = self.attn_plus(self.proj_plus(p_plus))    # [B, C_p, H, W]
-        attn_m = self.attn_minus(self.proj_minus(p_minus)) # [B, C_p, H, W]
-        return torch.cat([attn_p, attn_m], dim=1)           # [B, 2*C_p, H, W]
-
-
-class MotionFeatureGate(nn.Module):
-    """Apply motion attention maps to a single feature-pyramid level.
-
-    Uses a residual gate: ``out = feat * (1 + gate(motion))`` so that
-    zero-initialised gate weights produce identity output at the start of
-    training.  ``motion`` is resized to match the feature spatial resolution.
-
-    Args:
-        feature_channels: Number of channels in the backbone feature map.
-        motion_channels: Number of channels in the MDD output tensor.
-    """
-
-    def __init__(self, feature_channels: int, motion_channels: int) -> None:
-        super().__init__()
-        self.gate = nn.Sequential(
-            nn.Conv2d(motion_channels, feature_channels, 1, bias=True),
-            nn.Tanh(),  # outputs in [-1, 1]; multiplied by (1 + ...) keeps features positive
-        )
-        nn.init.zeros_(self.gate[0].weight)
-        nn.init.zeros_(self.gate[0].bias)
-
-    def forward(self, feat: torch.Tensor, motion: torch.Tensor) -> torch.Tensor:
-        # Resize motion maps to match feature resolution.
-        if motion.shape[-2:] != feat.shape[-2:]:
-            target_size = feat.shape[-2:]
-            if torch.onnx.is_in_onnx_export():
-                target_size = (int(feat.shape[-2]), int(feat.shape[-1]))
-            motion = F.interpolate(motion, size=target_size, mode="bilinear", align_corners=False)
-        return feat * (1.0 + self.gate(motion))
+        raw = self.raw_polarities(frames)
+        if not self.learnable:
+            return raw
+        return raw * self.attention(raw)
 
 
 class RSTRSpatialAttention(nn.Module):
-    """Spatial self-attention block for R-STR refinement (single scale).
-
-    Implements the spatial leg of TimeSformer's factorised space-time attention.
-    For Phase-1 (T=1) this is equivalent to standard spatial self-attention.
-    Token sequence: H*W spatial tokens, each of dim ``embed_dim``.
-
-    Args:
-        embed_dim: Channel depth of the feature map.
-        num_heads: Multi-head attention heads.
-        dropout: Dropout probability on the attention output.
-    """
+    """Pre-norm transformer block used for both spatial and temporal tokens."""
 
     def __init__(self, embed_dim: int, num_heads: int = 8, dropout: float = 0.1) -> None:
         super().__init__()
+        if embed_dim % num_heads != 0:
+            raise ValueError(
+                f"R-STR hidden_dim ({embed_dim}) must be divisible by num_heads ({num_heads})."
+            )
         self.norm = nn.LayerNorm(embed_dim)
-        self.attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True)
+        self.attn = nn.MultiheadAttention(
+            embed_dim, num_heads, dropout=dropout, batch_first=True
+        )
         self.dropout = nn.Dropout(dropout)
         self.norm2 = nn.LayerNorm(embed_dim)
         self.ffn = nn.Sequential(
@@ -278,41 +299,60 @@ class RSTRSpatialAttention(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, N, C]  where N = H*W
-        residual = x
-        x = self.norm(x)
-        x, _ = self.attn(x, x, x, need_weights=False)
-        x = residual + self.dropout(x)
-        residual = x
-        x = self.norm2(x)
-        x = self.ffn(x)
-        return residual + x
+        normalized = self.norm(x)
+        attended, _ = self.attn(normalized, normalized, normalized, need_weights=False)
+        x = x + self.dropout(attended)
+        return x + self.ffn(self.norm2(x))
 
 
-class RSTRHead(nn.Module):
-    """R-STR: Residual Spatio-Temporal Refinement applied to one feature scale.
+class TemporalDraftHeatmapHead(nn.Module):
+    """Produce one draft heatmap logit plane per temporal feature map."""
 
-    Flattens the spatial feature map to a sequence, runs ``num_blocks`` spatial
-    attention blocks to estimate a correction delta, then applies:
-        H_final = sigmoid(Draft + Delta)
-    projected back to the original channel depth.  Pixel-shuffle upsampling is
-    used for optional fine-resolution output matching.
+    def __init__(self, in_channels: int, num_frames: int, hidden_dim: int) -> None:
+        super().__init__()
+        hidden_dim = max(8, int(hidden_dim))
+        self.num_frames = int(num_frames)
+        self.feature_head = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_dim, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, 1, 1),
+        )
+        self.motion_to_time = nn.Conv2d(4, self.num_frames, 3, padding=1)
 
-    Args:
-        in_channels: Feature channel count for this scale.
-        hidden_dim: Internal projection dimension (defaults to in_channels).
-        num_heads: Attention heads.
-        num_blocks: Number of stacked RSTR blocks.
-        dropout: Dropout applied inside attention and FFN.
-        use_pixel_shuffle: Use PixelShuffle ×2 upsampling on the delta (keeps
-            output at the same spatial resolution as input via padding trick).
-        context_mask_prob: Stochastic context masking dropout during training
-            (equivalent to the ρ=0.1 from the paper).
+    def forward(
+        self,
+        temporal_feature: torch.Tensor,
+        motion_maps: torch.Tensor,
+    ) -> torch.Tensor:
+        if temporal_feature.ndim != 5:
+            raise ValueError(
+                "Draft heatmap head expects [B, T, C, H, W], "
+                f"got {tuple(temporal_feature.shape)}."
+            )
+        batch, frames, channels, height, width = temporal_feature.shape
+        if frames != self.num_frames:
+            raise ValueError(f"Expected T={self.num_frames}, got T={frames}.")
+        feature_logits = self.feature_head(
+            temporal_feature.reshape(batch * frames, channels, height, width)
+        ).reshape(batch, frames, height, width)
+        resized_motion = F.interpolate(
+            motion_maps, size=(height, width), mode="bilinear", align_corners=False
+        )
+        return feature_logits + self.motion_to_time(resized_motion)
+
+
+class TemporalRSTRHead(nn.Module):
+    """Factorised spatial/temporal refinement of three draft heatmaps.
+
+    The final correction projection is zero-initialised, so the module begins
+    as the exact identity in logit space. With PixelShuffle enabled the patch
+    embedding downsamples by two and the residual projection restores the
+    original resolution.
     """
 
     def __init__(
         self,
-        in_channels: int,
+        num_frames: int = 3,
         hidden_dim: int = 256,
         num_heads: int = 8,
         num_blocks: int = 2,
@@ -321,56 +361,444 @@ class RSTRHead(nn.Module):
         context_mask_prob: float = 0.1,
     ) -> None:
         super().__init__()
-        self.context_mask_prob = context_mask_prob
-        # Project to hidden_dim for attention.
-        self.proj_in = nn.Conv2d(in_channels, hidden_dim, 1)
-        # Spatial attention blocks.
-        self.blocks = nn.ModuleList(
+        if num_frames != 3:
+            raise ValueError(f"TrackNetV5 R-STR requires exactly three frames, got {num_frames}.")
+        if not 0.0 <= context_mask_prob < 1.0:
+            raise ValueError("context_mask_prob must be in [0, 1).")
+        self.num_frames = num_frames
+        self.context_mask_prob = float(context_mask_prob)
+        self.use_pixel_shuffle = bool(use_pixel_shuffle)
+        self.patch_scale = 2 if self.use_pixel_shuffle else 1
+        self.draft_embed = nn.Conv2d(
+            1,
+            hidden_dim,
+            kernel_size=self.patch_scale,
+            stride=self.patch_scale,
+        )
+        self.motion_embed = nn.Conv2d(4, hidden_dim, 3, padding=1)
+        self.spatial_blocks = nn.ModuleList(
             [RSTRSpatialAttention(hidden_dim, num_heads, dropout) for _ in range(num_blocks)]
         )
-        # Project back to in_channels to produce the delta.
-        self.proj_out = nn.Conv2d(hidden_dim, in_channels, 1)
-        nn.init.zeros_(self.proj_out.weight)
-        nn.init.zeros_(self.proj_out.bias)
+        self.temporal_blocks = nn.ModuleList(
+            [RSTRSpatialAttention(hidden_dim, num_heads, dropout) for _ in range(num_blocks)]
+        )
+        output_channels = self.patch_scale * self.patch_scale
+        self.residual_projection = nn.Conv2d(
+            hidden_dim, output_channels, 3, padding=1
+        )
+        nn.init.zeros_(self.residual_projection.weight)
+        nn.init.zeros_(self.residual_projection.bias)
 
-    def forward(self, feat: torch.Tensor) -> torch.Tensor:
-        # feat: [B, C, H, W]
-        B, C, H, W = feat.shape
-        export_height = int(H) if torch.onnx.is_in_onnx_export() else H
-        export_width = int(W) if torch.onnx.is_in_onnx_export() else W
-        # Project to hidden_dim.
-        x = self.proj_in(feat)  # [B, D, H, W]
-        D = x.shape[1]
-        # Stochastic context masking during training (regularises temporal attention).
+    def forward(
+        self,
+        draft_logits: torch.Tensor,
+        motion_maps: torch.Tensor,
+    ) -> torch.Tensor:
+        if draft_logits.ndim != 4:
+            raise ValueError(
+                "R-STR expects [B, T, H, W] draft logits, "
+                f"got {tuple(draft_logits.shape)}."
+            )
+        batch, frames, height, width = draft_logits.shape
+        if frames != self.num_frames:
+            raise ValueError(f"Expected T={self.num_frames}, got T={frames}.")
+        pad_height = (-height) % self.patch_scale
+        pad_width = (-width) % self.patch_scale
+        padded = F.pad(draft_logits, (0, pad_width, 0, pad_height))
+        padded_height, padded_width = padded.shape[-2:]
+        embedded = self.draft_embed(
+            padded.reshape(batch * frames, 1, padded_height, padded_width)
+        )
+        token_height, token_width = embedded.shape[-2:]
+        embedded = embedded.reshape(batch, frames, -1, token_height, token_width)
+
+        motion_context = self.motion_embed(
+            F.interpolate(
+                motion_maps,
+                size=(padded_height, padded_width),
+                mode="bilinear",
+                align_corners=False,
+            )
+        )
+        motion_context = F.interpolate(
+            motion_context,
+            size=(token_height, token_width),
+            mode="bilinear",
+            align_corners=False,
+        )
+        embedded = embedded + motion_context.unsqueeze(1)
+
         if self.training and self.context_mask_prob > 0.0:
-            mask = torch.rand(B, 1, H, W, device=x.device) > self.context_mask_prob
-            x = x * mask.float()
-        # Flatten spatial for self-attention: [B, H*W, D]
-        x = x.flatten(2).transpose(1, 2)
-        for blk in self.blocks:
-            x = blk(x)
-        # Reshape back to spatial: [B, D, H, W]
-        # Keep only batch dynamic at this Conv boundary during ONNX export.
-        x = x.transpose(1, 2).reshape(-1, D, export_height, export_width)
-        # Project to correction delta.
-        delta = self.proj_out(x)  # [B, C, H, W]
-        # Apply residual correction: sigmoid(Draft + Delta)
-        return torch.sigmoid(feat + delta)
+            keep = (
+                torch.rand(batch, frames, 1, 1, 1, device=embedded.device)
+                >= self.context_mask_prob
+            )
+            # Always retain the centre draft; only temporal context is dropped.
+            keep[:, frames // 2] = True
+            embedded = embedded * keep.to(embedded.dtype)
+
+        hidden_dim = embedded.shape[2]
+        for spatial, temporal in zip(self.spatial_blocks, self.temporal_blocks):
+            spatial_tokens = embedded.reshape(
+                batch * frames, hidden_dim, token_height * token_width
+            ).transpose(1, 2)
+            spatial_tokens = spatial(spatial_tokens)
+            embedded = spatial_tokens.transpose(1, 2).reshape(
+                batch, frames, hidden_dim, token_height, token_width
+            )
+
+            temporal_tokens = embedded.permute(0, 3, 4, 1, 2).reshape(
+                batch * token_height * token_width, frames, hidden_dim
+            )
+            temporal_tokens = temporal(temporal_tokens)
+            embedded = temporal_tokens.reshape(
+                batch, token_height, token_width, frames, hidden_dim
+            ).permute(0, 3, 4, 1, 2)
+
+        residual = self.residual_projection(
+            embedded.reshape(batch * frames, hidden_dim, token_height, token_width)
+        )
+        if self.use_pixel_shuffle:
+            residual = F.pixel_shuffle(residual, self.patch_scale)
+        elif residual.shape[-2:] != (padded_height, padded_width):
+            residual = F.interpolate(
+                residual,
+                size=(padded_height, padded_width),
+                mode="bilinear",
+                align_corners=False,
+            )
+        residual = residual.reshape(batch, frames, padded_height, padded_width)
+        residual = residual[..., :height, :width]
+        return draft_logits + residual
+
+
+class RSTRHead(TemporalRSTRHead):
+    """Compatibility wrapper treating input channels as temporal drafts.
+
+    New TrackNet code uses :class:`TemporalRSTRHead` directly. This wrapper is
+    retained for imports from older integrations and returns probabilities as
+    the previous class did.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 3,
+        hidden_dim: int = 256,
+        num_heads: int = 8,
+        num_blocks: int = 2,
+        dropout: float = 0.1,
+        use_pixel_shuffle: bool = True,
+        context_mask_prob: float = 0.1,
+    ) -> None:
+        if in_channels != 3:
+            raise ValueError(
+                "RSTRHead now refines exactly three temporal draft heatmaps; "
+                f"use in_channels=3, got {in_channels}."
+            )
+        super().__init__(
+            num_frames=3,
+            hidden_dim=hidden_dim,
+            num_heads=num_heads,
+            num_blocks=num_blocks,
+            dropout=dropout,
+            use_pixel_shuffle=use_pixel_shuffle,
+            context_mask_prob=context_mask_prob,
+        )
+
+    def forward(
+        self,
+        feat: torch.Tensor,
+        motion_maps: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if motion_maps is None:
+            motion_maps = feat.new_zeros((feat.shape[0], 4, *feat.shape[-2:]))
+        return torch.sigmoid(super().forward(feat, motion_maps))
+
+
+class HeatmapResidualFusion(nn.Module):
+    """Add a heatmap-conditioned residual to one RF-DETR feature level."""
+
+    def __init__(self, feature_channels: int) -> None:
+        super().__init__()
+        self.projection = nn.Conv2d(1, feature_channels, 1)
+        nn.init.zeros_(self.projection.weight)
+        nn.init.zeros_(self.projection.bias)
+
+    def forward(self, feature: torch.Tensor, heatmap: torch.Tensor) -> torch.Tensor:
+        if heatmap.shape[-2:] != feature.shape[-2:]:
+            heatmap = F.interpolate(
+                heatmap, size=feature.shape[-2:], mode="bilinear", align_corners=False
+            )
+        return feature + self.projection(heatmap)
+
+
+@dataclass
+class MotionOutput:
+    """TrackNet outputs consumed by the temporal LWDETR adapter and losses."""
+
+    features: List[torch.Tensor]
+    draft_heatmap_logits: torch.Tensor
+    heatmap_logits: torch.Tensor
+    heatmaps: torch.Tensor
+    motion_maps: torch.Tensor
+    feature_level: int
+
+
+def _normalise_temporal_targets(
+    targets: Sequence[Any] | Mapping[str, Any],
+) -> List[List[Mapping[str, Any]]]:
+    if isinstance(targets, Mapping):
+        return [[targets]]
+    targets_list = list(targets)
+    if not targets_list:
+        return []
+    if isinstance(targets_list[0], Mapping):
+        return [[item for item in targets_list]]
+    normalised: List[List[Mapping[str, Any]]] = []
+    for sample in targets_list:
+        frames = list(sample)
+        if not all(isinstance(item, Mapping) for item in frames):
+            raise TypeError("Every temporal target must be a mapping.")
+        normalised.append(frames)
+    return normalised
+
+
+def _target_image_size(
+    target: Mapping[str, Any],
+    image_size: Optional[Tuple[int, int]],
+) -> Tuple[float, float]:
+    size = image_size if image_size is not None else target.get("size")
+    if size is None:
+        raise ValueError("Pixel-coordinate boxes require image_size or target['size'].")
+    if torch.is_tensor(size):
+        size = size.detach().cpu().tolist()
+    if len(size) != 2:
+        raise ValueError(f"Expected image size (height, width), got {size!r}.")
+    return float(size[0]), float(size[1])
+
+
+def build_gaussian_heatmap_targets(
+    targets: Sequence[Any] | Mapping[str, Any],
+    output_size: Tuple[int, int],
+    *,
+    image_size: Optional[Tuple[int, int]] = None,
+    focus_mode: str = "all",
+    primary_field: str = "primary_label_index",
+    min_sigma: float = 1.0,
+) -> torch.Tensor:
+    """Rasterise RF-DETR boxes into soft Gaussian TrackNet targets.
+
+    ``targets`` is normally ``[batch][time]`` mappings. Boxes default to
+    normalized ``cxcywh``; set ``box_format`` to ``xyxy_normalized``, ``cxcywh``
+    or ``xyxy`` for the other supported representations.
+    """
+    focus_mode = str(focus_mode).lower()
+    if focus_mode not in {"single", "all"}:
+        raise ValueError("focus_mode must be 'single' or 'all'.")
+    height, width = (int(output_size[0]), int(output_size[1]))
+    if height <= 0 or width <= 0:
+        raise ValueError(f"output_size must be positive, got {output_size!r}.")
+    if min_sigma <= 0:
+        raise ValueError("min_sigma must be positive.")
+
+    nested_targets = _normalise_temporal_targets(targets)
+    if not nested_targets:
+        return torch.empty((0, 0, height, width), dtype=torch.float32)
+    frame_count = len(nested_targets[0])
+    if frame_count == 0 or any(len(sample) != frame_count for sample in nested_targets):
+        raise ValueError("Every sample must provide the same non-zero number of frames.")
+
+    reference_boxes = next(
+        (
+            item.get("boxes")
+            for sample in nested_targets
+            for item in sample
+            if torch.is_tensor(item.get("boxes"))
+        ),
+        None,
+    )
+    device = reference_boxes.device if reference_boxes is not None else torch.device("cpu")
+    dtype = (
+        reference_boxes.dtype
+        if reference_boxes is not None and reference_boxes.is_floating_point()
+        else torch.float32
+    )
+    heatmaps = torch.zeros(
+        (len(nested_targets), frame_count, height, width), device=device, dtype=dtype
+    )
+    grid_y = torch.arange(height, device=device, dtype=dtype).view(height, 1)
+    grid_x = torch.arange(width, device=device, dtype=dtype).view(1, width)
+
+    for batch_index, sample in enumerate(nested_targets):
+        for frame_index, target in enumerate(sample):
+            boxes = target.get("boxes")
+            if boxes is None:
+                boxes = torch.empty((0, 4), device=device, dtype=dtype)
+            boxes = torch.as_tensor(boxes, device=device, dtype=dtype).reshape(-1, 4)
+            if boxes.numel() == 0:
+                continue
+            selected = torch.arange(boxes.shape[0], device=device)
+            if focus_mode == "single":
+                if boxes.shape[0] == 1:
+                    selected = selected[:1]
+                else:
+                    primary = target.get(primary_field)
+                    if primary is None and isinstance(target.get("metadata"), Mapping):
+                        primary = target["metadata"].get(primary_field)
+                    if torch.is_tensor(primary):
+                        primary = int(primary.item())
+                    if primary is None:
+                        raise ValueError(
+                            f"single focus found {boxes.shape[0]} boxes without {primary_field!r}."
+                        )
+                    primary = int(primary)
+                    if primary < 0 or primary >= boxes.shape[0]:
+                        raise ValueError(
+                            f"{primary_field}={primary} is outside [0, {boxes.shape[0] - 1}]."
+                        )
+                    selected = selected.new_tensor([primary])
+            boxes = boxes[selected]
+
+            box_format = str(target.get("box_format", "cxcywh_normalized")).lower()
+            if box_format in {"cxcywh_normalized", "cxcywhn"}:
+                centres_x = boxes[:, 0] * width
+                centres_y = boxes[:, 1] * height
+                box_widths = boxes[:, 2] * width
+                box_heights = boxes[:, 3] * height
+            elif box_format in {"xyxy_normalized", "xyxyn"}:
+                centres_x = (boxes[:, 0] + boxes[:, 2]) * 0.5 * width
+                centres_y = (boxes[:, 1] + boxes[:, 3]) * 0.5 * height
+                box_widths = (boxes[:, 2] - boxes[:, 0]).abs() * width
+                box_heights = (boxes[:, 3] - boxes[:, 1]).abs() * height
+            elif box_format in {"cxcywh", "xyxy"}:
+                source_height, source_width = _target_image_size(target, image_size)
+                if box_format == "cxcywh":
+                    centres_x = boxes[:, 0] * width / source_width
+                    centres_y = boxes[:, 1] * height / source_height
+                    box_widths = boxes[:, 2].abs() * width / source_width
+                    box_heights = boxes[:, 3].abs() * height / source_height
+                else:
+                    centres_x = (boxes[:, 0] + boxes[:, 2]) * 0.5 * width / source_width
+                    centres_y = (boxes[:, 1] + boxes[:, 3]) * 0.5 * height / source_height
+                    box_widths = (boxes[:, 2] - boxes[:, 0]).abs() * width / source_width
+                    box_heights = (boxes[:, 3] - boxes[:, 1]).abs() * height / source_height
+            else:
+                raise ValueError(f"Unsupported box_format {box_format!r}.")
+
+            sigma_x = (box_widths / 6.0).clamp_min(float(min_sigma))
+            sigma_y = (box_heights / 6.0).clamp_min(float(min_sigma))
+            frame_heatmap = heatmaps[batch_index, frame_index]
+            for centre_x, centre_y, sx, sy in zip(
+                centres_x, centres_y, sigma_x, sigma_y
+            ):
+                gaussian = torch.exp(
+                    -0.5
+                    * (
+                        ((grid_x - centre_x) / sx).square()
+                        + ((grid_y - centre_y) / sy).square()
+                    )
+                )
+                frame_heatmap.copy_(torch.maximum(frame_heatmap, gaussian))
+    return heatmaps
+
+
+def weighted_heatmap_bce(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    gamma: float = 2.0,
+    positive_weight: Optional[float] = None,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    """Class-balanced focal BCE over soft Gaussian heatmap targets."""
+    if logits.shape != targets.shape:
+        raise ValueError(
+            f"Heatmap logits/targets must have equal shapes, got {logits.shape} and {targets.shape}."
+        )
+    if gamma < 0:
+        raise ValueError("gamma must be non-negative.")
+    probabilities = logits.sigmoid()
+    if positive_weight is None:
+        positive_mass = targets.detach().sum().clamp_min(1.0)
+        negative_mass = (1.0 - targets.detach()).sum()
+        positive_weight_tensor = (negative_mass / positive_mass).clamp(1.0, 100.0)
+    else:
+        if positive_weight <= 0:
+            raise ValueError("positive_weight must be positive.")
+        positive_weight_tensor = logits.new_tensor(float(positive_weight))
+    focal_weights = (
+        targets * (1.0 - probabilities).pow(gamma) * positive_weight_tensor
+        + (1.0 - targets) * probabilities.pow(gamma)
+    )
+    losses = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+    losses = losses * focal_weights
+    if reduction == "none":
+        return losses
+    if reduction == "sum":
+        return losses.sum()
+    if reduction != "mean":
+        raise ValueError("reduction must be 'none', 'sum', or 'mean'.")
+    return losses.sum() / focal_weights.sum().clamp_min(1.0)
+
+
+def extract_heatmap_peaks(
+    heatmaps: torch.Tensor,
+    *,
+    focus_mode: str = "all",
+    threshold: float = 0.5,
+    nms_kernel: int = 3,
+    max_peaks: int = 20,
+    from_logits: bool = False,
+) -> List[List[torch.Tensor]]:
+    """Extract local maxima as per-frame ``[x, y, score]`` tensors."""
+    if heatmaps.ndim == 3:
+        heatmaps = heatmaps.unsqueeze(1)
+    if heatmaps.ndim != 4:
+        raise ValueError(f"Expected [B, T, H, W], got {tuple(heatmaps.shape)}.")
+    focus_mode = str(focus_mode).lower()
+    if focus_mode not in {"single", "all"}:
+        raise ValueError("focus_mode must be 'single' or 'all'.")
+    if nms_kernel < 1 or nms_kernel % 2 == 0:
+        raise ValueError("nms_kernel must be a positive odd integer.")
+    if max_peaks <= 0:
+        raise ValueError("max_peaks must be positive.")
+    probabilities = heatmaps.sigmoid() if from_logits else heatmaps
+    pooled = F.max_pool2d(
+        probabilities.reshape(-1, 1, *probabilities.shape[-2:]),
+        kernel_size=nms_kernel,
+        stride=1,
+        padding=nms_kernel // 2,
+    ).reshape_as(probabilities)
+    local = (probabilities >= threshold) & (probabilities == pooled)
+    result: List[List[torch.Tensor]] = []
+    limit = 1 if focus_mode == "single" else max_peaks
+    for sample_scores, sample_local in zip(probabilities, local):
+        sample_result: List[torch.Tensor] = []
+        for frame_scores, frame_local in zip(sample_scores, sample_local):
+            coordinates = frame_local.nonzero(as_tuple=False)
+            if coordinates.numel() == 0:
+                sample_result.append(frame_scores.new_empty((0, 3)))
+                continue
+            scores = frame_scores[coordinates[:, 0], coordinates[:, 1]]
+            count = min(limit, scores.numel())
+            top_scores, order = scores.topk(count, largest=True, sorted=True)
+            top_coordinates = coordinates[order]
+            sample_result.append(
+                torch.stack(
+                    (
+                        top_coordinates[:, 1].to(top_scores.dtype),
+                        top_coordinates[:, 0].to(top_scores.dtype),
+                        top_scores,
+                    ),
+                    dim=1,
+                )
+            )
+        result.append(sample_result)
+    return result
 
 
 class MotionModule(nn.Module):
-    """Top-level motion module attached to LWDETR.
-
-    Encapsulates MDD polarity computation, per-scale feature gates, and an
-    optional R-STR refinement head.  Accepts a single-frame input (Phase 1)
-    and synthesises the temporal window internally using the configured
-    ``fallback_mode``.
-
-    Args:
-        feature_channels_per_scale: List of channel counts for each pyramid
-            level output by the backbone (e.g. [256, 256, 256] for [P2,P3,P4]).
-        motion_cfg: The ``model.motion`` sub-dict from the trainer config.
-    """
+    """Three-frame TrackNetV5 branch attached to one LWDETR instance."""
 
     def __init__(
         self,
@@ -381,114 +809,236 @@ class MotionModule(nn.Module):
         if not feature_channels_per_scale:
             raise ValueError("MotionModule requires at least one backbone feature level.")
         self.feature_channels_per_scale = [int(channel) for channel in feature_channels_per_scale]
-        v5_cfg = motion_cfg.get("tracknet_v5", {}) or {}
-        mdd_cfg = v5_cfg.get("mdd", {}) or {}
-        rstr_cfg = v5_cfg.get("rstr", {}) or {}
-        temporal_cfg = motion_cfg.get("temporal", {}) or {}
+        merged_cfg = _validated_motion_config(motion_cfg)
+        temporal_cfg = merged_cfg["temporal"]
+        focus_cfg = merged_cfg["focus"]
+        v5_cfg = merged_cfg["tracknet_v5"]
+        mdd_cfg = v5_cfg["mdd"]
+        heatmap_cfg = v5_cfg["heatmap"]
+        rstr_cfg = v5_cfg["rstr"]
+        loss_cfg = merged_cfg["loss"]
 
-        self.num_frames: int = int(temporal_cfg.get("num_frames", 3))
-        self.fallback_mode: str = str(temporal_cfg.get("fallback_mode", "identity"))
-        self.noise_std: float = float(temporal_cfg.get("noise_std", 0.02))
-
-        # MDD module.
-        self.mdd_enabled: bool = bool(mdd_cfg.get("enabled", True))
-        polarity_channels: int = int(mdd_cfg.get("polarity_channels", 4))
-        # polarity_channels must be even (split between P+ and P-)
-        if polarity_channels % 2 != 0:
-            polarity_channels += 1
-        half_p = polarity_channels // 2
-        attn_cfg = mdd_cfg.get("attention", {}) or {}
-
-        if self.mdd_enabled:
-            self.mdd = MotionDirectionDecoupling(
-                in_channels=3,
-                polarity_channels=half_p,
-                init_k=float(attn_cfg.get("init_k", 1.0)),
-                init_m=float(attn_cfg.get("init_m", 0.5)),
+        self.num_frames = int(temporal_cfg.get("num_frames", 3))
+        if self.num_frames != 3:
+            raise ValueError(
+                f"TrackNetV5 temporal integration requires num_frames=3, got {self.num_frames}."
             )
-            motion_ch = polarity_channels  # 2 * half_p
-        else:
-            self.mdd = None  # type: ignore[assignment]
-            motion_ch = 0
+        self.frame_stride = int(temporal_cfg.get("frame_stride", 1))
+        if self.frame_stride <= 0:
+            raise ValueError("frame_stride must be positive.")
+        self.anchor_index = 1
+        anchor = str(temporal_cfg.get("anchor", "center")).lower()
+        if anchor != "center":
+            raise ValueError("Only centre-frame TrackNet/RF-DETR alignment is supported.")
+        self.fallback_mode = str(temporal_cfg.get("fallback_mode", "real")).lower()
+        self.noise_std = float(temporal_cfg.get("noise_std", 0.02))
+        self.allow_single_frame_fallback = bool(
+            temporal_cfg.get("allow_single_frame_fallback", False)
+            or self.fallback_mode in {"identity", "zero", "noise"}
+        )
 
-        # Per-scale feature gates (only built when MDD is on).
-        self.gates = nn.ModuleList()
-        if self.mdd_enabled and motion_ch > 0:
-            for ch in feature_channels_per_scale:
-                self.gates.append(MotionFeatureGate(ch, motion_ch))
-        else:
-            for _ in feature_channels_per_scale:
-                self.gates.append(nn.Identity())
+        self.focus_mode = str(focus_cfg.get("mode", "all")).lower()
+        if self.focus_mode not in {"single", "all"}:
+            raise ValueError("model.motion.focus.mode must be 'single' or 'all'.")
+        self.primary_field = str(
+            focus_cfg.get("primary_field", "primary_label_index")
+        )
+        self.min_sigma = float(heatmap_cfg.get("min_sigma", 1.0))
+        self.peak_threshold = float(heatmap_cfg.get("peak_threshold", 0.5))
+        self.peak_nms_kernel = int(heatmap_cfg.get("peak_nms_kernel", 3))
+        self.max_peaks = int(heatmap_cfg.get("max_peaks", 20))
+        self.heatmap_weight = float(loss_cfg.get("heatmap_weight", 1.0))
+        self.heatmap_gamma = float(loss_cfg.get("gamma", 2.0))
 
-        # Optional R-STR head.
-        self.rstr_enabled: bool = bool(rstr_cfg.get("enabled", True))
-        if self.rstr_enabled:
-            self.rstr_heads = nn.ModuleList()
-            for ch in feature_channels_per_scale:
-                self.rstr_heads.append(
-                    RSTRHead(
-                        in_channels=ch,
-                        hidden_dim=int(rstr_cfg.get("hidden_dim", 256)),
-                        num_heads=int(rstr_cfg.get("num_heads", 8)),
-                        num_blocks=int(rstr_cfg.get("num_blocks", 2)),
-                        dropout=float(rstr_cfg.get("dropout", 0.1)),
-                        use_pixel_shuffle=bool(rstr_cfg.get("use_pixel_shuffle", True)),
-                        context_mask_prob=float(rstr_cfg.get("context_mask_prob", 0.1)),
-                    )
+        self.mdd_enabled = bool(mdd_cfg.get("enabled", True))
+        attention_cfg = mdd_cfg.get("attention", {}) or {}
+        self.mdd = (
+            MotionDirectionDecoupling(
+                in_channels=3,
+                polarity_channels=int(mdd_cfg.get("polarity_channels", 4)),
+                init_k=float(attention_cfg.get("init_k", 1.0)),
+                init_m=float(attention_cfg.get("init_m", 0.5)),
+                learnable=bool(attention_cfg.get("learnable", True)),
+            )
+            if self.mdd_enabled
+            else None
+        )
+
+        rstr_hidden = int(rstr_cfg.get("hidden_dim", 256))
+        self.draft_heads = nn.ModuleList(
+            [
+                TemporalDraftHeatmapHead(
+                    channel,
+                    self.num_frames,
+                    min(rstr_hidden, max(16, channel // 2)),
                 )
-        else:
-            self.rstr_heads = None  # type: ignore[assignment]
-
-    # ------------------------------------------------------------------
-    # Temporal window synthesis (Phase-1 single-frame fallback)
-    # ------------------------------------------------------------------
+                for channel in self.feature_channels_per_scale
+            ]
+        )
+        self.rstr_enabled = bool(rstr_cfg.get("enabled", True))
+        self.rstr = (
+            TemporalRSTRHead(
+                num_frames=self.num_frames,
+                hidden_dim=rstr_hidden,
+                num_heads=int(rstr_cfg.get("num_heads", 8)),
+                num_blocks=int(rstr_cfg.get("num_blocks", 2)),
+                dropout=float(rstr_cfg.get("dropout", 0.1)),
+                use_pixel_shuffle=bool(rstr_cfg.get("use_pixel_shuffle", True)),
+                context_mask_prob=float(rstr_cfg.get("context_mask_prob", 0.1)),
+            )
+            if self.rstr_enabled
+            else None
+        )
+        fusion_mode = str((v5_cfg.get("fusion", {}) or {}).get("mode", "zero_init_residual"))
+        if fusion_mode != "zero_init_residual":
+            raise ValueError(
+                "Only tracknet_v5.fusion.mode='zero_init_residual' is supported."
+            )
+        self.fusions = nn.ModuleList(
+            [HeatmapResidualFusion(channel) for channel in self.feature_channels_per_scale]
+        )
+        self.last_output: Optional[MotionOutput] = None
 
     def _make_frame_window(self, images: torch.Tensor) -> torch.Tensor:
-        """Expand [B, 3, H, W] to [B, T, 3, H, W] using the configured fallback."""
-        if images.dim() == 5:
-            # Already a temporal sequence — use as-is.
+        """Validate real input or explicitly synthesize an allowed still-image window."""
+        if images.ndim == 5:
+            if images.shape[1] != self.num_frames or images.shape[2] != 3:
+                raise ValueError(
+                    f"Expected [B, {self.num_frames}, 3, H, W], got {tuple(images.shape)}."
+                )
             return images
-        B = images.shape[0]
-        mode = self.fallback_mode
-        if mode in ("identity", "zero"):
-            frames = images.unsqueeze(1).expand(B, self.num_frames, -1, -1, -1)
-            return frames
-        if mode == "noise":
+        if images.ndim != 4 or images.shape[1] != 3:
+            raise ValueError(f"Expected RGB images or temporal frames, got {tuple(images.shape)}.")
+        if not self.allow_single_frame_fallback:
+            raise RuntimeError(
+                "TrackNet is enabled but received one frame. Set "
+                "temporal.allow_single_frame_fallback=true explicitly to replicate it."
+            )
+        batch = images.shape[0]
+        if self.fallback_mode == "noise":
             frames = [images]
             for _ in range(self.num_frames - 1):
-                noise = torch.randn_like(images) * self.noise_std
-                frames.append(images + noise)
-            return torch.stack(frames, dim=1)  # [B, T, 3, H, W]
-        # Fallback to identity for unknown modes.
-        return images.unsqueeze(1).expand(B, self.num_frames, -1, -1, -1)
+                frames.append(images + torch.randn_like(images) * self.noise_std)
+            return torch.stack(frames, dim=1)
+        return images.unsqueeze(1).expand(batch, self.num_frames, -1, -1, -1)
 
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
+    @staticmethod
+    def _validate_temporal_features(
+        frames: torch.Tensor,
+        features: Sequence[torch.Tensor],
+        expected_channels: Sequence[int],
+    ) -> None:
+        if len(features) != len(expected_channels):
+            raise RuntimeError(
+                f"Backbone returned {len(features)} feature levels; expected {len(expected_channels)}."
+            )
+        for index, (feature, channels) in enumerate(zip(features, expected_channels)):
+            if feature.ndim != 5:
+                raise ValueError(
+                    f"Temporal feature {index} must be [B, T, C, H, W], got {tuple(feature.shape)}."
+                )
+            if feature.shape[:2] != frames.shape[:2] or feature.shape[2] != channels:
+                raise ValueError(
+                    f"Temporal feature {index} shape {tuple(feature.shape)} does not match "
+                    f"frames {tuple(frames.shape)} and C={channels}."
+                )
 
-    def forward(
+    def forward_temporal(
         self,
-        images: torch.Tensor,
-        features: list,
-    ) -> list:
-        """Apply motion processing to backbone feature maps.
+        frames: torch.Tensor,
+        temporal_features: Sequence[torch.Tensor],
+    ) -> MotionOutput:
+        """Run MDD/heatmap/R-STR and return centre-frame RF-DETR features."""
+        frames = self._make_frame_window(frames)
+        self._validate_temporal_features(
+            frames, temporal_features, self.feature_channels_per_scale
+        )
+        if self.mdd is None:
+            motion_maps = frames.new_zeros(
+                (frames.shape[0], 4, frames.shape[-2], frames.shape[-1])
+            )
+        else:
+            motion_maps = self.mdd(frames)
 
-        Args:
-            images: Raw input tensor [B, 3, H, W] or [B, T, 3, H, W].
-            features: List of NestedTensors from LWDETR backbone (one per
-                pyramid level).  Each NestedTensor has ``.tensors`` and
-                ``.mask`` attributes.
+        feature_level = max(
+            range(len(temporal_features)),
+            key=lambda index: int(temporal_features[index].shape[-2])
+            * int(temporal_features[index].shape[-1]),
+        )
+        draft_low_resolution = self.draft_heads[feature_level](
+            temporal_features[feature_level], motion_maps
+        )
+        heatmap_low_resolution = (
+            self.rstr(draft_low_resolution, motion_maps)
+            if self.rstr is not None
+            else draft_low_resolution
+        )
+        output_size = (int(frames.shape[-2]), int(frames.shape[-1]))
+        draft_logits = F.interpolate(
+            draft_low_resolution,
+            size=output_size,
+            mode="bilinear",
+            align_corners=False,
+        )
+        heatmap_logits = F.interpolate(
+            heatmap_low_resolution,
+            size=output_size,
+            mode="bilinear",
+            align_corners=False,
+        )
+        heatmaps = heatmap_logits.sigmoid()
 
-        Returns:
-            Modulated feature list (same type/length as input).
-        """
+        centre_features = [
+            feature[:, self.anchor_index].contiguous() for feature in temporal_features
+        ]
+        centre_features[feature_level] = self.fusions[feature_level](
+            centre_features[feature_level],
+            heatmaps[:, self.anchor_index : self.anchor_index + 1],
+        )
+        output = MotionOutput(
+            features=centre_features,
+            draft_heatmap_logits=draft_logits,
+            heatmap_logits=heatmap_logits,
+            heatmaps=heatmaps,
+            motion_maps=motion_maps,
+            feature_level=feature_level,
+        )
+        self.last_output = output
+        return output
+
+    def build_heatmap_targets(
+        self,
+        targets: Sequence[Any] | Mapping[str, Any],
+        output_size: Tuple[int, int],
+        *,
+        image_size: Optional[Tuple[int, int]] = None,
+    ) -> torch.Tensor:
+        return build_gaussian_heatmap_targets(
+            targets,
+            output_size,
+            image_size=image_size,
+            focus_mode=self.focus_mode,
+            primary_field=self.primary_field,
+            min_sigma=self.min_sigma,
+        )
+
+    def heatmap_loss(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        return self.heatmap_weight * weighted_heatmap_bce(
+            logits, targets, gamma=self.heatmap_gamma
+        )
+
+    def extract_peaks(self, heatmaps: torch.Tensor) -> List[List[torch.Tensor]]:
+        return extract_heatmap_peaks(
+            heatmaps,
+            focus_mode=self.focus_mode,
+            threshold=self.peak_threshold,
+            nms_kernel=self.peak_nms_kernel,
+            max_peaks=self.max_peaks,
+        )
+
+    def forward(self, images: torch.Tensor, features: list) -> list:
         feature_tensors = [nested.tensors for nested in features]
         modulated_tensors = self.forward_export(images, feature_tensors)
-
-        # Preserve the masks and NestedTensor contract used by regular LWDETR
-        # inference/training.  The tensor-only export path below deliberately
-        # shares all feature math with this path so ONNX cannot silently omit
-        # the motion module.
         return [
             _rebuild_nested_tensor(src, nested.mask)
             for src, nested in zip(modulated_tensors, features)
@@ -499,53 +1049,26 @@ class MotionModule(nn.Module):
         images: torch.Tensor,
         features: List[torch.Tensor],
     ) -> List[torch.Tensor]:
-        """Apply motion processing to tensor-only backbone export features.
+        """Compatibility path for still-image export and legacy callers.
 
-        RF-DETR's ONNX mode changes the backbone output from ``NestedTensor``
-        objects to raw tensors.  Keeping this as an explicit, shared path makes
-        the exported graph numerically equivalent to the regular motion path
-        while retaining RF-DETR's tensor-only export contract.
+        Real temporal execution must pass one feature tensor per frame through
+        :meth:`forward_temporal`; a 4-D feature is repeated only when explicit
+        single-frame fallback is enabled.
         """
-        if len(features) != len(self.feature_channels_per_scale):
-            raise RuntimeError(
-                "RF-DETR motion feature-level mismatch: the backbone returned "
-                f"{len(features)} level(s), but motion_module was built for "
-                f"{len(self.feature_channels_per_scale)} level(s)."
-            )
-        # Build frame window for MDD.
-        frames = self._make_frame_window(images)  # [B, T, 3, H, W]
-
-        # Compute MDD motion maps.
-        if self.mdd_enabled and self.mdd is not None:
-            motion_maps = self.mdd(frames)  # [B, 2*polarity_channels, H_img, W_img]
-        else:
-            motion_maps = None
-
-        # Apply gates + RSTR to each feature scale.
-        modulated = []
-        for i, feature in enumerate(features):
-            src = feature  # [B, C, H_i, W_i]
-            if torch.onnx.is_in_onnx_export():
-                src = src.reshape(
-                    -1,
-                    self.feature_channels_per_scale[i],
-                    int(src.shape[-2]),
-                    int(src.shape[-1]),
+        frames = self._make_frame_window(images)
+        temporal_features: List[torch.Tensor] = []
+        for feature, channels in zip(features, self.feature_channels_per_scale):
+            if feature.ndim == 5:
+                temporal_features.append(feature)
+                continue
+            if feature.ndim != 4 or feature.shape[1] != channels:
+                raise ValueError(
+                    f"Expected feature [B, {channels}, H, W], got {tuple(feature.shape)}."
                 )
-
-            # Motion-guided feature gate.
-            if motion_maps is not None and i < len(self.gates):
-                gate = self.gates[i]
-                if not isinstance(gate, nn.Identity):
-                    src = gate(src, motion_maps)
-
-            # R-STR refinement.
-            if self.rstr_enabled and self.rstr_heads is not None and i < len(self.rstr_heads):
-                src = self.rstr_heads[i](src)
-
-            modulated.append(src)
-
-        return modulated
+            temporal_features.append(
+                feature.unsqueeze(1).expand(-1, self.num_frames, -1, -1, -1)
+            )
+        return self.forward_temporal(frames, temporal_features).features
 
 
 # ---------------------------------------------------------------------------
@@ -561,164 +1084,147 @@ def _rebuild_nested_tensor(tensors: torch.Tensor, mask: Optional[torch.Tensor]):
     return NestedTensor(tensors, mask)
 
 
-# ---------------------------------------------------------------------------
-# Monkey-patch: silence DINOv2 channel-count assertion
-# ---------------------------------------------------------------------------
-
-def _patch_dinov2_channel_check() -> None:
-    """Remove the hardcoded num_channels == 3 check in Dinov2WithRegistersPatchEmbeddings.
-
-    The check raises ValueError when the patch embedding receives more than 3
-    channels (e.g. from early-fusion motion input in Phase 2).  For Phase 1 we
-    still feed 3 channels, so the patch is a no-op but prevents surprises if
-    the user experiments with expanded inputs.
-    """
-    global _CHANNEL_CHECK_PATCHED
-    if _CHANNEL_CHECK_PATCHED:
-        return
-    try:
-        from rfdetr.models.backbone.dinov2_with_windowed_attn import (
-            Dinov2WithRegistersPatchEmbeddings,
+def _select_temporal_tensor(
+    tensor: torch.Tensor,
+    batch_size: int,
+    num_frames: int,
+    frame_index: int,
+) -> torch.Tensor:
+    if tensor.shape[0] != batch_size * num_frames:
+        raise RuntimeError(
+            "RF-DETR backbone temporal batch mismatch: "
+            f"first dimension is {tensor.shape[0]}, expected {batch_size * num_frames}."
         )
-        original_forward = Dinov2WithRegistersPatchEmbeddings.forward
-
-        def _flexible_forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-            # Allow any number of channels; the projection conv handles the mapping.
-            embeddings = self.projection(pixel_values).flatten(2).transpose(1, 2)
-            return embeddings
-
-        _flexible_forward._motion_patched = True
-        if not getattr(original_forward, "_motion_patched", False):
-            Dinov2WithRegistersPatchEmbeddings.forward = _flexible_forward
-    except Exception as exc:
-        warnings.warn(
-            f"[rf_detr_motion] Could not patch Dinov2WithRegistersPatchEmbeddings.forward: {exc}",
-            stacklevel=2,
-        )
-    _CHANNEL_CHECK_PATCHED = True
+    return tensor.reshape(batch_size, num_frames, *tensor.shape[1:])[:, frame_index]
 
 
-# ---------------------------------------------------------------------------
-# Monkey-patch: wrap LWDETR.forward to inject motion module
-# ---------------------------------------------------------------------------
+def run_temporal_lwdetr(
+    lwdetr: nn.Module,
+    frames: Any,
+    padding_masks: Optional[torch.Tensor] = None,
+    targets: Optional[Any] = None,
+) -> Dict[str, torch.Tensor]:
+    """Run a three-frame batch through one attached LWDETR instance.
 
-def _patch_lwdetr_motion_forward() -> None:
-    """Wrap LWDETR forward paths to call motion after the backbone.
-
-    The wrapper is transparent: if the model has no ``motion_module`` attribute
-    (e.g. checkpoints loaded without motion support) the forward runs unchanged.
-    Both regular ``forward`` and tensor-only ``forward_export`` are patched;
-    omitting the latter would silently produce an ONNX/TensorRT graph without
-    the attached motion module.  Installed once even if
-    ``ensure_motion_support()`` is called multiple times.
+    ``frames`` may be a tensor or a batch object exposing ``.frames`` and
+    optionally ``.padding_masks``. The backbone sees all ``B*T`` frames in one
+    call, the TrackNet branch receives reshaped temporal features, and stock
+    LWDETR continuation receives only centre-frame features. No class-level or
+    process-global method is patched.
     """
-    global _LWDETR_PATCHED
-    if _LWDETR_PATCHED:
-        return
-    try:
-        import rfdetr.models.lwdetr as lwdetr_module
-        try:
-            from rfdetr.utilities import nested_tensor_from_tensor_list  # rfdetr >= 1.6
-        except ImportError:
-            from rfdetr.util.misc import nested_tensor_from_tensor_list  # rfdetr < 1.6
+    mdd_frames = frames if torch.is_tensor(frames) else None
+    if not torch.is_tensor(frames):
+        batch_object = frames
+        frames = getattr(batch_object, "frames", None)
+        if frames is None:
+            raise TypeError("Temporal input must be a tensor or expose a .frames tensor.")
+        mdd_frames = getattr(batch_object, "mdd_frames", frames)
+        if padding_masks is None:
+            padding_masks = getattr(batch_object, "padding_masks", None)
+        if targets is None:
+            targets = getattr(batch_object, "detection_targets", None)
+        if targets is None:
+            targets = getattr(batch_object, "anchor_targets", None)
+    if frames.ndim != 5 or frames.shape[1:3] != (3, 3):
+        raise ValueError(
+            "Temporal LWDETR expects [B, 3, 3, H, W], "
+            f"received {tuple(frames.shape)}."
+        )
+    if not torch.is_tensor(mdd_frames) or mdd_frames.shape != frames.shape:
+        shape = getattr(mdd_frames, "shape", None)
+        raise ValueError(
+            "TemporalBatch.mdd_frames must be a tensor matching .frames, "
+            f"got {shape!r} vs {tuple(frames.shape)}."
+        )
+    mdd_frames = mdd_frames.to(device=frames.device, dtype=frames.dtype)
+    motion_module = getattr(lwdetr, "motion_module", None)
+    if not isinstance(motion_module, MotionModule):
+        raise RuntimeError(
+            "LWDETR has no attached MotionModule; call attach_motion_module() first."
+        )
+    batch_size, num_frames, channels, height, width = frames.shape
+    if padding_masks is None:
+        padding_masks = torch.zeros(
+            (batch_size, num_frames, height, width),
+            dtype=torch.bool,
+            device=frames.device,
+        )
+    if padding_masks.shape != (batch_size, num_frames, height, width):
+        raise ValueError(
+            "padding_masks must be [B, T, H, W], "
+            f"got {tuple(padding_masks.shape)}."
+        )
+    padding_masks = padding_masks.to(device=frames.device, dtype=torch.bool)
+    flattened_samples = _rebuild_nested_tensor(
+        frames.reshape(batch_size * num_frames, channels, height, width),
+        padding_masks.reshape(batch_size * num_frames, height, width),
+    )
+    backbone_result = lwdetr.backbone(flattened_samples)
+    if not isinstance(backbone_result, tuple) or len(backbone_result) != 3:
+        raise RuntimeError(
+            "rfdetr==1.8.3 backbone must return (features, positions, cross_attn_features)."
+        )
+    features, positions, cross_attn_features = backbone_result
+    temporal_features = [
+        feature.tensors.reshape(
+            batch_size, num_frames, *feature.tensors.shape[1:]
+        )
+        for feature in features
+    ]
+    motion_output = motion_module.forward_temporal(mdd_frames, temporal_features)
+    anchor = motion_module.anchor_index
 
-        original_init = lwdetr_module.LWDETR.__init__
-        original_forward = lwdetr_module.LWDETR.forward
-        original_forward_export = lwdetr_module.LWDETR.forward_export
-
-        def _motion_init(self, *args, **kwargs):
-            original_init(self, *args, **kwargs)
-            active_config = MOTION_SETTINGS
-            if bool(active_config.get("enabled", False)) and resolve_motion_type(active_config) != "none":
-                # LWDETR is now fully constructed, while RF-DETR's facade and
-                # Lightning loaders have not restored checkpoint weights yet.
-                attach_motion_module(self, active_config)
-
-        _motion_init._motion_patched = True
-
-        def _motion_forward(self, samples, targets=None):
-            # Normalise input to NestedTensor then extract raw pixels for motion.
-            # Must convert to NestedTensor *before* .tensors to handle variable-size
-            # image lists safely (nested_tensor_from_tensor_list pads to the same size).
-            if isinstance(samples, (list, torch.Tensor)):
-                samples = nested_tensor_from_tensor_list(samples)
-            raw_images = samples.tensors  # [B, 3, H_max, W_max] (padded)
-
-            # Run backbone (stock call).
-            features, poss, cross_attn_features = self.backbone(samples)
-
-            # Apply motion module if present (inserted by attach_motion_module).
-            if getattr(self, "motion_module", None) is not None:
-                features = self.motion_module(raw_images, features)
-
-            # --- Resume stock LWDETR.forward from after the backbone call ---
-            # We call the original forward but skip the backbone by temporarily
-            # replacing self.backbone with a stub that returns the (already computed)
-            # features, poss, cross_attn_features.
-            class _BackboneStub(nn.Module):
-                def forward(self, _samples):
-                    return features, poss, cross_attn_features
-
-            orig_backbone = self.backbone
-            self.backbone = _BackboneStub()
-            try:
-                # The original forward will re-normalise samples — feed back the
-                # NestedTensor so the isinstance check at line ~463 is a no-op.
-                result = original_forward(self, samples, targets)
-            finally:
-                self.backbone = orig_backbone
-            return result
-
-        _motion_forward._motion_patched = True
-
-        def _motion_forward_export(self, tensors):
-            backbone_result = self.backbone(tensors)
-            if not isinstance(backbone_result, tuple) or len(backbone_result) != 4:
-                raise RuntimeError(
-                    "Motion-aware RF-DETR export expected the backbone to return "
-                    "(features, masks, positions, cross_attention_features)."
+    centre_features = []
+    for modulated, original in zip(motion_output.features, features):
+        centre_mask = None
+        if original.mask is not None:
+            centre_mask = _select_temporal_tensor(
+                original.mask, batch_size, num_frames, anchor
+            )
+        centre_features.append(_rebuild_nested_tensor(modulated, centre_mask))
+    centre_positions = [
+        _select_temporal_tensor(position, batch_size, num_frames, anchor)
+        for position in positions
+    ]
+    centre_cross_attn_features = None
+    if cross_attn_features is not None:
+        centre_cross_attn_features = []
+        for feature in cross_attn_features:
+            centre_mask = None
+            if feature.mask is not None:
+                centre_mask = _select_temporal_tensor(
+                    feature.mask, batch_size, num_frames, anchor
                 )
-            features, masks, poss, cross_attn_features = backbone_result
+            centre_cross_attn_features.append(
+                _rebuild_nested_tensor(
+                    _select_temporal_tensor(
+                        feature.tensors, batch_size, num_frames, anchor
+                    ),
+                    centre_mask,
+                )
+            )
 
-            motion_module = getattr(self, "motion_module", None)
-            if motion_module is not None:
-                motion_export = getattr(motion_module, "forward_export", None)
-                if not callable(motion_export):
-                    raise RuntimeError(
-                        "Attached RF-DETR motion module has no tensor-only forward_export(); "
-                        "refusing to export a graph that would omit motion processing."
-                    )
-                features = motion_export(tensors, list(features))
+    centre_samples = _rebuild_nested_tensor(
+        frames[:, anchor], padding_masks[:, anchor]
+    )
+    original_backbone_forward = lwdetr.backbone.forward
 
-            # Resume the version-pinned upstream forward_export after its
-            # backbone call.  Replacing only the forward callable keeps the
-            # registered module/parameters intact while torch.onnx traces the
-            # already-computed backbone and motion tensors.
-            original_backbone_forward = self.backbone.forward
+    def _centre_backbone_forward(_samples):
+        return centre_features, centre_positions, centre_cross_attn_features
 
-            def _backbone_export_stub(_tensors):
-                return features, masks, poss, cross_attn_features
-
-            self.backbone.forward = _backbone_export_stub
-            try:
-                return original_forward_export(self, tensors)
-            finally:
-                self.backbone.forward = original_backbone_forward
-
-        _motion_forward_export._motion_patched = True
-        if not getattr(original_init, "_motion_patched", False):
-            lwdetr_module.LWDETR.__init__ = _motion_init
-        if not getattr(original_forward, "_motion_patched", False):
-            lwdetr_module.LWDETR.forward = _motion_forward
-        if not getattr(original_forward_export, "_motion_patched", False):
-            lwdetr_module.LWDETR.forward_export = _motion_forward_export
-        _LWDETR_PATCHED = True
-    except Exception as exc:
-        warnings.warn(
-            f"[rf_detr_motion] Could not patch LWDETR.forward: {exc}. "
-            "Motion module will not be applied during forward passes.",
-            stacklevel=2,
-        )
+    # Call the version-pinned stock continuation without mutating its class.
+    stock_forward = getattr(type(lwdetr).forward, "_motion_original", type(lwdetr).forward)
+    lwdetr.backbone.forward = _centre_backbone_forward
+    try:
+        output = stock_forward(lwdetr, centre_samples, targets)
+    finally:
+        lwdetr.backbone.forward = original_backbone_forward
+    if not isinstance(output, dict):
+        raise RuntimeError("LWDETR forward must return a prediction dictionary.")
+    output["pred_heatmaps"] = motion_output.heatmaps
+    output["pred_heatmap_logits"] = motion_output.heatmap_logits
+    output["motion_maps"] = motion_output.motion_maps
+    return output
 
 
 # ---------------------------------------------------------------------------
@@ -734,12 +1240,6 @@ def _deep_merge(base: dict, override: dict) -> dict:
         else:
             result[k] = v
     return result
-
-
-def _record_motion_settings(motion_cfg: Dict[str, Any]) -> None:
-    """Write the caller's motion config into the global MOTION_SETTINGS dict."""
-    global MOTION_SETTINGS
-    MOTION_SETTINGS = _deep_merge(deepcopy(_MOTION_DEFAULTS), motion_cfg or {})
 
 
 def resolve_motion_type(motion_cfg: Optional[Dict[str, Any]]) -> str:
@@ -774,24 +1274,19 @@ def apply_motion_overrides(
 # ---------------------------------------------------------------------------
 
 def is_patched() -> bool:
-    """Return True once both LWDETR and DINOv2 patches have been applied."""
-    return _LWDETR_PATCHED and _CHANNEL_CHECK_PATCHED
+    """Return False; TrackNet integration is instance-bound and never patched."""
+    return False
 
 
 def ensure_motion_support(motion_cfg: Optional[Dict[str, Any]] = None) -> None:
-    """Apply in-process patches and record motion settings (idempotent).
-
-    Call this at the model-build choke point (same as ensure_p2_support for P2),
-    before constructing the rfdetr model object.
-
-    Args:
-        motion_cfg: The ``model.motion`` dict from the trainer config.
-    """
+    """Validate an enabled TrackNet request without process-global mutation."""
     motion_cfg = motion_cfg or {}
-    _record_motion_settings(motion_cfg)
+    if not bool(motion_cfg.get("enabled", False)):
+        return
+    if resolve_motion_type(motion_cfg) == "none":
+        return
+    _validated_motion_config(motion_cfg)
     _check_version()
-    _patch_dinov2_channel_check()
-    _patch_lwdetr_motion_forward()
 
 
 def _infer_motion_feature_channels(lwdetr: nn.Module) -> List[int]:
@@ -859,6 +1354,28 @@ def _infer_motion_feature_channels(lwdetr: nn.Module) -> List[int]:
     return feature_channels
 
 
+def _instance_motion_forward(
+    lwdetr: nn.Module,
+    samples: Any,
+    targets: Optional[Any] = None,
+):
+    """Instance-bound dispatch: temporal batches use TrackNet, images stay stock."""
+    is_temporal_tensor = torch.is_tensor(samples) and samples.ndim == 5
+    is_temporal_batch = hasattr(samples, "frames")
+    if is_temporal_tensor or is_temporal_batch:
+        return run_temporal_lwdetr(lwdetr, samples, targets=targets)
+    return type(lwdetr).forward(lwdetr, samples, targets)
+
+
+def _instance_temporal_forward(
+    lwdetr: nn.Module,
+    frames: Any,
+    padding_masks: Optional[torch.Tensor] = None,
+    targets: Optional[Any] = None,
+):
+    return run_temporal_lwdetr(lwdetr, frames, padding_masks, targets)
+
+
 def attach_motion_module(model: nn.Module, motion_cfg: Optional[Dict[str, Any]] = None) -> None:
     """Build a MotionModule and attach it to the LWDETR model instance.
 
@@ -880,6 +1397,8 @@ def attach_motion_module(model: nn.Module, motion_cfg: Optional[Dict[str, Any]] 
     mtype = resolve_motion_type(motion_cfg)
     if mtype == "none":
         return
+    _validated_motion_config(motion_cfg)
+    _check_version()
 
     # Preserve intent separately from successful attachment.  The TensorRT
     # export validator uses this marker to fail if model discovery/version skew
@@ -912,6 +1431,10 @@ def attach_motion_module(model: nn.Module, motion_cfg: Optional[Dict[str, Any]] 
         else:
             motion_module.to(device=reference_parameter.device)
     lwdetr.motion_module = motion_module  # type: ignore[assignment]
+    lwdetr.forward = MethodType(_instance_motion_forward, lwdetr)  # type: ignore[method-assign]
+    lwdetr.forward_temporal = MethodType(  # type: ignore[attr-defined]
+        _instance_temporal_forward, lwdetr
+    )
     lwdetr._motion_export_required = True  # type: ignore[attr-defined]
 
 
@@ -940,9 +1463,60 @@ def _motion_state_from_checkpoint(checkpoint: Mapping[str, Any]) -> Dict[str, to
                 if key.startswith(prefix):
                     key = key[len(prefix):]
                     changed = True
+        if key.startswith("temporal_adapter.motion_module."):
+            key = key[len("temporal_adapter."):]
         if key.startswith("motion_module."):
             motion_state[key] = value
     return motion_state
+
+
+def load_motion_checkpoint_weights(
+    model: nn.Module,
+    checkpoint_path: Any,
+) -> None:
+    """Load only attached ``motion_module`` tensors from a training checkpoint."""
+    lwdetr = _find_lwdetr(model)
+    if lwdetr is None or not isinstance(getattr(lwdetr, "motion_module", None), MotionModule):
+        raise RuntimeError(
+            "Cannot load TrackNet weights before attach_motion_module() has succeeded."
+        )
+    path = Path(str(checkpoint_path)).expanduser()
+    if not path.is_file():
+        raise RuntimeError(f"Motion checkpoint does not exist: {path}")
+    try:
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(path, map_location="cpu")
+    if not isinstance(checkpoint, Mapping):
+        raise RuntimeError(f"Motion checkpoint must be a mapping: {path}")
+    motion_state = _motion_state_from_checkpoint(checkpoint)
+    if not motion_state:
+        raise RuntimeError(f"Checkpoint {path} contains no motion_module.* weights.")
+    _assert_new_motion_architecture_metadata(checkpoint, motion_state)
+    stripped_state = {
+        key[len("motion_module."):]: value for key, value in motion_state.items()
+    }
+    expected_state = lwdetr.motion_module.state_dict()
+    missing = sorted(set(expected_state) - set(stripped_state))
+    unexpected = sorted(set(stripped_state) - set(expected_state))
+    mismatched = sorted(
+        key
+        for key in set(expected_state) & set(stripped_state)
+        if tuple(expected_state[key].shape) != tuple(stripped_state[key].shape)
+    )
+    if missing or unexpected or mismatched:
+        details = []
+        if missing:
+            details.append(f"missing={missing[:5]}")
+        if unexpected:
+            details.append(f"unexpected={unexpected[:5]}")
+        if mismatched:
+            details.append(f"shape_mismatch={mismatched[:5]}")
+        raise RuntimeError(
+            f"Checkpoint {path} is incompatible with the attached TrackNet module: "
+            + "; ".join(details)
+        )
+    lwdetr.motion_module.load_state_dict(stripped_state, strict=True)
 
 
 def _checkpoint_architecture_metadata(checkpoint: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
@@ -954,6 +1528,41 @@ def _checkpoint_architecture_metadata(checkpoint: Mapping[str, Any]) -> Optional
     if not isinstance(metadata, Mapping):
         raise RuntimeError('Checkpoint pitchobjectlab_architecture metadata must be a mapping.')
     return metadata
+
+
+def _assert_new_motion_architecture_metadata(
+    checkpoint: Mapping[str, Any],
+    motion_state: Mapping[str, torch.Tensor],
+) -> None:
+    """Reject legacy TrackNet tensors while leaving stock checkpoints untouched."""
+
+    if not motion_state:
+        return
+    metadata = _checkpoint_architecture_metadata(checkpoint)
+    if metadata is None:
+        raise RuntimeError(
+            "Checkpoint contains motion_module.* tensors but has no "
+            "pitchobjectlab_architecture metadata. Refusing to load a legacy "
+            "TrackNet prototype checkpoint."
+        )
+    schema_version = metadata.get("schema_version")
+    if schema_version != _TRACKNET_ARCHITECTURE_SCHEMA_VERSION:
+        raise RuntimeError(
+            "TrackNet checkpoint architecture metadata must use schema_version="
+            f"{_TRACKNET_ARCHITECTURE_SCHEMA_VERSION}, got {schema_version!r}."
+        )
+    saved_motion = metadata.get("motion")
+    if not isinstance(saved_motion, Mapping):
+        raise RuntimeError(
+            "TrackNet checkpoint architecture metadata must contain a model.motion mapping."
+        )
+    if not bool(saved_motion.get("enabled", False)) or str(
+        saved_motion.get("type", "")
+    ).lower() != "tracknet_v5":
+        raise RuntimeError(
+            "TrackNet checkpoint architecture metadata must identify an enabled "
+            "motion.type='tracknet_v5' graph."
+        )
 
 
 def _assert_motion_metadata_compatible(
@@ -1012,9 +1621,9 @@ def assert_motion_checkpoint_compatible(
     if not isinstance(checkpoint, Mapping):
         raise RuntimeError(f"Motion checkpoint must be a mapping: {path}")
 
-    _assert_motion_metadata_compatible(checkpoint, expected_architecture)
-
     checkpoint_state = _motion_state_from_checkpoint(checkpoint)
+    _assert_new_motion_architecture_metadata(checkpoint, checkpoint_state)
+    _assert_motion_metadata_compatible(checkpoint, expected_architecture)
     expected_state = {
         key: value
         for key, value in lwdetr.state_dict().items()
@@ -1056,57 +1665,20 @@ def assert_motion_export_ready(
     model: nn.Module,
     motion_cfg: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Fail before ONNX export if enabled motion cannot enter the graph.
-
-    ``motion_cfg`` should be supplied by callers that know motion was requested.
-    Without it, an attached ``motion_module`` is treated as the signal that the
-    model requires motion-aware export.  Disabled/non-motion models remain a
-    no-op.
-    """
-    requested = None
+    """Reject ONNX/TensorRT export for the true temporal TrackNet graph."""
     if motion_cfg is not None:
-        requested = bool(motion_cfg.get("enabled", False)) and resolve_motion_type(motion_cfg) != "none"
-
-    lwdetr = _find_lwdetr(model)
-    attached = lwdetr is not None and getattr(lwdetr, "motion_module", None) is not None
-    if requested is None:
-        wrappers = [model]
-        if hasattr(model, "model"):
-            wrappers.append(model.model)
-        if hasattr(model, "model") and hasattr(model.model, "model"):
-            wrappers.append(model.model.model)
-        requested = attached or any(
-            bool(getattr(candidate, "_motion_export_required", False)) for candidate in wrappers
+        requested = bool(motion_cfg.get("enabled", False)) and (
+            resolve_motion_type(motion_cfg) != "none"
         )
-    if requested is False:
+    else:
+        lwdetr = _find_lwdetr(model)
+        requested = lwdetr is not None and getattr(lwdetr, "motion_module", None) is not None
+    if not requested:
         return
-    if lwdetr is None:
-        raise RuntimeError(
-            "Motion-enabled RF-DETR export could not locate the LWDETR model; "
-            "refusing to build an ONNX/TensorRT graph without motion processing."
-        )
-    if not attached:
-        raise RuntimeError(
-            "Motion-enabled RF-DETR export has no attached motion_module; "
-            "call attach_motion_module() after constructing/aligning the model."
-        )
-    if not callable(getattr(lwdetr.motion_module, "forward_export", None)):
-        raise RuntimeError(
-            "The attached RF-DETR motion module does not support tensor-only ONNX export."
-        )
-    fallback_mode = getattr(lwdetr.motion_module, "fallback_mode", None)
-    if fallback_mode is not None and str(fallback_mode).strip().lower() != "identity":
-        raise RuntimeError(
-            "TensorRT still-image motion export requires "
-            "model.motion.temporal.fallback_mode='identity' for deterministic tracing; "
-            f"got {fallback_mode!r}."
-        )
-    export_forward = getattr(type(lwdetr), "forward_export", None)
-    if not getattr(export_forward, "_motion_patched", False):
-        raise RuntimeError(
-            "LWDETR.forward_export is not motion-aware; call ensure_motion_support() "
-            "before constructing the model."
-        )
+    raise RuntimeError(
+        "True temporal TrackNetV5 ONNX/TensorRT export is not supported. "
+        "Use the PyTorch train/test/inference path or disable model.motion."
+    )
 
 
 def _find_lwdetr(model: nn.Module) -> Optional[nn.Module]:

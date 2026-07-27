@@ -36,7 +36,6 @@ from types import SimpleNamespace
 from typing import Any, Dict, MutableMapping, Optional
 
 import colorama
-import yaml
 from colorama import Fore, Style
 from tqdm import tqdm
 
@@ -54,11 +53,7 @@ TIMESTAMP_FORMAT = "%Y%m%d%H%M%S"
 
 
 def load_yaml(path: Path) -> Dict[str, Any]:
-    with path.open("r", encoding="utf-8") as file:
-        data = yaml.safe_load(file) or {}
-    if not isinstance(data, dict):
-        raise TypeError(f"Config root must be a mapping: {path}")
-    return data
+    return trainer.load_yaml(path)
 
 
 def apply_cli_overrides(config: MutableMapping[str, Any], args: argparse.Namespace) -> None:
@@ -79,6 +74,10 @@ def apply_cli_overrides(config: MutableMapping[str, Any], args: argparse.Namespa
         model["resolution"] = args.resolution
     if args.num_classes is not None:
         model["num_classes"] = args.num_classes
+    tracknet_focus = getattr(args, "tracknet_focus", None)
+    if tracknet_focus is not None:
+        motion = model.setdefault("motion", {})
+        motion.setdefault("focus", {})["mode"] = tracknet_focus
     optimization = model.setdefault("inference_optimization", {})
     backend_override = getattr(args, "inference_backend", None)
     if backend_override is not None:
@@ -722,6 +721,11 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
     parser.add_argument("--resolution", type=int, help="Input resolution override.")
     parser.add_argument("--num-classes", type=int, help="Optional class count override.")
     parser.add_argument(
+        "--tracknet-focus",
+        choices=("single", "all"),
+        help="Override model.motion.focus.mode for temporal TrackNet evaluation.",
+    )
+    parser.add_argument(
         "--inference-backend",
         choices=["pytorch", "tensorrt"],
         help="Inference backend override. PyTorch FP32 remains the default.",
@@ -860,6 +864,7 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
         bar.update(1)
 
     test_settings = internal_config.get("test", {})
+    temporal_enabled = trainer.temporal_motion_enabled(internal_config)
     mode = trainer.periodic_test_mode(test_settings)
     evaluation_type = str(internal_config.get("evaluation", {}).get("type", "auto")).strip().lower()
     segmentation_model = bool(
@@ -870,7 +875,22 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
         and mode == "full_image"
         and evaluation_type in {"auto", "segm", "segment", "segmentation", "mask", "masks"}
     )
-    if parallel_chunks > 1:
+    if temporal_enabled:
+        if parallel_chunks > 1:
+            raise ValueError("Real temporal TrackNet standalone test currently requires test.parallel.chunks=1")
+        if rf_model is None or train_config is None:
+            raise RuntimeError("Temporal RF-DETR evaluator runtime was not initialized.")
+        from rf_detr_temporal_runtime import run_temporal_split
+
+        result = run_temporal_split(
+            rf_model=rf_model,
+            config=internal_config,
+            output_dir=output_dir,
+            split=str(test_settings.get("split", "test")),
+            save_heatmaps=True,
+        )
+        print(json.dumps(result["summary"], indent=2, ensure_ascii=False))
+    elif parallel_chunks > 1:
         if parallel_evaluator_config is None:
             raise RuntimeError("Parallel evaluator config was not initialized.")
         result = run_evaluation(

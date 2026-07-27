@@ -121,6 +121,39 @@ Remove `--dry-run` only after accepting the printed file-count, disk-usage, and
 HH:MM:SS runtime estimate. Each real run writes a config snapshot,
 `run_timing.json`, and `run.log` into the output folder.
 
+## Real-temporal TrackNetV5 micro smoke
+
+The bounded micro smoke uses one real three-frame training window at 128 x 128,
+batch size 1, and zero DataLoader workers. It freezes the detector and optimizes
+only the TrackNet heatmap branch. Acceptance is intentionally limited to finite
+forward/backward results, non-zero finite gradients, lower final total and
+heatmap losses, and a reloadable checkpoint; it is not an accuracy benchmark.
+
+Run the two focus modes from `projects/rf_detr_trainer`:
+
+```bash
+uv run --frozen python run_temporal_micro_smoke.py --focus all --steps 8 --max-minutes 20
+uv run --frozen python run_temporal_micro_smoke.py --focus single --steps 4 --max-minutes 20
+```
+
+The normal command launches a hidden worker under a parent watchdog. If the
+worker exceeds the wall-clock limit, the parent terminates its complete process
+tree and exits with code 124. Results and checkpoints are written beneath
+`runs/rf_detr/micro_smoke/<focus>/`.
+
+The `all` checkpoint can then exercise one test and inference window:
+
+```bash
+uv run --frozen python test_rf_detr_model.py --config config/rf_detr_test_smoke_temporal_tracknet_v5.yaml --checkpoint runs/rf_detr/micro_smoke/all/checkpoint_micro_smoke.pth --yes
+uv run --frozen python inference_rf_detr_model.py --config config/rf_detr_inference_smoke_temporal_tracknet_v5.yaml --checkpoint runs/rf_detr/micro_smoke/all/checkpoint_micro_smoke.pth --yes
+```
+
+Real-temporal TrackNetV5 (`temporal.mode: real`) is PyTorch-only. ONNX and
+TensorRT requests intentionally fail rather than silently using a single-frame
+graph. Full fine-tuning, accuracy claims, the complete P2/TrackNet architecture
+matrix, video boundary/look-ahead handling, temporal SAHI, and multi-process
+inference are deferred; none is part of this bounded smoke contract.
+
 ## Common CLI Examples
 
 Custom dataset and output folder:

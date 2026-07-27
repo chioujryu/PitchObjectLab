@@ -137,107 +137,154 @@ class LearnableSigmoidAttentionTest(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class MDDTest(unittest.TestCase):
-    def _make_mdd(self, polarity_channels=2):
+    def _make_mdd(self, learnable=False):
         return motion.MotionDirectionDecoupling(
             in_channels=3,
-            polarity_channels=polarity_channels,
+            polarity_channels=4,
+            learnable=learnable,
         )
 
     def test_output_shape(self):
-        mdd = self._make_mdd(polarity_channels=2)
-        frames = torch.rand(2, 3, 3, 16, 16)  # [B, T, C, H, W]
+        mdd = self._make_mdd()
+        frames = torch.rand(2, 3, 3, 16, 16)
         out = mdd(frames)
-        # Should be [B, 2*polarity_channels, H, W]
         self.assertEqual(out.shape, (2, 4, 16, 16))
 
-    def test_zero_delta_gate_is_identity(self):
-        """With identical frames (delta=0), the feature gate must be identity.
+    def test_identical_frames_produce_exact_zero(self):
+        mdd = self._make_mdd(learnable=True)
+        image = torch.rand(2, 3, 8, 8)
+        frames = image.unsqueeze(1).expand(-1, 3, -1, -1, -1)
+        self.assertTrue(torch.equal(mdd(frames), torch.zeros(2, 4, 8, 8)))
 
-        When delta=0, proj_plus and proj_minus have zero-init weights so their
-        outputs are 0.  The MDD attention maps are then sigmoid(k*(0-m)) — a
-        constant non-zero value.  However, the MotionFeatureGate.gate conv is
-        *also* zero-init, so gate(any_motion) == 0 and the gated feature is
-        feat*(1+0) == feat — identity end-to-end.
-        """
-        gate = motion.MotionFeatureGate(feature_channels=8, motion_channels=4)
-        feat = torch.rand(1, 8, 8, 8)
-        # The gate conv is zero-init, so its output is zero regardless of the
-        # motion map value, and the result equals the input feature.
-        any_motion = torch.ones(1, 4, 8, 8)  # non-zero input to the gate
-        out = gate(feat, any_motion)
-        self.assertTrue(torch.allclose(out, feat, atol=1e-6))
+    def test_uses_luminance_and_both_adjacent_pairs(self):
+        mdd = self._make_mdd()
+        frames = torch.zeros(1, 3, 3, 2, 2)
+        frames[:, 1, 0] = 1.0  # red increases from previous to centre
+        frames[:, 2, 0] = 0.25  # red decreases from centre to next
+        out = mdd(frames)
+        self.assertTrue(torch.allclose(out[:, 0], torch.full_like(out[:, 0], 0.299)))
+        self.assertTrue(torch.equal(out[:, 1], torch.zeros_like(out[:, 1])))
+        self.assertTrue(torch.equal(out[:, 2], torch.zeros_like(out[:, 2])))
+        self.assertTrue(torch.allclose(out[:, 3], torch.full_like(out[:, 3], 0.299 * 0.75)))
 
     def test_polarity_fields_are_non_negative(self):
-        """P⁺ = ReLU(Δ) and P⁻ = ReLU(−Δ) are always >= 0."""
-        mdd = self._make_mdd(polarity_channels=2)
-        frames = torch.randn(2, 3, 3, 16, 16)
-        # Zero-init projections mean output is zero; use hooks to check internal polarity maps.
-        # We re-initialise weights to random to get a non-trivial output.
-        nn.init.normal_(mdd.proj_plus.weight, std=0.1)
-        nn.init.normal_(mdd.proj_minus.weight, std=0.1)
-        out = mdd(frames)
-        # All outputs should be non-negative (attention is sigmoid of projected polarity fields).
+        out = self._make_mdd(learnable=True)(torch.randn(2, 3, 3, 16, 16))
         self.assertTrue((out >= 0).all())
 
-    def test_polarity_channels_must_be_positive(self):
-        with self.assertRaises(Exception):
-            motion.MotionDirectionDecoupling(in_channels=3, polarity_channels=0)
+    def test_requires_exact_tracknet_shape(self):
+        with self.assertRaises(ValueError):
+            motion.MotionDirectionDecoupling(in_channels=3, polarity_channels=2)
+        with self.assertRaises(ValueError):
+            self._make_mdd()(torch.rand(1, 2, 3, 8, 8))
 
 
 # ---------------------------------------------------------------------------
 # MotionFeatureGate
 # ---------------------------------------------------------------------------
-
-class MotionFeatureGateTest(unittest.TestCase):
-    def test_output_shape_matches_feature(self):
-        gate = motion.MotionFeatureGate(feature_channels=256, motion_channels=4)
-        feat = torch.rand(2, 256, 20, 20)
-        motion_maps = torch.rand(2, 4, 40, 40)  # different spatial size — should be resized
-        out = gate(feat, motion_maps)
-        self.assertEqual(out.shape, feat.shape)
-
-    def test_zero_gate_weight_is_identity(self):
-        """Zero-initialised gate conv → gate(motion) = 0 → out = feat * 1.0 = feat."""
-        gate = motion.MotionFeatureGate(feature_channels=8, motion_channels=4)
-        feat = torch.rand(1, 8, 4, 4)
-        motion_maps = torch.rand(1, 4, 4, 4)
-        out = gate(feat, motion_maps)
-        self.assertTrue(torch.allclose(out, feat, atol=1e-6))
-
-
-# ---------------------------------------------------------------------------
 # RSTRHead
 # ---------------------------------------------------------------------------
 
 class RSTRHeadTest(unittest.TestCase):
-    def test_output_shape_preserved(self):
-        head = motion.RSTRHead(in_channels=32, hidden_dim=64, num_heads=4, num_blocks=1)
-        feat = torch.rand(2, 32, 8, 8)
-        out = head(feat)
-        self.assertEqual(out.shape, feat.shape)
+    @staticmethod
+    def _make_head(**overrides):
+        kwargs = {
+            "num_frames": 3,
+            "hidden_dim": 16,
+            "num_heads": 2,
+            "num_blocks": 1,
+            "dropout": 0.0,
+            "use_pixel_shuffle": True,
+            "context_mask_prob": 0.0,
+        }
+        kwargs.update(overrides)
+        return motion.TemporalRSTRHead(**kwargs)
 
-    def test_output_in_zero_one_range(self):
-        """R-STR applies sigmoid at the end; output must be in [0, 1]."""
-        head = motion.RSTRHead(in_channels=16, hidden_dim=32, num_heads=4, num_blocks=1)
-        feat = torch.rand(1, 16, 6, 6)
-        out = head(feat)
-        self.assertTrue((out >= 0).all() and (out <= 1).all())
+    def test_output_shape_preserved_with_odd_resolution(self):
+        head = self._make_head()
+        drafts = torch.rand(2, 3, 7, 9)
+        out = head(drafts, torch.rand(2, 4, 14, 18))
+        self.assertEqual(out.shape, drafts.shape)
 
-    def test_zero_init_proj_out_acts_as_near_identity(self):
-        """With zero-init proj_out, delta ≈ 0, so output ≈ sigmoid(feat)."""
-        head = motion.RSTRHead(in_channels=8, hidden_dim=16, num_heads=2, num_blocks=1)
-        feat = torch.rand(1, 8, 4, 4)
-        out = head(feat)
-        expected = torch.sigmoid(feat)
-        self.assertTrue(torch.allclose(out, expected, atol=1e-5))
+    def test_zero_init_residual_is_exact_logit_identity(self):
+        head = self._make_head()
+        drafts = torch.randn(1, 3, 6, 6)
+        out = head(drafts, torch.rand(1, 4, 12, 12))
+        self.assertTrue(torch.equal(out, drafts))
 
-    def test_no_nan_gradient(self):
-        head = motion.RSTRHead(in_channels=16, hidden_dim=32, num_heads=4, num_blocks=2)
-        feat = torch.rand(1, 16, 8, 8, requires_grad=True)
-        out = head(feat)
-        loss = out.mean()
+    def test_temporal_branch_receives_gradient(self):
+        head = self._make_head()
+        nn.init.normal_(head.residual_projection.weight, std=0.01)
+        drafts = torch.rand(1, 3, 6, 6, requires_grad=True)
+        out = head(drafts, torch.rand(1, 4, 12, 12))
+        out.square().mean().backward()
+        self.assertTrue(torch.isfinite(drafts.grad).all())
+        self.assertTrue(any(
+            parameter.grad is not None and parameter.grad.abs().sum() > 0
+            for parameter in head.temporal_blocks.parameters()
+        ))
+
+    def test_eval_is_deterministic_and_training_context_mask_is_supported(self):
+        head = self._make_head(context_mask_prob=0.5)
+        drafts = torch.rand(1, 3, 6, 6)
+        motion_maps = torch.rand(1, 4, 12, 12)
+        head.eval()
+        self.assertTrue(torch.equal(head(drafts, motion_maps), head(drafts, motion_maps)))
+        head.train()
+        self.assertEqual(head(drafts, motion_maps).shape, drafts.shape)
+
+
+class HeatmapUtilitiesTest(unittest.TestCase):
+    @staticmethod
+    def _two_ball_targets(primary=None):
+        target = {
+            "boxes": torch.tensor([[0.25, 0.5, 0.1, 0.2], [0.75, 0.5, 0.2, 0.2]]),
+            "box_format": "cxcywh_normalized",
+        }
+        if primary is not None:
+            target["primary_label_index"] = primary
+        return [[target, target, target]]
+
+    def test_gaussian_all_focus_contains_both_centres(self):
+        heatmaps = motion.build_gaussian_heatmap_targets(
+            self._two_ball_targets(), (32, 64), focus_mode="all"
+        )
+        self.assertEqual(heatmaps.shape, (1, 3, 32, 64))
+        self.assertGreater(float(heatmaps[0, 1, 16, 16]), 0.95)
+        self.assertGreater(float(heatmaps[0, 1, 16, 48]), 0.95)
+
+    def test_gaussian_single_focus_requires_explicit_primary_for_multiball(self):
+        with self.assertRaisesRegex(ValueError, "without 'primary_label_index'"):
+            motion.build_gaussian_heatmap_targets(
+                self._two_ball_targets(), (32, 64), focus_mode="single"
+            )
+        heatmaps = motion.build_gaussian_heatmap_targets(
+            self._two_ball_targets(primary=1), (32, 64), focus_mode="single"
+        )
+        self.assertLess(float(heatmaps[0, 1, 16, 16]), 0.1)
+        self.assertGreater(float(heatmaps[0, 1, 16, 48]), 0.95)
+
+    def test_weighted_bce_is_finite_and_backpropagates(self):
+        logits = torch.zeros(1, 3, 16, 16, requires_grad=True)
+        targets = torch.zeros_like(logits)
+        targets[:, :, 8, 8] = 1.0
+        loss = motion.weighted_heatmap_bce(logits, targets, gamma=2.0)
         loss.backward()
-        self.assertFalse(torch.isnan(feat.grad).any())
+        self.assertTrue(torch.isfinite(loss))
+        self.assertTrue(torch.isfinite(logits.grad).all())
+
+    def test_peak_extraction_single_and_all(self):
+        heatmaps = torch.zeros(1, 1, 12, 12)
+        heatmaps[0, 0, 3, 4] = 0.8
+        heatmaps[0, 0, 8, 9] = 0.9
+        all_peaks = motion.extract_heatmap_peaks(
+            heatmaps, focus_mode="all", threshold=0.5, max_peaks=20
+        )
+        single_peak = motion.extract_heatmap_peaks(
+            heatmaps, focus_mode="single", threshold=0.5
+        )
+        self.assertEqual(all_peaks[0][0].shape, (2, 3))
+        self.assertEqual(single_peak[0][0].shape, (1, 3))
+        self.assertTrue(torch.equal(single_peak[0][0][0, :2], torch.tensor([9.0, 8.0])))
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +392,48 @@ class MotionModuleTest(unittest.TestCase):
             self.assertTrue(torch.allclose(nested.tensors, exported, atol=1e-6))
 
 
+    def test_true_temporal_forward_returns_full_resolution_heatmaps(self):
+        mod = self._make_module()
+        mod.eval()
+        frames = torch.rand(2, 3, 3, 32, 40)
+        temporal_features = [
+            torch.rand(2, 3, 32, 8, 10),
+            torch.rand(2, 3, 32, 4, 5),
+            torch.rand(2, 3, 32, 2, 3),
+        ]
+        output = mod.forward_temporal(frames, temporal_features)
+        self.assertEqual(output.heatmap_logits.shape, (2, 3, 32, 40))
+        self.assertEqual(output.motion_maps.shape, (2, 4, 32, 40))
+        self.assertEqual([item.shape for item in output.features], [
+            (2, 32, 8, 10), (2, 32, 4, 5), (2, 32, 2, 3)
+        ])
+
+    def test_zero_init_fusion_is_exact_centre_feature_identity(self):
+        mod = self._make_module()
+        mod.eval()
+        frames = torch.rand(1, 3, 3, 16, 16)
+        temporal_features = [
+            torch.rand(1, 3, 32, 8, 8),
+            torch.rand(1, 3, 32, 4, 4),
+            torch.rand(1, 3, 32, 2, 2),
+        ]
+        output = mod.forward_temporal(frames, temporal_features)
+        for original, fused in zip(temporal_features, output.features):
+            self.assertTrue(torch.equal(fused, original[:, 1]))
+
+    def test_real_mode_rejects_unapproved_single_frame_fallback(self):
+        cfg = deepcopy(self._BASE_CFG)
+        cfg["temporal"] = {
+            "mode": "real",
+            "num_frames": 3,
+            "fallback_mode": "real",
+            "allow_single_frame_fallback": False,
+        }
+        mod = self._make_module(cfg)
+        with self.assertRaisesRegex(RuntimeError, "received one frame"):
+            mod._make_frame_window(torch.rand(1, 3, 16, 16))
+
+
 # ---------------------------------------------------------------------------
 # Config helpers
 # ---------------------------------------------------------------------------
@@ -407,6 +496,26 @@ class BuildModelKwargsMotionTest(unittest.TestCase):
         })
         self.assertNotIn("motion_config", kwargs)
 
+    def test_type_none_is_inert_even_when_enabled_flag_is_true(self):
+        kwargs = trainer.build_model_kwargs(
+            {
+                "model": {
+                    "size": "medium",
+                    "motion": {
+                        "enabled": True,
+                        "type": "none",
+                        "overrides": {"num_queries": 17},
+                    },
+                }
+            }
+        )
+        self.assertNotIn("num_queries", kwargs)
+        self.assertFalse(
+            trainer.motion_module_enabled(
+                {"model": {"motion": {"enabled": True, "type": "none"}}}
+            )
+        )
+
     def test_enabled_applies_overrides(self):
         """When enabled, apply_motion_overrides must inject non-null override values."""
         kwargs = trainer.build_model_kwargs({
@@ -440,160 +549,183 @@ class BuildModelKwargsMotionTest(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class EnsureMotionSupportTest(unittest.TestCase):
-    def test_idempotent(self):
-        """Calling ensure_motion_support multiple times should not raise."""
-        for _ in range(3):
-            motion.ensure_motion_support({"enabled": True, "type": "tracknet_v5"})
-        self.assertTrue(motion.is_patched())
+    def test_disabled_support_is_completely_non_mutating(self):
+        self.assertFalse(hasattr(motion, "MOTION_SETTINGS"))
+        with patch.object(motion, "_check_version") as version_check:
+            motion.ensure_motion_support({"enabled": False})
+        version_check.assert_not_called()
+        self.assertFalse(motion.is_patched())
 
-    def test_is_patched_after_call(self):
-        motion.ensure_motion_support()
-        self.assertTrue(motion.is_patched())
+    def test_enabled_support_validates_without_global_patch(self):
+        with patch.object(motion, "_check_version") as version_check:
+            for _ in range(3):
+                motion.ensure_motion_support({"enabled": True, "type": "tracknet_v5"})
+        self.assertEqual(version_check.call_count, 3)
+        self.assertFalse(motion.is_patched())
 
-    def test_forward_export_is_patched(self):
-        motion.ensure_motion_support({"enabled": True, "type": "tracknet_v5"})
+    def test_enabled_tracknet_rejects_unimplemented_temporal_graph_options(self):
+        cases = (
+            ("temporal.anchor", ("temporal", "anchor"), "start"),
+            ("temporal.boundary_policy", ("temporal", "boundary_policy"), "replicate"),
+            (
+                "tracknet_v5.feature_source",
+                ("tracknet_v5", "feature_source"),
+                "center_frame",
+            ),
+            (
+                "tracknet_v5.feature_level",
+                ("tracknet_v5", "feature_level"),
+                "p3",
+            ),
+            (
+                "rstr.attention_mode",
+                ("tracknet_v5", "rstr", "attention_mode"),
+                "joint",
+            ),
+        )
+        for expected_field, path, unsupported_value in cases:
+            config = _small_motion_config("real")
+            cursor = config
+            for key in path[:-1]:
+                cursor = cursor.setdefault(key, {})
+            cursor[path[-1]] = unsupported_value
+            with self.subTest(field=expected_field), patch.object(
+                motion, "_check_version"
+            ) as version_check:
+                with self.assertRaisesRegex(ValueError, expected_field):
+                    motion.ensure_motion_support(config)
+                version_check.assert_not_called()
+
+    def test_enabled_support_does_not_modify_lwdetr_class_methods(self):
         from rfdetr.models.lwdetr import LWDETR
 
-        self.assertTrue(getattr(LWDETR.forward_export, "_motion_patched", False))
-
-    def test_enabled_config_does_not_leak_into_later_disabled_model(self):
-        import rfdetr.models.lwdetr as lwdetr_module
-
-        saved_settings = deepcopy(motion.MOTION_SETTINGS)
-        saved_patched = motion._LWDETR_PATCHED
-        saved_methods = (
-            _FakeLWDETR.__init__,
-            _FakeLWDETR.forward,
-            _FakeLWDETR.forward_export,
+        original_methods = (LWDETR.__init__, LWDETR.forward, LWDETR.forward_export)
+        motion.ensure_motion_support({"enabled": True, "type": "tracknet_v5"})
+        self.assertEqual(
+            (LWDETR.__init__, LWDETR.forward, LWDETR.forward_export), original_methods
         )
-        try:
-            with patch.object(lwdetr_module, "LWDETR", _FakeLWDETR):
-                motion._LWDETR_PATCHED = False
-                motion.ensure_motion_support(_small_motion_config())
-                enabled_model = _FakeLWDETR()
-                self.assertIsInstance(enabled_model.motion_module, motion.MotionModule)
 
-                motion.ensure_motion_support({"enabled": False})
-                disabled_model = _FakeLWDETR()
-                self.assertFalse(hasattr(disabled_model, "motion_module"))
-                self.assertFalse(motion.MOTION_SETTINGS["enabled"])
-                self.assertEqual(
-                    motion.MOTION_SETTINGS["temporal"]["fallback_mode"], "identity"
-                )
-        finally:
-            _FakeLWDETR.__init__, _FakeLWDETR.forward, _FakeLWDETR.forward_export = saved_methods
-            motion.MOTION_SETTINGS = saved_settings
-            motion._LWDETR_PATCHED = saved_patched
-
-    def test_export_wrapper_applies_motion_to_tensor_features(self):
+    def test_attachment_is_explicit_and_instance_bound(self):
         import rfdetr.models.lwdetr as lwdetr_module
 
-        class FakeBackbone(nn.Module):
-            def forward(self, tensors):
-                feature = tensors[:, :1]
-                mask = torch.zeros(
-                    tensors.shape[0], tensors.shape[2], tensors.shape[3], dtype=torch.bool
-                )
-                position = torch.zeros_like(feature)
-                return [feature], [mask], [position], None
+        with patch.object(lwdetr_module, "LWDETR", _FakeLWDETR):
+            enabled_model = _FakeLWDETR()
+            disabled_model = _FakeLWDETR()
+            motion.attach_motion_module(enabled_model, _small_motion_config())
+            motion.attach_motion_module(disabled_model, {"enabled": False})
+        self.assertIsInstance(enabled_model.motion_module, motion.MotionModule)
+        self.assertFalse(hasattr(disabled_model, "motion_module"))
 
-        class FakeMotion(nn.Module):
+
+class InstanceTemporalForwardTest(unittest.TestCase):
+    def test_attached_forward_accepts_raw_5d_and_temporal_batch(self):
+        import rfdetr.models.lwdetr as lwdetr_module
+
+        class FakeJoiner(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.calls = 0
+                self.level = _FakeBackboneLevel(("P4",), 8)
+                self.seen_tensors = []
 
-            def forward_export(self, _images, features):
-                self.calls += 1
-                return [feature * 3.0 for feature in features]
+            def __getitem__(self, index):
+                if index != 0:
+                    raise IndexError(index)
+                return self.level
 
-        class FakeLWDETR(nn.Module):
+            def forward(self, samples):
+                tensors, masks = samples.decompose()
+                self.seen_tensors.append(tensors.detach().clone())
+                pooled = torch.nn.functional.avg_pool2d(tensors.mean(1, keepdim=True), 2)
+                feature = pooled.expand(-1, 8, -1, -1).contiguous()
+                feature_mask = torch.nn.functional.interpolate(
+                    masks[:, None].float(), size=feature.shape[-2:], mode="nearest"
+                )[:, 0].bool()
+                nested = motion._rebuild_nested_tensor(feature, feature_mask)
+                return [nested], [torch.zeros_like(feature)], None
+
+        class TemporalFakeLWDETR(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.backbone = FakeBackbone()
-                self.motion_module = FakeMotion()
+                self.backbone = FakeJoiner()
+                self.transformer = nn.Module()
+                self.transformer.d_model = 8
+                self.anchor = nn.Parameter(torch.zeros(1))
 
             def forward(self, samples, targets=None):
-                return self.backbone(samples)
+                features, _, _ = self.backbone(samples)
+                batch = features[0].tensors.shape[0]
+                return {
+                    "pred_logits": features[0].tensors.mean((2, 3))[:, None, :1],
+                    "pred_boxes": features[0].tensors.new_zeros((batch, 1, 4)),
+                }
 
             def forward_export(self, tensors):
-                features, _, _, _ = self.backbone(tensors)
-                return features[0]
+                return tensors
 
-        original_patched = motion._LWDETR_PATCHED
-        try:
-            with patch.object(lwdetr_module, "LWDETR", FakeLWDETR):
-                motion._LWDETR_PATCHED = False
-                motion._patch_lwdetr_motion_forward()
-                model = FakeLWDETR()
-                inputs = torch.ones(2, 3, 4, 4)
+        config = _small_motion_config("real")
+        config["temporal"]["allow_single_frame_fallback"] = False
+        with patch.object(lwdetr_module, "LWDETR", TemporalFakeLWDETR):
+            model = TemporalFakeLWDETR()
+            class_forward = TemporalFakeLWDETR.forward
+            motion.attach_motion_module(model, config)
+            frames = torch.rand(2, 3, 3, 16, 20)
+            normalized_frames = frames * 4.0 - 2.0
+            mdd_inputs = []
+            original_mdd_forward = model.motion_module.mdd.forward
 
-                output = model.forward_export(inputs)
+            def capture_mdd_input(value):
+                mdd_inputs.append(value.detach().clone())
+                return original_mdd_forward(value)
 
-                self.assertEqual(model.motion_module.calls, 1)
-                self.assertTrue(torch.equal(output, torch.full((2, 1, 4, 4), 3.0)))
-                self.assertIs(model.backbone.forward.__func__, FakeBackbone.forward)
-
-                traced = torch.jit.trace_module(
-                    model,
-                    {"forward_export": inputs},
-                    check_trace=False,
+            with patch.object(
+                model.motion_module.mdd,
+                "forward",
+                side_effect=capture_mdd_input,
+            ):
+                raw_output = model(frames)
+                batch = SimpleNamespace(
+                    frames=normalized_frames,
+                    mdd_frames=frames,
+                    padding_masks=torch.zeros(2, 3, 16, 20, dtype=torch.bool),
+                    anchor_targets=[{"boxes": torch.empty(0, 4)} for _ in range(2)],
                 )
-                self.assertTrue(
-                    torch.equal(
-                        traced.forward_export(inputs),
-                        torch.full((2, 1, 4, 4), 3.0),
-                    )
-                )
-        finally:
-            motion._LWDETR_PATCHED = original_patched
+                batch_output = model(batch)
+
+        self.assertIs(TemporalFakeLWDETR.forward, class_forward)
+        torch.testing.assert_close(mdd_inputs[0], frames)
+        torch.testing.assert_close(mdd_inputs[1], frames)
+        torch.testing.assert_close(
+            model.backbone.seen_tensors[0],
+            frames.reshape(6, 3, 16, 20),
+        )
+        torch.testing.assert_close(
+            model.backbone.seen_tensors[1],
+            normalized_frames.reshape(6, 3, 16, 20),
+        )
+        for output in (raw_output, batch_output):
+            self.assertEqual(output["pred_logits"].shape[0], 2)
+            self.assertEqual(output["pred_heatmap_logits"].shape, (2, 3, 16, 20))
+            self.assertEqual(output["pred_heatmaps"].shape, (2, 3, 16, 20))
+            self.assertEqual(output["motion_maps"].shape, (2, 4, 16, 20))
 
 
 class MotionExportValidationTest(unittest.TestCase):
     def test_disabled_motion_is_noop(self):
         motion.assert_motion_export_ready(nn.Linear(2, 2), {"enabled": False})
 
-    def test_enabled_motion_requires_attached_module(self):
-        fake_lwdetr_type = type("LWDETR", (nn.Module,), {})
-        model = fake_lwdetr_type()
-        with self.assertRaisesRegex(RuntimeError, "no attached motion_module"):
+    def test_enabled_temporal_motion_is_explicitly_unsupported(self):
+        with self.assertRaisesRegex(RuntimeError, "ONNX/TensorRT export is not supported"):
             motion.assert_motion_export_ready(
-                model,
+                nn.Linear(2, 2),
                 {"enabled": True, "type": "tracknet_v5"},
             )
-
-    def test_enabled_motion_requires_motion_aware_forward_export(self):
-        class ExportableMotion(nn.Module):
-            def forward_export(self, _images, features):
-                return features
-
-        fake_lwdetr_type = type("LWDETR", (nn.Module,), {})
-        model = fake_lwdetr_type()
-        model.motion_module = ExportableMotion()
-        with self.assertRaisesRegex(RuntimeError, "forward_export is not motion-aware"):
-            motion.assert_motion_export_ready(
-                model,
-                {"enabled": True, "type": "tracknet_v5"},
-            )
-
-    def test_tensor_rt_export_requires_identity_fallback(self):
-        import rfdetr.models.lwdetr as lwdetr_module
-
-        with patch.object(lwdetr_module, "LWDETR", _FakeLWDETR):
-            model = _FakeLWDETR()
-            config = _small_motion_config("identity")
-            motion.attach_motion_module(model, config)
-            motion.assert_motion_export_ready(model, config)
-
-            model.motion_module.fallback_mode = "noise"
-            with self.assertRaisesRegex(RuntimeError, "requires.*identity"):
-                motion.assert_motion_export_ready(model, config)
 
 
 class MotionCheckpointCompatibilityTest(unittest.TestCase):
     @staticmethod
     def _metadata(motion_config):
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "model_size": "medium",
             "motion": motion_config,
         }
@@ -606,9 +738,38 @@ class MotionCheckpointCompatibilityTest(unittest.TestCase):
             motion.attach_motion_module(model, _small_motion_config())
             with tempfile.TemporaryDirectory() as directory:
                 checkpoint = Path(directory) / "motion_exact.pth"
-                torch.save({"model": model.state_dict()}, checkpoint)
+                torch.save(
+                    {
+                        "model": model.state_dict(),
+                        "pitchobjectlab_architecture": self._metadata(
+                            _small_motion_config()
+                        ),
+                    },
+                    checkpoint,
+                )
 
                 motion.assert_motion_checkpoint_compatible(model, checkpoint)
+
+    def test_checkpoint_rejects_legacy_motion_tensors_without_architecture_metadata(self):
+        import rfdetr.models.lwdetr as lwdetr_module
+
+        with patch.object(lwdetr_module, "LWDETR", _FakeLWDETR):
+            model = _FakeLWDETR()
+            motion.attach_motion_module(model, _small_motion_config())
+            with tempfile.TemporaryDirectory() as directory:
+                checkpoint = Path(directory) / "legacy_motion.pth"
+                torch.save({"model": model.state_dict()}, checkpoint)
+
+                with self.assertRaisesRegex(
+                    RuntimeError, "legacy TrackNet prototype checkpoint"
+                ):
+                    motion.assert_motion_checkpoint_compatible(model, checkpoint)
+
+    def test_stock_checkpoint_without_motion_tensors_does_not_require_metadata(self):
+        checkpoint = {"model": {"anchor": torch.zeros(1)}}
+        motion_state = motion._motion_state_from_checkpoint(checkpoint)
+        self.assertEqual(motion_state, {})
+        motion._assert_new_motion_architecture_metadata(checkpoint, motion_state)
 
     def test_optimizer_step_checkpoint_round_trip_preserves_updated_motion_state(self):
         import rfdetr.models.lwdetr as lwdetr_module
@@ -643,12 +804,18 @@ class MotionCheckpointCompatibilityTest(unittest.TestCase):
             }
             changed = [key for key in before if not torch.equal(before[key], updated[key])]
             self.assertTrue(changed, "One optimizer step must update motion_module weights")
-            self.assertIn("gates.0.gate.0.weight", changed)
+            self.assertIn("fusions.0.projection.weight", changed)
 
             with tempfile.TemporaryDirectory() as directory:
                 checkpoint = Path(directory) / "motion_trained.pth"
                 saved_state = model.state_dict()
-                torch.save({"model": saved_state}, checkpoint)
+                torch.save(
+                    {
+                        "model": saved_state,
+                        "pitchobjectlab_architecture": self._metadata(config),
+                    },
+                    checkpoint,
+                )
                 self.assertTrue(
                     any(key.startswith("motion_module.") for key in saved_state),
                     "Training checkpoints must contain motion_module.* tensors",
@@ -688,10 +855,18 @@ class MotionCheckpointCompatibilityTest(unittest.TestCase):
             model = _FakeLWDETR()
             motion.attach_motion_module(model, _small_motion_config())
             state = {key: value.clone() for key, value in model.state_dict().items()}
-            state["motion_module.gates.0.gate.0.weight"] = torch.zeros(1)
+            state["motion_module.fusions.0.projection.weight"] = torch.zeros(1)
             with tempfile.TemporaryDirectory() as directory:
                 checkpoint = Path(directory) / "motion_shape.pth"
-                torch.save({"model": state}, checkpoint)
+                torch.save(
+                    {
+                        "model": state,
+                        "pitchobjectlab_architecture": self._metadata(
+                            _small_motion_config()
+                        ),
+                    },
+                    checkpoint,
+                )
 
                 with self.assertRaisesRegex(RuntimeError, "shape_mismatch"):
                     motion.assert_motion_checkpoint_compatible(model, checkpoint)
@@ -722,6 +897,37 @@ class MotionCheckpointCompatibilityTest(unittest.TestCase):
                     )
 
 
+    def test_load_motion_checkpoint_weights_only_restores_tracknet(self):
+        import rfdetr.models.lwdetr as lwdetr_module
+
+        config = _small_motion_config()
+        with patch.object(lwdetr_module, "LWDETR", _FakeLWDETR):
+            source = _FakeLWDETR()
+            motion.attach_motion_module(source, config)
+            source.motion_module.fusions[0].projection.bias.data.fill_(0.42)
+            with tempfile.TemporaryDirectory() as directory:
+                checkpoint = Path(directory) / "motion_only_load.pth"
+                torch.save(
+                    {
+                        "model": source.state_dict(),
+                        "pitchobjectlab_architecture": self._metadata(config),
+                    },
+                    checkpoint,
+                )
+
+                destination = _FakeLWDETR()
+                motion.attach_motion_module(destination, config)
+                self.assertFalse(torch.equal(
+                    destination.motion_module.fusions[0].projection.bias,
+                    source.motion_module.fusions[0].projection.bias,
+                ))
+                motion.load_motion_checkpoint_weights(destination, checkpoint)
+                self.assertTrue(torch.equal(
+                    destination.motion_module.fusions[0].projection.bias,
+                    source.motion_module.fusions[0].projection.bias,
+                ))
+
+
 # ---------------------------------------------------------------------------
 # attach_motion_module guard
 # ---------------------------------------------------------------------------
@@ -750,8 +956,9 @@ class AttachMotionModuleTest(unittest.TestCase):
             attached = model.motion_module
 
             self.assertEqual(attached.feature_channels_per_scale, [32, 32, 32])
-            self.assertEqual(len(attached.gates), 3)
-            self.assertEqual(attached.gates[0].gate[0].out_channels, 32)
+            self.assertEqual(len(attached.fusions), 3)
+            self.assertEqual(len(attached.draft_heads), 3)
+            self.assertEqual(attached.fusions[0].projection.out_channels, 32)
 
             motion.attach_motion_module(model, config)
             self.assertIs(model.motion_module, attached)
@@ -767,7 +974,7 @@ class AttachMotionModuleTest(unittest.TestCase):
             motion.attach_motion_module(model, _small_motion_config())
 
         self.assertEqual(model.motion_module.feature_channels_per_scale, [32, 32])
-        self.assertEqual(len(model.motion_module.gates), 2)
+        self.assertEqual(len(model.motion_module.fusions), 2)
 
     def test_compiled_wrapper_is_unwrapped_before_motion_attachment(self):
         import rfdetr.models.lwdetr as lwdetr_module

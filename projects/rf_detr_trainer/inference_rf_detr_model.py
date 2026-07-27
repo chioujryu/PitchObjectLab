@@ -32,7 +32,6 @@ from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional,
 from urllib.parse import urlparse
 
 import colorama
-import yaml
 from colorama import Fore, Style
 from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
@@ -82,11 +81,7 @@ class VideoFrameWindow:
 
 
 def load_yaml(path: Path) -> Dict[str, Any]:
-    with path.open("r", encoding="utf-8") as file:
-        data = yaml.safe_load(file) or {}
-    if not isinstance(data, dict):
-        raise TypeError(f"Config root must be a mapping: {path}")
-    return data
+    return trainer.load_yaml(path)
 
 
 def apply_cli_overrides(config: MutableMapping[str, Any], args: argparse.Namespace) -> None:
@@ -109,6 +104,10 @@ def apply_cli_overrides(config: MutableMapping[str, Any], args: argparse.Namespa
         model["device"] = args.device
     if args.confidence_threshold is not None:
         model["confidence_threshold"] = args.confidence_threshold
+    tracknet_focus = getattr(args, "tracknet_focus", None)
+    if tracknet_focus is not None:
+        motion = model.setdefault("motion", {})
+        motion.setdefault("focus", {})["mode"] = tracknet_focus
     optimization = model.setdefault("inference_optimization", {})
     backend_override = getattr(args, "inference_backend", None)
     if backend_override is not None:
@@ -767,19 +766,22 @@ def load_rfdetr_model(config: Mapping[str, Any]) -> Any:
             trainer.build_pitchobjectlab_architecture(config),
         )
     motion_config = config.get("model", {}).get("motion", {}) or {}
-    if bool(motion_config.get("enabled", False)):
-        from rf_detr_motion import attach_motion_module
+    if trainer.motion_module_enabled(config):
+        from rf_detr_motion import (
+            assert_motion_checkpoint_compatible,
+            attach_motion_module,
+            load_motion_checkpoint_weights,
+        )
 
         attach_motion_module(rf_model.model, motion_config)
         model_config = getattr(rf_model, "model_config", None)
         checkpoint_path = getattr(model_config, "pretrain_weights", None)
-        from rf_detr_motion import assert_motion_checkpoint_compatible
-
         assert_motion_checkpoint_compatible(
             rf_model.model,
             checkpoint_path,
             trainer.build_pitchobjectlab_architecture(config),
         )
+        load_motion_checkpoint_weights(rf_model.model, checkpoint_path)
     accelerated_model, _ = trainer.configure_rfdetr_inference_acceleration(
         rf_model,
         config,
@@ -1323,6 +1325,11 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
     parser.add_argument("--device", help="Device override: auto, cpu, cuda, cuda:0, 0, 1.")
     parser.add_argument("--confidence-threshold", type=float, help="Model confidence threshold override.")
     parser.add_argument(
+        "--tracknet-focus",
+        choices=("single", "all"),
+        help="Override model.motion.focus.mode for temporal TrackNet inference.",
+    )
+    parser.add_argument(
         "--inference-backend",
         choices=["pytorch", "tensorrt"],
         help="Inference backend override. PyTorch FP32 remains the default.",
@@ -1414,6 +1421,50 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
     if timing_context is not None:
         acceleration_handle = trainer.get_inference_acceleration_handle(model)
         timing_context["acceleration"] = dict(acceleration_handle.metadata)
+
+    if trainer.temporal_motion_enabled(config):
+        from rf_detr_temporal_runtime import run_temporal_split
+
+        temporal_result = run_temporal_split(
+            rf_model=model,
+            config=config,
+            output_dir=output_dir,
+            split=str(config.get("inference", {}).get("temporal_split", "test")),
+            save_heatmaps=bool(config.get("inference", {}).get("save_heatmaps", True)),
+        )
+        temporal_summary = dict(temporal_result["summary"])
+        stage_timing = {
+            "images_or_frames": int(temporal_summary.get("windows", 0)),
+            "total_seconds": float(temporal_summary.get("total_seconds", 0.0)),
+            "model_forward_seconds": float(temporal_summary.get("model_forward_seconds", 0.0)),
+            "base_model_forward_seconds": float(temporal_summary.get("model_forward_seconds", 0.0)),
+            "sahi_model_forward_seconds": 0.0,
+            "recheck_model_forward_seconds": 0.0,
+            "preprocess_seconds": 0.0,
+            "postprocess_seconds": max(
+                0.0,
+                float(temporal_summary.get("total_seconds", 0.0))
+                - float(temporal_summary.get("model_forward_seconds", 0.0)),
+            ),
+        }
+        total_seconds = stage_timing["total_seconds"]
+        stage_timing["model_forward_ratio"] = stage_timing["model_forward_seconds"] / total_seconds if total_seconds else 0.0
+        stage_timing["sahi_model_forward_ratio"] = 0.0
+        stage_timing["recheck_model_forward_ratio"] = 0.0
+        if timing_context is not None:
+            timing_context["stage_timing"] = stage_timing
+        trainer.write_json(output_dir / "inference_summary.json", temporal_summary)
+        trainer.dump_config_snapshot(
+            output_dir=output_dir,
+            merged_config=config,
+            metadata={"event": "temporal_inference", "stage_timing": stage_timing},
+            source_config=source_config,
+        )
+        if verbose:
+            print(json.dumps(temporal_summary, indent=2, ensure_ascii=False))
+            print(f"RF-DETR temporal inference output directory: {output_dir}")
+        return 0
+
     render_ids = resolve_render_ids(config, categories)
     tracking_config = video_tracking.parse_tracking_config(config, categories)
     tracker_device = resolved_tracker_device(config, tracking_config)
