@@ -256,9 +256,9 @@ test:
   # SAHI sliced-inference settings. Options: mapping.
   sahi:
     # Slice height for sahi mode. Options: positive integer.
-    slice_height: 320
+    slice_height: 160
     # Slice width for sahi mode. Options: positive integer.
-    slice_width: 320
+    slice_width: 160
     # Height overlap between adjacent slices. Options: 0.0-0.9.
     overlap_height_ratio: 0.2
     # Width overlap between adjacent slices. Options: 0.0-0.9.

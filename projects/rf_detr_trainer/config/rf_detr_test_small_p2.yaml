@@ -36,13 +36,13 @@ model:
   # RF-DETR model size. Detection: base, nano, small, medium, large. Segmentation: seg-preview, seg-nano, seg-small, seg-medium, seg-large, seg-xlarge, seg-2xlarge.
   size: small
   # Required custom-architecture checkpoint. Keep null only when supplying --checkpoint. Options: null or a matching local .pth/.pt/.ckpt path.
-  pretrain_weights: null
+  pretrain_weights: /home/new_users/zhiyu/trash/small/checkpoint_best_ema.pth
   # Input resolution override. Options: null for model default, or an int divisible by model window requirements.
   resolution: null
   # Class count override. Options: null to infer from dataset, or positive integer.
   num_classes: null
   # Device selector. Options: auto, cpu, cuda, cuda:0, 0, 1, "0,1" for round-robin multi-GPU, mps, -1.
-  device: auto
+  device: cuda:5
   # RF-DETR AMP construction setting; separate from standalone inference_optimization. Options: true, false.
   amp: true
   # Prediction confidence threshold used by inference and operating metrics. Options: 0.0-1.0.
@@ -54,7 +54,7 @@ model:
   # Standalone inference/test acceleration settings. This does not change training-time AMP. Options: mapping.
   inference_optimization:
     # Inference runtime. Options: pytorch, tensorrt. PyTorch FP32 preserves the legacy behavior.
-    backend: pytorch
+    backend: tensorrt
     # PyTorch-only inference settings. Options: mapping.
     pytorch:
       # PyTorch compute precision. Options: fp32, bf16.
@@ -237,7 +237,7 @@ test:
   # Test mode selector block. Options: mapping.
   test_mode:
     # Test mode. Options: full_image, class_crop, sahi.
-    mode: full_image
+    mode: sahi
   # Class-crop/object-crop test settings. Options: mapping.
   crop:
     # Class IDs used to find class_crop windows from model predictions. Empty means all predicted classes are eligible.
@@ -258,9 +258,9 @@ test:
   # SAHI sliced-inference settings. Options: mapping.
   sahi:
     # Slice height for sahi mode. Options: positive integer.
-    slice_height: 640
+    slice_height: 160
     # Slice width for sahi mode. Options: positive integer.
-    slice_width: 640
+    slice_width: 160
     # Height overlap between adjacent slices. Options: 0.0-0.9.
     overlap_height_ratio: 0.2
     # Width overlap between adjacent slices. Options: 0.0-0.9.
@@ -276,7 +276,7 @@ test:
     # Class-agnostic slice merge. Options: true, false.
     postprocess_class_agnostic: false
     # RF-DETR SAHI slice/recheck batch size. Options: positive integer.
-    batch_size: 4
+    batch_size: 32
     # recheck nested configuration block. Options: mapping.
     recheck:
       # Run a second centered B*B verification pass for selected SAHI target-class boxes. Options: true, false.
@@ -287,7 +287,7 @@ test:
       target_class_names:
         - soccer_ball
       # B*B centered crop size for the second pass. Options: positive integer pixels.
-      crop_size: 960
+      crop_size: 320
       # Confidence threshold for the second pass. Options: 0.0-1.0.
       second_confidence_threshold: 0.25
       # Weight applied to the first-stage confidence. Options: non-negative float.
@@ -305,7 +305,7 @@ test:
     # Save sampled prediction test images with GT and predictions. Options: true, false.
     enabled: true
     # Maximum sampled prediction images to save; also caps error-case images by default. Options: null for all candidates, or non-negative integer.
-    max_images: 100
+    max_images: 300
     # Visual subfolder under output. Options: folder name or placeholder template.
     output_subdir: visuals
     # Sampling mode. Options: first, last, random.
@@ -345,7 +345,7 @@ test:
   # Number of images in each saved model-input batch grid. Options: positive integer.
   model_input_batch_size: 9
   # RF-DETR full-image/class-crop evaluator batch size. Options: positive integer.
-  batch_size: 4
+  batch_size: 32
   # DataLoader workers for TrainConfig adapter. Options: 2 by project rule.
   num_workers: 2
   # Max detections used in evaluation metrics. Options: positive integer.

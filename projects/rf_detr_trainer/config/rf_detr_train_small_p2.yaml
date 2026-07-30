@@ -37,7 +37,7 @@ model:
   # Number of classes. Options: positive integer or null to infer from dataset.
   num_classes: null
   # Compute device selector. Options: auto, cpu, cuda, cuda:N, N, comma-separated GPU IDs, mps, -1.
-  device: cuda:6
+  device: auto
   # amp setting for this config block. Options: documented value for this RF-DETR config section.
   amp: true
   # extra_model_args setting for this config block. Options: documented value for this RF-DETR config section.
@@ -217,11 +217,11 @@ train:
   # RF-DETR dataset file/source selector. Options: roboflow or dataset YAML/relative file name.
   dataset_file: roboflow
   # Compute device selector. Options: auto, cpu, cuda, cuda:N, N, comma-separated GPU IDs, mps, -1.
-  device: auto
+  device: cuda:7
   # Training epoch count. Options: positive integer.
-  epochs: 40
+  epochs: 30
   # Reduced from 4 鈫?2 to accommodate R-STR memory overhead per scale.
-  batch_size: 4
+  batch_size: 5
   # Raised from 4 鈫?8 to keep effective batch = 16.
   grad_accum_steps: 8
   # Auto-batch target effective batch size. Options: positive integer.

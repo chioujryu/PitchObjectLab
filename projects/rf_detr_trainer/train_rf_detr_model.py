@@ -31,6 +31,11 @@ Example usage:
 
     uv run python train_rf_detr_model.py --demo --dry-run --yes
 
+    uv run python train_rf_detr_model.py \
+        --resume runs/rf_detr/train/example/checkpoint_2.ckpt \
+        --output-dir runs/rf_detr/train/example \
+        --exist-ok true
+
 Notes:
     - RF-DETR dataset_file="roboflow" auto-detects Roboflow COCO and YOLO layouts.
     - dataset.source_format="auto" detects RF-DETR/Roboflow, Ultralytics YOLO,
@@ -60,6 +65,7 @@ import time
 import warnings
 from copy import deepcopy
 from datetime import datetime
+from functools import wraps
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from string import Formatter
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
@@ -202,6 +208,7 @@ BATCH_GRID_TILE_SIZE = 320
 BATCH_GRID_CAPTION_HEIGHT = 28
 BATCH_GRID_COLUMNS = 3
 BATCH_GRID_MAX_ITEMS = 9
+_RFDETR_INVALID_BBOX_FILTER_PATCHED = False
 _RFDETR_DETECTION_HFLIP_PATCHED = False
 
 
@@ -3577,8 +3584,51 @@ def _rfdetr_keypoint_flip_pairs_for_task(args: Any) -> Optional[List[int]]:
     return None
 
 
+def ensure_rfdetr_invalid_bbox_filter_support() -> None:
+    """Filter bboxes that become degenerate during Albumentations normalization.
+
+    RF-DETR pre-filters boxes whose absolute coordinates are already degenerate,
+    but a sub-pixel box can still collapse when Albumentations normalizes its
+    float32 coordinates. Enabling the processor's native invalid-box filter
+    drops those boxes together with the configured label fields before
+    validation, instead of crashing a DataLoader worker.
+    """
+    global _RFDETR_INVALID_BBOX_FILTER_PATCHED
+    if _RFDETR_INVALID_BBOX_FILTER_PATCHED:
+        return
+
+    from rfdetr.datasets.transforms import AlbumentationsWrapper
+
+    current_init = AlbumentationsWrapper.__init__
+    if getattr(current_init, "_pitchobjectlab_invalid_bbox_filter_patch", False):
+        _RFDETR_INVALID_BBOX_FILTER_PATCHED = True
+        return
+
+    @wraps(current_init)
+    def patched_init(self: Any, *args: Any, **kwargs: Any) -> None:
+        current_init(self, *args, **kwargs)
+        processors = getattr(getattr(self, "transform", None), "processors", {})
+        bbox_processor = processors.get("bboxes") if isinstance(processors, Mapping) else None
+        bbox_params = getattr(bbox_processor, "params", None)
+        if bbox_params is None:
+            return
+        if not hasattr(bbox_params, "filter_invalid_bboxes"):
+            raise RuntimeError(
+                "The installed Albumentations version does not support "
+                "BboxParams.filter_invalid_bboxes; run `uv sync` to restore "
+                "the project-locked dependencies."
+            )
+        bbox_params.filter_invalid_bboxes = True
+
+    patched_init._pitchobjectlab_invalid_bbox_filter_patch = True
+    AlbumentationsWrapper.__init__ = patched_init
+    _RFDETR_INVALID_BBOX_FILTER_PATCHED = True
+
+
 def ensure_rfdetr_detection_hflip_support() -> None:
-    """Keep RF-DETR detection training from disabling HorizontalFlip augmentation."""
+    """Install RF-DETR CPU augmentation compatibility fixes."""
+    ensure_rfdetr_invalid_bbox_filter_support()
+
     global _RFDETR_DETECTION_HFLIP_PATCHED
     if _RFDETR_DETECTION_HFLIP_PATCHED:
         return
@@ -3739,6 +3789,28 @@ def build_train_kwargs(config: Mapping[str, Any], output_dir: Path) -> Dict[str,
         train_kwargs["_device"] = str(device)
     train_kwargs["run_test"] = bool(train_kwargs.get("run_test", False))
     return train_kwargs
+
+
+def resolve_train_resume_checkpoint(
+    config: MutableMapping[str, Any],
+    source_config: Optional[Path] = None,
+) -> Optional[Path]:
+    """Resolve and validate ``train.resume`` before any run output is created."""
+    train = config.setdefault("train", {})
+    resume = train.get("resume")
+    if resume is None or (isinstance(resume, str) and not resume.strip()):
+        train["resume"] = None
+        return None
+
+    bases = [source_config.parent] if source_config is not None else []
+    bases.extend([Path.cwd(), PROJECT_DIR, REPO_ROOT])
+    checkpoint = resolve_existing_path(resume, bases, "train.resume")
+    if checkpoint.suffix.lower() != ".ckpt":
+        raise ValueError(
+            f"train.resume must point to a PyTorch Lightning .ckpt file, got: {checkpoint}"
+        )
+    train["resume"] = str(checkpoint)
+    return checkpoint
 
 
 def size_hw(value: Any) -> Optional[Tuple[float, float]]:
@@ -5279,6 +5351,7 @@ def apply_cli_overrides(config: MutableMapping[str, Any], args: argparse.Namespa
         "weight_decay": args.weight_decay,
         "num_workers": args.workers,
         "checkpoint_interval": args.checkpoint_interval,
+        "resume": getattr(args, "resume", None),
         "eval_interval": args.eval_interval,
         "early_stopping": args.early_stopping,
         "early_stopping_patience": args.early_stopping_patience,
@@ -5402,6 +5475,11 @@ Example usage:
     parser.add_argument("--weight-decay", type=float, default=None, help="Weight decay.")
     parser.add_argument("--workers", type=int, default=None, help="Dataloader workers.")
     parser.add_argument("--checkpoint-interval", type=int, default=None, help="Save checkpoint every N epochs.")
+    parser.add_argument(
+        "--resume",
+        default=None,
+        help="Resume from a PyTorch Lightning .ckpt checkpoint, restoring optimizer, scheduler, and callback state.",
+    )
     parser.add_argument("--eval-interval", type=int, default=None, help="Run validation metrics every N epochs.")
     parser.add_argument("--early-stopping", type=parse_bool, default=None, help="Enable early stopping.")
     parser.add_argument("--early-stopping-patience", type=int, default=None, help="Early stopping patience.")
@@ -5478,6 +5556,7 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
         if timing_context is not None:
             timing_context["verbose"] = verbose and not distributed_child
         apply_demo_mode(config, timestamp, verbose)
+        resolve_train_resume_checkpoint(config, source_config)
         child_metadata: Dict[str, Any] = {}
         if distributed_child:
             child_metadata = apply_distributed_child_runtime_overrides(config)

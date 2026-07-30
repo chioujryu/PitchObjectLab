@@ -42,7 +42,7 @@ model:
   # Class count override. Options: null to infer from checkpoint/config, or positive integer.
   num_classes: null
   # Device selector. Options: auto, cpu, cuda, cuda:0, 0, 1, mps, -1.
-  device: auto
+  device: cuda:3
   # RF-DETR AMP construction setting; separate from standalone inference_optimization. Options: true, false.
   amp: true
   # Prediction confidence threshold used for rendered boxes. Options: 0.0-1.0.
@@ -54,7 +54,7 @@ model:
   # Standalone inference/test acceleration settings. This does not change training-time AMP. Options: mapping.
   inference_optimization:
     # Inference runtime. Options: pytorch, tensorrt. PyTorch FP32 preserves the legacy behavior.
-    backend: pytorch
+    backend: tensorrt
     # PyTorch-only inference settings. Options: mapping.
     pytorch:
       # PyTorch compute precision. Options: fp32, bf16.

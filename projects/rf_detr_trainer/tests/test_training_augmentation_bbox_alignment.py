@@ -41,6 +41,58 @@ def _transform_names(transform_pipeline) -> list[str]:
 
 
 class TrainingAugmentationBBoxAlignmentTest(unittest.TestCase):
+    def test_subpixel_degenerate_box_is_filtered_with_instance_fields_aligned(self):
+        trainer.ensure_rfdetr_invalid_bbox_filter_support()
+        # Calling the installer repeatedly must not wrap the constructor twice.
+        trainer.ensure_rfdetr_invalid_bbox_filter_support()
+
+        from albumentations import HorizontalFlip
+        from rfdetr.datasets.transforms import AlbumentationsWrapper
+
+        image_size = 480
+        y_min = np.float32(0.12399024)
+        y_max = np.nextafter(y_min, np.float32(np.inf))
+        self.assertGreater(y_max, y_min)
+        self.assertEqual(np.float32(y_min / image_size), np.float32(y_max / image_size))
+
+        masks = torch.zeros((2, image_size, image_size), dtype=torch.bool)
+        masks[1, 100:120, 100:120] = True
+        target = {
+            "boxes": torch.tensor(
+                [
+                    [10.0, y_min, 20.0, y_max],
+                    [100.0, 100.0, 120.0, 120.0],
+                ],
+                dtype=torch.float32,
+            ),
+            "labels": torch.tensor([3, 7], dtype=torch.int64),
+            "area": torch.tensor([float(y_max - y_min) * 10.0, 400.0], dtype=torch.float32),
+            "iscrowd": torch.tensor([0, 0], dtype=torch.int64),
+            "masks": masks,
+            "size": torch.tensor([image_size, image_size]),
+            "orig_size": torch.tensor([image_size, image_size]),
+        }
+
+        wrapper = AlbumentationsWrapper(HorizontalFlip(p=1.0))
+        bbox_params = wrapper.transform.processors["bboxes"].params
+        self.assertTrue(bbox_params.filter_invalid_bboxes)
+
+        _, transformed = wrapper(Image.new("RGB", (image_size, image_size)), target)
+
+        self.assertEqual(transformed["boxes"].shape, (1, 4))
+        torch.testing.assert_close(
+            transformed["boxes"][0],
+            torch.tensor([360.0, 100.0, 380.0, 120.0]),
+            atol=1e-4,
+            rtol=0.0,
+        )
+        torch.testing.assert_close(transformed["labels"], torch.tensor([7]))
+        torch.testing.assert_close(transformed["area"], torch.tensor([400.0]))
+        torch.testing.assert_close(transformed["iscrowd"], torch.tensor([0]))
+        self.assertEqual(transformed["masks"].shape, (1, image_size, image_size))
+        self.assertEqual(int(transformed["masks"][0].sum()), 400)
+        self.assertTrue(transformed["masks"][0, 100:120, 360:380].all())
+
     def test_detection_training_keeps_horizontal_flip_augmentation_enabled(self):
         trainer.ensure_rfdetr_detection_hflip_support()
         import rfdetr.datasets.coco as coco_module

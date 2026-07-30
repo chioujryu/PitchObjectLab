@@ -96,6 +96,22 @@ Skip the confirmation prompt after you accept the estimate:
 uv run python train_rf_detr_model.py --yes
 ```
 
+Resume an interrupted run from its latest complete Lightning checkpoint:
+
+```bash
+uv run python train_rf_detr_model.py \
+  --resume runs/rf_detr/train/EXISTING_RUN/checkpoint_N.ckpt \
+  --output-dir runs/rf_detr/train/EXISTING_RUN \
+  --exist-ok true
+```
+
+`--resume` restores the model, optimizer, scheduler, EMA, early-stopping, and
+checkpoint callback state. Use a `checkpoint_N.ckpt` archive rather than a
+`checkpoint_best_*.pth` inference checkpoint. Resuming starts after the last
+completed epoch stored in the checkpoint; work from a partially completed
+epoch is repeated. The normal output estimate and confirmation still apply,
+or pass `--yes` after reviewing them.
+
 Training and evaluation DataLoader workers are standardized at `2` in configs
 and defaults for stable Windows/Linux behavior.
 
