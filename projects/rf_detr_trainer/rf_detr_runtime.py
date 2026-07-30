@@ -5,6 +5,8 @@ implementation re-exports the mature helper functions from the training module
 so train, test, and inference do not import each other's entrypoint files.
 """
 
+from __future__ import annotations
+
 from collections.abc import Mapping
 from copy import deepcopy
 from pathlib import Path
@@ -12,7 +14,7 @@ from typing import Any
 
 import rf_detr_acceleration as _acceleration
 import train_rf_detr_model as _trainer_runtime
-from train_rf_detr_model import *  # noqa: F401,F403
+from train_rf_detr_model import *  # noqa: F403
 
 get_model_class = _trainer_runtime.get_model_class
 build_model_kwargs = _trainer_runtime.build_model_kwargs
@@ -30,14 +32,10 @@ def _require_custom_architecture_checkpoint(config: Mapping[str, Any], operation
     motion_enabled = _trainer_runtime.motion_module_enabled(config)
     if not p2_enabled and not motion_enabled:
         return
-    should_pass, checkpoint = _trainer_runtime.normalize_pretrain_weights(
-        model.get("pretrain_weights", "default")
-    )
+    should_pass, checkpoint = _trainer_runtime.normalize_pretrain_weights(model.get("pretrain_weights", "default"))
     if should_pass and checkpoint not in {None, "default"}:
         return
-    architecture = " + ".join(
-        name for name, enabled in (("P2", p2_enabled), ("TrackNetV5", motion_enabled)) if enabled
-    )
+    architecture = " + ".join(name for name, enabled in (("P2", p2_enabled), ("TrackNetV5", motion_enabled)) if enabled)
     raise ValueError(
         f"{operation} with the custom {architecture} architecture requires an explicit matching "
         "checkpoint via model.pretrain_weights or --checkpoint."
@@ -165,7 +163,7 @@ def configure_rfdetr_inference_acceleration(
         device=runtime_device,
     )
     accelerated_model = handle.model
-    setattr(accelerated_model, "_rf_detr_acceleration_handle", handle)
+    accelerated_model._rf_detr_acceleration_handle = handle
     return accelerated_model, handle
 
 
@@ -367,13 +365,13 @@ def build_rfdetr_evaluator_runtime(
     output_dir = Path(output_dir).expanduser()
     model_cls = get_model_class(str(model_settings.get("size", "medium")))
     rf_model = model_cls(**build_model_kwargs(merged_config))
-    p2_config = model_settings.get('p2', {}) or {}
-    if bool(p2_config.get('enabled', False)):
+    p2_config = model_settings.get("p2", {}) or {}
+    if bool(p2_config.get("enabled", False)):
         from rf_detr_p2 import assert_p2_checkpoint_compatible
 
         assert_p2_checkpoint_compatible(
             rf_model.model,
-            getattr(rf_model.model_config, 'pretrain_weights', None),
+            getattr(rf_model.model_config, "pretrain_weights", None),
             build_pitchobjectlab_architecture(merged_config, rf_model.model_config),
         )
 

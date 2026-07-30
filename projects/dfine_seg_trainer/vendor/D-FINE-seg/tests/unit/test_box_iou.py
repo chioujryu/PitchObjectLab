@@ -5,7 +5,6 @@ training. Identity / disjoint / round-trip checks pin the invariants.
 """
 
 import torch
-
 from src.d_fine.arch.utils import (
     box_cxcywh_to_xyxy,
     box_iou,
@@ -16,7 +15,7 @@ from src.d_fine.arch.utils import (
 
 def test_box_iou_identical_boxes_is_one():
     boxes = torch.tensor([[0.0, 0.0, 10.0, 10.0], [5.0, 5.0, 15.0, 15.0]])
-    iou, union = box_iou(boxes, boxes)
+    iou, _union = box_iou(boxes, boxes)
     diag = torch.diag(iou)
     assert torch.allclose(diag, torch.ones_like(diag))
 

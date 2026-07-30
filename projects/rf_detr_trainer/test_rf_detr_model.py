@@ -1,4 +1,4 @@
-"""
+r"""
 Standalone RF-DETR test runner with full_image, sahi, and class_crop modes.
 
 Usage:
@@ -33,13 +33,13 @@ from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, MutableMapping, Optional
+from typing import Any, MutableMapping
 
 import colorama
+import rf_detr_runtime as trainer
 from colorama import Fore, Style
 from tqdm import tqdm
 
-import rf_detr_runtime as trainer
 from projects.object_detection_dataset_evaluator.object_detection_dataset_evaluator import (
     expand_chunk_devices,
     parse_devices,
@@ -52,7 +52,7 @@ DEFAULT_CONFIG = Path(__file__).resolve().parent / "config" / "rf_detr_test.yaml
 TIMESTAMP_FORMAT = "%Y%m%d%H%M%S"
 
 
-def load_yaml(path: Path) -> Dict[str, Any]:
+def load_yaml(path: Path) -> dict[str, Any]:
     return trainer.load_yaml(path)
 
 
@@ -143,13 +143,11 @@ def _standalone_test_devices(config: Mapping[str, Any]) -> list[str]:
     return parse_devices(effective_model_cfg)
 
 
-def build_test_parallel_plan(config: Mapping[str, Any], image_count: Optional[int]) -> Dict[str, Any]:
+def build_test_parallel_plan(config: Mapping[str, Any], image_count: int | None) -> dict[str, Any]:
     """Build deterministic chunk/device assignments for estimates and execution."""
     chunks = standalone_parallel_chunks(config)
     if image_count is not None and chunks > int(image_count):
-        raise ValueError(
-            f"test.parallel.chunks is {chunks}, but the evaluated image count is only {int(image_count)}."
-        )
+        raise ValueError(f"test.parallel.chunks is {chunks}, but the evaluated image count is only {int(image_count)}.")
     devices = _standalone_test_devices(config)
     assignments = expand_chunk_devices(devices, chunks)
     device_counts = dict(Counter(assignments))
@@ -188,14 +186,8 @@ def validate_parallel_test_compatibility(config: Mapping[str, Any]) -> None:
     test_settings = config.get("test", {})
     mode = trainer.periodic_test_mode(test_settings if isinstance(test_settings, Mapping) else {})
     evaluation = config.get("evaluation", {})
-    evaluation_type = str(
-        evaluation.get("type", "auto") if isinstance(evaluation, Mapping) else "auto"
-    ).strip().lower()
-    if (
-        configured_segmentation_head(config)
-        and mode == "full_image"
-        and evaluation_type != "bbox"
-    ):
+    evaluation_type = str(evaluation.get("type", "auto") if isinstance(evaluation, Mapping) else "auto").strip().lower()
+    if configured_segmentation_head(config) and mode == "full_image" and evaluation_type != "bbox":
         raise ValueError(
             "Parallel full_image testing for a segmentation model does not support mask-aware evaluation. "
             "Set evaluation.type=bbox to run parallel bbox evaluation, or set test.parallel.chunks=1 "
@@ -238,11 +230,7 @@ def build_rfdetr_evaluator_preview(
     model_cls = trainer.get_model_class(str(model_cfg.get("size", "medium")))
     model_kwargs = trainer.build_model_kwargs(config)
     resolution_value = model_kwargs.get("resolution")
-    resolution = (
-        int(resolution_value)
-        if resolution_value is not None
-        else _model_config_default_resolution(model_cls)
-    )
+    resolution = int(resolution_value) if resolution_value is not None else _model_config_default_resolution(model_cls)
     model_preview = SimpleNamespace(
         resolution=resolution,
         segmentation_head=configured_segmentation_head(config),
@@ -272,8 +260,8 @@ def build_parallel_rfdetr_evaluator_config(
     output_dir: Path,
     split: str,
     *,
-    prepared_tensorrt: Optional[Mapping[str, Mapping[str, Any]]] = None,
-) -> Dict[str, Any]:
+    prepared_tensorrt: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Build the spawn-worker evaluator config for standalone parallel testing."""
     chunks = standalone_parallel_chunks(config)
     if chunks <= 1:
@@ -336,14 +324,14 @@ def normalize_test_device(value: Any) -> str:
     return text
 
 
-def _float_or_none(value: Any) -> Optional[float]:
+def _float_or_none(value: Any) -> float | None:
     try:
         return float(value)
     except (TypeError, ValueError):
         return None
 
 
-def average_inference_seconds(result: Mapping[str, Any], output_dir: Path) -> Optional[float]:
+def average_inference_seconds(result: Mapping[str, Any], output_dir: Path) -> float | None:
     """Return average inference seconds per image from result payload or saved evaluator files."""
     summary = result.get("summary")
     if isinstance(summary, Mapping):
@@ -417,9 +405,8 @@ def print_inference_timing_summary(result: Mapping[str, Any], output_dir: Path) 
         print(f"Per-image inference stats: {stats_path}")
 
 
-def normalized_stage_timing(result: Mapping[str, Any]) -> Dict[str, Any]:
+def normalized_stage_timing(result: Mapping[str, Any]) -> dict[str, Any]:
     """Return additive timing totals in the shared run_timing.json schema."""
-
     existing = result.get("stage_timing")
     if isinstance(existing, Mapping):
         timing = dict(existing)
@@ -440,10 +427,7 @@ def normalized_stage_timing(result: Mapping[str, Any]) -> Dict[str, Any]:
         return {}
 
     def total(key: str, *, fallback: str | None = None) -> float:
-        return sum(
-            float(row.get(key, row.get(fallback, 0.0) if fallback is not None else 0.0) or 0.0)
-            for row in rows
-        )
+        return sum(float(row.get(key, row.get(fallback, 0.0) if fallback is not None else 0.0) or 0.0) for row in rows)
 
     total_seconds = total("elapsed_seconds")
     forward_seconds = total("model_forward_seconds", fallback="elapsed_seconds")
@@ -471,7 +455,7 @@ def normalized_stage_timing(result: Mapping[str, Any]) -> Dict[str, Any]:
     return timing
 
 
-def _non_negative_int_or_none(value: Any) -> Optional[int]:
+def _non_negative_int_or_none(value: Any) -> int | None:
     if value is None:
         return None
     if isinstance(value, str) and value.strip().lower() in {"", "all", "none", "null"}:
@@ -502,7 +486,7 @@ def estimate_standalone_test_outputs(
     config: Mapping[str, Any],
     output_dir: Path,
     dataset_plan: Mapping[str, Any],
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Estimate standalone test files before materializing dataset or output folders."""
     test_settings = config.get("test", {})
     evaluation = config.get("evaluation", {})
@@ -554,7 +538,12 @@ def estimate_standalone_test_outputs(
         + parallel_summary_files
         + int(tensorrt_artifacts["file_count"])
     )
-    image_outputs = model_input_files + max(0, visual_files - 2 if visual_files else 0) + max(0, error_case_files - 3 if error_case_files else 0) + dataset_case_files
+    image_outputs = (
+        model_input_files
+        + max(0, visual_files - 2 if visual_files else 0)
+        + max(0, error_case_files - 3 if error_case_files else 0)
+        + dataset_case_files
+    )
     approx_bytes = (
         dataset_cache_bytes
         + metric_files * 200_000
@@ -615,14 +604,20 @@ def confirm_test_or_exit(estimate: Mapping[str, Any], verbose: bool, assume_yes:
     print(json.dumps(dict(estimate), indent=2, ensure_ascii=False))
     if assume_yes:
         if verbose:
-            print(Fore.BLUE + Style.BRIGHT + "Confirmation skipped because --yes or confirm_before_run=false is enabled.")
+            print(
+                Fore.BLUE + Style.BRIGHT + "Confirmation skipped because --yes or confirm_before_run=false is enabled."
+            )
         return
-    answer = input(Fore.BLUE + Style.BRIGHT + "Continue and start standalone test? [y/N]: " + Style.RESET_ALL).strip().lower()
+    answer = (
+        input(Fore.BLUE + Style.BRIGHT + "Continue and start standalone test? [y/N]: " + Style.RESET_ALL)
+        .strip()
+        .lower()
+    )
     if answer not in {"y", "yes"}:
         raise SystemExit("Aborted by developer before test output was produced.")
 
 
-def build_internal_test_config(config: Mapping[str, Any]) -> Dict[str, Any]:
+def build_internal_test_config(config: Mapping[str, Any]) -> dict[str, Any]:
     """Translate a test-only YAML into the internal RF-DETR/evaluator shape."""
     internal = deepcopy(dict(config))
     test = dict(internal.get("test", {}) or {})
@@ -642,10 +637,12 @@ def build_internal_test_config(config: Mapping[str, Any]) -> Dict[str, Any]:
     test_mode = test.get("test_mode", {})
     test_mode_value = test_mode.get("mode") if isinstance(test_mode, Mapping) else None
     mode = (
-        internal.get("test_mode", {}).get("mode")
-        if isinstance(internal.get("test_mode"), Mapping)
-        else None
-    ) or test_mode_value or test.get("mode") or periodic_mode or "full_image"
+        (internal.get("test_mode", {}).get("mode") if isinstance(internal.get("test_mode"), Mapping) else None)
+        or test_mode_value
+        or test.get("mode")
+        or periodic_mode
+        or "full_image"
+    )
     split = str(test.get("split") or periodic_source.get("split") or dataset.get("split", "test") or "test")
     max_images = trainer.parse_limit_value(test.get("max_images", periodic_source.get("max_images")), "test.max_images")
     crop = test.get("crop") or internal.get("crop") or periodic_source.get("crop") or {}
@@ -668,8 +665,12 @@ def build_internal_test_config(config: Mapping[str, Any]) -> Dict[str, Any]:
     internal["crop"] = dict(crop)
     internal["sahi"] = dict(sahi)
     evaluation.setdefault("classwise", bool(test.get("classwise", periodic_source.get("classwise", True))))
-    evaluation.setdefault("max_detections", [1, 10, int(test.get("max_dets", periodic_source.get("max_dets", 500)) or 500)])
-    evaluation.setdefault("match_iou_threshold", float(test.get("match_iou_threshold", periodic_source.get("match_iou_threshold", 0.5))))
+    evaluation.setdefault(
+        "max_detections", [1, 10, int(test.get("max_dets", periodic_source.get("max_dets", 500)) or 500)]
+    )
+    evaluation.setdefault(
+        "match_iou_threshold", float(test.get("match_iou_threshold", periodic_source.get("match_iou_threshold", 0.5)))
+    )
     test_settings = {
         **test,
         "split": split,
@@ -683,7 +684,9 @@ def build_internal_test_config(config: Mapping[str, Any]) -> Dict[str, Any]:
         "plots": bool(test.get("plots", periodic_source.get("plots", False))),
         "save_dataset_cases": bool(test.get("save_dataset_cases", periodic_source.get("save_dataset_cases", False))),
         "visual_samples": dict(visual_samples),
-        "model_input_batch_size": int(test.get("model_input_batch_size", periodic_source.get("model_input_batch_size", 9)) or 9),
+        "model_input_batch_size": int(
+            test.get("model_input_batch_size", periodic_source.get("model_input_batch_size", 9)) or 9
+        ),
         "batch_size": int(test.get("batch_size", periodic_source.get("batch_size", 4)) or 4),
         "error_cases": dict(error_cases),
         "conf": model.get("confidence_threshold", 0.25),
@@ -713,7 +716,7 @@ def build_internal_test_config(config: Mapping[str, Any]) -> Dict[str, Any]:
     return internal
 
 
-def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int:
+def _main_impl(timing_context: MutableMapping[str, Any] | None = None) -> int:
     parser = argparse.ArgumentParser(description="RF-DETR standalone test runner.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="Path to rf_detr_test.yaml.")
     parser.add_argument("--model-size", help="RF-DETR size override, e.g. medium, large, seg-small, seg-2xlarge.")
@@ -744,7 +747,9 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
     )
     parser.add_argument("--output-dir", help="Exact output directory override.")
     parser.add_argument("--test-mode", choices=["full_image", "sahi", "class_crop"], help="Test mode override.")
-    parser.add_argument("--max-images", type=trainer.parse_scalar, help="Maximum test images to evaluate. Use all/null for all.")
+    parser.add_argument(
+        "--max-images", type=trainer.parse_scalar, help="Maximum test images to evaluate. Use all/null for all."
+    )
     parser.add_argument("--batch-size", type=int, help="RF-DETR full-image/class-crop evaluator batch size.")
     parser.add_argument("--sahi-batch-size", type=int, help="RF-DETR SAHI slice/recheck batch size.")
     parser.add_argument("--chunks", type=int, help="Concurrent standalone test chunks/model replicas.")
@@ -843,9 +848,7 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
                     raise RuntimeError("TensorRT preparation did not return worker artifacts.")
                 if timing_context is not None:
                     timing_context["acceleration"] = {
-                        key: value
-                        for key, value in preparation.items()
-                        if key != "device_artifacts"
+                        key: value for key, value in preparation.items() if key != "device_artifacts"
                     }
             parallel_evaluator_config = build_parallel_rfdetr_evaluator_config(
                 internal_config,
@@ -867,9 +870,7 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
     temporal_enabled = trainer.temporal_motion_enabled(internal_config)
     mode = trainer.periodic_test_mode(test_settings)
     evaluation_type = str(internal_config.get("evaluation", {}).get("type", "auto")).strip().lower()
-    segmentation_model = bool(
-        rf_model is not None and getattr(rf_model.model_config, "segmentation_head", False)
-    )
+    segmentation_model = bool(rf_model is not None and getattr(rf_model.model_config, "segmentation_head", False))
     use_segmentation_eval = (
         segmentation_model
         and mode == "full_image"

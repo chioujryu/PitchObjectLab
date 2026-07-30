@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
 
 import numpy as np
 import torch
 from loguru import logger
 from omegaconf import DictConfig
-
 from sam3 import build_sam3_image_model
 from sam3.model.sam3_image_processor import Sam3Processor
 
@@ -15,18 +13,16 @@ from sam3.model.sam3_image_processor import Sam3Processor
 @dataclass
 class SegmentResult:
     """Output of one segmentation pass on a single frame."""
-    masks: np.ndarray    # (N, H, W) bool
-    boxes: np.ndarray    # (N, 4) xyxy pixel coords
-    scores: np.ndarray   # (N,) float32
+
+    masks: np.ndarray  # (N, H, W) bool
+    boxes: np.ndarray  # (N, 4) xyxy pixel coords
+    scores: np.ndarray  # (N,) float32
 
 
 class SAM3Segmentor:
-    """
-    Wraps Sam3Processor for per-frame automatic segmentation driven by text
-    prompts (e.g. "ball", "soccer ball").
+    """Wraps Sam3Processor for per-frame automatic segmentation driven by text prompts (e.g. "ball", "soccer ball").
 
-    Half-precision and GPU selection are handled here; the processor is kept
-    in eval mode throughout inference.
+    Half-precision and GPU selection are handled here; the processor is kept in eval mode throughout inference.
     """
 
     def __init__(self, cfg: DictConfig) -> None:
@@ -50,8 +46,7 @@ class SAM3Segmentor:
 
     def _build_processor(self) -> Sam3Processor:
         logger.info(
-            f"Loading SAM3 image model (type={self._cfg.model.sam3_type}, "
-            f"device={self.device}, half={self.half})"
+            f"Loading SAM3 image model (type={self._cfg.model.sam3_type}, device={self.device}, half={self.half})"
         )
         checkpoint = self._cfg.model.sam3_checkpoint  # None → HuggingFace auto-download
         model = build_sam3_image_model(
@@ -73,12 +68,12 @@ class SAM3Segmentor:
     # ------------------------------------------------------------------
 
     def segment(self, frame_bgr: np.ndarray) -> SegmentResult:
-        """
-        Segment a single BGR frame (numpy HxWx3 uint8).
-        Runs all configured text prompts and merges results before returning.
+        """Segment a single BGR frame (numpy HxWx3 uint8). Runs all configured text prompts and merges results before
+        returning.
         """
         import cv2
         from PIL import Image as PILImage
+
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         frame_pil = PILImage.fromarray(frame_rgb)
 
@@ -100,9 +95,9 @@ class SAM3Segmentor:
             if "boxes" not in state or len(state["boxes"]) == 0:
                 continue
 
-            boxes = state["boxes"].cpu().float().numpy()       # (N, 4) xyxy
-            masks = state["masks"].squeeze(1).cpu().numpy()    # (N, H, W) bool
-            scores = state["scores"].cpu().float().numpy()     # (N,)
+            boxes = state["boxes"].cpu().float().numpy()  # (N, 4) xyxy
+            masks = state["masks"].squeeze(1).cpu().numpy()  # (N, H, W) bool
+            scores = state["scores"].cpu().float().numpy()  # (N,)
 
             all_masks.append(masks)
             all_boxes.append(boxes)
@@ -133,6 +128,7 @@ class SAM3Segmentor:
 # Helpers
 # ------------------------------------------------------------------
 
+
 def _nms_numpy(boxes: np.ndarray, scores: np.ndarray, iou_threshold: float) -> list[int]:
     """Simple greedy NMS over xyxy boxes."""
     if len(boxes) == 0:
@@ -152,6 +148,6 @@ def _nms_numpy(boxes: np.ndarray, scores: np.ndarray, iou_threshold: float) -> l
         iy2 = np.minimum(y2[i], y2)
         inter = (ix2 - ix1).clip(0) * (iy2 - iy1).clip(0)
         iou = inter / (areas[i] + areas - inter + 1e-6)
-        suppressed |= (iou > iou_threshold)
+        suppressed |= iou > iou_threshold
         suppressed[i] = False
     return keep

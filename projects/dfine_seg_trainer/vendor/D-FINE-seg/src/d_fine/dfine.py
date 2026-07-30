@@ -1,11 +1,9 @@
 from copy import deepcopy
 from pathlib import Path
 
-import torch.nn as nn
-import torch.optim as optim
-
 from src.d_fine.dfine_criterion import DFINECriterion
 from src.d_fine.utils import ensure_pretrained
+from torch import nn, optim
 
 from .arch.dfine_decoder import DFINETransformer
 from .arch.hgnetv2 import HGNetv2
@@ -14,10 +12,10 @@ from .configs import models
 from .matcher import HungarianMatcher
 from .utils import load_tuning_state
 
-__all__ = ["DFINE"]
+__all__ = ["DEFINE"]
 
 
-class DFINE(nn.Module):
+class DEFINE(nn.Module):
     __inject__ = [
         "backbone",
         "encoder",
@@ -83,7 +81,7 @@ def build_model(
     if enable_mask_head and 8 not in enc_strides:
         return_idx = model_cfg["HGNetv2"]["return_idx"]
         if 1 not in return_idx:  # stage index 1 = stride 8
-            model_cfg["HGNetv2"]["return_idx"] = [1] + return_idx
+            model_cfg["HGNetv2"]["return_idx"] = [1, *return_idx]
         backbone_name = model_cfg["HGNetv2"]["name"]
         stage2_ch = HGNetv2.arch_configs[backbone_name]["stage_config"]["stage2"][2]
         model_cfg["DFINETransformer"]["mask_low_level_ch"] = stage2_ch
@@ -92,7 +90,7 @@ def build_model(
     encoder = HybridEncoder(**model_cfg["HybridEncoder"])
     decoder = DFINETransformer(num_classes=num_classes, **model_cfg["DFINETransformer"])
 
-    model = DFINE(backbone, encoder, decoder)
+    model = DEFINE(backbone, encoder, decoder)
 
     if pretrained_model_path:
         resolved = ensure_pretrained(pretrained_model_path)
@@ -135,9 +133,7 @@ def build_optimizer(model, lr, backbone_lr, betas, weight_decay, base_lr):
                 backbone_exclude_norm.append(param)
 
         # Group 3: "encoder" or "decoder" plus "norm"/"bn"/"bias"
-        elif ("encoder" in name or "decoder" in name) and (
-            "norm" in name or "bn" in name or "bias" in name
-        ):
+        elif ("encoder" in name or "decoder" in name) and ("norm" in name or "bn" in name or "bias" in name):
             encdec_norm_bias.append(param)
 
         else:

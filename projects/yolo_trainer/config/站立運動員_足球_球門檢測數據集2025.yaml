@@ -105,7 +105,7 @@ train:
   compile: false
 
   # Validation interval. Run val every N epochs. Options:
-  #   1  — every epoch (default, identical to standard Ultralytics behaviour)
+  #   1  — every epoch (default, identical to standard Ultralytics behavior)
   #   5  — every 5th epoch; on other epochs the previous val result is reused so that
   #         early stopping and best.pt still track real val performance
   #   0  — disable validation entirely (equivalent to val=false)
