@@ -11,8 +11,7 @@ def main(cfg: DictConfig) -> None:
     img_paths.extend([x.name for x in data_path.iterdir() if not str(x.name).startswith(".")])
 
     with open(data_path.parent / "val.csv", "w") as f:
-        for img_path in img_paths:
-            f.write(str(img_path) + "\n")
+        f.writelines(str(img_path) + "\n" for img_path in img_paths)
 
 
 if __name__ == "__main__":

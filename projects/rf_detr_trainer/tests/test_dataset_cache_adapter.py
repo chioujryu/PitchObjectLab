@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import os
 import sys
@@ -11,7 +13,7 @@ from PIL import Image
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_DIR))
 
-import train_rf_detr_model as trainer  # noqa: E402
+import train_rf_detr_model as trainer
 
 TEMP_ROOT = Path(os.environ.get("RF_DETR_TEST_TMP", r"C:\tmp" if os.name == "nt" else "/tmp/rf_detr_trainer_tests"))
 TEMP_ROOT.mkdir(parents=True, exist_ok=True)
@@ -277,7 +279,9 @@ class DatasetCacheAdapterTest(unittest.TestCase):
                     make_image(split_dir / name)
                     image_id = index + 1
                     images.append({"id": image_id, "file_name": name, "width": 100, "height": 80})
-                    annotations.append({"id": image_id, "image_id": image_id, "category_id": 1, "bbox": [10, 12, 20, 30]})
+                    annotations.append(
+                        {"id": image_id, "image_id": image_id, "category_id": 1, "bbox": [10, 12, 20, 30]}
+                    )
                 (split_dir / "_annotations.coco.json").write_text(
                     json.dumps(
                         {
