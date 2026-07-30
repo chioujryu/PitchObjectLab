@@ -1,17 +1,17 @@
 """Optional three-frame TrackNetV5-inspired branch for RF-DETR.
 
 The enabled path keeps all three temporal feature maps for TrackNet and sends
-only the centre frame through the RF-DETR transformer/decoder. The default
+only the center frame through the RF-DETR transformer/decoder. The default
 ``center_only`` backbone gradient mode runs context frames sequentially without
 activation gradients while the shared backbone remains trainable through the
-centre frame. TrackNet provides:
+center frame. TrackNet provides:
 
 * four luminance Motion Direction Decoupling maps for both adjacent pairs;
 * paper-parameterised MDD attention maps and motion-aware draft heatmaps;
 * factorised spatial/temporal R-STR refinement with patch/PixelShuffle decode;
 * bbox-Gaussian targets, weighted focal BCE, and single/all peak extraction;
-* a zero-initialised heatmap residual fused into the highest-resolution centre
-  feature, preserving stock detector behaviour at initialisation.
+* a zero-initialised heatmap residual fused into the highest-resolution center
+  feature, preserving stock detector behavior at initialization.
 
 Integration is instance-bound. ``attach_motion_module`` adds the module and a
 5-D/TemporalBatch dispatcher only to the requested LWDETR instance; disabled
@@ -26,32 +26,32 @@ from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from types import MethodType
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Mapping, Sequence
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 __all__ = [
-    'assert_motion_checkpoint_compatible',
-    "ensure_motion_support",
-    "attach_motion_module",
-    "load_motion_checkpoint_weights",
-    "assert_motion_export_ready",
-    "apply_motion_overrides",
-    "is_patched",
+    "MotionDirectionDecoupling",
     "MotionModule",
     "MotionOutput",
-    "MotionDirectionDecoupling",
     "TemporalRSTRHead",
+    "apply_motion_overrides",
+    "assert_motion_checkpoint_compatible",
+    "assert_motion_export_ready",
+    "attach_motion_module",
     "build_gaussian_heatmap_targets",
-    "weighted_heatmap_bce",
+    "ensure_motion_support",
     "extract_heatmap_peaks",
+    "is_patched",
+    "load_motion_checkpoint_weights",
     "run_temporal_lwdetr",
+    "weighted_heatmap_bce",
 ]
 
 # Convenience overrides that map to real ModelConfig fields.
-_BASELINE_RFDETR_VERSION = '1.8.3'
+_BASELINE_RFDETR_VERSION = "1.8.3"
 _TRACKNET_ARCHITECTURE_SCHEMA_VERSION = 3
 
 _MOTION_OVERRIDE_CASTS = {
@@ -62,7 +62,7 @@ _MOTION_OVERRIDE_CASTS = {
 }
 
 # Global settings threaded from the YAML config to the patches (mirrors P2_SETTINGS).
-_MOTION_DEFAULTS: Dict[str, Any] = {
+_MOTION_DEFAULTS: dict[str, Any] = {
     "enabled": False,
     "type": "tracknet_v5",
     "temporal": {
@@ -125,13 +125,15 @@ _MOTION_DEFAULTS: Dict[str, Any] = {
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _first(value: Any, fallback: Any) -> Any:
     return fallback if value is None else value
 
 
 def _check_version() -> None:
     try:
-        import importlib.metadata as metadata
+        from importlib import metadata
+
         version = metadata.version("rfdetr")
     except Exception:
         version = "unknown"
@@ -143,26 +145,15 @@ def _check_version() -> None:
         )
 
 
-def _validated_motion_config(motion_cfg: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+def _validated_motion_config(motion_cfg: Mapping[str, Any] | None) -> dict[str, Any]:
     """Merge defaults and reject temporal graph options not implemented here."""
-
-    raw_attention = (
-        (((motion_cfg or {}).get("tracknet_v5", {}) or {}).get("mdd", {}) or {}).get(
-            "attention", {}
-        )
-        or {}
-    )
-    legacy_attention = sorted(
-        key for key in ("init_k", "init_m") if key in raw_attention
-    )
+    raw_attention = (((motion_cfg or {}).get("tracknet_v5", {}) or {}).get("mdd", {}) or {}).get("attention", {}) or {}
+    legacy_attention = sorted(key for key in ("init_k", "init_m") if key in raw_attention)
     if legacy_attention:
         raise ValueError(
-            "TrackNetV5 MDD now uses paper parameters init_alpha/init_beta; "
-            f"remove legacy {legacy_attention!r}."
+            f"TrackNetV5 MDD now uses paper parameters init_alpha/init_beta; remove legacy {legacy_attention!r}."
         )
-    raw_rstr = (
-        ((motion_cfg or {}).get("tracknet_v5", {}) or {}).get("rstr", {}) or {}
-    )
+    raw_rstr = ((motion_cfg or {}).get("tracknet_v5", {}) or {}).get("rstr", {}) or {}
     if "use_pixel_shuffle" in raw_rstr:
         raise ValueError(
             "TrackNetV5 R-STR always decodes with PixelShuffle; replace "
@@ -201,13 +192,8 @@ def _validated_motion_config(motion_cfg: Optional[Mapping[str, Any]]) -> Dict[st
     )
     for field, value, expected in supported:
         if value != expected:
-            raise ValueError(
-                f"{field} must be {expected!r} for the current TrackNetV5 "
-                f"temporal graph, got {value!r}."
-            )
-    backbone_grad_mode = str(
-        temporal.get("backbone_grad_mode", "center_only")
-    ).lower()
+            raise ValueError(f"{field} must be {expected!r} for the current TrackNetV5 temporal graph, got {value!r}.")
+    backbone_grad_mode = str(temporal.get("backbone_grad_mode", "center_only")).lower()
     if backbone_grad_mode not in {"center_only", "all_frames"}:
         raise ValueError(
             "model.motion.temporal.backbone_grad_mode must be 'center_only' "
@@ -215,15 +201,14 @@ def _validated_motion_config(motion_cfg: Optional[Mapping[str, Any]]) -> Dict[st
         )
     patch_size = int(rstr.get("patch_size", 16))
     if patch_size <= 0:
-        raise ValueError(
-            "model.motion.tracknet_v5.rstr.patch_size must be a positive integer."
-        )
+        raise ValueError("model.motion.tracknet_v5.rstr.patch_size must be a positive integer.")
     return merged
 
 
 # ---------------------------------------------------------------------------
 # PyTorch module classes
 # ---------------------------------------------------------------------------
+
 
 class LearnableSigmoidAttention(nn.Module):
     """TrackNetV5 attention mapping from the published alpha/beta equations."""
@@ -253,9 +238,7 @@ class LearnableSigmoidAttention(nn.Module):
         self.epsilon = float(epsilon)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        k = 5.0 / (
-            0.45 * torch.abs(torch.tanh(self.alpha)) + self.epsilon
-        )
+        k = 5.0 / (0.45 * torch.abs(torch.tanh(self.alpha)) + self.epsilon)
         m = 0.6 * torch.tanh(self.beta)
         return torch.sigmoid(k * (torch.abs(x) - m))
 
@@ -263,12 +246,11 @@ class LearnableSigmoidAttention(nn.Module):
 class MotionDirectionDecoupling(nn.Module):
     """TrackNetV5 luminance MDD for a three-frame window.
 
-    The four output planes are, in order, positive and negative luminance
-    changes for ``previous -> centre`` followed by positive and negative
-    changes for ``centre -> next``. The outputs are four bounded attention maps.
+    The four output planes are, in order, positive and negative luminance changes for ``previous -> center`` followed by
+    positive and negative changes for ``center -> next``. The outputs are four bounded attention maps.
     """
 
-    LUMA_WEIGHTS: Tuple[float, float, float] = (0.299, 0.587, 0.114)
+    LUMA_WEIGHTS: tuple[float, float, float] = (0.299, 0.587, 0.114)
 
     def __init__(
         self,
@@ -305,15 +287,9 @@ class MotionDirectionDecoupling(nn.Module):
     def raw_polarities(self, frames: torch.Tensor) -> torch.Tensor:
         """Return unnormalised ``[B, 4, H, W]`` luminance polarity fields."""
         if frames.ndim != 5:
-            raise ValueError(
-                "MDD expects [B, 3, 3, H, W] frames, "
-                f"received shape {tuple(frames.shape)}."
-            )
+            raise ValueError(f"MDD expects [B, 3, 3, H, W] frames, received shape {tuple(frames.shape)}.")
         if frames.shape[1] != 3 or frames.shape[2] != 3:
-            raise ValueError(
-                "MDD requires exactly three RGB frames, "
-                f"received shape {tuple(frames.shape)}."
-            )
+            raise ValueError(f"MDD requires exactly three RGB frames, received shape {tuple(frames.shape)}.")
         weights = self.luma_weights.to(device=frames.device, dtype=frames.dtype)
         luminance = (frames * weights).sum(dim=2)
         previous_to_centre = luminance[:, 1] - luminance[:, 0]
@@ -339,13 +315,9 @@ class RSTRSpatialAttention(nn.Module):
     def __init__(self, embed_dim: int, num_heads: int = 8, dropout: float = 0.1) -> None:
         super().__init__()
         if embed_dim % num_heads != 0:
-            raise ValueError(
-                f"R-STR hidden_dim ({embed_dim}) must be divisible by num_heads ({num_heads})."
-            )
+            raise ValueError(f"R-STR hidden_dim ({embed_dim}) must be divisible by num_heads ({num_heads}).")
         self.norm = nn.LayerNorm(embed_dim)
-        self.attn = nn.MultiheadAttention(
-            embed_dim, num_heads, dropout=dropout, batch_first=True
-        )
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True)
         self.dropout = nn.Dropout(dropout)
         self.norm2 = nn.LayerNorm(embed_dim)
         self.ffn = nn.Sequential(
@@ -383,29 +355,23 @@ class TemporalDraftHeatmapHead(nn.Module):
         motion_maps: torch.Tensor,
     ) -> torch.Tensor:
         if temporal_feature.ndim != 5:
-            raise ValueError(
-                "Draft heatmap head expects [B, T, C, H, W], "
-                f"got {tuple(temporal_feature.shape)}."
-            )
+            raise ValueError(f"Draft heatmap head expects [B, T, C, H, W], got {tuple(temporal_feature.shape)}.")
         batch, frames, channels, height, width = temporal_feature.shape
         if frames != self.num_frames:
             raise ValueError(f"Expected T={self.num_frames}, got T={frames}.")
-        feature_logits = self.feature_head(
-            temporal_feature.reshape(batch * frames, channels, height, width)
-        ).reshape(batch, frames, height, width)
-        resized_motion = F.interpolate(
-            motion_maps, size=(height, width), mode="bilinear", align_corners=False
+        feature_logits = self.feature_head(temporal_feature.reshape(batch * frames, channels, height, width)).reshape(
+            batch, frames, height, width
         )
+        resized_motion = F.interpolate(motion_maps, size=(height, width), mode="bilinear", align_corners=False)
         return feature_logits + self.motion_to_time(resized_motion)
 
 
 class TemporalRSTRHead(nn.Module):
     """Factorised spatial/temporal refinement of three draft heatmaps.
 
-    The final correction projection is zero-initialised, so the module begins
-    as the exact identity in logit space when context masking is disabled.
-    Non-overlapping patches bound attention memory and PixelShuffle restores
-    the original draft resolution.
+    The final correction projection is zero-initialised, so the module begins as the exact identity in logit space when
+    context masking is disabled. Non-overlapping patches bound attention memory and PixelShuffle restores the original
+    draft resolution.
     """
 
     def __init__(
@@ -437,9 +403,7 @@ class TemporalRSTRHead(nn.Module):
             stride=self.patch_size,
         )
         self.motion_embed = nn.Conv2d(4, hidden_dim, 3, padding=1)
-        self.temporal_position = nn.Parameter(
-            torch.zeros(1, self.num_frames, hidden_dim, 1, 1)
-        )
+        self.temporal_position = nn.Parameter(torch.zeros(1, self.num_frames, hidden_dim, 1, 1))
         nn.init.trunc_normal_(self.temporal_position, std=0.02)
         self.spatial_blocks = nn.ModuleList(
             [RSTRSpatialAttention(hidden_dim, num_heads, dropout) for _ in range(num_blocks)]
@@ -448,9 +412,7 @@ class TemporalRSTRHead(nn.Module):
             [RSTRSpatialAttention(hidden_dim, num_heads, dropout) for _ in range(num_blocks)]
         )
         output_channels = self.patch_size * self.patch_size
-        self.residual_projection = nn.Conv2d(
-            hidden_dim, output_channels, 3, padding=1
-        )
+        self.residual_projection = nn.Conv2d(hidden_dim, output_channels, 3, padding=1)
         nn.init.zeros_(self.residual_projection.weight)
         nn.init.zeros_(self.residual_projection.bias)
 
@@ -464,7 +426,6 @@ class TemporalRSTRHead(nn.Module):
         dtype: torch.dtype,
     ) -> torch.Tensor:
         """Return dynamic factorised 2-D sine/cosine positions."""
-
         quarter = hidden_dim // 4
         frequency = torch.arange(quarter, device=device, dtype=torch.float32)
         frequency = torch.pow(
@@ -492,10 +453,7 @@ class TemporalRSTRHead(nn.Module):
         motion_maps: torch.Tensor,
     ) -> torch.Tensor:
         if draft_logits.ndim != 4:
-            raise ValueError(
-                "R-STR expects [B, T, H, W] draft logits, "
-                f"got {tuple(draft_logits.shape)}."
-            )
+            raise ValueError(f"R-STR expects [B, T, H, W] draft logits, got {tuple(draft_logits.shape)}.")
         batch, frames, height, width = draft_logits.shape
         if frames != self.num_frames:
             raise ValueError(f"Expected T={self.num_frames}, got T={frames}.")
@@ -512,9 +470,7 @@ class TemporalRSTRHead(nn.Module):
         pad_width = (-width) % self.patch_size
         padded = F.pad(base_logits, (0, pad_width, 0, pad_height))
         padded_height, padded_width = padded.shape[-2:]
-        embedded = self.draft_embed(
-            padded.reshape(batch * frames, 1, padded_height, padded_width)
-        )
+        embedded = self.draft_embed(padded.reshape(batch * frames, 1, padded_height, padded_width))
         token_height, token_width = embedded.shape[-2:]
         embedded = embedded.reshape(batch, frames, -1, token_height, token_width)
 
@@ -540,33 +496,24 @@ class TemporalRSTRHead(nn.Module):
             dtype=embedded.dtype,
         )
         embedded = (
-            embedded
-            + motion_context.unsqueeze(1)
-            + spatial_position
-            + self.temporal_position.to(dtype=embedded.dtype)
+            embedded + motion_context.unsqueeze(1) + spatial_position + self.temporal_position.to(dtype=embedded.dtype)
         )
 
         hidden_dim = embedded.shape[2]
         for spatial, temporal in zip(self.spatial_blocks, self.temporal_blocks):
-            spatial_tokens = embedded.reshape(
-                batch * frames, hidden_dim, token_height * token_width
-            ).transpose(1, 2)
+            spatial_tokens = embedded.reshape(batch * frames, hidden_dim, token_height * token_width).transpose(1, 2)
             spatial_tokens = spatial(spatial_tokens)
-            embedded = spatial_tokens.transpose(1, 2).reshape(
-                batch, frames, hidden_dim, token_height, token_width
-            )
+            embedded = spatial_tokens.transpose(1, 2).reshape(batch, frames, hidden_dim, token_height, token_width)
 
             temporal_tokens = embedded.permute(0, 3, 4, 1, 2).reshape(
                 batch * token_height * token_width, frames, hidden_dim
             )
             temporal_tokens = temporal(temporal_tokens)
-            embedded = temporal_tokens.reshape(
-                batch, token_height, token_width, frames, hidden_dim
-            ).permute(0, 3, 4, 1, 2)
+            embedded = temporal_tokens.reshape(batch, token_height, token_width, frames, hidden_dim).permute(
+                0, 3, 4, 1, 2
+            )
 
-        residual = self.residual_projection(
-            embedded.reshape(batch * frames, hidden_dim, token_height, token_width)
-        )
+        residual = self.residual_projection(embedded.reshape(batch * frames, hidden_dim, token_height, token_width))
         residual = F.pixel_shuffle(residual, self.patch_size)
         residual = residual.reshape(batch, frames, padded_height, padded_width)
         residual = residual[..., :height, :width]
@@ -576,9 +523,8 @@ class TemporalRSTRHead(nn.Module):
 class RSTRHead(TemporalRSTRHead):
     """Compatibility wrapper treating input channels as temporal drafts.
 
-    New TrackNet code uses :class:`TemporalRSTRHead` directly. This wrapper is
-    retained for imports from older integrations and returns probabilities as
-    the previous class did.
+    New TrackNet code uses :class:`TemporalRSTRHead` directly. This wrapper is retained for imports from older
+    integrations and returns probabilities as the previous class did.
     """
 
     def __init__(
@@ -593,8 +539,7 @@ class RSTRHead(TemporalRSTRHead):
     ) -> None:
         if in_channels != 3:
             raise ValueError(
-                "RSTRHead now refines exactly three temporal draft heatmaps; "
-                f"use in_channels=3, got {in_channels}."
+                f"RSTRHead now refines exactly three temporal draft heatmaps; use in_channels=3, got {in_channels}."
             )
         super().__init__(
             num_frames=3,
@@ -609,7 +554,7 @@ class RSTRHead(TemporalRSTRHead):
     def forward(
         self,
         feat: torch.Tensor,
-        motion_maps: Optional[torch.Tensor] = None,
+        motion_maps: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if motion_maps is None:
             motion_maps = feat.new_zeros((feat.shape[0], 4, *feat.shape[-2:]))
@@ -627,9 +572,7 @@ class HeatmapResidualFusion(nn.Module):
 
     def forward(self, feature: torch.Tensor, heatmap: torch.Tensor) -> torch.Tensor:
         if heatmap.shape[-2:] != feature.shape[-2:]:
-            heatmap = F.interpolate(
-                heatmap, size=feature.shape[-2:], mode="bilinear", align_corners=False
-            )
+            heatmap = F.interpolate(heatmap, size=feature.shape[-2:], mode="bilinear", align_corners=False)
         return feature + self.projection(heatmap)
 
 
@@ -637,7 +580,7 @@ class HeatmapResidualFusion(nn.Module):
 class MotionOutput:
     """TrackNet outputs consumed by the temporal LWDETR adapter and losses."""
 
-    features: List[torch.Tensor]
+    features: list[torch.Tensor]
     draft_heatmap_logits: torch.Tensor
     heatmap_logits: torch.Tensor
     heatmaps: torch.Tensor
@@ -647,7 +590,7 @@ class MotionOutput:
 
 def _normalise_temporal_targets(
     targets: Sequence[Any] | Mapping[str, Any],
-) -> List[List[Mapping[str, Any]]]:
+) -> list[list[Mapping[str, Any]]]:
     if isinstance(targets, Mapping):
         return [[targets]]
     targets_list = list(targets)
@@ -655,19 +598,19 @@ def _normalise_temporal_targets(
         return []
     if isinstance(targets_list[0], Mapping):
         return [[item for item in targets_list]]
-    normalised: List[List[Mapping[str, Any]]] = []
+    normalized: list[list[Mapping[str, Any]]] = []
     for sample in targets_list:
         frames = list(sample)
         if not all(isinstance(item, Mapping) for item in frames):
             raise TypeError("Every temporal target must be a mapping.")
-        normalised.append(frames)
-    return normalised
+        normalized.append(frames)
+    return normalized
 
 
 def _target_image_size(
     target: Mapping[str, Any],
-    image_size: Optional[Tuple[int, int]],
-) -> Tuple[float, float]:
+    image_size: tuple[int, int] | None,
+) -> tuple[float, float]:
     size = image_size if image_size is not None else target.get("size")
     if size is None:
         raise ValueError("Pixel-coordinate boxes require image_size or target['size'].")
@@ -680,18 +623,17 @@ def _target_image_size(
 
 def build_gaussian_heatmap_targets(
     targets: Sequence[Any] | Mapping[str, Any],
-    output_size: Tuple[int, int],
+    output_size: tuple[int, int],
     *,
-    image_size: Optional[Tuple[int, int]] = None,
+    image_size: tuple[int, int] | None = None,
     focus_mode: str = "all",
     primary_field: str = "primary_label_index",
     min_sigma: float = 1.0,
 ) -> torch.Tensor:
-    """Rasterise RF-DETR boxes into soft Gaussian TrackNet targets.
+    """Rasterize RF-DETR boxes into soft Gaussian TrackNet targets.
 
-    ``targets`` is normally ``[batch][time]`` mappings. Boxes default to
-    normalized ``cxcywh``; set ``box_format`` to ``xyxy_normalized``, ``cxcywh``
-    or ``xyxy`` for the other supported representations.
+    ``targets`` is normally ``[batch][time]`` mappings. Boxes default to normalized ``cxcywh``; set ``box_format`` to
+    ``xyxy_normalized``, ``cxcywh`` or ``xyxy`` for the other supported representations.
     """
     focus_mode = str(focus_mode).lower()
     if focus_mode not in {"single", "all"}:
@@ -710,23 +652,14 @@ def build_gaussian_heatmap_targets(
         raise ValueError("Every sample must provide the same non-zero number of frames.")
 
     reference_boxes = next(
-        (
-            item.get("boxes")
-            for sample in nested_targets
-            for item in sample
-            if torch.is_tensor(item.get("boxes"))
-        ),
+        (item.get("boxes") for sample in nested_targets for item in sample if torch.is_tensor(item.get("boxes"))),
         None,
     )
     device = reference_boxes.device if reference_boxes is not None else torch.device("cpu")
     dtype = (
-        reference_boxes.dtype
-        if reference_boxes is not None and reference_boxes.is_floating_point()
-        else torch.float32
+        reference_boxes.dtype if reference_boxes is not None and reference_boxes.is_floating_point() else torch.float32
     )
-    heatmaps = torch.zeros(
-        (len(nested_targets), frame_count, height, width), device=device, dtype=dtype
-    )
+    heatmaps = torch.zeros((len(nested_targets), frame_count, height, width), device=device, dtype=dtype)
     grid_y = torch.arange(height, device=device, dtype=dtype).view(height, 1)
     grid_x = torch.arange(width, device=device, dtype=dtype).view(1, width)
 
@@ -749,14 +682,10 @@ def build_gaussian_heatmap_targets(
                     if torch.is_tensor(primary):
                         primary = int(primary.item())
                     if primary is None:
-                        raise ValueError(
-                            f"single focus found {boxes.shape[0]} boxes without {primary_field!r}."
-                        )
+                        raise ValueError(f"single focus found {boxes.shape[0]} boxes without {primary_field!r}.")
                     primary = int(primary)
                     if primary < 0 or primary >= boxes.shape[0]:
-                        raise ValueError(
-                            f"{primary_field}={primary} is outside [0, {boxes.shape[0] - 1}]."
-                        )
+                        raise ValueError(f"{primary_field}={primary} is outside [0, {boxes.shape[0] - 1}].")
                     selected = selected.new_tensor([primary])
             boxes = boxes[selected]
 
@@ -789,16 +718,8 @@ def build_gaussian_heatmap_targets(
             sigma_x = (box_widths / 6.0).clamp_min(float(min_sigma))
             sigma_y = (box_heights / 6.0).clamp_min(float(min_sigma))
             frame_heatmap = heatmaps[batch_index, frame_index]
-            for centre_x, centre_y, sx, sy in zip(
-                centres_x, centres_y, sigma_x, sigma_y
-            ):
-                gaussian = torch.exp(
-                    -0.5
-                    * (
-                        ((grid_x - centre_x) / sx).square()
-                        + ((grid_y - centre_y) / sy).square()
-                    )
-                )
+            for centre_x, centre_y, sx, sy in zip(centres_x, centres_y, sigma_x, sigma_y):
+                gaussian = torch.exp(-0.5 * (((grid_x - centre_x) / sx).square() + ((grid_y - centre_y) / sy).square()))
                 frame_heatmap.copy_(torch.maximum(frame_heatmap, gaussian))
     return heatmaps
 
@@ -808,14 +729,12 @@ def weighted_heatmap_bce(
     targets: torch.Tensor,
     *,
     gamma: float = 2.0,
-    positive_weight: Optional[float] = None,
+    positive_weight: float | None = None,
     reduction: str = "mean",
 ) -> torch.Tensor:
     """Class-balanced focal BCE over soft Gaussian heatmap targets."""
     if logits.shape != targets.shape:
-        raise ValueError(
-            f"Heatmap logits/targets must have equal shapes, got {logits.shape} and {targets.shape}."
-        )
+        raise ValueError(f"Heatmap logits/targets must have equal shapes, got {logits.shape} and {targets.shape}.")
     if gamma < 0:
         raise ValueError("gamma must be non-negative.")
     probabilities = logits.sigmoid()
@@ -827,10 +746,9 @@ def weighted_heatmap_bce(
         if positive_weight <= 0:
             raise ValueError("positive_weight must be positive.")
         positive_weight_tensor = logits.new_tensor(float(positive_weight))
-    focal_weights = (
-        targets * (1.0 - probabilities).pow(gamma) * positive_weight_tensor
-        + (1.0 - targets) * probabilities.pow(gamma)
-    )
+    focal_weights = targets * (1.0 - probabilities).pow(gamma) * positive_weight_tensor + (
+        1.0 - targets
+    ) * probabilities.pow(gamma)
     losses = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
     losses = losses * focal_weights
     if reduction == "none":
@@ -850,7 +768,7 @@ def extract_heatmap_peaks(
     nms_kernel: int = 3,
     max_peaks: int = 20,
     from_logits: bool = False,
-) -> List[List[torch.Tensor]]:
+) -> list[list[torch.Tensor]]:
     """Extract local maxima as per-frame ``[x, y, score]`` tensors."""
     if heatmaps.ndim == 3:
         heatmaps = heatmaps.unsqueeze(1)
@@ -871,10 +789,10 @@ def extract_heatmap_peaks(
         padding=nms_kernel // 2,
     ).reshape_as(probabilities)
     local = (probabilities >= threshold) & (probabilities == pooled)
-    result: List[List[torch.Tensor]] = []
+    result: list[list[torch.Tensor]] = []
     limit = 1 if focus_mode == "single" else max_peaks
     for sample_scores, sample_local in zip(probabilities, local):
-        sample_result: List[torch.Tensor] = []
+        sample_result: list[torch.Tensor] = []
         for frame_scores, frame_local in zip(sample_scores, sample_local):
             coordinates = frame_local.nonzero(as_tuple=False)
             if coordinates.numel() == 0:
@@ -903,8 +821,8 @@ class MotionModule(nn.Module):
 
     def __init__(
         self,
-        feature_channels_per_scale: List[int],
-        motion_cfg: Dict[str, Any],
+        feature_channels_per_scale: list[int],
+        motion_cfg: dict[str, Any],
     ) -> None:
         super().__init__()
         if not feature_channels_per_scale:
@@ -921,9 +839,7 @@ class MotionModule(nn.Module):
 
         self.num_frames = int(temporal_cfg.get("num_frames", 3))
         if self.num_frames != 3:
-            raise ValueError(
-                f"TrackNetV5 temporal integration requires num_frames=3, got {self.num_frames}."
-            )
+            raise ValueError(f"TrackNetV5 temporal integration requires num_frames=3, got {self.num_frames}.")
         self.frame_stride = int(temporal_cfg.get("frame_stride", 1))
         if self.frame_stride <= 0:
             raise ValueError("frame_stride must be positive.")
@@ -937,16 +853,12 @@ class MotionModule(nn.Module):
             temporal_cfg.get("allow_single_frame_fallback", False)
             or self.fallback_mode in {"identity", "zero", "noise"}
         )
-        self.backbone_grad_mode = str(
-            temporal_cfg.get("backbone_grad_mode", "center_only")
-        ).lower()
+        self.backbone_grad_mode = str(temporal_cfg.get("backbone_grad_mode", "center_only")).lower()
 
         self.focus_mode = str(focus_cfg.get("mode", "all")).lower()
         if self.focus_mode not in {"single", "all"}:
             raise ValueError("model.motion.focus.mode must be 'single' or 'all'.")
-        self.primary_field = str(
-            focus_cfg.get("primary_field", "primary_label_index")
-        )
+        self.primary_field = str(focus_cfg.get("primary_field", "primary_label_index"))
         self.min_sigma = float(heatmap_cfg.get("min_sigma", 1.0))
         self.peak_threshold = float(heatmap_cfg.get("peak_threshold", 0.5))
         self.peak_nms_kernel = int(heatmap_cfg.get("peak_nms_kernel", 3))
@@ -996,21 +908,15 @@ class MotionModule(nn.Module):
         )
         fusion_mode = str((v5_cfg.get("fusion", {}) or {}).get("mode", "zero_init_residual"))
         if fusion_mode != "zero_init_residual":
-            raise ValueError(
-                "Only tracknet_v5.fusion.mode='zero_init_residual' is supported."
-            )
-        self.fusions = nn.ModuleList(
-            [HeatmapResidualFusion(channel) for channel in self.feature_channels_per_scale]
-        )
-        self.last_output: Optional[MotionOutput] = None
+            raise ValueError("Only tracknet_v5.fusion.mode='zero_init_residual' is supported.")
+        self.fusions = nn.ModuleList([HeatmapResidualFusion(channel) for channel in self.feature_channels_per_scale])
+        self.last_output: MotionOutput | None = None
 
     def _make_frame_window(self, images: torch.Tensor) -> torch.Tensor:
         """Validate real input or explicitly synthesize an allowed still-image window."""
         if images.ndim == 5:
             if images.shape[1] != self.num_frames or images.shape[2] != 3:
-                raise ValueError(
-                    f"Expected [B, {self.num_frames}, 3, H, W], got {tuple(images.shape)}."
-                )
+                raise ValueError(f"Expected [B, {self.num_frames}, 3, H, W], got {tuple(images.shape)}.")
             return images
         if images.ndim != 4 or images.shape[1] != 3:
             raise ValueError(f"Expected RGB images or temporal frames, got {tuple(images.shape)}.")
@@ -1034,14 +940,10 @@ class MotionModule(nn.Module):
         expected_channels: Sequence[int],
     ) -> None:
         if len(features) != len(expected_channels):
-            raise RuntimeError(
-                f"Backbone returned {len(features)} feature levels; expected {len(expected_channels)}."
-            )
+            raise RuntimeError(f"Backbone returned {len(features)} feature levels; expected {len(expected_channels)}.")
         for index, (feature, channels) in enumerate(zip(features, expected_channels)):
             if feature.ndim != 5:
-                raise ValueError(
-                    f"Temporal feature {index} must be [B, T, C, H, W], got {tuple(feature.shape)}."
-                )
+                raise ValueError(f"Temporal feature {index} must be [B, T, C, H, W], got {tuple(feature.shape)}.")
             if feature.shape[:2] != frames.shape[:2] or feature.shape[2] != channels:
                 raise ValueError(
                     f"Temporal feature {index} shape {tuple(feature.shape)} does not match "
@@ -1055,28 +957,19 @@ class MotionModule(nn.Module):
     ) -> MotionOutput:
         """Run MDD/heatmap/R-STR and return centre-frame RF-DETR features."""
         frames = self._make_frame_window(frames)
-        self._validate_temporal_features(
-            frames, temporal_features, self.feature_channels_per_scale
-        )
+        self._validate_temporal_features(frames, temporal_features, self.feature_channels_per_scale)
         if self.mdd is None:
-            motion_maps = frames.new_zeros(
-                (frames.shape[0], 4, frames.shape[-2], frames.shape[-1])
-            )
+            motion_maps = frames.new_zeros((frames.shape[0], 4, frames.shape[-2], frames.shape[-1]))
         else:
             motion_maps = self.mdd(frames)
 
         feature_level = max(
             range(len(temporal_features)),
-            key=lambda index: int(temporal_features[index].shape[-2])
-            * int(temporal_features[index].shape[-1]),
+            key=lambda index: int(temporal_features[index].shape[-2]) * int(temporal_features[index].shape[-1]),
         )
-        draft_low_resolution = self.draft_heads[feature_level](
-            temporal_features[feature_level], motion_maps
-        )
+        draft_low_resolution = self.draft_heads[feature_level](temporal_features[feature_level], motion_maps)
         heatmap_low_resolution = (
-            self.rstr(draft_low_resolution, motion_maps)
-            if self.rstr is not None
-            else draft_low_resolution
+            self.rstr(draft_low_resolution, motion_maps) if self.rstr is not None else draft_low_resolution
         )
         output_size = (int(frames.shape[-2]), int(frames.shape[-1]))
         draft_logits = F.interpolate(
@@ -1093,9 +986,7 @@ class MotionModule(nn.Module):
         )
         heatmaps = heatmap_logits.sigmoid()
 
-        centre_features = [
-            feature[:, self.anchor_index].contiguous() for feature in temporal_features
-        ]
+        centre_features = [feature[:, self.anchor_index].contiguous() for feature in temporal_features]
         centre_features[feature_level] = self.fusions[feature_level](
             centre_features[feature_level],
             heatmaps[:, self.anchor_index : self.anchor_index + 1],
@@ -1114,9 +1005,9 @@ class MotionModule(nn.Module):
     def build_heatmap_targets(
         self,
         targets: Sequence[Any] | Mapping[str, Any],
-        output_size: Tuple[int, int],
+        output_size: tuple[int, int],
         *,
-        image_size: Optional[Tuple[int, int]] = None,
+        image_size: tuple[int, int] | None = None,
     ) -> torch.Tensor:
         return build_gaussian_heatmap_targets(
             targets,
@@ -1128,11 +1019,9 @@ class MotionModule(nn.Module):
         )
 
     def heatmap_loss(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        return self.heatmap_weight * weighted_heatmap_bce(
-            logits, targets, gamma=self.heatmap_gamma
-        )
+        return self.heatmap_weight * weighted_heatmap_bce(logits, targets, gamma=self.heatmap_gamma)
 
-    def extract_peaks(self, heatmaps: torch.Tensor) -> List[List[torch.Tensor]]:
+    def extract_peaks(self, heatmaps: torch.Tensor) -> list[list[torch.Tensor]]:
         return extract_heatmap_peaks(
             heatmaps,
             focus_mode=self.focus_mode,
@@ -1144,16 +1033,13 @@ class MotionModule(nn.Module):
     def forward(self, images: torch.Tensor, features: list) -> list:
         feature_tensors = [nested.tensors for nested in features]
         modulated_tensors = self.forward_export(images, feature_tensors)
-        return [
-            _rebuild_nested_tensor(src, nested.mask)
-            for src, nested in zip(modulated_tensors, features)
-        ]
+        return [_rebuild_nested_tensor(src, nested.mask) for src, nested in zip(modulated_tensors, features)]
 
     def forward_export(
         self,
         images: torch.Tensor,
-        features: List[torch.Tensor],
-    ) -> List[torch.Tensor]:
+        features: list[torch.Tensor],
+    ) -> list[torch.Tensor]:
         """Compatibility path for still-image export and legacy callers.
 
         Real temporal execution must pass one feature tensor per frame through
@@ -1161,18 +1047,14 @@ class MotionModule(nn.Module):
         single-frame fallback is enabled.
         """
         frames = self._make_frame_window(images)
-        temporal_features: List[torch.Tensor] = []
+        temporal_features: list[torch.Tensor] = []
         for feature, channels in zip(features, self.feature_channels_per_scale):
             if feature.ndim == 5:
                 temporal_features.append(feature)
                 continue
             if feature.ndim != 4 or feature.shape[1] != channels:
-                raise ValueError(
-                    f"Expected feature [B, {channels}, H, W], got {tuple(feature.shape)}."
-                )
-            temporal_features.append(
-                feature.unsqueeze(1).expand(-1, self.num_frames, -1, -1, -1)
-            )
+                raise ValueError(f"Expected feature [B, {channels}, H, W], got {tuple(feature.shape)}.")
+            temporal_features.append(feature.unsqueeze(1).expand(-1, self.num_frames, -1, -1, -1))
         return self.forward_temporal(frames, temporal_features).features
 
 
@@ -1180,7 +1062,8 @@ class MotionModule(nn.Module):
 # NestedTensor helper (avoids importing rfdetr at module load time)
 # ---------------------------------------------------------------------------
 
-def _rebuild_nested_tensor(tensors: torch.Tensor, mask: Optional[torch.Tensor]):
+
+def _rebuild_nested_tensor(tensors: torch.Tensor, mask: torch.Tensor | None):
     """Re-wrap a (tensors, mask) pair as an rfdetr NestedTensor."""
     try:
         from rfdetr.utilities import NestedTensor  # rfdetr >= 1.6
@@ -1206,16 +1089,14 @@ def _select_temporal_tensor(
 def run_temporal_lwdetr(
     lwdetr: nn.Module,
     frames: Any,
-    padding_masks: Optional[torch.Tensor] = None,
-    targets: Optional[Any] = None,
-) -> Dict[str, torch.Tensor]:
+    padding_masks: torch.Tensor | None = None,
+    targets: Any | None = None,
+) -> dict[str, torch.Tensor]:
     """Run a three-frame batch through one attached LWDETR instance.
 
-    ``frames`` may be a tensor or a batch object exposing ``.frames`` and
-    optionally ``.padding_masks``. ``center_only`` runs the centre backbone
-    pass with gradients and the context passes sequentially under ``no_grad``;
-    ``all_frames`` retains the original ``B*T`` behavior. Stock LWDETR
-    continuation always receives only centre-frame features.
+    ``frames`` may be a tensor or a batch object exposing ``.frames`` and optionally ``.padding_masks``. ``center_only``
+    runs the center backbone pass with gradients and the context passes sequentially under ``no_grad``; ``all_frames``
+    retains the original ``B*T`` behavior. Stock LWDETR continuation always receives only centre-frame features.
     """
     mdd_frames = frames if torch.is_tensor(frames) else None
     if not torch.is_tensor(frames):
@@ -1231,22 +1112,16 @@ def run_temporal_lwdetr(
         if targets is None:
             targets = getattr(batch_object, "anchor_targets", None)
     if frames.ndim != 5 or frames.shape[1:3] != (3, 3):
-        raise ValueError(
-            "Temporal LWDETR expects [B, 3, 3, H, W], "
-            f"received {tuple(frames.shape)}."
-        )
+        raise ValueError(f"Temporal LWDETR expects [B, 3, 3, H, W], received {tuple(frames.shape)}.")
     if not torch.is_tensor(mdd_frames) or mdd_frames.shape != frames.shape:
         shape = getattr(mdd_frames, "shape", None)
         raise ValueError(
-            "TemporalBatch.mdd_frames must be a tensor matching .frames, "
-            f"got {shape!r} vs {tuple(frames.shape)}."
+            f"TemporalBatch.mdd_frames must be a tensor matching .frames, got {shape!r} vs {tuple(frames.shape)}."
         )
     mdd_frames = mdd_frames.to(device=frames.device, dtype=frames.dtype)
     motion_module = getattr(lwdetr, "motion_module", None)
     if not isinstance(motion_module, MotionModule):
-        raise RuntimeError(
-            "LWDETR has no attached MotionModule; call attach_motion_module() first."
-        )
+        raise RuntimeError("LWDETR has no attached MotionModule; call attach_motion_module() first.")
     batch_size, num_frames, channels, height, width = frames.shape
     if padding_masks is None:
         padding_masks = torch.zeros(
@@ -1255,10 +1130,7 @@ def run_temporal_lwdetr(
             device=frames.device,
         )
     if padding_masks.shape != (batch_size, num_frames, height, width):
-        raise ValueError(
-            "padding_masks must be [B, T, H, W], "
-            f"got {tuple(padding_masks.shape)}."
-        )
+        raise ValueError(f"padding_masks must be [B, T, H, W], got {tuple(padding_masks.shape)}.")
     padding_masks = padding_masks.to(device=frames.device, dtype=torch.bool)
     backbone_grad_mode = motion_module.backbone_grad_mode
     batched_backbone = backbone_grad_mode == "all_frames"
@@ -1269,19 +1141,13 @@ def run_temporal_lwdetr(
         )
         backbone_result = lwdetr.backbone(flattened_samples)
         if not isinstance(backbone_result, tuple) or len(backbone_result) != 3:
-            raise RuntimeError(
-                "rfdetr==1.8.3 backbone must return "
-                "(features, positions, cross_attn_features)."
-            )
+            raise RuntimeError("rfdetr==1.8.3 backbone must return (features, positions, cross_attn_features).")
         features, positions, cross_attn_features = backbone_result
         temporal_features = [
-            feature.tensors.reshape(
-                batch_size, num_frames, *feature.tensors.shape[1:]
-            )
-            for feature in features
+            feature.tensors.reshape(batch_size, num_frames, *feature.tensors.shape[1:]) for feature in features
         ]
     else:
-        temporal_feature_frames: List[List[torch.Tensor]] = []
+        temporal_feature_frames: list[list[torch.Tensor]] = []
         centre_result = None
         for frame_index in range(num_frames):
             frame_samples = _rebuild_nested_tensor(
@@ -1295,32 +1161,21 @@ def run_temporal_lwdetr(
                 with torch.no_grad():
                     result = lwdetr.backbone(frame_samples)
             if not isinstance(result, tuple) or len(result) != 3:
-                raise RuntimeError(
-                    "rfdetr==1.8.3 backbone must return "
-                    "(features, positions, cross_attn_features)."
-                )
-            temporal_feature_frames.append(
-                [feature.tensors for feature in result[0]]
-            )
+                raise RuntimeError("rfdetr==1.8.3 backbone must return (features, positions, cross_attn_features).")
+            temporal_feature_frames.append([feature.tensors for feature in result[0]])
             if frame_index != motion_module.anchor_index:
                 # Context positions and cross-attention features never reach
                 # the detector. Drop their references immediately.
                 del result
         if centre_result is None:
-            raise RuntimeError("Temporal centre backbone result was not produced.")
+            raise RuntimeError("Temporal center backbone result was not produced.")
         features, positions, cross_attn_features = centre_result
         feature_levels = len(features)
-        if any(
-            len(frame_features) != feature_levels
-            for frame_features in temporal_feature_frames
-        ):
+        if any(len(frame_features) != feature_levels for frame_features in temporal_feature_frames):
             raise RuntimeError("Temporal backbone feature-level count changed by frame.")
         temporal_features = [
             torch.stack(
-                [
-                    temporal_feature_frames[frame_index][level_index]
-                    for frame_index in range(num_frames)
-                ],
+                [temporal_feature_frames[frame_index][level_index] for frame_index in range(num_frames)],
                 dim=1,
             )
             for level_index in range(feature_levels)
@@ -1333,18 +1188,13 @@ def run_temporal_lwdetr(
         centre_mask = None
         if original.mask is not None:
             centre_mask = (
-                _select_temporal_tensor(
-                    original.mask, batch_size, num_frames, anchor
-                )
+                _select_temporal_tensor(original.mask, batch_size, num_frames, anchor)
                 if batched_backbone
                 else original.mask
             )
         centre_features.append(_rebuild_nested_tensor(modulated, centre_mask))
     centre_positions = (
-        [
-            _select_temporal_tensor(position, batch_size, num_frames, anchor)
-            for position in positions
-        ]
+        [_select_temporal_tensor(position, batch_size, num_frames, anchor) for position in positions]
         if batched_backbone
         else positions
     )
@@ -1355,18 +1205,14 @@ def run_temporal_lwdetr(
             centre_mask = None
             if feature.mask is not None:
                 centre_mask = (
-                    _select_temporal_tensor(
-                        feature.mask, batch_size, num_frames, anchor
-                    )
+                    _select_temporal_tensor(feature.mask, batch_size, num_frames, anchor)
                     if batched_backbone
                     else feature.mask
                 )
             centre_cross_attn_features.append(
                 _rebuild_nested_tensor(
                     (
-                        _select_temporal_tensor(
-                            feature.tensors, batch_size, num_frames, anchor
-                        )
+                        _select_temporal_tensor(feature.tensors, batch_size, num_frames, anchor)
                         if batched_backbone
                         else feature.tensors
                     ),
@@ -1374,9 +1220,7 @@ def run_temporal_lwdetr(
                 )
             )
 
-    centre_samples = _rebuild_nested_tensor(
-        frames[:, anchor], padding_masks[:, anchor]
-    )
+    centre_samples = _rebuild_nested_tensor(frames[:, anchor], padding_masks[:, anchor])
     original_backbone_forward = lwdetr.backbone.forward
 
     def _centre_backbone_forward(_samples):
@@ -1401,6 +1245,7 @@ def run_temporal_lwdetr(
 # Config helpers
 # ---------------------------------------------------------------------------
 
+
 def _deep_merge(base: dict, override: dict) -> dict:
     """Recursively merge override into base (returns new dict, does not mutate)."""
     result = dict(base)
@@ -1412,7 +1257,7 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
-def resolve_motion_type(motion_cfg: Optional[Dict[str, Any]]) -> str:
+def resolve_motion_type(motion_cfg: dict[str, Any] | None) -> str:
     """Return the validated motion module type string."""
     mtype = (motion_cfg or {}).get("type", "tracknet_v5")
     valid = {"tracknet_v5", "none"}
@@ -1428,7 +1273,7 @@ def resolve_motion_type(motion_cfg: Optional[Dict[str, Any]]) -> str:
 
 def apply_motion_overrides(
     kwargs: dict,
-    motion_cfg: Optional[Dict[str, Any]],
+    motion_cfg: dict[str, Any] | None,
 ) -> dict:
     """Merge motion.overrides (real ModelConfig fields) into model kwargs in place."""
     overrides = (motion_cfg or {}).get("overrides", {}) or {}
@@ -1443,12 +1288,13 @@ def apply_motion_overrides(
 # Public API
 # ---------------------------------------------------------------------------
 
+
 def is_patched() -> bool:
     """Return False; TrackNet integration is instance-bound and never patched."""
     return False
 
 
-def ensure_motion_support(motion_cfg: Optional[Dict[str, Any]] = None) -> None:
+def ensure_motion_support(motion_cfg: dict[str, Any] | None = None) -> None:
     """Validate an enabled TrackNet request without process-global mutation."""
     motion_cfg = motion_cfg or {}
     if not bool(motion_cfg.get("enabled", False)):
@@ -1459,7 +1305,7 @@ def ensure_motion_support(motion_cfg: Optional[Dict[str, Any]] = None) -> None:
     _check_version()
 
 
-def _infer_motion_feature_channels(lwdetr: nn.Module) -> List[int]:
+def _infer_motion_feature_channels(lwdetr: nn.Module) -> list[int]:
     """Read projector output widths from the actual RF-DETR backbone."""
     backbone_container = getattr(lwdetr, "backbone", None)
     backbone = backbone_container
@@ -1474,21 +1320,15 @@ def _infer_motion_feature_channels(lwdetr: nn.Module) -> List[int]:
     encoder_channels = getattr(getattr(backbone, "encoder", None), "_out_feature_channels", None)
     if projector is None or stages is None or not scales:
         raise RuntimeError(
-            "Could not inspect RF-DETR backbone[0].projector/projector_scale while "
-            "building the motion module."
+            "Could not inspect RF-DETR backbone[0].projector/projector_scale while building the motion module."
         )
     if not isinstance(encoder_channels, (list, tuple)) or not encoder_channels:
         raise RuntimeError(
-            "Could not inspect RF-DETR backbone[0].encoder._out_feature_channels while "
-            "building the motion module."
+            "Could not inspect RF-DETR backbone[0].encoder._out_feature_channels while building the motion module."
         )
     stage_count = len(stages)
     uses_extra_pool = bool(getattr(projector, "use_extra_pool", False))
-    pooled_last_level = (
-        uses_extra_pool
-        and scales[-1] == "P6"
-        and stage_count == len(scales) - 1
-    )
+    pooled_last_level = uses_extra_pool and scales[-1] == "P6" and stage_count == len(scales) - 1
     if stage_count != len(scales) and not pooled_last_level:
         raise RuntimeError(
             "RF-DETR projector metadata is inconsistent: "
@@ -1497,7 +1337,7 @@ def _infer_motion_feature_channels(lwdetr: nn.Module) -> List[int]:
         )
 
     transformer_width = int(getattr(getattr(lwdetr, "transformer", None), "d_model", 0) or 0)
-    feature_channels: List[int] = []
+    feature_channels: list[int] = []
     for index, stage in enumerate(stages):
         output_width = 0
         children = list(stage.children()) if isinstance(stage, nn.Module) else []
@@ -1512,9 +1352,7 @@ def _infer_motion_feature_channels(lwdetr: nn.Module) -> List[int]:
         if output_width <= 0:
             output_width = transformer_width
         if output_width <= 0:
-            raise RuntimeError(
-                f"Could not infer output channels for RF-DETR projector stage {index}."
-            )
+            raise RuntimeError(f"Could not infer output channels for RF-DETR projector stage {index}.")
         feature_channels.append(output_width)
     if pooled_last_level:
         if not feature_channels:
@@ -1527,7 +1365,7 @@ def _infer_motion_feature_channels(lwdetr: nn.Module) -> List[int]:
 def _instance_motion_forward(
     lwdetr: nn.Module,
     samples: Any,
-    targets: Optional[Any] = None,
+    targets: Any | None = None,
 ):
     """Instance-bound dispatch: temporal batches use TrackNet, images stay stock."""
     is_temporal_tensor = torch.is_tensor(samples) and samples.ndim == 5
@@ -1540,24 +1378,22 @@ def _instance_motion_forward(
 def _instance_temporal_forward(
     lwdetr: nn.Module,
     frames: Any,
-    padding_masks: Optional[torch.Tensor] = None,
-    targets: Optional[Any] = None,
+    padding_masks: torch.Tensor | None = None,
+    targets: Any | None = None,
 ):
     return run_temporal_lwdetr(lwdetr, frames, padding_masks, targets)
 
 
-def attach_motion_module(model: nn.Module, motion_cfg: Optional[Dict[str, Any]] = None) -> None:
+def attach_motion_module(model: nn.Module, motion_cfg: dict[str, Any] | None = None) -> None:
     """Build a MotionModule and attach it to the LWDETR model instance.
 
-    Must be called *after* the rfdetr model object has been constructed so that
-    the backbone's output channel shapes are known.  The module is attached as
-    ``model.motion_module`` (or ``model.model.motion_module`` when wrapped in a
-    PL module) and becomes part of the model's state_dict automatically.
+    Must be called *after* the rfdetr model object has been constructed so that the backbone's output channel shapes are
+    known. The module is attached as ``model.motion_module`` (or ``model.model.motion_module`` when wrapped in a PL
+    module) and becomes part of the model's state_dict automatically.
 
     Args:
-        model: The top-level model object.  We walk the attribute chain trying
-            ``model``, ``model.model``, and ``model.model.model`` to find an
-            LWDETR instance.
+        model: The top-level model object. We walk the attribute chain trying ``model``, ``model.model``, and
+            ``model.model.model`` to find an LWDETR instance.
         motion_cfg: The ``model.motion`` dict from the trainer config.
     """
     motion_cfg = motion_cfg or {}
@@ -1579,8 +1415,7 @@ def attach_motion_module(model: nn.Module, motion_cfg: Optional[Dict[str, Any]] 
     lwdetr = _find_lwdetr(model)
     if lwdetr is None:
         warnings.warn(
-            "[rf_detr_motion] Could not locate an LWDETR instance in the model. "
-            "Motion module not attached.",
+            "[rf_detr_motion] Could not locate an LWDETR instance in the model. Motion module not attached.",
             stacklevel=2,
         )
         return
@@ -1608,7 +1443,7 @@ def attach_motion_module(model: nn.Module, motion_cfg: Optional[Dict[str, Any]] 
     lwdetr._motion_export_required = True  # type: ignore[attr-defined]
 
 
-def _motion_state_from_checkpoint(checkpoint: Mapping[str, Any]) -> Dict[str, torch.Tensor]:
+def _motion_state_from_checkpoint(checkpoint: Mapping[str, Any]) -> dict[str, torch.Tensor]:
     """Return normalized ``motion_module.*`` tensors from RF-DETR checkpoint formats."""
     if isinstance(checkpoint.get("model"), Mapping):
         state = checkpoint["model"]
@@ -1621,7 +1456,7 @@ def _motion_state_from_checkpoint(checkpoint: Mapping[str, Any]) -> Dict[str, to
             "Motion checkpoint must contain an RF-DETR 'model' mapping or a Lightning 'state_dict' mapping."
         )
 
-    motion_state: Dict[str, torch.Tensor] = {}
+    motion_state: dict[str, torch.Tensor] = {}
     for raw_key, value in state.items():
         if not torch.is_tensor(value):
             continue
@@ -1631,10 +1466,10 @@ def _motion_state_from_checkpoint(checkpoint: Mapping[str, Any]) -> Dict[str, to
             changed = False
             for prefix in ("module.", "model.", "_orig_mod."):
                 if key.startswith(prefix):
-                    key = key[len(prefix):]
+                    key = key[len(prefix) :]
                     changed = True
         if key.startswith("temporal_adapter.motion_module."):
-            key = key[len("temporal_adapter."):]
+            key = key[len("temporal_adapter.") :]
         if key.startswith("motion_module."):
             motion_state[key] = value
     return motion_state
@@ -1647,9 +1482,7 @@ def load_motion_checkpoint_weights(
     """Load only attached ``motion_module`` tensors from a training checkpoint."""
     lwdetr = _find_lwdetr(model)
     if lwdetr is None or not isinstance(getattr(lwdetr, "motion_module", None), MotionModule):
-        raise RuntimeError(
-            "Cannot load TrackNet weights before attach_motion_module() has succeeded."
-        )
+        raise RuntimeError("Cannot load TrackNet weights before attach_motion_module() has succeeded.")
     path = Path(str(checkpoint_path)).expanduser()
     if not path.is_file():
         raise RuntimeError(f"Motion checkpoint does not exist: {path}")
@@ -1663,9 +1496,7 @@ def load_motion_checkpoint_weights(
     if not motion_state:
         raise RuntimeError(f"Checkpoint {path} contains no motion_module.* weights.")
     _assert_new_motion_architecture_metadata(checkpoint, motion_state)
-    stripped_state = {
-        key[len("motion_module."):]: value for key, value in motion_state.items()
-    }
+    stripped_state = {key[len("motion_module.") :]: value for key, value in motion_state.items()}
     expected_state = lwdetr.motion_module.state_dict()
     missing = sorted(set(expected_state) - set(stripped_state))
     unexpected = sorted(set(stripped_state) - set(expected_state))
@@ -1683,20 +1514,19 @@ def load_motion_checkpoint_weights(
         if mismatched:
             details.append(f"shape_mismatch={mismatched[:5]}")
         raise RuntimeError(
-            f"Checkpoint {path} is incompatible with the attached TrackNet module: "
-            + "; ".join(details)
+            f"Checkpoint {path} is incompatible with the attached TrackNet module: " + "; ".join(details)
         )
     lwdetr.motion_module.load_state_dict(stripped_state, strict=True)
 
 
-def _checkpoint_architecture_metadata(checkpoint: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
-    metadata = checkpoint.get('pitchobjectlab_architecture')
-    if metadata is None and isinstance(checkpoint.get('args'), Mapping):
-        metadata = checkpoint['args'].get('pitchobjectlab_architecture')
+def _checkpoint_architecture_metadata(checkpoint: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    metadata = checkpoint.get("pitchobjectlab_architecture")
+    if metadata is None and isinstance(checkpoint.get("args"), Mapping):
+        metadata = checkpoint["args"].get("pitchobjectlab_architecture")
     if metadata is None:
         return None
     if not isinstance(metadata, Mapping):
-        raise RuntimeError('Checkpoint pitchobjectlab_architecture metadata must be a mapping.')
+        raise RuntimeError("Checkpoint pitchobjectlab_architecture metadata must be a mapping.")
     return metadata
 
 
@@ -1705,7 +1535,6 @@ def _assert_new_motion_architecture_metadata(
     motion_state: Mapping[str, torch.Tensor],
 ) -> None:
     """Reject legacy TrackNet tensors while leaving stock checkpoints untouched."""
-
     if not motion_state:
         return
     metadata = _checkpoint_architecture_metadata(checkpoint)
@@ -1723,38 +1552,32 @@ def _assert_new_motion_architecture_metadata(
         )
     saved_motion = metadata.get("motion")
     if not isinstance(saved_motion, Mapping):
+        raise RuntimeError("TrackNet checkpoint architecture metadata must contain a model.motion mapping.")
+    if not bool(saved_motion.get("enabled", False)) or str(saved_motion.get("type", "")).lower() != "tracknet_v5":
         raise RuntimeError(
-            "TrackNet checkpoint architecture metadata must contain a model.motion mapping."
-        )
-    if not bool(saved_motion.get("enabled", False)) or str(
-        saved_motion.get("type", "")
-    ).lower() != "tracknet_v5":
-        raise RuntimeError(
-            "TrackNet checkpoint architecture metadata must identify an enabled "
-            "motion.type='tracknet_v5' graph."
+            "TrackNet checkpoint architecture metadata must identify an enabled motion.type='tracknet_v5' graph."
         )
 
 
 def _assert_motion_metadata_compatible(
     checkpoint: Mapping[str, Any],
-    expected_architecture: Optional[Mapping[str, Any]],
+    expected_architecture: Mapping[str, Any] | None,
 ) -> None:
     metadata = _checkpoint_architecture_metadata(checkpoint)
     if metadata is None or expected_architecture is None:
         return
-    if metadata.get('schema_version') != expected_architecture.get('schema_version'):
+    if metadata.get("schema_version") != expected_architecture.get("schema_version"):
         raise RuntimeError(
-            'Checkpoint architecture metadata schema does not match this runtime: '
+            "Checkpoint architecture metadata schema does not match this runtime: "
             f"checkpoint={metadata.get('schema_version')!r}, "
             f"runtime={expected_architecture.get('schema_version')!r}."
         )
-    if int(metadata.get('schema_version', 0) or 0) >= 3:
-        checkpoint_fingerprint = metadata.get('architecture_fingerprint')
-        expected_fingerprint = expected_architecture.get('architecture_fingerprint')
+    if int(metadata.get("schema_version", 0) or 0) >= 3:
+        checkpoint_fingerprint = metadata.get("architecture_fingerprint")
+        expected_fingerprint = expected_architecture.get("architecture_fingerprint")
         if not checkpoint_fingerprint or not expected_fingerprint:
             raise RuntimeError(
-                "TrackNet schema v3 checkpoint/runtime metadata must contain an "
-                "architecture_fingerprint."
+                "TrackNet schema v3 checkpoint/runtime metadata must contain an architecture_fingerprint."
             )
         if checkpoint_fingerprint != expected_fingerprint:
             raise RuntimeError(
@@ -1763,26 +1586,26 @@ def _assert_motion_metadata_compatible(
                 f"checkpoint={checkpoint_fingerprint!r}, "
                 f"runtime={expected_fingerprint!r}."
             )
-    saved_size = str(metadata.get('model_size', '')).strip().lower()
-    expected_size = str(expected_architecture.get('model_size', '')).strip().lower()
+    saved_size = str(metadata.get("model_size", "")).strip().lower()
+    expected_size = str(expected_architecture.get("model_size", "")).strip().lower()
     if saved_size != expected_size:
         raise RuntimeError(
-            'Checkpoint model size does not match the configured runtime: '
-            f'checkpoint={saved_size!r}, runtime={expected_size!r}.'
+            "Checkpoint model size does not match the configured runtime: "
+            f"checkpoint={saved_size!r}, runtime={expected_size!r}."
         )
-    saved_motion = metadata.get('motion')
-    expected_motion = expected_architecture.get('motion')
+    saved_motion = metadata.get("motion")
+    expected_motion = expected_architecture.get("motion")
     if saved_motion != expected_motion:
         raise RuntimeError(
-            'Checkpoint TrackNet architecture metadata does not match model.motion in the runtime config: '
-            f'checkpoint={saved_motion!r}, runtime={expected_motion!r}.'
+            "Checkpoint TrackNet architecture metadata does not match model.motion in the runtime config: "
+            f"checkpoint={saved_motion!r}, runtime={expected_motion!r}."
         )
 
 
 def assert_motion_checkpoint_compatible(
     model: nn.Module,
     checkpoint_path: Any,
-    expected_architecture: Optional[Mapping[str, Any]] = None,
+    expected_architecture: Mapping[str, Any] | None = None,
 ) -> None:
     """Require a complete, shape-exact TrackNet state before test/inference."""
     lwdetr = _find_lwdetr(model)
@@ -1809,11 +1632,7 @@ def assert_motion_checkpoint_compatible(
     checkpoint_state = _motion_state_from_checkpoint(checkpoint)
     _assert_new_motion_architecture_metadata(checkpoint, checkpoint_state)
     _assert_motion_metadata_compatible(checkpoint, expected_architecture)
-    expected_state = {
-        key: value
-        for key, value in lwdetr.state_dict().items()
-        if key.startswith("motion_module.")
-    }
+    expected_state = {key: value for key, value in lwdetr.state_dict().items() if key.startswith("motion_module.")}
     if not checkpoint_state:
         raise RuntimeError(
             f"Checkpoint {path} contains no motion_module.* weights. Refusing to run "
@@ -1835,26 +1654,22 @@ def assert_motion_checkpoint_compatible(
             details.append(f"unexpected={unexpected[:5]}")
         if mismatched:
             shape_details = [
-                f"{key}: checkpoint={tuple(checkpoint_state[key].shape)}, "
-                f"model={tuple(expected_state[key].shape)}"
+                f"{key}: checkpoint={tuple(checkpoint_state[key].shape)}, model={tuple(expected_state[key].shape)}"
                 for key in mismatched[:5]
             ]
             details.append(f"shape_mismatch={shape_details}")
         raise RuntimeError(
-            f"Checkpoint {path} is incompatible with the configured TrackNet motion module: "
-            + "; ".join(details)
+            f"Checkpoint {path} is incompatible with the configured TrackNet motion module: " + "; ".join(details)
         )
 
 
 def assert_motion_export_ready(
     model: nn.Module,
-    motion_cfg: Optional[Dict[str, Any]] = None,
+    motion_cfg: dict[str, Any] | None = None,
 ) -> None:
     """Reject ONNX/TensorRT export for the true temporal TrackNet graph."""
     if motion_cfg is not None:
-        requested = bool(motion_cfg.get("enabled", False)) and (
-            resolve_motion_type(motion_cfg) != "none"
-        )
+        requested = bool(motion_cfg.get("enabled", False)) and (resolve_motion_type(motion_cfg) != "none")
     else:
         lwdetr = _find_lwdetr(model)
         requested = lwdetr is not None and getattr(lwdetr, "motion_module", None) is not None
@@ -1866,10 +1681,11 @@ def assert_motion_export_ready(
     )
 
 
-def _find_lwdetr(model: nn.Module) -> Optional[nn.Module]:
+def _find_lwdetr(model: nn.Module) -> nn.Module | None:
     """Walk common PL wrapper layers to locate the inner LWDETR model."""
     try:
         import rfdetr.models.lwdetr as lwdetr_module
+
         LWDETR_cls = lwdetr_module.LWDETR
     except Exception:
         LWDETR_cls = None

@@ -1,19 +1,20 @@
-from pathlib import Path
+from __future__ import annotations
+
 import sys
 import tempfile
-from types import SimpleNamespace
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from PIL import Image
 import torch
-
+from PIL import Image
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
-import train_rf_detr_model as trainer  # noqa: E402
+import train_rf_detr_model as trainer
 
 
 def fake_validation_batch() -> tuple[SimpleNamespace, list[dict[str, torch.Tensor]]]:
@@ -201,7 +202,9 @@ class ValidationPredictionGridTest(unittest.TestCase):
             path.write_bytes(b"stale")
 
             callback.on_validation_epoch_start(fake_trainer, None)
-            callback.on_validation_batch_end(fake_trainer, None, fake_validation_outputs(0.5), fake_validation_batch(), 0)
+            callback.on_validation_batch_end(
+                fake_trainer, None, fake_validation_outputs(0.5), fake_validation_batch(), 0
+            )
 
             self.assertNotEqual(path.read_bytes(), b"stale")
             self.assertEqual(path.read_bytes()[:2], b"\xff\xd8")
@@ -258,7 +261,9 @@ class ValidationPredictionGridTest(unittest.TestCase):
             self.assertEqual(estimate["batch_grid_files"], 9)
             self.assertEqual(estimate["train_batch_grid_files"], trainer.TRAIN_BATCH_GRID_MAX_BATCHES)
             self.assertEqual(estimate["validation_label_grid_files"], trainer.VALIDATION_PREDICTION_GRID_MAX_BATCHES)
-            self.assertEqual(estimate["validation_prediction_grid_files"], trainer.VALIDATION_PREDICTION_GRID_MAX_BATCHES)
+            self.assertEqual(
+                estimate["validation_prediction_grid_files"], trainer.VALIDATION_PREDICTION_GRID_MAX_BATCHES
+            )
             self.assertNotIn("dataset_grid_files", estimate)
             self.assertNotIn("dataset_grid_dir", estimate)
 

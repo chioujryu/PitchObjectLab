@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dfine_seg_trainer.augmentation import build_aug_runtime
-from dfine_seg_trainer.common import build_output_dir, parse_extra_args, parse_device_ids
+from dfine_seg_trainer.common import build_output_dir, parse_device_ids, parse_extra_args
 
 
 def test_output_placeholders_render_with_safe_names() -> None:
@@ -9,7 +9,10 @@ def test_output_placeholders_render_with_safe_names() -> None:
         "model": {"task": "segment", "name": "s"},
         "dataset": {"dataset_dir": "D:/datasets/my data", "source_format": "auto"},
         "train": {"epochs": 5, "batch_size": 2, "device": "cuda:0", "gpus": [0], "img_size": [640, 640]},
-        "output": {"root": "runs/detect/dfine_seg/train", "name": "{task}_{model_name}_{dataset_name}_{epochs}_{timestamp}"},
+        "output": {
+            "root": "runs/detect/dfine_seg/train",
+            "name": "{task}_{model_name}_{dataset_name}_{epochs}_{timestamp}",
+        },
     }
     out = build_output_dir(config, "20260525112233", "global")
     assert out.name == "segment_s_my_data_5_20260525112233"

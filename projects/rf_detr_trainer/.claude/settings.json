@@ -1,7 +1,5 @@
 {
   "permissions": {
-    "allow": [
-      "Agent"
-    ]
+    "allow": ["Agent"]
   }
 }
