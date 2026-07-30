@@ -1,20 +1,19 @@
 import os
-from contextlib import contextmanager
-from pathlib import Path
 import sys
 import tempfile
 import unittest
-
+from contextlib import contextmanager
+from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
-import inference_rf_detr_model as inference_runner  # noqa: E402
-import rf_detr_acceleration as acceleration  # noqa: E402
-import rf_detr_runtime as runtime  # noqa: E402
-import test_rf_detr_model as test_runner  # noqa: E402
-import train_rf_detr_model as trainer  # noqa: E402
+import inference_rf_detr_model as inference_runner
+import rf_detr_acceleration as acceleration
+import rf_detr_runtime as runtime
+import test_rf_detr_model as test_runner
+import train_rf_detr_model as trainer
 
 
 @contextmanager
@@ -42,9 +41,7 @@ class RFDETROutputPathTest(unittest.TestCase):
                     {"output": {"output_dir": str(relative_output)}},
                     self.timestamp,
                 )
-                test_config = test_runner.build_internal_test_config(
-                    {"output": {"output_dir": str(relative_output)}}
-                )
+                test_config = test_runner.build_internal_test_config({"output": {"output_dir": str(relative_output)}})
                 test_output = runtime.build_output_dir(test_config, self.timestamp)
                 inference_output = inference_runner.build_output_dir(
                     {"output": {"output_dir": str(relative_output)}},

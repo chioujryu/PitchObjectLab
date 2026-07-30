@@ -31,7 +31,6 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
-
 from src.d_fine.utils import ensure_pretrained
 from src.dl.utils import abs_xyxy_to_norm_xywh
 from src.infer.torch_model import Torch_model
@@ -56,10 +55,8 @@ def _source_images() -> list[Path]:
 def _downscale_to_jpg(src: Path, max_long_side: int, jpeg_quality: int) -> Path | None:
     """Re-encode `src` as a downscaled `.jpg` in the same folder.
 
-    Returns the path of the resulting JPEG, or None if `src` was unreadable.
-    If `src` was a non-jpg source (e.g. .png), it's removed after a successful
-    write so the asset folder stays lean and the test has one obvious input
-    per stem.
+    Returns the path of the resulting JPEG, or None if `src` was unreadable. If `src` was a non-jpg source (e.g. .png),
+    it's removed after a successful write so the asset folder stays lean and the test has one obvious input per stem.
     """
     img = cv2.imread(str(src))
     if img is None:
@@ -68,9 +65,7 @@ def _downscale_to_jpg(src: Path, max_long_side: int, jpeg_quality: int) -> Path 
     long_side = max(h, w)
     if long_side > max_long_side:
         scale = max_long_side / long_side
-        img = cv2.resize(
-            img, (int(round(w * scale)), int(round(h * scale))), interpolation=cv2.INTER_AREA
-        )
+        img = cv2.resize(img, (round(w * scale), round(h * scale)), interpolation=cv2.INTER_AREA)
     out_path = src.with_suffix(".jpg")
     cv2.imwrite(str(out_path), img, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality])
     if src.suffix.lower() != ".jpg":
@@ -86,17 +81,13 @@ def _wipe_stale_labels(image_stems: set[str]) -> None:
             p.unlink()
 
 
-def _write_labels(image_path: Path, boxes_xyxy: np.ndarray, labels: np.ndarray,
-                  img_h: int, img_w: int) -> None:
+def _write_labels(image_path: Path, boxes_xyxy: np.ndarray, labels: np.ndarray, img_h: int, img_w: int) -> None:
     label_path = image_path.with_suffix(".txt")
     if len(boxes_xyxy) == 0:
         label_path.write_text("")
         return
     yolo = abs_xyxy_to_norm_xywh(boxes_xyxy, height=img_h, width=img_w)
-    lines = [
-        f"{int(c)} {row[0]:.6f} {row[1]:.6f} {row[2]:.6f} {row[3]:.6f}"
-        for c, row in zip(labels, yolo)
-    ]
+    lines = [f"{int(c)} {row[0]:.6f} {row[1]:.6f} {row[2]:.6f} {row[3]:.6f}" for c, row in zip(labels, yolo)]
     label_path.write_text("\n".join(lines) + "\n")
 
 
@@ -107,9 +98,7 @@ def main() -> None:
 
     sources = _source_images()
     if not sources:
-        raise SystemExit(
-            f"no source images in {ASSETS_DIR}; drop one or more .png/.jpg files there."
-        )
+        raise SystemExit(f"no source images in {ASSETS_DIR}; drop one or more .png/.jpg files there.")
 
     # Downscale + normalize extensions first so the rest of the pipeline only
     # ever sees `.jpg` inputs and labels are written against the final file.
@@ -161,14 +150,20 @@ def main() -> None:
         kept += 1
         print(f"  {img_path.name}: {n_det} detections ({w}x{h})")
 
-    BASELINE_PATH.write_text(json.dumps({
-        "mAP_50_min": 0.95,
-        "mAP_50_95_min": 0.70,
-        "n_images": kept,
-        "n_detections": total,
-        "conf_thresh": CONF_THRESH,
-        "max_long_side": MAX_LONG_SIDE,
-    }, indent=2) + "\n")
+    BASELINE_PATH.write_text(
+        json.dumps(
+            {
+                "mAP_50_min": 0.95,
+                "mAP_50_95_min": 0.70,
+                "n_images": kept,
+                "n_detections": total,
+                "conf_thresh": CONF_THRESH,
+                "max_long_side": MAX_LONG_SIDE,
+            },
+            indent=2,
+        )
+        + "\n"
+    )
     print(f"wrote baseline -> {BASELINE_PATH}")
 
 

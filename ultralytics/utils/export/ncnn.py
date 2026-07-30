@@ -44,18 +44,18 @@ def torch2ncnn(
     file = Path(file)
     f = Path(str(file).replace(file.suffix, f"_ncnn_model{os.sep}"))
 
-    ncnn_args = dict(
-        ncnnparam=(f / "model.ncnn.param").as_posix(),
-        ncnnbin=(f / "model.ncnn.bin").as_posix(),
-        ncnnpy=(f / "model_ncnn.py").as_posix(),
-    )
-    pnnx_args = dict(
-        ptpath=(f / "model.pt").as_posix(),
-        pnnxparam=(f / "model.pnnx.param").as_posix(),
-        pnnxbin=(f / "model.pnnx.bin").as_posix(),
-        pnnxpy=(f / "model_pnnx.py").as_posix(),
-        pnnxonnx=(f / "model.pnnx.onnx").as_posix(),
-    )
+    ncnn_args = {
+        "ncnnparam": (f / "model.ncnn.param").as_posix(),
+        "ncnnbin": (f / "model.ncnn.bin").as_posix(),
+        "ncnnpy": (f / "model_ncnn.py").as_posix(),
+    }
+    pnnx_args = {
+        "ptpath": (f / "model.pt").as_posix(),
+        "pnnxparam": (f / "model.pnnx.param").as_posix(),
+        "pnnxbin": (f / "model.pnnx.bin").as_posix(),
+        "pnnxpy": (f / "model_pnnx.py").as_posix(),
+        "pnnxonnx": (f / "model.pnnx.onnx").as_posix(),
+    }
 
     f.mkdir(exist_ok=True)  # make ncnn_model directory
     device_type = device.type if device is not None else "cpu"
