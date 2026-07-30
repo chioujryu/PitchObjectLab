@@ -10,16 +10,12 @@ Example usage:
 from __future__ import annotations
 
 import argparse
-import os
 import platform
 import re
-import subprocess
-from pathlib import Path
 from typing import Any
 
 import colorama
 from colorama import Fore, Style
-
 from dfine_seg_trainer.common import PROJECT_DIR, detect_cuda_banner, detect_ip_region, detect_nvidia, save_yaml
 
 colorama.init(autoreset=True)
@@ -117,15 +113,15 @@ package = false
 
 [tool.uv.sources]
 torch = [
-    {{ index = "{torch_index['name']}", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }},
+    {{ index = "{torch_index["name"]}", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }},
 ]
 torchvision = [
-    {{ index = "{torch_index['name']}", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }},
+    {{ index = "{torch_index["name"]}", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }},
 ]
 
 [[tool.uv.index]]
-name = "{torch_index['name']}"
-url = "{torch_index['url']}"
+name = "{torch_index["name"]}"
+url = "{torch_index["url"]}"
 explicit = true
 {default_index}
 [dependency-groups]
@@ -167,9 +163,13 @@ Example usage:
   uv run python setup_dfine_seg_env.py --torch-index cpu
 """,
     )
-    parser.add_argument("--region", choices=["auto", "china", "global"], default="auto", help="Package/model mirror region.")
+    parser.add_argument(
+        "--region", choices=["auto", "china", "global"], default="auto", help="Package/model mirror region."
+    )
     parser.add_argument("--torch-index", default=None, help="Force PyTorch wheel tag: cpu, cu126, cu128, cu130.")
-    parser.add_argument("--dry-run", action="store_true", help="Print the selected environment without writing pyproject.toml.")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Print the selected environment without writing pyproject.toml."
+    )
     return parser
 
 
@@ -185,7 +185,9 @@ def main() -> int:
     blue(f"Detected region: {region} (IP country={detected.get('country_code')}).")
     blue(f"Selected PyTorch wheel index: {torch_index['tag']} -> {torch_index['url']}.")
     for gpu in detect_nvidia():
-        blue(f"GPU {gpu.get('index')}: {gpu.get('name')} ({gpu.get('memory_total_mib')} MiB, driver {gpu.get('driver_version')}).")
+        blue(
+            f"GPU {gpu.get('index')}: {gpu.get('name')} ({gpu.get('memory_total_mib')} MiB, driver {gpu.get('driver_version')})."
+        )
 
     if args.dry_run:
         blue("Dry run complete. pyproject.toml was not changed.")

@@ -1,6 +1,6 @@
 """Unit tests for BallFilter — no GPU / SAM3 required."""
+
 import numpy as np
-import pytest
 from omegaconf import OmegaConf
 
 from pitch_ball_tracker.detection.ball_filter import BallFilter, _mask_circularity_area
@@ -25,6 +25,7 @@ def _make_cfg(**overrides):
 def _circle_mask(cx, cy, r, H=200, W=200):
     """Create a boolean mask with a filled circle."""
     import cv2
+
     mask = np.zeros((H, W), dtype=np.uint8)
     cv2.circle(mask, (cx, cy), r, 255, -1)
     return mask.astype(bool)
@@ -37,6 +38,7 @@ def _rect_mask(x1, y1, x2, y2, H=200, W=200):
 
 
 # ------------------------------------------------------------------
+
 
 class TestMaskCircularityArea:
     def test_circle_high_circularity(self):
@@ -78,7 +80,7 @@ class TestBallFilter:
     def test_rejects_rectangle(self):
         cfg = _make_cfg()
         bf = BallFilter(cfg)
-        mask = _rect_mask(10, 10, 30, 100)   # elongated
+        mask = _rect_mask(10, 10, 30, 100)  # elongated
         result = self._make_result([mask], [[10, 10, 30, 100]])
         cands = bf.filter(result)
         assert len(cands) == 0
@@ -86,7 +88,7 @@ class TestBallFilter:
     def test_rejects_too_small(self):
         cfg = _make_cfg()
         bf = BallFilter(cfg)
-        mask = _circle_mask(100, 100, 3)     # tiny
+        mask = _circle_mask(100, 100, 3)  # tiny
         result = self._make_result([mask], [[97, 97, 103, 103]])
         cands = bf.filter(result)
         assert len(cands) == 0
@@ -94,7 +96,7 @@ class TestBallFilter:
     def test_rejects_too_large(self):
         cfg = _make_cfg()
         bf = BallFilter(cfg)
-        mask = _circle_mask(100, 100, 90)    # huge
+        mask = _circle_mask(100, 100, 90)  # huge
         result = self._make_result([mask], [[10, 10, 190, 190]])
         cands = bf.filter(result)
         assert len(cands) == 0

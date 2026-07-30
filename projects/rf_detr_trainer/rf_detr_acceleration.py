@@ -30,7 +30,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 import torch
-
+from typing_extensions import Self
 
 _MANIFEST_SCHEMA_VERSION = 2
 _TENSORRT_EXPORT_ABI_VERSION = 3
@@ -115,7 +115,6 @@ class AccelerationHandle:
     @property
     def backend(self) -> str:
         """Effective backend name (exactly ``pytorch`` or ``tensorrt``)."""
-
         return self.settings.backend
 
     @property
@@ -133,14 +132,12 @@ class AccelerationHandle:
 
     def infer_raw(self, tensor: torch.Tensor) -> dict[str, torch.Tensor]:
         """Run raw model inference and return RF-DETR postprocessor keys."""
-
         if self._infer_raw is None:
             raise RuntimeError("This acceleration handle does not expose raw inference.")
         return normalize_raw_outputs(self._infer_raw(tensor))
 
     def postprocess(self, outputs: Mapping[str, torch.Tensor], target_sizes: torch.Tensor) -> Any:
         """Use the original RF-DETR postprocessor for bbox/mask decoding."""
-
         callback = getattr(self.model, "postprocess", None)
         if callable(callback):
             return callback(outputs, target_sizes)
@@ -155,14 +152,12 @@ class AccelerationHandle:
 
     def consume_forward_seconds(self) -> float:
         """Return and reset true model-forward time accumulated since the last call."""
-
         if self._forward_recorder is None:
             return 0.0
         return self._forward_recorder.consume_seconds()
 
     def consume_postprocess_seconds(self) -> float:
         """Return and reset RF-DETR postprocessor time accumulated since the last call."""
-
         if self._postprocess_recorder is None:
             return 0.0
         return self._postprocess_recorder.consume_seconds()
@@ -350,7 +345,6 @@ def resolve_tensorrt_cache_dir(value: Any = None) -> Path:
 
 def _optimization_source(config: Mapping[str, Any]) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
     """Return ``(optimization block, model block)`` for root/model/direct inputs."""
-
     model_source = config.get("model")
     if isinstance(model_source, Mapping):
         optimization = model_source.get("inference_optimization", {})
@@ -369,10 +363,9 @@ def resolve_acceleration_config(
 ) -> InferenceOptimizationConfig:
     """Validate and resolve the shared RF-DETR acceleration configuration.
 
-    ``config`` may be the complete execution configuration, the ``model``
-    mapping, or the ``model.inference_optimization`` mapping itself.
+    ``config`` may be the complete execution configuration, the ``model`` mapping, or the
+    ``model.inference_optimization`` mapping itself.
     """
-
     if not isinstance(config, Mapping):
         raise TypeError("Acceleration config must be a mapping.")
     source, model_source = _optimization_source(config)
@@ -433,9 +426,7 @@ def resolve_acceleration_config(
     opt_batch = profile_value("opt_batch_size", automatic_opt_batch)
     max_batch = profile_value("max_batch_size", automatic_max_batch)
     if min_batch != 1:
-        raise ValueError(
-            "TensorRT min_batch_size must be 1 so real tail batches and the batch-1 warmup remain valid."
-        )
+        raise ValueError("TensorRT min_batch_size must be 1 so real tail batches and the batch-1 warmup remain valid.")
     if not min_batch <= opt_batch <= max_batch:
         raise ValueError(
             "TensorRT profile must satisfy min_batch_size <= opt_batch_size <= max_batch_size; "
@@ -495,7 +486,6 @@ def _require_cuda(device: torch.device, *, bf16: bool = False) -> None:
 
 def normalize_raw_outputs(outputs: Any) -> dict[str, torch.Tensor]:
     """Normalize RF-DETR dict/tuple/TensorRT output names to raw model keys."""
-
     if isinstance(outputs, (tuple, list)):
         if len(outputs) not in {2, 3}:
             raise ValueError(f"Expected two or three RF-DETR outputs, got {len(outputs)}.")
@@ -566,7 +556,6 @@ def _base_metadata(settings: InferenceOptimizationConfig) -> dict[str, Any]:
 
 def apply_pytorch_optimization(model: Any, settings: InferenceOptimizationConfig) -> AccelerationHandle:
     """Apply the validated PyTorch backend, with FP32 preserving legacy behavior."""
-
     if settings.backend != "pytorch":
         raise ValueError("apply_pytorch_optimization() requires backend='pytorch'.")
     metadata = _base_metadata(settings)
@@ -665,12 +654,10 @@ def preflight_inference_acceleration(
 ) -> dict[str, Any]:
     """Fail before model construction when acceleration dependencies are unavailable.
 
-    FP32 remains a zero-dependency no-op. BF16 validates CUDA hardware support.
-    TensorRT validates CUDA, ONNX, TensorRT 10, its requested precision flag,
-    and the existence of explicitly supplied artifacts. It never builds or
-    writes an engine during preflight.
+    FP32 remains a zero-dependency no-op. BF16 validates CUDA hardware support. TensorRT validates CUDA, ONNX, TensorRT
+    10, its requested precision flag, and the existence of explicitly supplied artifacts. It never builds or writes an
+    engine during preflight.
     """
-
     settings = (
         settings_or_config
         if isinstance(settings_or_config, InferenceOptimizationConfig)
@@ -806,7 +793,6 @@ def _qualified_type(value: Any) -> str | None:
 
 def _module_state_shapes(module: Any) -> dict[str, list[int]]:
     """Return a weight-free structural signature for cache provenance."""
-
     callback = getattr(module, "state_dict", None)
     if not callable(callback):
         return {}
@@ -819,7 +805,6 @@ def _module_state_shapes(module: Any) -> dict[str, list[int]]:
 
 def _model_architecture_identity(model: Any) -> dict[str, Any]:
     """Fingerprint the graph-affecting P2/TrackNet structure actually attached."""
-
     context = getattr(model, "model", None)
     module = getattr(context, "model", None)
     if module is None:
@@ -1040,7 +1025,6 @@ def validate_engine_manifest(
     A timing cache accelerates future builds but is not required to execute an
     engine. Callers considering timing-cache reuse opt into validating it.
     """
-
     engine = Path(engine_path)
     manifest_file = Path(manifest_path)
     if not engine.is_file():
@@ -1098,7 +1082,7 @@ class _ArtifactLock:
         self.stale_after = stale_after
         self._owned = False
 
-    def __enter__(self) -> _ArtifactLock:
+    def __enter__(self) -> Self:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         deadline = time.monotonic() + self.timeout
         while True:
@@ -1117,7 +1101,7 @@ class _ArtifactLock:
                     raise TimeoutError(f"Timed out waiting for TensorRT cache lock: {self.path}") from None
                 time.sleep(0.1)
 
-    def __exit__(self, *_args: Any) -> None:
+    def __exit__(self, *_args: object) -> None:
         if self._owned:
             self.path.unlink(missing_ok=True)
 
@@ -1136,7 +1120,6 @@ def build_tensorrt_engine(
     timing_cache_path: str | Path | None = None,
 ) -> Path:
     """Build a TensorRT 10 engine with dynamic batch and fixed spatial shape."""
-
     if settings.backend != "tensorrt":
         raise ValueError("build_tensorrt_engine() requires backend='tensorrt'.")
     trt = trt_module if trt_module is not None else _import_tensorrt()
@@ -1223,14 +1206,13 @@ def build_tensorrt_engine(
 
 
 def _onnx_dimension_value(dimension: Any) -> int | None:
-    '''Return a positive static ONNX dimension, or None when symbolic/unknown.'''
-
-    has_field = getattr(dimension, 'HasField', None)
+    """Return a positive static ONNX dimension, or None when symbolic/unknown."""
+    has_field = getattr(dimension, "HasField", None)
     if callable(has_field):
         with contextlib.suppress(ValueError):
-            if not has_field('dim_value'):
+            if not has_field("dim_value"):
                 return None
-    value = getattr(dimension, 'dim_value', None)
+    value = getattr(dimension, "dim_value", None)
     if isinstance(value, bool):
         return None
     try:
@@ -1244,14 +1226,14 @@ def _onnx_dimension_text(dimension: Any) -> str:
     value = _onnx_dimension_value(dimension)
     if value is not None:
         return str(value)
-    symbolic = str(getattr(dimension, 'dim_param', '') or '').strip()
-    return symbolic or 'unknown'
+    symbolic = str(getattr(dimension, "dim_param", "") or "").strip()
+    return symbolic or "unknown"
 
 
 def _onnx_value_dimensions(value_info: Any) -> list[Any]:
-    tensor_type = getattr(getattr(value_info, 'type', None), 'tensor_type', None)
-    shape = getattr(tensor_type, 'shape', None)
-    dimensions = getattr(shape, 'dim', None)
+    tensor_type = getattr(getattr(value_info, "type", None), "tensor_type", None)
+    shape = getattr(tensor_type, "shape", None)
+    dimensions = getattr(shape, "dim", None)
     return list(dimensions) if dimensions is not None else []
 
 
@@ -1268,50 +1250,46 @@ def _onnx_io_contract_issues(
     initializer_names = {str(initializer.name) for initializer in graph.initializer}
     graph_inputs = [value for value in graph.input if str(value.name) not in initializer_names]
     graph_outputs = list(graph.output)
-    expected_outputs = ['dets', 'labels', *(['masks'] if segmentation else [])]
+    expected_outputs = ["dets", "labels", *(["masks"] if segmentation else [])]
     issues: list[str] = []
 
     actual_inputs = [str(value.name) for value in graph_inputs]
     actual_outputs = [str(value.name) for value in graph_outputs]
-    if actual_inputs != ['input']:
-        issues.append(f'graph inputs must be [input], got {actual_inputs}')
+    if actual_inputs != ["input"]:
+        issues.append(f"graph inputs must be [input], got {actual_inputs}")
     if actual_outputs != expected_outputs:
-        issues.append(f'graph outputs must be {expected_outputs}, got {actual_outputs}')
+        issues.append(f"graph outputs must be {expected_outputs}, got {actual_outputs}")
 
-    expected_ranks = {'input': 4, 'dets': 3, 'labels': 3, 'masks': 4}
+    expected_ranks = {"input": 4, "dets": 3, "labels": 3, "masks": 4}
     for value_info in [*graph_inputs, *graph_outputs]:
         name = str(value_info.name)
-        tensor_type = getattr(getattr(value_info, 'type', None), 'tensor_type', None)
-        element_type = getattr(tensor_type, 'elem_type', None)
+        tensor_type = getattr(getattr(value_info, "type", None), "tensor_type", None)
+        element_type = getattr(tensor_type, "elem_type", None)
         if element_type is not None and int(element_type) != 1:
-            issues.append(f'{name!r} must use ONNX FLOAT tensors, got elem_type={element_type!r}')
+            issues.append(f"{name!r} must use ONNX FLOAT tensors, got elem_type={element_type!r}")
         dimensions = _onnx_value_dimensions(value_info)
         expected_rank = expected_ranks.get(name)
         if expected_rank is not None and len(dimensions) != expected_rank:
-            issues.append(f'{name!r} must be rank {expected_rank}, got rank {len(dimensions)}')
+            issues.append(f"{name!r} must be rank {expected_rank}, got rank {len(dimensions)}")
             continue
         for axis, dimension in enumerate(dimensions):
             static_value = _onnx_dimension_value(dimension)
             if axis == 0:
                 if static_value is not None:
-                    issues.append(
-                        f'{name!r} batch axis must be dynamic, got {_onnx_dimension_text(dimension)}'
-                    )
-                elif not str(getattr(dimension, 'dim_param', '') or '').strip():
-                    issues.append(f'{name!r} batch axis must be symbolic, got unknown')
+                    issues.append(f"{name!r} batch axis must be dynamic, got {_onnx_dimension_text(dimension)}")
+                elif not str(getattr(dimension, "dim_param", "") or "").strip():
+                    issues.append(f"{name!r} batch axis must be symbolic, got unknown")
             elif static_value is None:
-                issues.append(
-                    f'{name!r} axis {axis} must be static, got {_onnx_dimension_text(dimension)}'
-                )
+                issues.append(f"{name!r} axis {axis} must be static, got {_onnx_dimension_text(dimension)}")
     expected_output_shapes: dict[str, list[int | None]] = {
-        'dets': [None, num_queries, 4],
-        'labels': [None, num_queries, num_logit_slots],
+        "dets": [None, num_queries, 4],
+        "labels": [None, num_queries, num_logit_slots],
     }
     if segmentation:
         mask_size = None
         if mask_downsample_ratio is not None:
             mask_size = int(resolution) // int(mask_downsample_ratio)
-        expected_output_shapes['masks'] = [None, num_queries, mask_size, mask_size]
+        expected_output_shapes["masks"] = [None, num_queries, mask_size, mask_size]
     for value_info in graph_outputs:
         name = str(value_info.name)
         expected_shape = expected_output_shapes.get(name)
@@ -1324,11 +1302,10 @@ def _onnx_io_contract_issues(
             actual_value = _onnx_dimension_value(dimensions[axis])
             if actual_value != int(expected_value):
                 issues.append(
-                    f'{name!r} axis {axis} must be {expected_value}, '
-                    f'got {_onnx_dimension_text(dimensions[axis])}'
+                    f"{name!r} axis {axis} must be {expected_value}, got {_onnx_dimension_text(dimensions[axis])}"
                 )
 
-    input_info = next((value for value in graph_inputs if str(value.name) == 'input'), None)
+    input_info = next((value for value in graph_inputs if str(value.name) == "input"), None)
     if input_info is not None:
         dimensions = _onnx_value_dimensions(input_info)
         if len(dimensions) == 4:
@@ -1337,60 +1314,53 @@ def _onnx_io_contract_issues(
                 actual_value = _onnx_dimension_value(dimensions[axis])
                 if actual_value != expected_value:
                     issues.append(
-                        f'input axis {axis} must be {expected_value}, '
-                        f'got {_onnx_dimension_text(dimensions[axis])}'
+                        f"input axis {axis} must be {expected_value}, got {_onnx_dimension_text(dimensions[axis])}"
                     )
     return issues
 
 
 def _onnx_convolution_contract_issues(graph: Any) -> list[str]:
-    value_infos = {
-        str(value.name): value
-        for value in [*graph.input, *graph.output, *graph.value_info]
-    }
+    value_infos = {str(value.name): value for value in [*graph.input, *graph.output, *graph.value_info]}
     issues: list[str] = []
     for node in graph.node:
         operation = str(node.op_type)
-        if operation not in {'Conv', 'ConvTranspose'} or not node.input:
+        if operation not in {"Conv", "ConvTranspose"} or not node.input:
             continue
         tensor_name = str(node.input[0])
         value_info = value_infos.get(tensor_name)
-        node_name = str(node.name or '<unnamed>')
+        node_name = str(node.name or "<unnamed>")
         if value_info is None:
-            issues.append(
-                f'{operation} node {node_name!r} input tensor {tensor_name!r} has no inferred shape'
-            )
+            issues.append(f"{operation} node {node_name!r} input tensor {tensor_name!r} has no inferred shape")
             continue
         dimensions = _onnx_value_dimensions(value_info)
         if len(dimensions) != 4:
             issues.append(
-                f'{operation} node {node_name!r} input tensor {tensor_name!r} '
-                f'must be rank 4 NCHW, got rank {len(dimensions)}'
+                f"{operation} node {node_name!r} input tensor {tensor_name!r} "
+                f"must be rank 4 NCHW, got rank {len(dimensions)}"
             )
             continue
-        for axis, label in ((1, 'channel'), (2, 'height'), (3, 'width')):
+        for axis, label in ((1, "channel"), (2, "height"), (3, "width")):
             if _onnx_dimension_value(dimensions[axis]) is None:
                 issues.append(
-                    f'{operation} node {node_name!r} input tensor {tensor_name!r} {label} axis '
-                    f'must be static, got {_onnx_dimension_text(dimensions[axis])}'
+                    f"{operation} node {node_name!r} input tensor {tensor_name!r} {label} axis "
+                    f"must be static, got {_onnx_dimension_text(dimensions[axis])}"
                 )
     return issues
 
 
 def _onnx_shape_tensor_contract_issues(graph: Any) -> list[str]:
     """Reject the pre-1.8.3 dynamic shape rewrite unsupported by TensorRT."""
-
     issues: list[str] = []
     for node in graph.node:
-        if str(node.op_type) != 'ScatterND':
+        if str(node.op_type) != "ScatterND":
             continue
-        node_name = str(node.name or '<unnamed>')
+        node_name = str(node.name or "<unnamed>")
         inputs = [str(value) for value in node.input]
         outputs = [str(value) for value in node.output]
         issues.append(
-            f'ScatterND node {node_name!r} is not allowed in the RF-DETR TensorRT '
-            f'shape contract; inputs={inputs}, outputs={outputs}. '
-            'Use the rfdetr==1.8.3 export path.'
+            f"ScatterND node {node_name!r} is not allowed in the RF-DETR TensorRT "
+            f"shape contract; inputs={inputs}, outputs={outputs}. "
+            "Use the rfdetr==1.8.3 export path."
         )
     return issues
 
@@ -1406,15 +1376,14 @@ def _validate_onnx_export_contract(
     mask_downsample_ratio: int | None = None,
     onnx_module: Any | None = None,
 ) -> Path:
-    '''Validate and persist TensorRT-safe dynamic-batch/static-NCHW shapes.'''
-
+    """Validate and persist TensorRT-safe dynamic-batch/static-NCHW shapes."""
     onnx = onnx_module or _import_onnx()
     source = Path(path)
     try:
         model_proto = onnx.load(str(source))
         onnx.checker.check_model(model_proto)
     except Exception as exc:
-        raise RuntimeError(f'Unable to load/check exported ONNX model {source}: {exc}') from exc
+        raise RuntimeError(f"Unable to load/check exported ONNX model {source}: {exc}") from exc
     try:
         inferred = onnx.shape_inference.infer_shapes(
             model_proto,
@@ -1424,7 +1393,7 @@ def _validate_onnx_export_contract(
         )
         onnx.checker.check_model(inferred)
     except Exception as exc:
-        raise RuntimeError(f'Unable to infer/check exported ONNX shapes for {source}: {exc}') from exc
+        raise RuntimeError(f"Unable to infer/check exported ONNX shapes for {source}: {exc}") from exc
 
     issues = _onnx_io_contract_issues(
         inferred.graph,
@@ -1438,13 +1407,11 @@ def _validate_onnx_export_contract(
     issues.extend(_onnx_convolution_contract_issues(inferred.graph))
     issues.extend(_onnx_shape_tensor_contract_issues(inferred.graph))
     if issues:
-        raise RuntimeError(
-            'TensorRT ONNX export contract validation failed:\n- ' + '\n- '.join(issues)
-        )
+        raise RuntimeError("TensorRT ONNX export contract validation failed:\n- " + "\n- ".join(issues))
 
     descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f'.{source.name}.',
-        suffix='.shape-inferred.tmp',
+        prefix=f".{source.name}.",
+        suffix=".shape-inferred.tmp",
         dir=source.parent,
     )
     os.close(descriptor)
@@ -1454,7 +1421,7 @@ def _validate_onnx_export_contract(
         os.replace(temporary, source)
     except Exception as exc:
         temporary.unlink(missing_ok=True)
-        raise RuntimeError(f'Unable to persist inferred ONNX shapes for {source}: {exc}') from exc
+        raise RuntimeError(f"Unable to persist inferred ONNX shapes for {source}: {exc}") from exc
     return source
 
 
@@ -1491,8 +1458,8 @@ def _export_dynamic_onnx(model: Any, output_dir: Path, settings: InferenceOptimi
         num_logit_slots=_model_num_logit_slots(model),
         mask_downsample_ratio=(
             _positive_int(
-                getattr(getattr(model, 'model_config', None), 'mask_downsample_ratio', 4),
-                'model mask_downsample_ratio',
+                getattr(getattr(model, "model_config", None), "mask_downsample_ratio", 4),
+                "model mask_downsample_ratio",
             )
             if _infer_segmentation(model)
             else None
@@ -1509,12 +1476,10 @@ def _infer_segmentation(model: Any) -> bool:
 def _release_pytorch_cuda_weights(model: Any) -> None:
     """Move live RF-DETR weights off CUDA before TensorRT build/load.
 
-    RF-DETR's exporter restores the source model to its configured device.
-    Keeping that copy resident while the builder reserves its workspace is a
-    common first-build OOM on laptop GPUs.  The TensorRT adapter retains this
-    CPU copy only so callers can explicitly restore the PyTorch backend later.
+    RF-DETR's exporter restores the source model to its configured device. Keeping that copy resident while the builder
+    reserves its workspace is a common first-build OOM on laptop GPUs. The TensorRT adapter retains this CPU copy only
+    so callers can explicitly restore the PyTorch backend later.
     """
-
     context = getattr(model, "model", None)
     module = getattr(context, "model", None)
     if module is None or not hasattr(module, "to"):
@@ -1526,7 +1491,6 @@ def _release_pytorch_cuda_weights(model: Any) -> None:
 
 def _combined_p2_motion_diagnostic(model: Any, resolution: int) -> str | None:
     """Describe the quadratic attention pressure of a P2+TrackNet graph."""
-
     architecture = _model_architecture_identity(model)
     levels = list(architecture.get("projector_scale", []) or [])
     motion = architecture.get("motion", {}) or {}
@@ -1534,9 +1498,7 @@ def _combined_p2_motion_diagnostic(model: Any, resolution: int) -> str | None:
         return None
     stride_by_level = {"P2": 4, "P3": 8, "P4": 16, "P5": 32, "P6": 64}
     tokens_by_level = {
-        level: max(1, int(resolution) // stride_by_level[level]) ** 2
-        for level in levels
-        if level in stride_by_level
+        level: max(1, int(resolution) // stride_by_level[level]) ** 2 for level in levels if level in stride_by_level
     }
     total_tokens = sum(tokens_by_level.values())
     return (
@@ -1557,7 +1519,6 @@ def prepare_tensorrt_engine(
     segmentation: bool | None = None,
 ) -> TensorRTArtifact:
     """Validate a supplied engine or atomically export/build a cached engine."""
-
     if settings.backend != "tensorrt":
         raise ValueError("prepare_tensorrt_engine() requires backend='tensorrt'.")
     trt = _import_tensorrt()
@@ -1722,7 +1683,6 @@ def _torch_dtype_for_trt(trt: Any, dtype: Any) -> torch.dtype:
 
 def chunk_batch_ranges(total: int, maximum: int) -> list[tuple[int, int]]:
     """Return lossless contiguous batch chunks no larger than ``maximum``."""
-
     total = _positive_int(total, "batch size")
     maximum = _positive_int(maximum, "maximum batch size")
     return [(start, min(start + maximum, total)) for start in range(0, total, maximum)]
@@ -1776,8 +1736,7 @@ class TensorRTRunner:
         self.input_dtype = _torch_dtype_for_trt(self._trt, self._engine.get_tensor_dtype(self.input_name))
         if self.input_dtype is not torch.float32:
             raise RuntimeError(
-                f"TensorRT RF-DETR project engines require FP32 input I/O; {self.input_name!r} is "
-                f"{self.input_dtype}."
+                f"TensorRT RF-DETR project engines require FP32 input I/O; {self.input_name!r} is {self.input_dtype}."
             )
         profile_shapes = self._engine.get_tensor_profile_shape(self.input_name, 0)
         if len(profile_shapes) != 3:
@@ -1797,9 +1756,7 @@ class TensorRTRunner:
                 raise RuntimeError(f"TensorRT RF-DETR engine has unsupported or duplicate output {name!r}.")
             dtype = _torch_dtype_for_trt(self._trt, self._engine.get_tensor_dtype(name))
             if dtype is not torch.float32:
-                raise RuntimeError(
-                    f"TensorRT RF-DETR project engines require FP32 output I/O; {name!r} is {dtype}."
-                )
+                raise RuntimeError(f"TensorRT RF-DETR project engines require FP32 output I/O; {name!r} is {dtype}.")
             self._semantic_output_names[semantic_name] = name
             self._output_shapes[name] = tuple(int(value) for value in self._engine.get_tensor_shape(name))
         missing_outputs = {"pred_boxes", "pred_logits"} - set(self._semantic_output_names)
@@ -1819,9 +1776,7 @@ class TensorRTRunner:
         if len(boxes_shape) != 3 or boxes_shape[-1] != 4 or boxes_shape[1] <= 0:
             raise RuntimeError(f"TensorRT boxes output must be [N, queries, 4]; got {boxes_shape}.")
         if len(logits_shape) != 3 or logits_shape[1] != boxes_shape[1] or logits_shape[2] <= 0:
-            raise RuntimeError(
-                f"TensorRT logits output must be [N, {boxes_shape[1]}, classes]; got {logits_shape}."
-            )
+            raise RuntimeError(f"TensorRT logits output must be [N, {boxes_shape[1]}, classes]; got {logits_shape}.")
         masks_name = self._semantic_output_names.get("pred_masks")
         if masks_name is not None:
             masks_shape = self._output_shapes[masks_name]
@@ -1832,8 +1787,7 @@ class TensorRTRunner:
                 or masks_shape[2] != masks_shape[3]
             ):
                 raise RuntimeError(
-                    "TensorRT masks output must be [N, queries, fixed-height, fixed-width]; "
-                    f"got {masks_shape}."
+                    f"TensorRT masks output must be [N, queries, fixed-height, fixed-width]; got {masks_shape}."
                 )
 
     def _validate_engine_contract(self) -> None:
@@ -1868,7 +1822,7 @@ class TensorRTRunner:
         expected_outputs = identity.get("outputs")
         if not isinstance(expected_outputs, list):
             raise RuntimeError("TensorRT manifest does not contain its output names.")
-        if set(self._output_names) != set(str(name) for name in expected_outputs):
+        if set(self._output_names) != {str(name) for name in expected_outputs}:
             raise RuntimeError(
                 f"TensorRT engine outputs {self._output_names} do not match manifest {expected_outputs}."
             )
@@ -1958,7 +1912,10 @@ class TensorRTRunner:
                 f"TensorRT RF-DETR input must have shape [N, {', '.join(str(v) for v in self.max_shape[1:])}]; "
                 f"got {tuple(tensor.shape)}."
             )
-        chunks = [self._infer_chunk(tensor[start:end]) for start, end in chunk_batch_ranges(tensor.shape[0], self.max_batch_size)]
+        chunks = [
+            self._infer_chunk(tensor[start:end])
+            for start, end in chunk_batch_ranges(tensor.shape[0], self.max_batch_size)
+        ]
         if len(chunks) == 1:
             return chunks[0]
         keys = set(chunks[0])
@@ -2070,7 +2027,6 @@ def install_tensorrt_backend(
     release_pytorch_cuda: bool = True,
 ) -> TensorRTPredictAdapter:
     """Install a TensorRT runner behind RF-DETR's existing ``predict`` path."""
-
     return TensorRTPredictAdapter(model, runner, release_pytorch_cuda=release_pytorch_cuda)
 
 
@@ -2085,7 +2041,6 @@ def configure_inference_acceleration(
     device: str | torch.device | None = None,
 ) -> AccelerationHandle:
     """Fail-fast high-level configuration for PyTorch or TensorRT inference."""
-
     settings = (
         config_or_settings
         if isinstance(config_or_settings, InferenceOptimizationConfig)

@@ -149,7 +149,7 @@ model:
       num_frames: 3
       # Stride between frames when using real video data. Options: positive integer.
       frame_stride: 1
-      # How to synthesise multi-frame input for single-frame datasets.
+      # How to synthesize multi-frame input for single-frame datasets.
       # Options:
       #   identity — all T frames identical (Δ=0, zero motion maps, identity gate).
       #   noise    — add Gaussian noise (noise_std) to produce synthetic deltas.
@@ -202,7 +202,7 @@ model:
 
     # loss nested configuration block. Options: mapping.
     loss:
-      # Motion attention auxiliary loss weight (reserved for future regularisation).
+      # Motion attention auxiliary loss weight (reserved for future regularization).
       # Options: non-negative float. 0.0 disables (recommended until real motion data).
       motion_attention_weight: 0.0
 

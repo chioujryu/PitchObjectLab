@@ -1,40 +1,34 @@
 from __future__ import annotations
 
-from typing import Optional
-
 import cv2
 import numpy as np
 from loguru import logger
-from omegaconf import DictConfig, ListConfig
+from omegaconf import DictConfig
 
 
 class FieldFilter:
-    """
-    Estimates the playing-field boundary and returns a binary mask (True =
-    inside field) used by the rest of the pipeline.
+    """Estimates the playing-field boundary and returns a binary mask (True = inside field) used by the rest of the
+    pipeline.
 
-    Two modes:
-      auto    – detect field by HSV green-colour segmentation; find the
+    Two modes: auto – detect field by HSV green-colour segmentation; find the
                 largest contiguous green region; build a convex hull mask.
-      manual  – use a polygon provided in the config (list of [x, y] points).
+    manual – use a polygon provided in the config (list of [x, y] points).
 
-    The mask is cached and refreshed every `update_interval` frames to avoid
-    recomputing on every frame (field boundaries move slowly).
+    The mask is cached and refreshed every `update_interval` frames to avoid recomputing on every frame (field
+    boundaries move slowly).
     """
 
-    _UPDATE_INTERVAL = 30   # re-detect every N frames
+    _UPDATE_INTERVAL = 30  # re-detect every N frames
 
     def __init__(self, cfg: DictConfig) -> None:
         fc = cfg.field
         self._enabled: bool = fc.boundary_filter
         self._auto: bool = fc.auto_detect
-        self._manual_polygon: Optional[list] = (
-            list(fc.manual_polygon) if fc.manual_polygon is not None else None
-        )
+        self._manual_polygon: list | None = list(fc.manual_polygon) if fc.manual_polygon is not None else None
         self._hsv_range: list[int] = list(fc.green_hsv_range)
         self._min_ratio: float = fc.min_field_area_ratio
 
-        self._mask: Optional[np.ndarray] = None
+        self._mask: np.ndarray | None = None
         self._frame_count: int = 0
 
     # ------------------------------------------------------------------
@@ -42,10 +36,8 @@ class FieldFilter:
     # ------------------------------------------------------------------
 
     def update(self, frame_bgr: np.ndarray) -> np.ndarray:
-        """
-        Update (or reuse cached) field mask for `frame_bgr`.
-        Returns a boolean HxW mask (True = inside field).
-        Always returns a valid mask even if detection fails (all-True fallback).
+        """Update (or reuse cached) field mask for `frame_bgr`. Returns a boolean HxW mask (True = inside field). Always
+        returns a valid mask even if detection fails (all-True fallback).
         """
         H, W = frame_bgr.shape[:2]
         if not self._enabled:
@@ -68,11 +60,11 @@ class FieldFilter:
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _detect_field(self, frame_bgr: np.ndarray) -> Optional[np.ndarray]:
+    def _detect_field(self, frame_bgr: np.ndarray) -> np.ndarray | None:
         H, W = frame_bgr.shape[:2]
         hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-        lo = np.array(self._hsv_range[0::2], dtype=np.uint8)   # H_lo, S_lo, V_lo
-        hi = np.array(self._hsv_range[1::2], dtype=np.uint8)   # H_hi, S_hi, V_hi
+        lo = np.array(self._hsv_range[0::2], dtype=np.uint8)  # H_lo, S_lo, V_lo
+        hi = np.array(self._hsv_range[1::2], dtype=np.uint8)  # H_hi, S_hi, V_hi
         green_mask = cv2.inRange(hsv, lo, hi)
 
         # Morphological clean-up
@@ -89,10 +81,7 @@ class FieldFilter:
         largest = max(contours, key=cv2.contourArea)
         area_ratio = cv2.contourArea(largest) / (H * W)
         if area_ratio < self._min_ratio:
-            logger.warning(
-                f"FieldFilter: largest green region too small ({area_ratio:.2%}); "
-                "using full frame."
-            )
+            logger.warning(f"FieldFilter: largest green region too small ({area_ratio:.2%}); using full frame.")
             return None
 
         # Convex hull for a cleaner field boundary
