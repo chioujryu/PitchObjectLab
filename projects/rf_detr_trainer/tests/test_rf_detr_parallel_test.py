@@ -11,10 +11,9 @@ from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import torch
-
 import rf_detr_runtime
 import test_rf_detr_model as test_runner
+import torch
 
 
 def _cli_args(**updates):
@@ -347,13 +346,9 @@ class SpawnFactoryTests(unittest.TestCase):
             return_value=types.SimpleNamespace(backend="tensorrt", precision="fp16"),
         ), patch.object(
             rf_detr_runtime, "preflight_rfdetr_inference_acceleration", side_effect=preflight
-        ), patch.object(
-            torch.cuda, "get_device_properties", side_effect=properties
-        ), patch.object(
+        ), patch.object(torch.cuda, "get_device_properties", side_effect=properties), patch.object(
             torch.cuda, "get_device_capability", side_effect=capability
-        ), patch.object(
-            rf_detr_runtime, "build_rfdetr_evaluator_runtime", side_effect=build_runtime
-        ), patch.object(
+        ), patch.object(rf_detr_runtime, "build_rfdetr_evaluator_runtime", side_effect=build_runtime), patch.object(
             rf_detr_runtime, "get_inference_acceleration_handle", side_effect=get_handle
         ):
             result = rf_detr_runtime._prepare_parallel_tensorrt_profiles(

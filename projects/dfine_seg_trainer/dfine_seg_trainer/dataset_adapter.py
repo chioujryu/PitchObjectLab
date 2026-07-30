@@ -182,7 +182,9 @@ def detect_dataset_format(config: Mapping[str, Any]) -> tuple[str, Path, dict[st
             return "roboflow_yolo", source_dir, {"data_yaml": str(data_yaml), "yaml": yaml_data}
         return "ultralytics_yolo", source_dir, {"data_yaml": str(data_yaml), "yaml": yaml_data}
 
-    if dataset_cfg.get("coco_json") or any((source_dir / name).exists() for name in ("annotations.json", "instances_train.json")):
+    if dataset_cfg.get("coco_json") or any(
+        (source_dir / name).exists() for name in ("annotations.json", "instances_train.json")
+    ):
         return "coco_json", source_dir, {}
 
     if list(source_dir.rglob("*.xml")):
@@ -278,8 +280,8 @@ def split_items(items: list[Any], ratios: list[float], seed: int) -> dict[str, l
     shuffled = list(items)
     random.Random(seed).shuffle(shuffled)
     n = len(shuffled)
-    n_train = int(round(n * normalized[0]))
-    n_val = int(round(n * normalized[1]))
+    n_train = round(n * normalized[0])
+    n_val = round(n * normalized[1])
     n_train = min(max(n_train, 0), n)
     n_val = min(max(n_val, 0), n - n_train)
     train = shuffled[:n_train]
@@ -531,12 +533,17 @@ def convert_roboflow_coco(plan: DatasetPlan, config: Mapping[str, Any], progress
             src_img = src_split / image["file_name"]
             if not src_img.exists():
                 src_img = src_split / "images" / image["file_name"]
-            rel_name = f"{out_split}/{sanitize_name(Path(image['file_name']).stem)}{Path(image['file_name']).suffix.lower()}"
+            rel_name = (
+                f"{out_split}/{sanitize_name(Path(image['file_name']).stem)}{Path(image['file_name']).suffix.lower()}"
+            )
             image["file_name"] = rel_name
             if src_img.exists():
                 placed = link_or_copy(src_img, plan.cache_dir / "images" / rel_name, link_mode)
                 stats["link_methods"][placed] = stats["link_methods"].get(placed, 0) + 1
-        stats["splits"][out_split] = {"images": len(data.get("images", [])), "annotations": len(data.get("annotations", []))}
+        stats["splits"][out_split] = {
+            "images": len(data.get("images", [])),
+            "annotations": len(data.get("annotations", [])),
+        }
         stats["annotations"] += len(data.get("annotations", []))
         write_json(plan.cache_dir / f"{out_split}.json", data)
     if not names:
@@ -550,7 +557,11 @@ def convert_coco_json(plan: DatasetPlan, config: Mapping[str, Any], progress: bo
     """Convert already-COCO datasets into D-FINE split JSON files."""
     dataset_cfg = config.get("dataset", {})
     link_mode = str(dataset_cfg.get("link_mode", "auto"))
-    image_root = resolve_path(dataset_cfg.get("image_dir"), PROJECT_DIR, must_exist=True) if dataset_cfg.get("image_dir") else plan.source_dir / "images"
+    image_root = (
+        resolve_path(dataset_cfg.get("image_dir"), PROJECT_DIR, must_exist=True)
+        if dataset_cfg.get("image_dir")
+        else plan.source_dir / "images"
+    )
     split_paths = {
         "train": dataset_cfg.get("coco_train_json") or dataset_cfg.get("coco_json") or plan.source_dir / "train.json",
         "val": dataset_cfg.get("coco_val_json") or plan.source_dir / "val.json",
@@ -574,7 +585,10 @@ def convert_coco_json(plan: DatasetPlan, config: Mapping[str, Any], progress: bo
             if src_img.exists():
                 placed = link_or_copy(src_img, plan.cache_dir / "images" / rel_name, link_mode)
                 stats["link_methods"][placed] = stats["link_methods"].get(placed, 0) + 1
-        stats["splits"][split] = {"images": len(data.get("images", [])), "annotations": len(data.get("annotations", []))}
+        stats["splits"][split] = {
+            "images": len(data.get("images", [])),
+            "annotations": len(data.get("annotations", [])),
+        }
         stats["annotations"] += len(data.get("annotations", []))
         write_json(plan.cache_dir / f"{split}.json", data)
     if not names:
@@ -586,7 +600,9 @@ def convert_coco_json(plan: DatasetPlan, config: Mapping[str, Any], progress: bo
 
 def convert_labelme(plan: DatasetPlan, config: Mapping[str, Any], progress: bool) -> PreparedDataset:
     """Convert LabelMe polygon JSON files."""
-    json_files = sorted(path for path in plan.source_dir.rglob("*.json") if path.name not in {"train.json", "val.json", "test.json"})
+    json_files = sorted(
+        path for path in plan.source_dir.rglob("*.json") if path.name not in {"train.json", "val.json", "test.json"}
+    )
     dataset_cfg = config.get("dataset", {})
     split_ratio = list(dataset_cfg.get("split_ratio", [0.8, 0.1, 0.1]))
     split_seed = int(dataset_cfg.get("split_seed", 0))
@@ -598,7 +614,9 @@ def convert_labelme(plan: DatasetPlan, config: Mapping[str, Any], progress: bool
     for split, files in splits.items():
         coco = {"images": [], "annotations": [], "categories": []}
         ann_id = 1
-        for img_id, label_path in enumerate(tqdm(files, desc=f"Converting {split}", unit="json", disable=not progress), start=1):
+        for img_id, label_path in enumerate(
+            tqdm(files, desc=f"Converting {split}", unit="json", disable=not progress), start=1
+        ):
             data = json.loads(label_path.read_text(encoding="utf-8"))
             image_path = (label_path.parent / data["imagePath"]).resolve()
             if not image_path.exists():
@@ -635,7 +653,11 @@ def convert_labelme(plan: DatasetPlan, config: Mapping[str, Any], progress: bool
                 stats["annotations"] += 1
         stats["splits"][split] = {"images": len(coco["images"]), "annotations": len(coco["annotations"])}
         write_json(plan.cache_dir / f"{split}.json", coco)
-    names = configured_class_names(config) or [name for name, _ in sorted(name_to_id.items(), key=lambda x: x[1])] or ["class_0"]
+    names = (
+        configured_class_names(config)
+        or [name for name, _ in sorted(name_to_id.items(), key=lambda x: x[1])]
+        or ["class_0"]
+    )
     inject_categories(plan.cache_dir, names)
     write_categories(plan.cache_dir, names)
     return finish_prepared(plan, names, stats)
@@ -649,22 +671,39 @@ def convert_voc(plan: DatasetPlan, config: Mapping[str, Any], progress: bool) ->
     if task == "segment" and not box_to_mask:
         raise ValueError("Pascal VOC is box-only. Set dataset.box_to_mask=true or use model.task=detect.")
     xml_files = sorted(plan.source_dir.rglob("*.xml"))
-    splits = split_items(xml_files, list(dataset_cfg.get("split_ratio", [0.8, 0.1, 0.1])), int(dataset_cfg.get("split_seed", 0)))
+    splits = split_items(
+        xml_files, list(dataset_cfg.get("split_ratio", [0.8, 0.1, 0.1])), int(dataset_cfg.get("split_seed", 0))
+    )
     name_to_id: dict[str, int] = {}
     stats = {"splits": {}, "link_methods": {}, "annotations": 0, "box_to_mask_annotations": 0}
     plan.cache_dir.mkdir(parents=True, exist_ok=True)
     for split, files in splits.items():
         coco = {"images": [], "annotations": [], "categories": []}
         ann_id = 1
-        for img_id, xml_path in enumerate(tqdm(files, desc=f"Converting {split}", unit="xml", disable=not progress), start=1):
+        for img_id, xml_path in enumerate(
+            tqdm(files, desc=f"Converting {split}", unit="xml", disable=not progress), start=1
+        ):
             root = ET.parse(xml_path).getroot()
             filename = root.findtext("filename") or f"{xml_path.stem}.jpg"
-            image_path = next((p for p in [xml_path.parent / filename, plan.source_dir / "JPEGImages" / filename, plan.source_dir / "images" / filename] if p.exists()), None)
+            image_path = next(
+                (
+                    p
+                    for p in [
+                        xml_path.parent / filename,
+                        plan.source_dir / "JPEGImages" / filename,
+                        plan.source_dir / "images" / filename,
+                    ]
+                    if p.exists()
+                ),
+                None,
+            )
             if image_path is None:
                 continue
             width, height = image_size(image_path)
             rel_name = f"{split}/{sanitize_name(image_path.stem)}{image_path.suffix.lower()}"
-            placed = link_or_copy(image_path, plan.cache_dir / "images" / rel_name, str(dataset_cfg.get("link_mode", "auto")))
+            placed = link_or_copy(
+                image_path, plan.cache_dir / "images" / rel_name, str(dataset_cfg.get("link_mode", "auto"))
+            )
             stats["link_methods"][placed] = stats["link_methods"].get(placed, 0) + 1
             coco["images"].append({"id": img_id, "file_name": rel_name, "width": width, "height": height})
             for obj in root.findall("object"):
@@ -696,7 +735,11 @@ def convert_voc(plan: DatasetPlan, config: Mapping[str, Any], progress: bool) ->
                 stats["box_to_mask_annotations"] += int(box_to_mask)
         stats["splits"][split] = {"images": len(coco["images"]), "annotations": len(coco["annotations"])}
         write_json(plan.cache_dir / f"{split}.json", coco)
-    names = configured_class_names(config) or [name for name, _ in sorted(name_to_id.items(), key=lambda x: x[1])] or ["class_0"]
+    names = (
+        configured_class_names(config)
+        or [name for name, _ in sorted(name_to_id.items(), key=lambda x: x[1])]
+        or ["class_0"]
+    )
     inject_categories(plan.cache_dir, names)
     write_categories(plan.cache_dir, names)
     return finish_prepared(plan, names, stats)
@@ -705,22 +748,41 @@ def convert_voc(plan: DatasetPlan, config: Mapping[str, Any], progress: bool) ->
 def convert_dota(plan: DatasetPlan, config: Mapping[str, Any], progress: bool) -> PreparedDataset:
     """Convert DOTA oriented boxes to axis-aligned COCO boxes with polygon segmentation."""
     dataset_cfg = config.get("dataset", {})
-    label_root = next((p for p in [plan.source_dir / "labelTxt", plan.source_dir / "labels"] if p.exists()), plan.source_dir)
+    label_root = next(
+        (p for p in [plan.source_dir / "labelTxt", plan.source_dir / "labels"] if p.exists()), plan.source_dir
+    )
     label_files = sorted(label_root.rglob("*.txt"))
-    splits = split_items(label_files, list(dataset_cfg.get("split_ratio", [0.8, 0.1, 0.1])), int(dataset_cfg.get("split_seed", 0)))
+    splits = split_items(
+        label_files, list(dataset_cfg.get("split_ratio", [0.8, 0.1, 0.1])), int(dataset_cfg.get("split_seed", 0))
+    )
     name_to_id: dict[str, int] = {}
     stats = {"splits": {}, "link_methods": {}, "annotations": 0}
     plan.cache_dir.mkdir(parents=True, exist_ok=True)
     for split, files in splits.items():
         coco = {"images": [], "annotations": [], "categories": []}
         ann_id = 1
-        for img_id, label_path in enumerate(tqdm(files, desc=f"Converting {split}", unit="txt", disable=not progress), start=1):
-            image_path = next((p for ext in IMAGE_EXTENSIONS for p in [plan.source_dir / "images" / f"{label_path.stem}{ext}", plan.source_dir / f"{label_path.stem}{ext}"] if p.exists()), None)
+        for img_id, label_path in enumerate(
+            tqdm(files, desc=f"Converting {split}", unit="txt", disable=not progress), start=1
+        ):
+            image_path = next(
+                (
+                    p
+                    for ext in IMAGE_EXTENSIONS
+                    for p in [
+                        plan.source_dir / "images" / f"{label_path.stem}{ext}",
+                        plan.source_dir / f"{label_path.stem}{ext}",
+                    ]
+                    if p.exists()
+                ),
+                None,
+            )
             if image_path is None:
                 continue
             width, height = image_size(image_path)
             rel_name = f"{split}/{sanitize_name(image_path.stem)}{image_path.suffix.lower()}"
-            placed = link_or_copy(image_path, plan.cache_dir / "images" / rel_name, str(dataset_cfg.get("link_mode", "auto")))
+            placed = link_or_copy(
+                image_path, plan.cache_dir / "images" / rel_name, str(dataset_cfg.get("link_mode", "auto"))
+            )
             stats["link_methods"][placed] = stats["link_methods"].get(placed, 0) + 1
             coco["images"].append({"id": img_id, "file_name": rel_name, "width": width, "height": height})
             for raw in label_path.read_text(encoding="utf-8", errors="ignore").splitlines():
@@ -749,7 +811,11 @@ def convert_dota(plan: DatasetPlan, config: Mapping[str, Any], progress: bool) -
                 stats["annotations"] += 1
         stats["splits"][split] = {"images": len(coco["images"]), "annotations": len(coco["annotations"])}
         write_json(plan.cache_dir / f"{split}.json", coco)
-    names = configured_class_names(config) or [name for name, _ in sorted(name_to_id.items(), key=lambda x: x[1])] or ["class_0"]
+    names = (
+        configured_class_names(config)
+        or [name for name, _ in sorted(name_to_id.items(), key=lambda x: x[1])]
+        or ["class_0"]
+    )
     inject_categories(plan.cache_dir, names)
     write_categories(plan.cache_dir, names)
     return finish_prepared(plan, names, stats)
