@@ -1,4 +1,4 @@
-"""
+r"""
 Train D-FINE-seg with a config-first, Ultralytics-style workflow.
 
 This wrapper adds:
@@ -46,13 +46,9 @@ from typing import Any, Mapping, MutableMapping
 
 import colorama
 from colorama import Fore, Style
-from tqdm import tqdm
-
 from dfine_seg_trainer.augmentation import build_aug_runtime
 from dfine_seg_trainer.common import (
     DEFAULT_CONFIG,
-    PROJECT_DIR,
-    REPO_ROOT,
     VENDOR_DIR,
     VENDORED_DFINE_COMMIT,
     build_output_dir,
@@ -75,6 +71,7 @@ from dfine_seg_trainer.common import (
     write_json,
 )
 from dfine_seg_trainer.dataset_adapter import PreparedDataset, build_dataset_plan, materialize_dataset
+from tqdm import tqdm
 
 colorama.init(autoreset=True)
 os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
@@ -147,7 +144,9 @@ def apply_demo_mode(config: MutableMapping[str, Any], timestamp: str, region: st
         return
     train = config.setdefault("train", {})
     output = config.setdefault("output", {})
-    output["output_dir"] = render_template(demo.get("output_dir", "demo_runs/dfine_demo_{timestamp}"), config, timestamp, region)
+    output["output_dir"] = render_template(
+        demo.get("output_dir", "demo_runs/dfine_demo_{timestamp}"), config, timestamp, region
+    )
     train["epochs"] = min(int(train.get("epochs", 1)), int(demo.get("max_epochs", 2)))
     if isinstance(train.get("batch_size"), int) and int(train["batch_size"]) > 0:
         train["batch_size"] = min(int(train["batch_size"]), int(demo.get("max_batch_size", 2)))
@@ -167,7 +166,22 @@ def estimate_outputs(config: Mapping[str, Any], output_dir: Path, dataset_plan: 
     metrics_files = 6
     config_files = 5
     debug_images = min(100, int(dataset_plan.estimate.get("source_image_files", 0))) if debug_enabled else 0
-    eval_images = min(max(int(train.get("batch_size", 1) if isinstance(train.get("batch_size"), int) and train.get("batch_size") > 0 else 4) * 6, 6), int(dataset_plan.estimate.get("source_image_files", 0))) if eval_enabled else 0
+    eval_images = (
+        min(
+            max(
+                int(
+                    train.get("batch_size", 1)
+                    if isinstance(train.get("batch_size"), int) and train.get("batch_size") > 0
+                    else 4
+                )
+                * 6,
+                6,
+            ),
+            int(dataset_plan.estimate.get("source_image_files", 0)),
+        )
+        if eval_enabled
+        else 0
+    )
     plots = 12 if eval_enabled else 0
     cache_files = int(dataset_plan.estimate.get("conversion_output_files_estimate", 0))
     source_bytes = int(dataset_plan.estimate.get("source_image_bytes", 0))
@@ -196,7 +210,11 @@ def print_estimate(estimate: Mapping[str, Any], verbose: bool) -> None:
     """Print a concise resource estimate."""
     blue("Planned output/resource estimate:", verbose, force=True)
     blue(f"  Output directory: {estimate['output_dir']}", verbose, force=True)
-    blue(f"  Source images: {estimate['source_images']} ({format_bytes(estimate['source_image_bytes'])})", verbose, force=True)
+    blue(
+        f"  Source images: {estimate['source_images']} ({format_bytes(estimate['source_image_bytes'])})",
+        verbose,
+        force=True,
+    )
     blue(
         "  Estimated generated files: "
         f"checkpoints={estimate['checkpoint_files_estimate']}, "
@@ -211,7 +229,9 @@ def print_estimate(estimate: Mapping[str, Any], verbose: bool) -> None:
     blue(f"  Dataset cache disk estimate: {format_bytes(estimate['dataset_cache_disk_estimate'])}", verbose, force=True)
 
 
-def confirm_or_exit(config: Mapping[str, Any], args: argparse.Namespace, estimate: Mapping[str, Any], verbose: bool) -> None:
+def confirm_or_exit(
+    config: Mapping[str, Any], args: argparse.Namespace, estimate: Mapping[str, Any], verbose: bool
+) -> None:
     """Ask confirmation before heavy outputs."""
     print_estimate(estimate, verbose)
     confirm = bool(config.get("runtime", {}).get("confirm_before_run", True))
@@ -244,7 +264,11 @@ def resolve_pretrained_path(config: Mapping[str, Any], region: str, verbose: boo
         return ""
     if str(raw).lower() != "auto":
         return str(raw)
-    filename = f"dfine_seg_{name}_coco.pt" if task == "segment" else f"dfine_{name}_{model.get('pretrained_dataset', 'coco')}.pt"
+    filename = (
+        f"dfine_seg_{name}_coco.pt"
+        if task == "segment"
+        else f"dfine_{name}_{model.get('pretrained_dataset', 'coco')}.pt"
+    )
     path = VENDOR_DIR / "pretrained" / filename
     if path.exists():
         return str(path)
@@ -255,7 +279,11 @@ def resolve_pretrained_path(config: Mapping[str, Any], region: str, verbose: boo
             downloaded = try_modelscope_download(repo_id, filename, path, verbose)
             if downloaded:
                 return str(downloaded)
-        blue("Pretrained weights are missing. China mode will use HF_ENDPOINT fallback for this run.", verbose, force=True)
+        blue(
+            "Pretrained weights are missing. China mode will use HF_ENDPOINT fallback for this run.",
+            verbose,
+            force=True,
+        )
     return str(path)
 
 
@@ -468,16 +496,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="Path to wrapper YAML config.")
     parser.add_argument("--yes", action="store_true", help="Skip output/resource confirmation.")
     parser.add_argument("--dry-run", action="store_true", help="Validate and estimate without training.")
-    parser.add_argument("--verbose", dest="verbose", action="store_true", default=None, help="Enable blue wrapper logs.")
+    parser.add_argument(
+        "--verbose", dest="verbose", action="store_true", default=None, help="Enable blue wrapper logs."
+    )
     parser.add_argument("--quiet", dest="verbose", action="store_false", help="Disable blue wrapper logs.")
-    parser.add_argument("--confirm-before-run", type=parse_bool, default=None, help="Ask before creating heavy outputs.")
+    parser.add_argument(
+        "--confirm-before-run", type=parse_bool, default=None, help="Ask before creating heavy outputs."
+    )
     parser.add_argument("--demo", action="store_true", default=None, help="Enable demo constraints.")
     parser.add_argument("--no-demo", dest="demo", action="store_false", help="Disable demo constraints.")
     parser.add_argument("--task", choices=["detect", "segment"], default=None, help="D-FINE task.")
     parser.add_argument("--dataset-dir", default=None, help="Source dataset root.")
     parser.add_argument(
         "--dataset-format",
-        choices=["auto", "dfine_coco", "coco_json", "roboflow_coco", "roboflow_yolo", "ultralytics_yolo", "labelme", "pascal_voc", "dota"],
+        choices=[
+            "auto",
+            "dfine_coco",
+            "coco_json",
+            "roboflow_coco",
+            "roboflow_yolo",
+            "ultralytics_yolo",
+            "labelme",
+            "pascal_voc",
+            "dota",
+        ],
         default=None,
         help="Source dataset format.",
     )
@@ -490,15 +532,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--project", default=None, help="Output root when output-dir is empty.")
     parser.add_argument("--name", default=None, help="Output run folder name when output-dir is empty.")
     parser.add_argument("--exist-ok", type=parse_bool, default=None, help="Allow existing output directory.")
-    parser.add_argument("--extra", action="append", default=None, help="Extra config override as dot.path=value. Repeatable.")
+    parser.add_argument(
+        "--extra", action="append", default=None, help="Extra config override as dot.path=value. Repeatable."
+    )
     return parser
 
 
 def main() -> int:
-    """
-    Main entry point.
+    """Main entry point.
 
-    Usage:
+    Examples:
       1. Prepare environment:
          uv run python setup_dfine_seg_env.py
          uv sync
@@ -545,12 +588,18 @@ def main() -> int:
         estimate = estimate_outputs(config, output_dir, dataset_plan)
         confirm_or_exit(config, args, estimate, verbose)
         if bool(config.get("runtime", {}).get("dry_run", False)) or args.dry_run:
-            blue("Dry run complete. Training was not started and dataset cache was not materialized.", verbose, force=True)
+            blue(
+                "Dry run complete. Training was not started and dataset cache was not materialized.",
+                verbose,
+                force=True,
+            )
             bar.update(bar.total - bar.n)
             return 0
         bar.set_description("Dataset cache")
         output_dir.mkdir(parents=True, exist_ok=True)
-        prepared = materialize_dataset(dataset_plan, config, progress=bool(config.get("runtime", {}).get("progress_bar", True)))
+        prepared = materialize_dataset(
+            dataset_plan, config, progress=bool(config.get("runtime", {}).get("progress_bar", True))
+        )
         config.setdefault("dataset", {})["prepared_dir"] = str(prepared.path)
         bar.update(1)
 

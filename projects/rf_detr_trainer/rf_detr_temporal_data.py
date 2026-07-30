@@ -4,7 +4,7 @@ The stock RF-DETR data path remains untouched.  This module is used only when
 the motion branch is enabled and a dataset provides
 ``metadata/temporal_index.jsonl``.  It builds complete, sequence-local temporal
 windows and returns an RF-DETR-compatible ``(samples, targets)`` batch where
-``samples.tensors`` and ``samples.mask`` expose the centre/anchor frame.
+``samples.tensors`` and ``samples.mask`` expose the center/anchor frame.
 
 YOLO boxes are read as normalized ``cx, cy, width, height`` values.  Every
 spatial transform is replayed across all frames in a window, and target boxes
@@ -93,13 +93,9 @@ def _resolve_indexed_path(dataset_root: Path, value: str, field: str, line_numbe
     try:
         resolved.relative_to(dataset_root)
     except ValueError as exc:
-        raise ValueError(
-            f"temporal index line {line_number}: {field} escapes dataset root: {value!r}"
-        ) from exc
+        raise ValueError(f"temporal index line {line_number}: {field} escapes dataset root: {value!r}") from exc
     if not resolved.is_file():
-        raise FileNotFoundError(
-            f"temporal index line {line_number}: {field} does not exist: {resolved}"
-        )
+        raise FileNotFoundError(f"temporal index line {line_number}: {field} does not exist: {resolved}")
     return resolved
 
 
@@ -168,10 +164,9 @@ def load_temporal_index(
 ) -> TemporalIndex:
     """Load and validate a temporal dataset index.
 
-    Paths in the JSONL index must remain under the dataset root.  Frame identity
-    is unique within ``(split, sequence_id)`` and is retained in ``metadata``.
+    Paths in the JSONL index must remain under the dataset root. Frame identity is unique within ``(split,
+    sequence_id)`` and is retained in ``metadata``.
     """
-
     yaml_path = Path(data_yaml).expanduser().resolve()
     if not yaml_path.is_file():
         raise FileNotFoundError(f"dataset.yaml does not exist: {yaml_path}")
@@ -219,9 +214,7 @@ def load_temporal_index(
         primary_raw = row.get("primary_label_index")
         primary = None if primary_raw is None else int(primary_raw)
         if primary is not None and primary < 0:
-            raise ValueError(
-                f"temporal index line {line_number}: primary_label_index must be non-negative or null"
-            )
+            raise ValueError(f"temporal index line {line_number}: primary_label_index must be non-negative or null")
         box_count_raw = row.get("box_count")
         box_count = None if box_count_raw is None else int(box_count_raw)
         if box_count is not None and box_count < 0:
@@ -269,11 +262,9 @@ def build_temporal_windows(
 ) -> tuple[TemporalWindow, ...]:
     """Build complete sequence-local temporal windows.
 
-    Only ``anchor='center'`` and ``boundary_policy='drop'`` are intentionally
-    supported for training/evaluation.  Missing frame indices produce no
-    window; frames are never borrowed from a neighbouring sequence or split.
+    Only ``anchor='center'`` and ``boundary_policy='drop'`` are intentionally supported for training/evaluation. Missing
+    frame indices produce no window; frames are never borrowed from a neighboring sequence or split.
     """
-
     if num_frames < 1 or num_frames % 2 == 0:
         raise ValueError(f"num_frames must be a positive odd integer, got {num_frames}")
     if frame_stride < 1:
@@ -287,9 +278,7 @@ def build_temporal_windows(
     for record in records:
         group = grouped.setdefault((record.split, record.sequence_id), {})
         if record.frame_index in group:
-            raise ValueError(
-                f"duplicate frame_index {record.frame_index} in {record.split}/{record.sequence_id}"
-            )
+            raise ValueError(f"duplicate frame_index {record.frame_index} in {record.split}/{record.sequence_id}")
         group[record.frame_index] = record
 
     radius = num_frames // 2
@@ -314,11 +303,9 @@ def temporal_split_window_counts(
 ) -> dict[str, int]:
     """Return complete-window counts per split without materializing images.
 
-    ``dataset_root`` may be either the temporal dataset directory or its
-    ``dataset.yaml`` path. The helper is metadata-only so train entrypoints can
-    produce a reliable pre-run estimate cheaply.
+    ``dataset_root`` may be either the temporal dataset directory or its ``dataset.yaml`` path. The helper is
+    metadata-only so train entrypoints can produce a reliable pre-run estimate cheaply.
     """
-
     supplied = Path(dataset_root).expanduser()
     data_yaml = supplied if supplied.suffix.lower() in {".yaml", ".yml"} else supplied / "dataset.yaml"
     index = load_temporal_index(data_yaml)
@@ -351,16 +338,12 @@ def resize_temporal_frames(
     size: int | Sequence[int],
 ) -> tuple[list[Image.Image], list[dict[str, Tensor]]]:
     """Resize every frame to one exact ``(height, width)`` using one operation."""
-
     target_size = _normalise_size(size)
     assert target_size is not None
     height, width = target_size
     if len(images) != len(targets):
         raise ValueError("images and targets must have the same length")
-    resized_images = [
-        image.resize((width, height), resample=Image.Resampling.BILINEAR)
-        for image in images
-    ]
+    resized_images = [image.resize((width, height), resample=Image.Resampling.BILINEAR) for image in images]
     resized_targets: list[dict[str, Tensor]] = []
     for target in targets:
         transformed = _clone_target(target)
@@ -379,7 +362,6 @@ def horizontal_flip_temporal_frames(
     targets: Sequence[Mapping[str, Tensor]],
 ) -> tuple[list[Image.Image], list[dict[str, Tensor]]]:
     """Horizontally flip all frames and normalized ``cxcywh`` targets together."""
-
     if len(images) != len(targets):
         raise ValueError("images and targets must have the same length")
     flipped_images = [image.transpose(Image.Transpose.FLIP_LEFT_RIGHT) for image in images]
@@ -466,9 +448,7 @@ def _parse_yolo_label(path: Path) -> tuple[Tensor, Tensor]:
             continue
         fields = stripped.split()
         if len(fields) != 5:
-            raise ValueError(
-                f"{path}:{line_number}: expected 5 YOLO detection fields, got {len(fields)}"
-            )
+            raise ValueError(f"{path}:{line_number}: expected 5 YOLO detection fields, got {len(fields)}")
         try:
             class_value, cx, cy, width, height = (float(value) for value in fields)
         except ValueError as exc:
@@ -480,7 +460,7 @@ def _parse_yolo_label(path: Path) -> tuple[Tensor, Tensor]:
         if class_value != class_id or class_id < 0:
             raise ValueError(f"{path}:{line_number}: class id must be a non-negative integer")
         if not 0.0 <= cx <= 1.0 or not 0.0 <= cy <= 1.0:
-            raise ValueError(f"{path}:{line_number}: box centre must be within [0, 1]")
+            raise ValueError(f"{path}:{line_number}: box center must be within [0, 1]")
         if not 0.0 < width <= 1.0 or not 0.0 < height <= 1.0:
             raise ValueError(f"{path}:{line_number}: box width/height must be within (0, 1]")
         boxes.append([cx, cy, width, height])
@@ -507,9 +487,7 @@ def _focus_indices(
         return torch.zeros((0,), dtype=torch.int64)
     if box_count == 1:
         if primary_label_index not in (None, 0):
-            raise ValueError(
-                f"{record.label_path}: primary_label_index {primary_label_index} is invalid for one box"
-            )
+            raise ValueError(f"{record.label_path}: primary_label_index {primary_label_index} is invalid for one box")
         return torch.tensor([0], dtype=torch.int64)
     if primary_label_index is None:
         raise ValueError(
@@ -518,8 +496,7 @@ def _focus_indices(
         )
     if primary_label_index >= box_count:
         raise ValueError(
-            f"{record.label_path}: primary_label_index {primary_label_index} "
-            f"is outside [0, {box_count - 1}]"
+            f"{record.label_path}: primary_label_index {primary_label_index} is outside [0, {box_count - 1}]"
         )
     return torch.tensor([primary_label_index], dtype=torch.int64)
 
@@ -534,10 +511,9 @@ def generate_gaussian_heatmap(
 ) -> Tensor:
     """Render max-composited bbox-centred Gaussian targets.
 
-    ``boxes`` must be normalized ``cxcywh``.  Standard deviation is bbox
-    width/height divided by six, with ``min_sigma`` measured in output pixels.
+    ``boxes`` must be normalized ``cxcywh``. Standard deviation is bbox width/height divided by six, with ``min_sigma``
+    measured in output pixels.
     """
-
     output_size = _normalise_size(size)
     if output_size is None:
         raise ValueError("heatmap size must not be None")
@@ -561,18 +537,15 @@ def generate_gaussian_heatmap(
         center_y = float(box[1]) * max(height - 1, 1)
         sigma_x = max(float(box[2]) * width / 6.0, float(min_sigma))
         sigma_y = max(float(box[3]) * height / 6.0, float(min_sigma))
-        x0 = max(0, int(math.floor(center_x - truncate * sigma_x)))
-        x1 = min(width, int(math.ceil(center_x + truncate * sigma_x)) + 1)
-        y0 = max(0, int(math.floor(center_y - truncate * sigma_y)))
-        y1 = min(height, int(math.ceil(center_y + truncate * sigma_y)) + 1)
+        x0 = max(0, math.floor(center_x - truncate * sigma_x))
+        x1 = min(width, math.ceil(center_x + truncate * sigma_x) + 1)
+        y0 = max(0, math.floor(center_y - truncate * sigma_y))
+        y1 = min(height, math.ceil(center_y + truncate * sigma_y) + 1)
         xs = torch.arange(x0, x1, dtype=torch.float32, device=boxes.device)
         ys = torch.arange(y0, y1, dtype=torch.float32, device=boxes.device)
         gaussian = torch.exp(
             -0.5
-            * (
-                ((xs.unsqueeze(0) - center_x) / sigma_x).square()
-                + ((ys.unsqueeze(1) - center_y) / sigma_y).square()
-            )
+            * (((xs.unsqueeze(0) - center_x) / sigma_x).square() + ((ys.unsqueeze(1) - center_y) / sigma_y).square())
         )
         heatmap[y0:y1, x0:x1] = torch.maximum(heatmap[y0:y1, x0:x1], gaussian)
     return heatmap
@@ -613,77 +586,57 @@ class TemporalBatch:
         Manually constructed/raw batches leave the normalization fields unset
         and therefore keep their existing raw-tensor semantics.
         """
-
         frames = self.frames
         if self.normalization_mean is not None:
             if self.normalization_std is None:
-                raise RuntimeError(
-                    "TemporalBatch normalization_std is required when "
-                    "normalization_mean is set"
-                )
+                raise RuntimeError("TemporalBatch normalization_std is required when normalization_mean is set")
             mean = frames.new_tensor(self.normalization_mean).view(1, 1, 3, 1, 1)
             std = frames.new_tensor(self.normalization_std).view(1, 1, 3, 1, 1)
             frames = frames * std + mean
         elif self.normalization_std is not None:
-            raise RuntimeError(
-                "TemporalBatch normalization_mean is required when "
-                "normalization_std is set"
-            )
+            raise RuntimeError("TemporalBatch normalization_mean is required when normalization_std is set")
         frames = frames.clamp(0.0, 1.0)
         return frames.masked_fill(self.padding_masks.unsqueeze(2), 0.0)
 
     @property
     def tensors(self) -> Tensor:
         """Anchor images, compatible with ``NestedTensor.tensors`` consumers."""
-
         return self.frames[:, self.anchor_index]
 
     @property
     def mask(self) -> Tensor:
         """Anchor padding mask, compatible with ``NestedTensor.mask`` consumers."""
-
         return self.padding_masks[:, self.anchor_index]
 
     @property
     def flattened_tensors(self) -> Tensor:
         """All temporal images as ``[B*T, C, H, W]`` for the shared backbone."""
-
         batch, frames, channels, height, width = self.frames.shape
         return self.frames.reshape(batch * frames, channels, height, width)
 
     @property
     def flattened_mask(self) -> Tensor:
         """All temporal padding masks as ``[B*T, H, W]``."""
-
         batch, frames, height, width = self.padding_masks.shape
         return self.padding_masks.reshape(batch * frames, height, width)
 
     def decompose(self) -> tuple[Tensor, Tensor]:
         """Return anchor tensors/mask like RF-DETR's ``NestedTensor``."""
-
         return self.tensors, self.mask
 
-    def to(self, device: torch.device | str, **kwargs: Any) -> "TemporalBatch":
+    def to(self, device: torch.device | str, **kwargs: Any) -> TemporalBatch:
         """Move temporal tensors and tensor-valued frame targets to a device."""
-
         frames = self.frames.to(device, **kwargs)
         non_blocking = bool(kwargs.get("non_blocking", False))
         masks = self.padding_masks.to(device=device, non_blocking=non_blocking)
         moved_targets = tuple(
-            tuple(
-                {
-                    key: value.to(device, **kwargs)
-                    for key, value in target.items()
-                }
-                for target in sample_targets
-            )
+            tuple({key: value.to(device, **kwargs) for key, value in target.items()} for target in sample_targets)
             for sample_targets in self.frame_targets
         )
         return replace(self, frames=frames, padding_masks=masks, frame_targets=moved_targets)
 
-    def pin_memory(self) -> "TemporalBatch":
+    def pin_memory(self) -> TemporalBatch:
         """Pin batch tensors for asynchronous host-to-device transfer."""
-
         pinned_targets = tuple(
             tuple({key: value.pin_memory() for key, value in target.items()} for target in sample_targets)
             for sample_targets in self.frame_targets
@@ -809,9 +762,7 @@ class TemporalDataset(Dataset[TemporalSample]):
                     image = source.convert("RGB")
                 width, height = image.size
                 images.append(image)
-                targets.append(
-                    self._target_for_record(record, image_height=height, image_width=width)
-                )
+                targets.append(self._target_for_record(record, image_height=height, image_width=width))
             frames, transformed_targets = self.transform(images, targets)
         finally:
             for image in images:
@@ -843,21 +794,15 @@ class TemporalDataset(Dataset[TemporalSample]):
         }
         return TemporalSample(
             frames=frames,
-            padding_masks=torch.zeros(
-                (self.num_frames, height, width), dtype=torch.bool
-            ),
+            padding_masks=torch.zeros((self.num_frames, height, width), dtype=torch.bool),
             frame_targets=tuple(targets_with_heatmaps),
             metadata=metadata,
             anchor_index=window.anchor_index,
             normalization_mean=(
-                tuple(float(value) for value in self.transform.config.mean)
-                if self.transform.config.normalize
-                else None
+                tuple(float(value) for value in self.transform.config.mean) if self.transform.config.normalize else None
             ),
             normalization_std=(
-                tuple(float(value) for value in self.transform.config.std)
-                if self.transform.config.normalize
-                else None
+                tuple(float(value) for value in self.transform.config.std) if self.transform.config.normalize else None
             ),
         )
 
@@ -876,7 +821,6 @@ def temporal_collate_fn(
     block_size: int | None = None,
 ) -> tuple[TemporalBatch, list[dict[str, Tensor]]]:
     """Pad temporal samples and return RF-DETR's ``(samples, targets)`` shape."""
-
     if not samples:
         raise ValueError("cannot collate an empty temporal batch")
     frame_counts = {sample.frames.shape[0] for sample in samples}
@@ -888,22 +832,16 @@ def temporal_collate_fn(
     channels = {sample.frames.shape[1] for sample in samples}
     if channels != {3}:
         raise ValueError(f"temporal RGB batches require three channels, got {sorted(channels)}")
-    normalizations = {
-        (sample.normalization_mean, sample.normalization_std) for sample in samples
-    }
+    normalizations = {(sample.normalization_mean, sample.normalization_std) for sample in samples}
     if len(normalizations) != 1:
-        raise ValueError(
-            "all samples in a temporal batch must share one normalization"
-        )
+        raise ValueError("all samples in a temporal batch must share one normalization")
     normalization_mean, normalization_std = next(iter(normalizations))
 
     num_frames = next(iter(frame_counts))
     anchor_index = next(iter(anchor_indices))
     max_height = _round_up(max(sample.frames.shape[-2] for sample in samples), block_size)
     max_width = _round_up(max(sample.frames.shape[-1] for sample in samples), block_size)
-    frames = samples[0].frames.new_zeros(
-        (len(samples), num_frames, 3, max_height, max_width)
-    )
+    frames = samples[0].frames.new_zeros((len(samples), num_frames, 3, max_height, max_width))
     masks = torch.ones(
         (len(samples), num_frames, max_height, max_width),
         dtype=torch.bool,
@@ -926,9 +864,7 @@ def temporal_collate_fn(
                     "tracknet_heatmap shape must match transformed frame size, "
                     f"got {tuple(heatmap.shape)} vs {(height, width)}"
                 )
-            padded_target["tracknet_heatmap"] = F.pad(
-                heatmap, (0, max_width - width, 0, max_height - height)
-            )
+            padded_target["tracknet_heatmap"] = F.pad(heatmap, (0, max_width - width, 0, max_height - height))
             padded_frame_targets.append(padded_target)
         batched_targets.append(tuple(padded_frame_targets))
 
@@ -939,9 +875,7 @@ def temporal_collate_fn(
         anchor_target["temporal_primary_label_indices"] = torch.stack(
             [target["primary_label_index"] for target in padded_frame_targets]
         )
-        anchor_target["temporal_image_ids"] = torch.cat(
-            [target["image_id"] for target in padded_frame_targets]
-        )
+        anchor_target["temporal_image_ids"] = torch.cat([target["image_id"] for target in padded_frame_targets])
         anchor_targets.append(anchor_target)
 
     temporal_batch = TemporalBatch(
@@ -959,9 +893,8 @@ def temporal_collate_fn(
 class TemporalRFDETRDataModule(LightningDataModule):
     """Small Lightning-compatible facade around temporal PyTorch DataLoaders.
 
-    It deliberately has no dependency on Lightning itself.  RF-DETR entrypoints
-    may pass the returned loaders to their training module or wrap this object in
-    the installed Lightning version.
+    It deliberately has no dependency on Lightning itself. RF-DETR entrypoints may pass the returned loaders to their
+    training module or wrap this object in the installed Lightning version.
     """
 
     def __init__(
@@ -999,15 +932,12 @@ class TemporalRFDETRDataModule(LightningDataModule):
         self.block_size = block_size
         self.train_horizontal_flip = bool(train_horizontal_flip)
         self.max_windows_per_split = {
-            _canonical_split(split): int(limit)
-            for split, limit in dict(max_windows_per_split or {}).items()
+            _canonical_split(split): int(limit) for split, limit in dict(max_windows_per_split or {}).items()
         }
         if any(limit < 1 for limit in self.max_windows_per_split.values()):
             raise ValueError("max_windows_per_split values must be positive")
         self.pin_memory = bool(pin_memory)
-        self.persistent_workers = (
-            self.num_workers > 0 if persistent_workers is None else bool(persistent_workers)
-        )
+        self.persistent_workers = self.num_workers > 0 if persistent_workers is None else bool(persistent_workers)
         if self.num_workers == 0 and self.persistent_workers:
             raise ValueError("persistent_workers requires num_workers > 0")
         self.datasets: dict[str, TemporalDataset] = {}
@@ -1016,12 +946,10 @@ class TemporalRFDETRDataModule(LightningDataModule):
 
     def prepare_data(self) -> None:
         """Validate that the descriptor and temporal index can be read."""
-
         load_temporal_index(self.data_yaml)
 
     def setup(self, stage: str | None = None) -> None:
         """Construct only datasets relevant to the requested stage."""
-
         requested: tuple[str, ...]
         if stage in (None, "fit"):
             requested = ("train", "val")
@@ -1078,7 +1006,6 @@ class TemporalRFDETRDataModule(LightningDataModule):
         dataloader_idx: int,
     ) -> tuple[TemporalBatch, list[dict[str, Tensor]]]:
         """Move both temporal frames and all detection/heatmap targets together."""
-
         del dataloader_idx
         samples, targets = batch
         moved_targets = [

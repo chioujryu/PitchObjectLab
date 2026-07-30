@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from pathlib import Path
 from shutil import rmtree
 
@@ -6,9 +8,6 @@ import hydra
 import numpy as np
 import torch
 from omegaconf import DictConfig
-from torchvision.ops import box_iou
-from tqdm import tqdm
-
 from src.dl.dataset import Loader, parse_yolo_label_file
 from src.dl.utils import (
     abs_xyxy_to_norm_xywh,
@@ -17,6 +16,8 @@ from src.dl.utils import (
     vis_one_box,
 )
 from src.infer.torch_model import Torch_model
+from torchvision.ops import box_iou
+from tqdm import tqdm
 
 
 def norm_xywh_to_xyxy(norm_boxes: torch.Tensor) -> torch.Tensor:
@@ -67,12 +68,8 @@ def check_results(
     output_dir: Path,
     label_to_name: dict,
 ):
-    """
-    Match predictions to targets:
-      - same class
-      - IoU >= iou_thresh (computed on normalized xyxy)
-      - pred score >= conf_thresh
-    Save unmatched predictions as FP and unmatched targets as FN.
+    """Match predictions to targets: - same class - IoU >= iou_thresh (computed on normalized xyxy) - pred score >=
+    conf_thresh Save unmatched predictions as FP and unmatched targets as FN.
     """
     H, W = img.shape[:2]
 
@@ -84,9 +81,7 @@ def check_results(
         pred_scores = torch.zeros((0,), dtype=torch.float32)
     else:
         pred_boxes_xyxy_abs = torch.as_tensor(preds["boxes"], dtype=torch.float32)  # abs xyxy
-        pred_boxes_norm_xywh = torch.as_tensor(
-            preds["norm_boxes"], dtype=torch.float32
-        )  # norm xywh
+        pred_boxes_norm_xywh = torch.as_tensor(preds["norm_boxes"], dtype=torch.float32)  # norm xywh
         pred_labels = torch.as_tensor(preds["labels"], dtype=torch.long)
         pred_scores = torch.as_tensor(preds["scores"], dtype=torch.float32)
 
@@ -216,9 +211,7 @@ def run(model, train_loader, val_loader, cfg: DictConfig) -> None:
                 pred["boxes"] = pred["boxes"].cpu()
                 pred["labels"] = pred["labels"].cpu()
                 pred["scores"] = pred["scores"].cpu()
-                pred["norm_boxes"] = abs_xyxy_to_norm_xywh(
-                    pred["boxes"], img.shape[0], img.shape[1]
-                )
+                pred["norm_boxes"] = abs_xyxy_to_norm_xywh(pred["boxes"], img.shape[0], img.shape[1])
 
             check_results(
                 img=img,
