@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
+import tempfile
+import unittest
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
-import tempfile
-import unittest
 from unittest.mock import MagicMock, patch
 
 import torch
-
 import train_rf_detr_model as trainer_runtime
 
 
@@ -166,9 +165,7 @@ class StandaloneSegmentationAccelerationTest(unittest.TestCase):
                     return_value={"matched": True},
                 )
             )
-            merge_matching = stack.enter_context(
-                patch("rfdetr.evaluation.matching.merge_matching_data")
-            )
+            merge_matching = stack.enter_context(patch("rfdetr.evaluation.matching.merge_matching_data"))
             stack.enter_context(
                 patch.object(
                     trainer_runtime,
@@ -218,9 +215,11 @@ class StandaloneSegmentationAccelerationTest(unittest.TestCase):
         targets = _targets()
         runtime = _FakeSegmentationRuntime()
 
-        with tempfile.TemporaryDirectory() as temporary, self._manual_environment(
-            (samples, targets)
-        ) as (datamodule, build_matching, merge_matching):
+        with tempfile.TemporaryDirectory() as temporary, self._manual_environment((samples, targets)) as (
+            datamodule,
+            build_matching,
+            merge_matching,
+        ):
             payload = self._evaluate(temporary, datamodule, runtime)
 
         runtime.infer_raw.assert_called_once()
@@ -282,11 +281,12 @@ class StandaloneSegmentationAccelerationTest(unittest.TestCase):
         for samples, message in invalid_batches:
             with self.subTest(message=message):
                 runtime = _FakeSegmentationRuntime()
-                with tempfile.TemporaryDirectory() as temporary, self._manual_environment(
-                    (samples, target)
-                ) as (datamodule, _build_matching, _merge_matching):
-                    with self.assertRaisesRegex(ValueError, message):
-                        self._evaluate(temporary, datamodule, runtime)
+                with tempfile.TemporaryDirectory() as temporary, self._manual_environment((samples, target)) as (
+                    datamodule,
+                    _build_matching,
+                    _merge_matching,
+                ), self.assertRaisesRegex(ValueError, message):
+                    self._evaluate(temporary, datamodule, runtime)
 
                 runtime.infer_raw.assert_not_called()
                 runtime.postprocess.assert_not_called()

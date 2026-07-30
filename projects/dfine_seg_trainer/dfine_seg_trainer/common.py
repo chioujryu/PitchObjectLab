@@ -10,7 +10,6 @@ import re
 import shutil
 import subprocess
 import sys
-import time
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -373,7 +372,7 @@ def environment_snapshot(region: str) -> dict[str, Any]:
     }
 
 
-def format_bytes(num_bytes: float | int | None) -> str:
+def format_bytes(num_bytes: float | None) -> str:
     """Format byte counts for terminal display."""
     if num_bytes is None:
         return "unknown"
