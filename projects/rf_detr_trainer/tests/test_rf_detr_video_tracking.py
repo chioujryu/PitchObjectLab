@@ -4,20 +4,19 @@ These tests use scripted detections and a tiny synthetic video, so no RF-DETR
 model is loaded.
 """
 
-from pathlib import Path
 import re
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
-
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 REPO_ROOT = PROJECT_DIR.parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-import rf_detr_video_tracking as vt  # noqa: E402
+import rf_detr_video_tracking as vt
 
 CATEGORIES = [
     {"id": 0, "name": "standing_player"},
@@ -201,7 +200,13 @@ class BoxmotConfigTest(unittest.TestCase):
                     "algorithm": "ocsort",
                     "per_class": True,
                     "reid_weights": "weights/osnet_x0_25_msmt17.pt",
-                    "ocsort": {"max_age": 50, "asso_threshold": 0.4, "use_byte": True, "Q_xy_scaling": 1.0, "Q_s_scaling": 0.5},
+                    "ocsort": {
+                        "max_age": 50,
+                        "asso_threshold": 0.4,
+                        "use_byte": True,
+                        "Q_xy_scaling": 1.0,
+                        "Q_s_scaling": 0.5,
+                    },
                     "bytetrack": {"track_buffer": 40},
                     "botsort": {"with_reid": False},
                     "deepocsort": {"iou_threshold": 0.2},
@@ -285,19 +290,24 @@ class TrackingSummaryTest(unittest.TestCase):
 
 
 class TrackVisibilityTest(unittest.TestCase):
-    def _track(self, hits=5, last_seen=40, frames=range(0, 41)):
+    def _track(self, hits=5, last_seen=40, frames=range(41)):
         from collections import deque
 
         return vt.TrackedBall(
-            track_id=1, center_x=0.0, center_y=0.0, base_radius=80.0,
-            hits=hits, first_frame_index=0, last_seen_frame_index=last_seen,
+            track_id=1,
+            center_x=0.0,
+            center_y=0.0,
+            base_radius=80.0,
+            hits=hits,
+            first_frame_index=0,
+            last_seen_frame_index=last_seen,
             points=deque([(frame, float(frame), 0.0) for frame in frames]),
         )
 
     def test_is_track_visible_hides_stale_track(self):
         cfg = make_config(trajectory_max_age_frames=10)
         track = self._track(hits=5, last_seen=40)
-        self.assertTrue(vt.is_track_visible(track, 45, cfg))   # 5 frames since last seen -> visible
+        self.assertTrue(vt.is_track_visible(track, 45, cfg))  # 5 frames since last seen -> visible
         self.assertFalse(vt.is_track_visible(track, 55, cfg))  # 15 frames -> stale, hidden
         # unconfirmed (hits < min_hits) is hidden even if recent
         unconfirmed_cfg = make_config(trajectory_max_age_frames=10, min_hits=3)
@@ -306,10 +316,12 @@ class TrackVisibilityTest(unittest.TestCase):
         self.assertTrue(vt.is_track_visible(track, 9999, make_config(trajectory_max_age_frames=None)))
 
     def test_trail_points_age_filtered(self):
-        track = self._track(frames=range(0, 41))
+        track = self._track(frames=range(41))
         frames_drawn = [int(x) for (x, _y) in vt.trail_points(track, 40, make_config(trajectory_max_age_frames=10))]
         self.assertEqual(frames_drawn, list(range(30, 41)))  # only points within 10 frames of frame 40
-        self.assertEqual(len(vt.trail_points(track, 40, make_config(trajectory_max_age_frames=None))), 41)  # null -> all
+        self.assertEqual(
+            len(vt.trail_points(track, 40, make_config(trajectory_max_age_frames=None))), 41
+        )  # null -> all
 
     def test_live_center_extrapolates_during_gap(self):
         track = self._track(hits=5, last_seen=40)
@@ -318,13 +330,15 @@ class TrackVisibilityTest(unittest.TestCase):
         moving = make_config(use_velocity_prediction=True)
         self.assertEqual(vt.live_center(track, 43, moving), (112.0, 50.0))  # gap 3 -> 100 + 4*3
         self.assertEqual(vt.live_center(track, 40, moving), (100.0, 50.0))  # gap 0 -> last center
-        self.assertEqual(vt.live_center(track, 43, make_config(use_velocity_prediction=False)), (100.0, 50.0))  # velocity off
+        self.assertEqual(
+            vt.live_center(track, 43, make_config(use_velocity_prediction=False)), (100.0, 50.0)
+        )  # velocity off
         self.assertEqual(vt.live_center(track, None, moving), (100.0, 50.0))  # no current frame
 
 
 # --- O4: synthetic end-to-end video test (no RF-DETR model) -----------------
 
-import inference_rf_detr_model as inference_runner  # noqa: E402
+import inference_rf_detr_model as inference_runner
 
 # frame_index -> list of ball centers detected on that frame.
 SCRIPT = {0: [(20, 20)], 1: [(24, 20)], 2: [(28, 20)], 3: [(32, 20)], 4: [(36, 20)], 5: [(40, 20)]}
@@ -352,7 +366,10 @@ def _fake_predict_image(record, model, prediction_config, output_dir, save_visua
 
 def _fake_predict_images_rfdetr(records, model, batch_config, output_dir):
     predictions = [
-        [_scripted_prediction(record.image_id, cx, cy) for cx, cy in SCRIPT.get(_frame_index_from_name(record.file_name), [])]
+        [
+            _scripted_prediction(record.image_id, cx, cy)
+            for cx, cy in SCRIPT.get(_frame_index_from_name(record.file_name), [])
+        ]
         for record in records
     ]
     return predictions, None, None
@@ -481,9 +498,7 @@ class SyntheticVideoTrackingTest(unittest.TestCase):
                         inference_runner.evaluator, "predict_image", fake_predict_image
                     ), mock.patch.object(
                         inference_runner.evaluator, "predict_images_rfdetr", fake_predict_batch
-                    ), mock.patch.object(
-                        inference_runner, "create_tracker", return_value=tracker
-                    ), mock.patch.object(
+                    ), mock.patch.object(inference_runner, "create_tracker", return_value=tracker), mock.patch.object(
                         inference_runner, "draw_predictions", side_effect=capture_render
                     ):
                         rows, _, _ = inference_runner.predict_video_file(
