@@ -1,11 +1,9 @@
-
-
 # Train/val/test sets as 1) dir: path/to/imgs, 2) file: path/to/imgs.txt, or 3) list: [path/to/imgs1, path/to/imgs2, ..]
 path: /home/new_users/zhiyu/datasets/soccer/spatial_perception/Xbotgo/空中足球数据集V1/yolo/yolo_dataset # dataset root dir
 train: images/train # train images (relative to 'path') 4 images
 val: images/val # val images (relative to 'path') 4 images
-test: images/test  # test-original/images | images/test
-test-original: test-original/images  # test-original/images | images/test
+test: images/test # test-original/images | images/test
+test-original: test-original/images # test-original/images | images/test
 
 # Classes
 names:

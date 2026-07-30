@@ -10,11 +10,10 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_DIR))
 
-import train_rf_detr_model as trainer  # noqa: E402
+import train_rf_detr_model as trainer
 
 
 class TemporalNumClassesAlignmentTest(unittest.TestCase):

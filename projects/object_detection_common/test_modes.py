@@ -12,7 +12,7 @@ import csv
 import json
 import math
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Mapping, Sequence
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -57,7 +57,7 @@ def is_sahi_mode(config: Mapping[str, Any]) -> bool:
     return canonical_test_mode(config) == SAHI_MODE
 
 
-def default_crop_config(config: Mapping[str, Any]) -> Dict[str, Any]:
+def default_crop_config(config: Mapping[str, Any]) -> dict[str, Any]:
     """Return crop config with defaults applied."""
     crop = dict(config.get("crop", {}) or {})
     crop.setdefault("class_ids", [])
@@ -70,7 +70,7 @@ def default_crop_config(config: Mapping[str, Any]) -> Dict[str, Any]:
     return crop
 
 
-def coco_xywh_to_xyxy(bbox: Sequence[float]) -> Tuple[float, float, float, float]:
+def coco_xywh_to_xyxy(bbox: Sequence[float]) -> tuple[float, float, float, float]:
     """Convert COCO xywh to xyxy."""
     x, y, w, h = [float(value) for value in bbox[:4]]
     return x, y, x + w, y + h
@@ -80,7 +80,7 @@ def xyxy_to_coco_bbox(
     box: Sequence[float],
     width: int,
     height: int,
-) -> Optional[Tuple[List[float], float]]:
+) -> tuple[list[float], float] | None:
     """Clip xyxy to an image and return COCO xywh plus area."""
     x1, y1, x2, y2 = [float(value) for value in box[:4]]
     x1 = max(0.0, min(float(width), x1))
@@ -141,7 +141,7 @@ def bbox_match_score_xyxy(a: Sequence[float], b: Sequence[float], metric: str) -
     return bbox_iou_xyxy(a, b)
 
 
-def merge_coco_prediction_cluster(cluster: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+def merge_coco_prediction_cluster(cluster: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """Merge one SAHI duplicate cluster using the union box and best score/class."""
     if not cluster:
         raise ValueError("Cannot merge an empty prediction cluster.")
@@ -168,32 +168,40 @@ def coco_box_matches_any_cluster_box(
     match_threshold: float,
 ) -> bool:
     """Return True when a candidate overlaps any box already assigned to a cluster."""
-    return any(bbox_match_score_xyxy(candidate_box, cluster_box, match_metric) >= match_threshold for cluster_box in cluster_boxes)
+    return any(
+        bbox_match_score_xyxy(candidate_box, cluster_box, match_metric) >= match_threshold
+        for cluster_box in cluster_boxes
+    )
 
 
 def nms_coco_predictions(
     predictions: Sequence[Mapping[str, Any]],
     iou_threshold: float = 0.5,
     class_agnostic: bool = False,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Apply simple score-descending NMS to COCO prediction rows."""
     threshold = max(0.0, min(1.0, float(iou_threshold)))
-    groups: Dict[Tuple[int, int], List[Mapping[str, Any]]] = {}
+    groups: dict[tuple[int, int], list[Mapping[str, Any]]] = {}
     for prediction in predictions:
         image_id = int(prediction.get("image_id", 0))
         class_key = -1 if class_agnostic else int(prediction.get("category_id", 0))
         groups.setdefault((image_id, class_key), []).append(prediction)
 
-    kept: List[Dict[str, Any]] = []
+    kept: list[dict[str, Any]] = []
     for group in groups.values():
         ordered = sorted(group, key=lambda item: float(item.get("score", 0.0)), reverse=True)
-        selected: List[Mapping[str, Any]] = []
+        selected: list[Mapping[str, Any]] = []
         for prediction in ordered:
             box = coco_xywh_to_xyxy(prediction.get("bbox", [0, 0, 0, 0]))
-            if all(bbox_iou_xyxy(box, coco_xywh_to_xyxy(other.get("bbox", [0, 0, 0, 0]))) <= threshold for other in selected):
+            if all(
+                bbox_iou_xyxy(box, coco_xywh_to_xyxy(other.get("bbox", [0, 0, 0, 0]))) <= threshold
+                for other in selected
+            ):
                 selected.append(prediction)
         kept.extend(dict(item) for item in selected)
-    kept.sort(key=lambda item: (int(item.get("image_id", 0)), int(item.get("category_id", 0)), -float(item.get("score", 0.0))))
+    kept.sort(
+        key=lambda item: (int(item.get("image_id", 0)), int(item.get("category_id", 0)), -float(item.get("score", 0.0)))
+    )
     return kept
 
 
@@ -203,7 +211,7 @@ def postprocess_sahi_coco_predictions(
     match_metric: str = "IOS",
     match_threshold: float = 0.5,
     class_agnostic: bool = False,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Postprocess SAHI-style slice predictions with NMS or greedy non-max merging."""
     normalized_type = str(postprocess_type or "GREEDYNMM").strip().upper()
     if normalized_type in {"NMS", "LSNMS"}:
@@ -216,23 +224,23 @@ def postprocess_sahi_coco_predictions(
         raise ValueError("SAHI postprocess_type must be GREEDYNMM, NMM, NMS, or LSNMS.")
 
     threshold = max(0.0, min(1.0, float(match_threshold)))
-    groups: Dict[Tuple[int, int], List[Mapping[str, Any]]] = {}
+    groups: dict[tuple[int, int], list[Mapping[str, Any]]] = {}
     for prediction in predictions:
         image_id = int(prediction.get("image_id", 0))
         class_key = -1 if class_agnostic else int(prediction.get("category_id", 0))
         groups.setdefault((image_id, class_key), []).append(prediction)
 
-    kept: List[Dict[str, Any]] = []
+    kept: list[dict[str, Any]] = []
     for group in groups.values():
         pending = sorted(group, key=lambda item: float(item.get("score", 0.0)), reverse=True)
         while pending:
             seed = pending.pop(0)
-            matched: List[Mapping[str, Any]] = [seed]
-            cluster_boxes: List[Tuple[float, float, float, float]] = [coco_xywh_to_xyxy(seed.get("bbox", [0, 0, 0, 0]))]
+            matched: list[Mapping[str, Any]] = [seed]
+            cluster_boxes: list[tuple[float, float, float, float]] = [coco_xywh_to_xyxy(seed.get("bbox", [0, 0, 0, 0]))]
             expanded = True
             while expanded:
                 expanded = False
-                remaining: List[Mapping[str, Any]] = []
+                remaining: list[Mapping[str, Any]] = []
                 for candidate in pending:
                     candidate_box = coco_xywh_to_xyxy(candidate.get("bbox", [0, 0, 0, 0]))
                     if coco_box_matches_any_cluster_box(candidate_box, cluster_boxes, match_metric, threshold):
@@ -247,14 +255,16 @@ def postprocess_sahi_coco_predictions(
                 kept.append(merge_coco_prediction_cluster(matched))
             else:
                 kept.append(dict(seed))
-    kept.sort(key=lambda item: (int(item.get("image_id", 0)), int(item.get("category_id", 0)), -float(item.get("score", 0.0))))
+    kept.sort(
+        key=lambda item: (int(item.get("image_id", 0)), int(item.get("category_id", 0)), -float(item.get("score", 0.0)))
+    )
     return kept
 
 
-def category_maps(categories: Sequence[Mapping[str, Any]]) -> Tuple[Dict[int, str], Dict[str, int]]:
+def category_maps(categories: Sequence[Mapping[str, Any]]) -> tuple[dict[int, str], dict[str, int]]:
     """Build category id/name maps."""
-    id_to_name: Dict[int, str] = {}
-    name_to_id: Dict[str, int] = {}
+    id_to_name: dict[int, str] = {}
+    name_to_id: dict[str, int] = {}
     for category in categories:
         category_id = int(category["id"])
         name = str(category.get("name", category_id))
@@ -263,7 +273,7 @@ def category_maps(categories: Sequence[Mapping[str, Any]]) -> Tuple[Dict[int, st
     return id_to_name, name_to_id
 
 
-def config_list(value: Any) -> List[Any]:
+def config_list(value: Any) -> list[Any]:
     """Normalize scalar/list config values to a list."""
     if value is None or value == "":
         return []
@@ -276,10 +286,10 @@ def config_list(value: Any) -> List[Any]:
     return [value]
 
 
-def resolve_crop_class_ids(categories: Sequence[Mapping[str, Any]], crop_cfg: Mapping[str, Any]) -> List[int]:
+def resolve_crop_class_ids(categories: Sequence[Mapping[str, Any]], crop_cfg: Mapping[str, Any]) -> list[int]:
     """Resolve crop class ids. Empty means all predicted classes are eligible."""
     id_to_name, name_to_id = category_maps(categories)
-    selected: List[int] = []
+    selected: list[int] = []
     seen = set()
     for value in config_list(crop_cfg.get("class_ids")):
         category_id = int(value)
@@ -306,7 +316,7 @@ def select_crop_window_from_predictions(
     categories: Sequence[Mapping[str, Any]],
     width: int,
     height: int,
-) -> Optional[Tuple[int, int, int, int, int]]:
+) -> tuple[int, int, int, int, int] | None:
     """Return padded crop window from prediction boxes, or None when no class matches."""
     selected_ids = set(resolve_crop_class_ids(categories, crop_cfg))
     source_conf = crop_cfg.get("source_conf")
@@ -339,10 +349,10 @@ def select_crop_window_from_predictions(
     y2 = min(float(height), y2 + pad_y)
     if x2 <= x1 or y2 <= y1:
         return None
-    ix1 = int(math.floor(x1))
-    iy1 = int(math.floor(y1))
-    ix2 = int(math.ceil(x2))
-    iy2 = int(math.ceil(y2))
+    ix1 = math.floor(x1)
+    iy1 = math.floor(y1)
+    ix2 = math.ceil(x2)
+    iy2 = math.ceil(y2)
     ix2 = max(ix1 + 1, min(int(width), ix2))
     iy2 = max(iy1 + 1, min(int(height), iy2))
     return ix1, iy1, ix2 - ix1, iy2 - iy1, len(eligible)
@@ -354,9 +364,9 @@ def project_predictions_to_original(
     offset_y: int,
     original_width: int,
     original_height: int,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Project crop-local COCO predictions back to original image coordinates."""
-    projected: List[Dict[str, Any]] = []
+    projected: list[dict[str, Any]] = []
     for prediction in predictions:
         x, y, w, h = [float(value) for value in prediction.get("bbox", [0, 0, 0, 0])[:4]]
         converted = xyxy_to_coco_bbox(
@@ -376,14 +386,14 @@ def project_predictions_to_original(
     return projected
 
 
-def slice_axis_starts(length: int, window: int, overlap_ratio: float) -> List[int]:
+def slice_axis_starts(length: int, window: int, overlap_ratio: float) -> list[int]:
     """Return deterministic starts that cover one image axis."""
     length = max(1, int(length))
     window = max(1, min(int(window), length))
     if window >= length:
         return [0]
     overlap_ratio = max(0.0, min(0.95, float(overlap_ratio)))
-    step = max(1, int(round(window * (1.0 - overlap_ratio))))
+    step = max(1, round(window * (1.0 - overlap_ratio)))
     last_start = length - window
     starts = list(range(0, last_start + 1, step))
     if not starts or starts[-1] != last_start:
@@ -398,7 +408,7 @@ def generate_slice_windows_for_size(
     slice_height: int,
     overlap_width_ratio: float = 0.2,
     overlap_height_ratio: float = 0.2,
-) -> List[Tuple[int, int, int, int]]:
+) -> list[tuple[int, int, int, int]]:
     """Generate SAHI-style slice windows as x, y, width, height."""
     y_starts = slice_axis_starts(height, slice_height, overlap_height_ratio)
     x_starts = slice_axis_starts(width, slice_width, overlap_width_ratio)
@@ -411,7 +421,7 @@ def generate_slice_windows_for_size(
     ]
 
 
-def bbox_intersects_window(bbox: Sequence[float], window: Tuple[int, int, int, int]) -> bool:
+def bbox_intersects_window(bbox: Sequence[float], window: tuple[int, int, int, int]) -> bool:
     """Return whether a COCO xywh bbox intersects a window."""
     x, y, w, h = [float(value) for value in bbox[:4]]
     wx, wy, ww, wh = [float(value) for value in window]
@@ -420,8 +430,8 @@ def bbox_intersects_window(bbox: Sequence[float], window: Tuple[int, int, int, i
 
 def bbox_to_window_local(
     bbox: Sequence[float],
-    window: Tuple[int, int, int, int],
-) -> Optional[List[float]]:
+    window: tuple[int, int, int, int],
+) -> list[float] | None:
     """Clip a COCO bbox to a window and return local xywh."""
     x, y, w, h = [float(value) for value in bbox[:4]]
     wx, wy, ww, wh = [float(value) for value in window]
@@ -438,12 +448,12 @@ def build_model_input_cases(
     images: Sequence[Any],
     config: Mapping[str, Any],
     stats_rows: Sequence[Mapping[str, Any]],
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Build manifest rows for images actually sent to the model."""
     mode = canonical_test_mode(config)
     sahi_cfg = config.get("sahi", {})
     stats_by_image = {int(row.get("image_id", 0)): row for row in stats_rows}
-    cases: List[Dict[str, Any]] = []
+    cases: list[dict[str, Any]] = []
     case_index = 1
     for image in images:
         image_id = int(get_value(image, "image_id"))
@@ -524,9 +534,9 @@ def _font() -> ImageFont.ImageFont:
 def _draw_boxes(
     draw: ImageDraw.ImageDraw,
     boxes: Sequence[Mapping[str, Any]],
-    window: Tuple[int, int, int, int],
+    window: tuple[int, int, int, int],
     scale: float,
-    color: Tuple[int, int, int],
+    color: tuple[int, int, int],
     names: Mapping[int, str],
     with_scores: bool,
 ) -> None:
@@ -582,7 +592,12 @@ def _render_batch_grid(
 
         overlay = Image.new("RGBA", (tile_size, tile_size), (0, 0, 0, 0))
         shifted = ImageDraw.Draw(overlay)
-        draw_offset_window = (window[0] - paste_x / scale, window[1] - paste_y / scale, tile_size / scale, tile_size / scale)
+        draw_offset_window = (
+            window[0] - paste_x / scale,
+            window[1] - paste_y / scale,
+            tile_size / scale,
+            tile_size / scale,
+        )
         image_id = int(case["image_id"])
         if draw_predictions:
             _draw_boxes(
@@ -621,7 +636,7 @@ def write_model_input_artifacts(
     config: Mapping[str, Any],
     stats_rows: Sequence[Mapping[str, Any]],
     prefix: str = "test",
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Write model-input manifest and Ultralytics-style batch grids."""
     cases = build_model_input_cases(images, config, stats_rows)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -648,10 +663,10 @@ def write_model_input_artifacts(
     json_path = output_dir / "model_inputs_manifest.json"
     json_path.write_text(json.dumps({"cases": cases}, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    annotations_by_image: Dict[int, List[Mapping[str, Any]]] = {}
+    annotations_by_image: dict[int, list[Mapping[str, Any]]] = {}
     for annotation in annotations:
         annotations_by_image.setdefault(int(annotation["image_id"]), []).append(annotation)
-    predictions_by_image: Dict[int, List[Mapping[str, Any]]] = {}
+    predictions_by_image: dict[int, list[Mapping[str, Any]]] = {}
     for prediction in predictions:
         predictions_by_image.setdefault(int(prediction["image_id"]), []).append(prediction)
     names, _ = category_maps(categories)
@@ -670,8 +685,16 @@ def write_model_input_artifacts(
             break
         labels_path = output_dir / f"{prefix}_batch{batch_index}_labels.jpg"
         preds_path = output_dir / f"{prefix}_batch{batch_index}_pred.jpg"
-        _render_batch_grid(batch_cases, annotations_by_image, predictions_by_image, names, labels_path, draw_predictions=False)
-        _render_batch_grid(batch_cases, annotations_by_image, predictions_by_image, names, preds_path, draw_predictions=True)
-        manifest_rows.append({"path": str(labels_path), "kind": "model_inputs", "description": "Model input label batch grid."})
-        manifest_rows.append({"path": str(preds_path), "kind": "model_inputs", "description": "Model input prediction batch grid."})
+        _render_batch_grid(
+            batch_cases, annotations_by_image, predictions_by_image, names, labels_path, draw_predictions=False
+        )
+        _render_batch_grid(
+            batch_cases, annotations_by_image, predictions_by_image, names, preds_path, draw_predictions=True
+        )
+        manifest_rows.append(
+            {"path": str(labels_path), "kind": "model_inputs", "description": "Model input label batch grid."}
+        )
+        manifest_rows.append(
+            {"path": str(preds_path), "kind": "model_inputs", "description": "Model input prediction batch grid."}
+        )
     return manifest_rows

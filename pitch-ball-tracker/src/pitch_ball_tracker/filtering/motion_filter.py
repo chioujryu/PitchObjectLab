@@ -10,21 +10,20 @@ from pitch_ball_tracker.detection.ball_filter import BallCandidate
 
 
 class MotionFilter:
-    """
-    Filters ball candidates by motion magnitude computed from optical flow.
+    """Filters ball candidates by motion magnitude computed from optical flow.
 
     Strategy:
-      - Maintain a ring buffer of recent grayscale frames.
-      - Compute Farneback dense optical flow between the oldest and newest
+    - Maintain a ring buffer of recent grayscale frames.
+    - Compute Farneback dense optical flow between the oldest and newest
         buffered frame, giving a per-pixel (u, v) motion field.
-      - For each candidate, average |flow| over the bounding-box region.
-      - Candidates below `min_motion_px` are classified as stationary.
-      - Stationary candidates outside the field are removed outright.
-        Stationary candidates inside the field have their score penalised
+    - For each candidate, average |flow| over the bounding-box region.
+    - Candidates below `min_motion_px` are classified as stationary.
+    - Stationary candidates outside the field are removed outright.
+        Stationary candidates inside the field have their score penalized
         (configurable) so the tracker still sees them but with low confidence.
 
     Camera shake:
-      - The global mean flow is subtracted from each candidate's flow before
+    - The global mean flow is subtracted from each candidate's flow before
         thresholding, partially compensating for panning/shaking camera.
     """
 
@@ -38,7 +37,7 @@ class MotionFilter:
         self._penalty: float = mc.stationary_score_penalty
 
         self._gray_buffer: deque[np.ndarray] = deque(maxlen=max(self._history, 2))
-        self._flow: np.ndarray | None = None   # cached flow from last compute
+        self._flow: np.ndarray | None = None  # cached flow from last compute
 
     # ------------------------------------------------------------------
     # Public API
@@ -56,23 +55,20 @@ class MotionFilter:
         candidates: list[BallCandidate],
         field_mask: np.ndarray | None,
     ) -> list[BallCandidate]:
-        """
-        Apply motion filtering to `candidates`.
+        """Apply motion filtering to `candidates`.
 
         Args:
-            candidates : output from BallFilter.
-            field_mask : boolean HxW mask; True = inside field.  If None,
-                         stationary candidates are never penalised (treated as
-                         outside-field rule is skipped).
+            candidates: output from BallFilter.
+            field_mask: boolean HxW mask; True = inside field. If None, stationary candidates are never penalized
+                (treated as outside-field rule is skipped).
+
         Returns:
             Filtered + possibly score-penalised list of BallCandidate.
         """
         if not self._enabled or self._flow is None:
             return candidates
 
-        flow_mag = np.sqrt(
-            self._flow[..., 0] ** 2 + self._flow[..., 1] ** 2
-        ).astype(np.float32)
+        flow_mag = np.sqrt(self._flow[..., 0] ** 2 + self._flow[..., 1] ** 2).astype(np.float32)
 
         # Camera-shake compensation: subtract global median motion magnitude
         global_median = float(np.median(flow_mag))
@@ -92,17 +88,17 @@ class MotionFilter:
                 # Outside field and stationary → discard
                 continue
 
-            # Inside field and stationary → penalise score
+            # Inside field and stationary → penalize score
             if self._penalise:
-                penalised = BallCandidate(
+                penalized = BallCandidate(
                     box=c.box,
                     mask=c.mask,
                     score=c.score * self._penalty,
                     circularity=c.circularity,
                     area=c.area,
                 )
-                kept.append(penalised)
-            # If penalise disabled, drop stationary-inside-field too
+                kept.append(penalized)
+            # If penalize disabled, drop stationary-inside-field too
 
         return kept
 
@@ -116,18 +112,20 @@ class MotionFilter:
         curr = self._gray_buffer[-1]
         if self._method == "farneback":
             flow = cv2.calcOpticalFlowFarneback(
-                prev, curr,
+                prev,
+                curr,
                 None,
-                pyr_scale=0.5, levels=3, winsize=15,
-                iterations=3, poly_n=5, poly_sigma=1.2,
+                pyr_scale=0.5,
+                levels=3,
+                winsize=15,
+                iterations=3,
+                poly_n=5,
+                poly_sigma=1.2,
                 flags=0,
             )
         else:
             # Lucas-Kanade sparse → dense approximation via Farneback fallback
-            flow = cv2.calcOpticalFlowFarneback(
-                prev, curr, None,
-                0.5, 3, 15, 3, 5, 1.2, 0
-            )
+            flow = cv2.calcOpticalFlowFarneback(prev, curr, None, 0.5, 3, 15, 3, 5, 1.2, 0)
         return flow  # (H, W, 2)
 
     @staticmethod
@@ -144,9 +142,9 @@ class MotionFilter:
 
     @staticmethod
     def _is_in_field(box: np.ndarray, field_mask: np.ndarray | None) -> bool:
-        """Check whether the centre of the box lies inside the field mask."""
+        """Check whether the center of the box lies inside the field mask."""
         if field_mask is None:
-            return True   # no mask → treat as inside (conservative)
+            return True  # no mask → treat as inside (conservative)
         cx = int((box[0] + box[2]) / 2)
         cy = int((box[1] + box[3]) / 2)
         H, W = field_mask.shape

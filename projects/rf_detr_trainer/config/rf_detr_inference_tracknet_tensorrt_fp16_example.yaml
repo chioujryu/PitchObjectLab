@@ -21,10 +21,10 @@ model:
       precision: fp32
     tensorrt:
       precision: fp16
-      engine_path: ''
-      manifest_path: ''
+      engine_path: ""
+      manifest_path: ""
       # Empty resolves to runs/rf_detr/tensorrt_cache under rf_detr_trainer; absolute paths remain supported.
-      cache_dir: 'runs/rf_detr/tensorrt_cache'
+      cache_dir: "runs/rf_detr/tensorrt_cache"
       workspace_gib: 4
       force_rebuild: false
       profile:
@@ -69,12 +69,12 @@ model:
 
 dataset:
   class_names: []
-  data_yaml: ''
+  data_yaml: ""
 
 output:
-  output_dir: ''
+  output_dir: ""
   root: runs/rf_detr/inference
-  name: 'rfdetr_tracknet_tensorrt_fp16_{timestamp}'
+  name: "rfdetr_tracknet_tensorrt_fp16_{timestamp}"
   exist_ok: false
 
 inference:
