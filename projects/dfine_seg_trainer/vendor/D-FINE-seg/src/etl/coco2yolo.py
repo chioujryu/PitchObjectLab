@@ -6,18 +6,15 @@ from tqdm import tqdm
 
 
 def convert_coco_json(json_dir="../coco/annotations/", use_segments=False):
-    """
-    Convert COCO format annotations to YOLO format.
+    """Convert COCO format annotations to YOLO format.
 
     Args:
         json_dir: Directory containing COCO JSON annotation files
         use_segments: If True, output polygon segmentations; if False, output bounding boxes
-
-    COCO bbox format: [top-left x, top-left y, width, height] (absolute pixels)
-    YOLO bbox format: [center x, center y, width, height] (normalized 0-1)
-
-    COCO segmentation: [[x1, y1, x2, y2, ...], ...] (absolute pixels, can have multiple polygons)
-    YOLO segmentation: [x1, y1, x2, y2, ...] (normalized 0-1, single polygon per line)
+        COCO bbox format: [top-left x, top-left y, width, height] (absolute pixels)
+        YOLO bbox format: [center x, center y, width, height] (normalized 0-1)
+        COCO segmentation: [[x1, y1, x2, y2, ...], ...] (absolute pixels, can have multiple polygons)
+        YOLO segmentation: [x1, y1, x2, y2, ...] (normalized 0-1, single polygon per line)
     """
     save_dir = Path(json_dir).parent / "yolo_labels"
     save_dir.mkdir(exist_ok=True)
@@ -38,19 +35,18 @@ def convert_coco_json(json_dir="../coco/annotations/", use_segments=False):
         # Write labels.txt with category names
         labels_file = fn / "labels.txt"
         with open(labels_file, "w") as f:
-            for name in cat_names:
-                f.write(f"{name}\n")
+            f.writelines(f"{name}\n" for name in cat_names)
         print(f"Created {labels_file} with {len(cat_names)} classes")
 
         # Create image dict
-        images = {"%g" % x["id"]: x for x in data["images"]}
+        images = {"{:g}".format(x["id"]): x for x in data["images"]}
 
         # Write labels file
         for x in tqdm(data["annotations"], desc=f"Annotations {json_file}"):
             if x.get("iscrowd", 0):
                 continue
 
-            img = images.get("%g" % x["image_id"])
+            img = images.get("{:g}".format(x["image_id"]))
             if img is None:
                 continue
 

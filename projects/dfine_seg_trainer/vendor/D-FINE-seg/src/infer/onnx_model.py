@@ -1,4 +1,4 @@
-from typing import Dict, List, Tuple
+from __future__ import annotations
 
 import cv2
 import numpy as np
@@ -13,7 +13,7 @@ class ONNX_model:
         self,
         model_path: str,
         n_outputs: int,
-        conf_thresh: float | List[float] = 0.5,
+        conf_thresh: float | list[float] = 0.5,
         binarize_masks: bool = True,
         mask_threshold: float = 0.5,
         rect: bool = False,
@@ -47,12 +47,8 @@ class ONNX_model:
 
     def _load_model(self) -> None:
         providers = ["CUDAExecutionProvider"] if self.device == "cuda" else ["CPUExecutionProvider"]
-        provider_options = (
-            [{"cudnn_conv_algo_search": "DEFAULT"}] if self.device == "cuda" else [{}]
-        )
-        self.model = ort.InferenceSession(
-            self.model_path, providers=providers, provider_options=provider_options
-        )
+        provider_options = [{"cudnn_conv_algo_search": "DEFAULT"}] if self.device == "cuda" else [{}]
+        self.model = ort.InferenceSession(self.model_path, providers=providers, provider_options=provider_options)
         print(f"ONNX model loaded: {self.model_path} on {self.device}")
 
     def _read_model_metadata(self):
@@ -85,13 +81,13 @@ class ONNX_model:
         processed_size,  # (H, W) of network input (after your A.Compose)
         orig_sizes,  # Tensor [B, 2] (H, W)
         keep_ratio: bool,
-    ) -> List[torch.Tensor]:
+    ) -> list[torch.Tensor]:
         """Resize masks to original image size, handling letterbox padding if needed."""
         single = pred_masks.dim() == 3  # [Q,Hm,Wm]
         if single:
             pred_masks = pred_masks.unsqueeze(0)  # -> [1,Q,Hm,Wm]
 
-        B, Q, Hm, Wm = pred_masks.shape
+        B, _Q, Hm, Wm = pred_masks.shape
         proc_h, proc_w = int(processed_size[0]), int(processed_size[1])
 
         out = []
@@ -121,26 +117,20 @@ class ONNX_model:
 
         return [out[0]] if single else out
 
-    def _compute_nearest_size(self, shape, target_size, stride=32) -> Tuple[int, int]:
-        """Get nearest size that is divisible by 32"""
+    def _compute_nearest_size(self, shape, target_size, stride=32) -> tuple[int, int]:
+        """Get nearest size that is divisible by 32."""
         scale = target_size / max(shape)
-        new_shape = [int(round(dim * scale)) for dim in shape]
+        new_shape = [round(dim * scale) for dim in shape]
         return [max(stride, int(np.ceil(dim / stride) * stride)) for dim in new_shape]
 
     def _preprocess(self, img: NDArray, stride: int = 32, bgr: bool = True) -> torch.tensor:
         if not self.keep_ratio:  # simple resize
-            img = cv2.resize(
-                img, (self.input_size[1], self.input_size[0]), interpolation=cv2.INTER_LINEAR
-            )
+            img = cv2.resize(img, (self.input_size[1], self.input_size[0]), interpolation=cv2.INTER_LINEAR)
         elif self.rect:  # keep ratio and cut paddings
-            target_height, target_width = self._compute_nearest_size(
-                img.shape[:2], max(*self.input_size)
-            )
+            target_height, target_width = self._compute_nearest_size(img.shape[:2], max(*self.input_size))
             img = letterbox(img, (target_height, target_width), stride=stride, auto=False)[0]
         else:  # keep ratio adding paddings
-            img = letterbox(
-                img, (self.input_size[0], self.input_size[1]), stride=stride, auto=False
-            )[0]
+            img = letterbox(img, (self.input_size[0], self.input_size[1]), stride=stride, auto=False)[0]
 
         # 3ch BGR (cv2.imread) needs a swap; 3ch .npy is RGB already; >3ch is RGB+extras.
         if self.channels == 3 and bgr:
@@ -168,21 +158,19 @@ class ONNX_model:
             for idx, image in enumerate(inputs):
                 processed_inputs[idx] = self._preprocess(image, bgr=bgr)
                 original_sizes.append((image.shape[0], image.shape[1]))
-                processed_sizes.append(
-                    (processed_inputs[idx].shape[1], processed_inputs[idx].shape[2])
-                )
+                processed_sizes.append((processed_inputs[idx].shape[1], processed_inputs[idx].shape[2]))
         return processed_inputs, processed_sizes, original_sizes
 
-    def _predict(self, inputs: NDArray) -> List[NDArray]:
+    def _predict(self, inputs: NDArray) -> list[NDArray]:
         ort_inputs = {self.model.get_inputs()[0].name: inputs.astype(self.np_dtype)}
         return self.model.run(None, ort_inputs)
 
     def _postprocess(
         self,
-        outputs: List[NDArray],
-        processed_sizes: List[Tuple[int, int]],
-        original_sizes: List[Tuple[int, int]],
-    ) -> List[Dict[str, torch.Tensor]]:
+        outputs: list[NDArray],
+        processed_sizes: list[tuple[int, int]],
+        original_sizes: list[tuple[int, int]],
+    ) -> list[dict[str, torch.Tensor]]:
         """Confidence filtering + box rescaling + mask resize."""
         labels = torch.from_numpy(outputs[0])  # [B, K]
         boxes = torch.from_numpy(outputs[1])  # [B, K, 4], absolute xyxy in input_size space
@@ -231,28 +219,20 @@ class ONNX_model:
             results.append(out)
         return results
 
-    def __call__(
-        self, inputs: NDArray[np.uint8], bgr: bool = True
-    ) -> List[Dict[str, torch.Tensor]]:
-        """
-        Input image as ndarray (BGR, HWC) or BHWC. Pass ``bgr=False`` for
-        3-channel inputs already in RGB order (e.g., ``.npy`` read via
-        ``read_image_hwc``); ignored for >3 channels.
-        Output:
-            List of batch size length. Each element is a dict {"labels", "boxes", "scores"}
-            labels: torch.Tensor of shape (N,), dtype int64
-            boxes: torch.Tensor of shape (N, 4), dtype float32, abs values
-            scores: torch.Tensor of shape (N,), dtype float32
-            masks: torch.Tensor of shape (N, H, W), dtype float32. N = number of objects
+    def __call__(self, inputs: NDArray[np.uint8], bgr: bool = True) -> list[dict[str, torch.Tensor]]:
+        """Input image as ndarray (BGR, HWC) or BHWC. Pass ``bgr=False`` for 3-channel inputs already in RGB order
+        (e.g., ``.npy`` read via ``read_image_hwc``); ignored for >3 channels. Output: List of batch size
+        length. Each element is a dict {"labels", "boxes", "scores"} labels: torch.Tensor of shape (N,), dtype
+        int64 boxes: torch.Tensor of shape (N, 4), dtype float32, abs values scores: torch.Tensor of shape (N,),
+        dtype float32 masks: torch.Tensor of shape (N, H, W), dtype float32. N = number of objects.
         """
         processed_inputs, processed_sizes, original_sizes = self._prepare_inputs(inputs, bgr=bgr)
         preds = self._predict(processed_inputs)
         return self._postprocess(preds, processed_sizes, original_sizes)
 
     @staticmethod
-    def mask2poly(masks: np.ndarray, img_shape: Tuple[int, int]) -> List[np.ndarray]:
-        """
-        Convert binary masks to normalized polygon coordinates for YOLO segmentation format.
+    def mask2poly(masks: np.ndarray, img_shape: tuple[int, int]) -> list[np.ndarray]:
+        """Convert binary masks to normalized polygon coordinates for YOLO segmentation format.
 
         Args:
             masks: Binary masks array of shape [N, H, W] where N is number of instances
@@ -312,7 +292,7 @@ def letterbox(
 
     # Compute padding
     ratio = r, r  # initial uniform width, height ratios (may be updated below)
-    new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
+    new_unpad = round(shape[1] * r), round(shape[0] * r)
     dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]  # wh padding
     if auto:  # minimum rectangle
         dw, dh = np.mod(dw, stride), np.mod(dh, stride)  # wh padding
@@ -328,9 +308,7 @@ def letterbox(
         im = cv2.resize(im, new_unpad, interpolation=cv2.INTER_LINEAR)
     top, bottom = int(np.floor(dh)), int(np.ceil(dh))
     left, right = int(np.floor(dw)), int(np.ceil(dw))
-    im = cv2.copyMakeBorder(
-        im, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color
-    )  # add border
+    im = cv2.copyMakeBorder(im, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)  # add border
     return im, ratio, (dw, dh)
 
 
@@ -349,9 +327,7 @@ def clip_boxes(boxes, shape):
 def scale_boxes_ratio_kept(boxes, img1_shape, img0_shape, ratio_pad=None, padding=True):
     # Rescale boxes (xyxy) from img1_shape to img0_shape
     if ratio_pad is None:  # calculate from img0_shape
-        gain = min(
-            img1_shape[0] / img0_shape[0], img1_shape[1] / img0_shape[1]
-        )  # gain  = old / new
+        gain = min(img1_shape[0] / img0_shape[0], img1_shape[1] / img0_shape[1])  # gain  = old / new
         pad = (
             round((img1_shape[1] - img0_shape[1] * gain) / 2 - 0.1),
             round((img1_shape[0] - img0_shape[0] * gain) / 2 - 0.1),
@@ -380,7 +356,7 @@ def scale_boxes(boxes, orig_shape, resized_shape):
 
 def cleanup_masks(masks: torch.Tensor, boxes: torch.Tensor) -> torch.Tensor:
     # clean up masks outside of the corresponding bbox
-    N, H, W = masks.shape
+    _N, H, W = masks.shape
     device = masks.device
     dtype = masks.dtype
 
@@ -389,10 +365,7 @@ def cleanup_masks(masks: torch.Tensor, boxes: torch.Tensor) -> torch.Tensor:
 
     x1, y1, x2, y2 = boxes.T  # each (N,)
     inside = (
-        (xs >= x1[:, None, None])
-        & (xs < x2[:, None, None])
-        & (ys >= y1[:, None, None])
-        & (ys < y2[:, None, None])
+        (xs >= x1[:, None, None]) & (xs < x2[:, None, None]) & (ys >= y1[:, None, None]) & (ys < y2[:, None, None])
     )  # (N, H, W), bool
     masks = masks * inside.to(dtype)
     return masks

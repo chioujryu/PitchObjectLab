@@ -1,7 +1,7 @@
 from ultralytics.models.sam import SAM3SemanticPredictor
 
 # Initialize predictor
-overrides = dict(conf=0.25, task="segment", mode="predict", model="sam3.pt", half=True, save=True)
+overrides = {"conf": 0.25, "task": "segment", "mode": "predict", "model": "sam3.pt", "half": True, "save": True}
 predictor = SAM3SemanticPredictor(overrides=overrides)
 
 # Set image
