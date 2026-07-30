@@ -1,4 +1,4 @@
-from typing import Dict, List, Tuple
+from __future__ import annotations
 
 import cv2
 import numpy as np
@@ -13,12 +13,12 @@ class TRT_model:
         self,
         model_path: str,
         n_outputs: int,
-        conf_thresh: float | List[float] = 0.5,
+        conf_thresh: float | list[float] = 0.5,
         binarize_masks: bool = True,
         mask_threshold: float = 0.5,
         rect: bool = False,
         keep_ratio: bool = False,
-        device: str = None,
+        device: str | None = None,
         apply_nms: bool = True,
         nms_iou_thresh: float = 0.7,
         use_cuda_graph: bool = True,
@@ -51,9 +51,7 @@ class TRT_model:
             self.conf_threshs = [conf_thresh] * self.n_outputs
         elif isinstance(conf_thresh, list):
             self.conf_threshs = conf_thresh
-        self._conf_threshs_t = torch.tensor(
-            self.conf_threshs, device=self.device, dtype=torch.float32
-        )
+        self._conf_threshs_t = torch.tensor(self.conf_threshs, device=self.device, dtype=torch.float32)
 
         self._graph = None
         self._test_pred()
@@ -104,7 +102,7 @@ class TRT_model:
         the optimization profile's max so a single buffer accommodates any valid
         batch; the actual run shape is set on the context per call in `_predict`.
         """
-        self._outputs: List[torch.Tensor] = []
+        self._outputs: list[torch.Tensor] = []
         self._input_tensor: torch.Tensor | None = None
         self._input_dtype = torch.float32
         self._is_dynamic = False
@@ -151,12 +149,8 @@ class TRT_model:
         # Pinned host + uint8 GPU staging buffer for fast preprocessing.
         H, W = self.input_size
         if self.device == "cuda":
-            self._cpu_pinned_hwc = torch.empty(
-                (H, W, self.channels), dtype=torch.uint8, pin_memory=True
-            )
-            self._gpu_hwc = torch.empty(
-                (H, W, self.channels), dtype=torch.uint8, device=self.device
-            )
+            self._cpu_pinned_hwc = torch.empty((H, W, self.channels), dtype=torch.uint8, pin_memory=True)
+            self._gpu_hwc = torch.empty((H, W, self.channels), dtype=torch.uint8, device=self.device)
 
     def _capture_cuda_graph(self):
         """Capture the engine forward into a CUDA graph for low-overhead replay."""
@@ -205,18 +199,16 @@ class TRT_model:
         processed_size,  # (H, W) of network input (after your A.Compose)
         orig_sizes,  # Tensor [B, 2] (H, W)
         keep_ratio: bool,
-    ) -> List[torch.Tensor]:
-        """
-        Returns list of length B with masks resized to original image sizes:
-        Each item: Float Tensor [Q, H_orig, W_orig] in [0,1] (no thresholding here).
-        - Handles letterbox padding removal if keep_ratio=True.
-        - Works for both batched and single-image inputs.
+    ) -> list[torch.Tensor]:
+        """Returns list of length B with masks resized to original image sizes: Each item: Float Tensor [Q, H_orig,
+        W_orig] in [0,1] (no thresholding here). - Handles letterbox padding removal if keep_ratio=True. - Works
+        for both batched and single-image inputs.
         """
         single = pred_masks.dim() == 3  # [Q,Hm,Wm]
         if single:
             pred_masks = pred_masks.unsqueeze(0)  # -> [1,Q,Hm,Wm]
 
-        B, Q, Hm, Wm = pred_masks.shape
+        B, _Q, Hm, Wm = pred_masks.shape
         proc_h, proc_w = int(processed_size[0]), int(processed_size[1])
 
         out = []
@@ -248,16 +240,16 @@ class TRT_model:
             return [out[0]]
         return out
 
-    def _compute_nearest_size(self, shape, target_size, stride=32) -> Tuple[int, int]:
-        """Get nearest size that is divisible by 32"""
+    def _compute_nearest_size(self, shape, target_size, stride=32) -> tuple[int, int]:
+        """Get nearest size that is divisible by 32."""
         scale = target_size / max(shape)
-        new_shape = [int(round(dim * scale)) for dim in shape]
+        new_shape = [round(dim * scale) for dim in shape]
         return [max(stride, int(np.ceil(dim / stride) * stride)) for dim in new_shape]
 
     def _preprocess_to_pinned(self, img: NDArray, bgr: bool = True) -> None:
-        """Resize into the pinned HWC uint8 buffer. 3ch BGR path also does
-        BGR->RGB (cv2 source); 3ch RGB (.npy) and >3ch (np.load, RGB+extras)
-        skip the swap."""
+        """Resize into the pinned HWC uint8 buffer. 3ch BGR path also does BGR->RGB (cv2 source); 3ch RGB (.npy) and
+        >3ch (np.load, RGB+extras) skip the swap.
+        """
         H, W = self.input_size
         if not self.keep_ratio:
             resized = cv2.resize(img, (W, H), interpolation=cv2.INTER_LINEAR)
@@ -275,18 +267,12 @@ class TRT_model:
     def _preprocess(self, img: NDArray, stride: int = 32, bgr: bool = True) -> NDArray:
         """CPU-only preprocess used by the batched fall-back path."""
         if not self.keep_ratio:  # simple resize
-            img = cv2.resize(
-                img, (self.input_size[1], self.input_size[0]), interpolation=cv2.INTER_LINEAR
-            )
+            img = cv2.resize(img, (self.input_size[1], self.input_size[0]), interpolation=cv2.INTER_LINEAR)
         elif self.rect:  # keep ratio and cut paddings
-            target_height, target_width = self._compute_nearest_size(
-                img.shape[:2], max(*self.input_size)
-            )
+            target_height, target_width = self._compute_nearest_size(img.shape[:2], max(*self.input_size))
             img = letterbox(img, (target_height, target_width), stride=stride, auto=False)[0]
         else:  # keep ratio adding paddings
-            img = letterbox(
-                img, (self.input_size[0], self.input_size[1]), stride=stride, auto=False
-            )[0]
+            img = letterbox(img, (self.input_size[0], self.input_size[1]), stride=stride, auto=False)[0]
 
         # 3ch BGR (cv2.imread) needs a swap; 3ch .npy is RGB already; >3ch is RGB+extras.
         if self.channels == 3 and bgr:
@@ -310,8 +296,8 @@ class TRT_model:
             return self._input_tensor, [(H, W)], [(inputs.shape[0], inputs.shape[1])]
 
         # Generic / batched / CPU path: keep original behavior.
-        original_sizes: List[Tuple[int, int]] = []
-        processed_sizes: List[Tuple[int, int]] = []
+        original_sizes: list[tuple[int, int]] = []
+        processed_sizes: list[tuple[int, int]] = []
 
         if isinstance(inputs, np.ndarray) and inputs.ndim == 3:  # single image, CPU
             processed_inputs = self._preprocess(inputs, bgr=bgr)[None]
@@ -325,9 +311,7 @@ class TRT_model:
             for idx, image in enumerate(inputs):
                 processed_inputs[idx] = self._preprocess(image, bgr=bgr)
                 original_sizes.append((image.shape[0], image.shape[1]))
-                processed_sizes.append(
-                    (processed_inputs[idx].shape[1], processed_inputs[idx].shape[2])
-                )
+                processed_sizes.append((processed_inputs[idx].shape[1], processed_inputs[idx].shape[2]))
         else:
             raise TypeError(f"Unsupported input type: {type(inputs)}")
 
@@ -338,7 +322,7 @@ class TRT_model:
             tensor = tensor.to(self.device)
         return tensor, processed_sizes, original_sizes
 
-    def _predict(self, img: torch.Tensor, actual_batch: int | None = None) -> List[torch.Tensor]:
+    def _predict(self, img: torch.Tensor, actual_batch: int | None = None) -> list[torch.Tensor]:
         # `actual_batch` is the real run-time batch (== len(processed_sizes)).
         # Falling back to img.shape[0] is wrong for the single-image fast path
         # on dynamic engines, where img is the max-sized persistent buffer.
@@ -349,7 +333,7 @@ class TRT_model:
         # _prepare_inputs, just (graph-)replay or async-execute.
         if img is self._input_tensor:
             if self._is_dynamic:
-                run_shape = (actual_batch,) + tuple(self._input_tensor.shape[1:])
+                run_shape = (actual_batch, *tuple(self._input_tensor.shape[1:]))
                 self.context.set_input_shape(self._input_name, run_shape)
             if self._graph is not None:
                 self._graph.replay()
@@ -384,20 +368,18 @@ class TRT_model:
             self.context.set_tensor_address(self._input_name, self._input_tensor.data_ptr())
         return self._slice_outputs(actual_batch)
 
-    def _slice_outputs(self, batch: int) -> List[torch.Tensor]:
+    def _slice_outputs(self, batch: int) -> list[torch.Tensor]:
         # Outputs are sized at max batch; trim views to the actual run batch so
         # downstream postprocessing doesn't iterate empty rows. Cheap (no copy).
         return [o[:batch] for o in self._outputs]
 
     def _postprocess(
         self,
-        outputs: List[torch.Tensor],
-        processed_sizes: List[Tuple[int, int]],
-        original_sizes: List[Tuple[int, int]],
-    ) -> List[Dict[str, NDArray]]:
-        """
-        returns List with BS length. Each element is a dict {"labels", "boxes", "scores"}
-        """
+        outputs: list[torch.Tensor],
+        processed_sizes: list[tuple[int, int]],
+        original_sizes: list[tuple[int, int]],
+    ) -> list[dict[str, NDArray]]:
+        """Returns List with BS length. Each element is a dict {"labels", "boxes", "scores"}."""
         labels = outputs[0]  # [B, K]
         boxes = outputs[1]  # [B, K, 4], absolute xyxy in input_size space
         scores = outputs[2]  # [B, K]
@@ -441,36 +423,26 @@ class TRT_model:
             results.append(out)
         return results
 
-    def __call__(
-        self, inputs: NDArray[np.uint8], bgr: bool = True
-    ) -> List[Dict[str, torch.Tensor]]:
-        """
-        Input image as ndarray (BGR, HWC) or BHWC. Pass ``bgr=False`` for
-        3-channel inputs already in RGB order (e.g., ``.npy`` read via
-        ``read_image_hwc``); ignored for >3 channels.
-        Output:
-            List of batch size length. Each element is a dict {"labels", "boxes", "scores"}
-            labels: torch.Tensor of shape (N,), dtype int64
-            boxes: torch.Tensor of shape (N, 4), dtype float32, abs values
-            scores: torch.Tensor of shape (N,), dtype float32
-            masks: torch.Tensor of shape (N, H, W), dtype float32. N = number of objects
+    def __call__(self, inputs: NDArray[np.uint8], bgr: bool = True) -> list[dict[str, torch.Tensor]]:
+        """Input image as ndarray (BGR, HWC) or BHWC. Pass ``bgr=False`` for 3-channel inputs already in RGB order
+        (e.g., ``.npy`` read via ``read_image_hwc``); ignored for >3 channels. Output: List of batch size
+        length. Each element is a dict {"labels", "boxes", "scores"} labels: torch.Tensor of shape (N,), dtype
+        int64 boxes: torch.Tensor of shape (N, 4), dtype float32, abs values scores: torch.Tensor of shape (N,),
+        dtype float32 masks: torch.Tensor of shape (N, H, W), dtype float32. N = number of objects.
         """
         # Run all GPU work on the model's dedicated stream so TRT can avoid the
-        # extra default-stream synchronisations triggered by enqueueV3, then have
+        # extra default-stream synchronizations triggered by enqueueV3, then have
         # the default stream wait so subsequent .cpu() copies stay ordered.
         with torch.cuda.stream(self._stream):
-            processed_inputs, processed_sizes, original_sizes = self._prepare_inputs(
-                inputs, bgr=bgr
-            )
+            processed_inputs, processed_sizes, original_sizes = self._prepare_inputs(inputs, bgr=bgr)
             preds = self._predict(processed_inputs, actual_batch=len(processed_sizes))
             results = self._postprocess(preds, processed_sizes, original_sizes)
         torch.cuda.default_stream(self.device).wait_stream(self._stream)
         return results
 
     @staticmethod
-    def mask2poly(masks: np.ndarray, img_shape: Tuple[int, int]) -> List[np.ndarray]:
-        """
-        Convert binary masks to normalized polygon coordinates for YOLO segmentation format.
+    def mask2poly(masks: np.ndarray, img_shape: tuple[int, int]) -> list[np.ndarray]:
+        """Convert binary masks to normalized polygon coordinates for YOLO segmentation format.
 
         Args:
             masks: Binary masks array of shape [N, H, W] where N is number of instances
@@ -530,7 +502,7 @@ def letterbox(
 
     # Compute padding
     ratio = r, r  # initial uniform width, height ratios (may be updated below)
-    new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
+    new_unpad = round(shape[1] * r), round(shape[0] * r)
     dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]  # wh padding
     if auto:  # minimum rectangle
         dw, dh = np.mod(dw, stride), np.mod(dh, stride)  # wh padding
@@ -546,9 +518,7 @@ def letterbox(
         im = cv2.resize(im, new_unpad, interpolation=cv2.INTER_LINEAR)
     top, bottom = int(np.floor(dh)), int(np.ceil(dh))
     left, right = int(np.floor(dw)), int(np.ceil(dw))
-    im = cv2.copyMakeBorder(
-        im, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color
-    )  # add border
+    im = cv2.copyMakeBorder(im, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)  # add border
     return im, ratio, (dw, dh)
 
 
@@ -567,9 +537,7 @@ def clip_boxes(boxes, shape):
 def scale_boxes_ratio_kept(boxes, img1_shape, img0_shape, ratio_pad=None, padding=True):
     # Rescale boxes (xyxy) from img1_shape to img0_shape
     if ratio_pad is None:  # calculate from img0_shape
-        gain = min(
-            img1_shape[0] / img0_shape[0], img1_shape[1] / img0_shape[1]
-        )  # gain  = old / new
+        gain = min(img1_shape[0] / img0_shape[0], img1_shape[1] / img0_shape[1])  # gain  = old / new
         pad = (
             round((img1_shape[1] - img0_shape[1] * gain) / 2 - 0.1),
             round((img1_shape[0] - img0_shape[0] * gain) / 2 - 0.1),
@@ -598,7 +566,7 @@ def scale_boxes(boxes, orig_shape, resized_shape):
 
 def cleanup_masks(masks: torch.Tensor, boxes: torch.Tensor) -> torch.Tensor:
     # clean up masks outside of the corresponding bbox
-    N, H, W = masks.shape
+    _N, H, W = masks.shape
     device = masks.device
     dtype = masks.dtype
 
@@ -607,10 +575,7 @@ def cleanup_masks(masks: torch.Tensor, boxes: torch.Tensor) -> torch.Tensor:
 
     x1, y1, x2, y2 = boxes.T  # each (N,)
     inside = (
-        (xs >= x1[:, None, None])
-        & (xs < x2[:, None, None])
-        & (ys >= y1[:, None, None])
-        & (ys < y2[:, None, None])
+        (xs >= x1[:, None, None]) & (xs < x2[:, None, None]) & (ys >= y1[:, None, None]) & (ys < y2[:, None, None])
     )  # (N, H, W), bool
     masks = masks * inside.to(dtype)
     return masks

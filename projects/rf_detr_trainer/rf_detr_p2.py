@@ -20,13 +20,13 @@ The *installed* ``rfdetr`` package is already 95% ready for P2:
   deformable-attention ``sampling_offsets``/``attention_weights`` Linear layers plus the
   projector's first stage. ``torch``'s ``strict=False`` only skips missing/extra *keys*,
   not size-mismatched ones, so the loader would raise ``RuntimeError``. We therefore drop
-  the mismatched checkpoint tensors so they start randomly initialised -- exactly the
+  the mismatched checkpoint tensors so they start randomly initialized -- exactly the
   documented fine-tuning behavior.
 
 Three spots block P2, and all live in ``.venv`` (not version-controlled):
 
 1. ``rfdetr.config.ModelConfig.projector_scale`` is
-   ``List[Literal["P3", "P4", "P5"]]`` (each variant re-declares its own, even
+   ``List[Literal["P3", "P4", "P5"]]`` (each variant redeclares its own, even
    narrower, Literal -- e.g. ``RFDETRLargeConfig`` is ``List[Literal["P4",]]``).
    Pydantic rejects ``"P2"``.
 2. ``Backbone.__init__`` builds a *local* dict
@@ -54,18 +54,18 @@ from __future__ import annotations
 
 import warnings
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Mapping, MutableMapping, Optional, Sequence
+from typing import Any, List, Literal, Mapping, MutableMapping, Sequence
 
 import torch
 
 __all__ = [
-    'assert_p2_checkpoint_compatible',
-    'assert_p2_training_checkpoint_compatible',
     "P2_SETTINGS",
-    "ensure_p2_support",
-    "resolve_p2_projector_scale",
     "apply_p2_overrides",
+    "assert_p2_checkpoint_compatible",
+    "assert_p2_training_checkpoint_compatible",
+    "ensure_p2_support",
     "is_patched",
+    "resolve_p2_projector_scale",
 ]
 
 # Version of rfdetr the Backbone.__init__ copy below was written against. A mismatch
@@ -88,7 +88,7 @@ _OVERRIDE_CASTS = {
 
 # Projector internals threaded to the patched Backbone (NOT ModelConfig fields, because
 # rfdetr.config.BaseConfig rejects unknown constructor kwargs). None => use upstream default.
-P2_SETTINGS: Dict[str, Any] = {
+P2_SETTINGS: dict[str, Any] = {
     "num_blocks": None,
     "survival_prob": None,
     "force_drop_last_n_features": None,
@@ -123,7 +123,7 @@ def _first(value: Any, fallback: Any) -> Any:
 # --------------------------------------------------------------------------------------
 # Config helpers (pure; safe to call whether or not P2 is enabled).
 # --------------------------------------------------------------------------------------
-def resolve_p2_projector_scale(p2_config: Optional[Mapping[str, Any]]) -> List[str]:
+def resolve_p2_projector_scale(p2_config: Mapping[str, Any] | None) -> list[str]:
     """Validate and normalize model.p2.projector_scale (default [P2, P3, P4])."""
     raw = (p2_config or {}).get("projector_scale") or _DEFAULT_PROJECTOR_SCALE
     if isinstance(raw, str):
@@ -133,13 +133,10 @@ def resolve_p2_projector_scale(p2_config: Optional[Mapping[str, Any]]) -> List[s
         raise ValueError("model.p2.projector_scale must be a non-empty list of level names.")
     for level in scales:
         if level not in _VALID_SCALES:
-            raise ValueError(
-                f"model.p2.projector_scale has invalid level {level!r}; allowed: {list(_VALID_SCALES)}."
-            )
+            raise ValueError(f"model.p2.projector_scale has invalid level {level!r}; allowed: {list(_VALID_SCALES)}.")
     if sorted(scales) != scales:
         raise ValueError(
-            f"model.p2.projector_scale must be in ascending P-name order, got {scales}. "
-            "Example: [P2, P3, P4]."
+            f"model.p2.projector_scale must be in ascending P-name order, got {scales}. Example: [P2, P3, P4]."
         )
     if "P2" not in scales:
         warnings.warn(
@@ -152,12 +149,12 @@ def resolve_p2_projector_scale(p2_config: Optional[Mapping[str, Any]]) -> List[s
 
 def apply_p2_overrides(
     kwargs: MutableMapping[str, Any],
-    p2_config: Optional[Mapping[str, Any]],
+    p2_config: Mapping[str, Any] | None,
 ) -> MutableMapping[str, Any]:
     """Merge model.p2.overrides (real ModelConfig fields) into model kwargs in place.
 
-    Only non-null overrides are applied; they take precedence over values already
-    placed in kwargs from the model.* section.
+    Only non-null overrides are applied; they take precedence over values already placed in kwargs from the model.*
+    section.
     """
     overrides = (p2_config or {}).get("overrides", {}) or {}
     for key, cast in _OVERRIDE_CASTS.items():
@@ -167,14 +164,14 @@ def apply_p2_overrides(
     return kwargs
 
 
-def _record_settings(p2_config: Optional[Mapping[str, Any]]) -> None:
+def _record_settings(p2_config: Mapping[str, Any] | None) -> None:
     """Capture projector internals from model.p2.projector for the patched backbone."""
     projector = (p2_config or {}).get("projector", {}) or {}
     for key in P2_SETTINGS:
         P2_SETTINGS[key] = projector.get(key)
 
 
-def _build_projector_kwargs(layer_norm_arg: bool, rms_norm_arg: bool) -> Dict[str, Any]:
+def _build_projector_kwargs(layer_norm_arg: bool, rms_norm_arg: bool) -> dict[str, Any]:
     """Resolve MultiScaleProjector kwargs from P2_SETTINGS + backbone-provided norms."""
     return {
         "num_blocks": _first(P2_SETTINGS.get("num_blocks"), _PROJECTOR_DEFAULTS["num_blocks"]),
@@ -194,21 +191,18 @@ def _stabilize_raw_features_for_export(
     channels: Sequence[int],
     height: int,
     width: int,
-) -> List[torch.Tensor]:
+) -> list[torch.Tensor]:
     """Give TensorRT a static C/H/W contract at the projector boundary.
 
     DINO's ONNX graph reconstructs its feature maps through shape-tensor
     operations. With a dynamic input batch, ONNX/TensorRT can consequently
-    lose the otherwise-known channel dimension before a P2/P3
-    ``ConvTranspose``. TensorRT requires deconvolution input channels to be a
-    build-time constant.
+    lose the otherwise-known channel dimension before a P2/P3 ``ConvTranspose``. TensorRT requires deconvolution input
+    channels to be a build-time constant.
 
-    ``reshape(-1, C, H, W)`` deliberately leaves only batch inferred while
-    materialising the encoder metadata as constants in the exported graph.
-    This helper is used only by ``Backbone.forward_export`` and owns no state,
-    so normal training/inference and existing P2 checkpoint keys are unchanged.
+    ``reshape(-1, C, H, W)`` deliberately leaves only batch inferred while materialising the encoder metadata as
+    constants in the exported graph. This helper is used only by ``Backbone.forward_export`` and owns no state, so
+    normal training/inference and existing P2 checkpoint keys are unchanged.
     """
-
     if len(raw_features) != len(channels):
         raise RuntimeError(
             "P2 ONNX export expected one channel declaration per DINO feature, "
@@ -217,26 +211,24 @@ def _stabilize_raw_features_for_export(
     if height <= 0 or width <= 0:
         raise RuntimeError(f"P2 ONNX export requires positive fixed feature dimensions, got {(height, width)}.")
 
-    stabilized: List[torch.Tensor] = []
+    stabilized: list[torch.Tensor] = []
     for index, (feature, channel_count) in enumerate(zip(raw_features, channels)):
         if feature.ndim != 4:
             raise RuntimeError(
-                f"P2 ONNX export expected DINO feature {index} to be rank-4 NCHW, "
-                f"got shape {tuple(feature.shape)}."
+                f"P2 ONNX export expected DINO feature {index} to be rank-4 NCHW, got shape {tuple(feature.shape)}."
             )
         channel_count = int(channel_count)
         if channel_count <= 0:
             raise RuntimeError(
-                f"P2 ONNX export requires a positive fixed channel count for DINO feature {index}, "
-                f"got {channel_count}."
+                f"P2 ONNX export requires a positive fixed channel count for DINO feature {index}, got {channel_count}."
             )
         actual_chw = tuple(int(dimension) for dimension in feature.shape[1:])
         expected_chw = (channel_count, int(height), int(width))
         if actual_chw != expected_chw:
             raise RuntimeError(
-                f'P2 ONNX export feature {index} does not match encoder metadata: '
-                f'actual C/H/W={actual_chw}, expected C/H/W={expected_chw}. '
-                'Export shape must match the model resolution.'
+                f"P2 ONNX export feature {index} does not match encoder metadata: "
+                f"actual C/H/W={actual_chw}, expected C/H/W={expected_chw}. "
+                "Export shape must match the model resolution."
             )
         # Keep the shape tuple fully constant. ``-1`` is inferred from the
         # dynamic input batch; every dimension required by Conv/ConvTranspose
@@ -248,10 +240,10 @@ def _stabilize_raw_features_for_export(
 # --------------------------------------------------------------------------------------
 # Patches.
 # --------------------------------------------------------------------------------------
-def _all_subclasses(cls: type) -> List[type]:
+def _all_subclasses(cls: type) -> list[type]:
     """Return every (transitive) subclass of cls."""
     seen: set = set()
-    out: List[type] = []
+    out: list[type] = []
     stack = [cls]
     while stack:
         current = stack.pop()
@@ -266,7 +258,7 @@ def _all_subclasses(cls: type) -> List[type]:
 def _check_version() -> None:
     """Warn (do not fail) when the installed rfdetr differs from the patched baseline."""
     try:
-        import importlib.metadata as metadata
+        from importlib import metadata
 
         version = metadata.version("rfdetr")
     except Exception:  # pragma: no cover - metadata lookup is best-effort
@@ -288,7 +280,7 @@ def _relax_projector_scale_literal() -> None:
 
     new_annotation = List[Literal["P2", "P3", "P4", "P5", "P6"]]
     targets = [rf_config.ModelConfig, *_all_subclasses(rf_config.ModelConfig)]
-    failures: List[str] = []
+    failures: list[str] = []
     for cls in targets:
         field = cls.model_fields.get("projector_scale")
         if field is None:
@@ -309,8 +301,8 @@ def _relax_projector_scale_literal() -> None:
 def _patch_backbone_init() -> None:
     """Replace Backbone.__init__ with a P2-aware copy (adds P2=4.0 + projector knobs).
 
-    Faithful copy of rfdetr/models/backbone/backbone.py Backbone.__init__ (v1.8.3).
-    The only differences from upstream are marked with ``# P2:`` comments.
+    Faithful copy of rfdetr/models/backbone/backbone.py Backbone.__init__ (v1.8.3). The only differences from upstream
+    are marked with ``# P2:`` comments.
     """
     global _BACKBONE_PATCHED, _PATCHED_INIT
     import rfdetr.models.backbone.backbone as backbone_module
@@ -321,12 +313,12 @@ def _patch_backbone_init() -> None:
     def _p2_backbone_init(
         self,
         name: str,
-        pretrained_encoder: str = None,
-        window_block_indexes: list = None,
+        pretrained_encoder: str | None = None,
+        window_block_indexes: list | None = None,
         drop_path=0.0,
         out_channels=256,
-        out_feature_indexes: list = None,
-        projector_scale: list = None,
+        out_feature_indexes: list | None = None,
+        projector_scale: list | None = None,
         use_cls_token: bool = False,
         freeze_encoder: bool = False,
         layer_norm: bool = False,
@@ -378,7 +370,7 @@ def _patch_backbone_init() -> None:
             "only support projector scale P2/P3/P4/P5/P6 in ascending order."
         )
         # P2: added P2=4.0 (stride-4, scale-factor x4) -- upstream lacks this key.
-        level2scalefactor = dict(P2=4.0, P3=2.0, P4=1.0, P5=0.5, P6=0.25)
+        level2scalefactor = {"P2": 4.0, "P3": 2.0, "P4": 1.0, "P5": 0.5, "P6": 0.25}
         scale_factors = [level2scalefactor[lvl] for lvl in self.projector_scale]
 
         # P2: wire projector internals from config (defaults reproduce upstream behavior).
@@ -404,21 +396,19 @@ def _patch_backbone_init() -> None:
 
     def _p2_backbone_forward_export(self, tensors: torch.Tensor):
         """Tensor-only backbone forward with a static projector shape boundary."""
-
         raw_feats = self.encoder(tensors)
         encoder_shape = getattr(self.encoder, "shape", None)
         patch_size = int(getattr(self.encoder, "patch_size", 0) or 0)
         if not isinstance(encoder_shape, (tuple, list)) or len(encoder_shape) != 2:
             raise RuntimeError(
-                "P2 ONNX export could not determine the fixed DINO target shape; "
-                f"encoder.shape={encoder_shape!r}."
+                f"P2 ONNX export could not determine the fixed DINO target shape; encoder.shape={encoder_shape!r}."
             )
         target_height, target_width = (int(value) for value in encoder_shape)
         actual_input_hw = tuple(int(dimension) for dimension in tensors.shape[-2:])
         if actual_input_hw != (target_height, target_width):
             raise RuntimeError(
-                'P2 ONNX export shape must match the model resolution exactly: '
-                f'input H/W={actual_input_hw}, encoder.shape={(target_height, target_width)}.'
+                "P2 ONNX export shape must match the model resolution exactly: "
+                f"input H/W={actual_input_hw}, encoder.shape={(target_height, target_width)}."
             )
         if patch_size <= 0 or target_height % patch_size != 0 or target_width % patch_size != 0:
             raise RuntimeError(
@@ -455,13 +445,13 @@ def _patch_backbone_init() -> None:
 def _patch_pretrain_weight_filter() -> None:
     """Drop size-mismatched checkpoint tensors on non-strict ``LWDETR.load_state_dict``.
 
-    Stock detection checkpoints are single-scale (``projector_scale=["P4"]``); enabling
-    P2 changes ``num_feature_levels`` and resizes existing deformable-attention Linear
-    layers + the projector's first stage. ``torch``'s ``strict=False`` skips only
-    missing/extra keys, not size-mismatched ones, so ``load_pretrain_weights`` would
-    raise. We drop those tensors so they start randomly initialised (the documented P2
-    behavior). Applied only under P2, only on ``strict=False`` loads; a matching P2
-    checkpoint (test / inference / resume) mismatches nothing and loads unchanged.
+    Stock detection checkpoints are single-scale (``projector_scale=["P4"]``); enabling P2 changes
+    ``num_feature_levels`` and resizes existing deformable-attention Linear layers + the projector's first stage.
+    ``torch``'s ``strict=False`` skips only missing/extra keys, not size-mismatched ones, so ``load_pretrain_weights``
+    would
+    raise. We drop those tensors so they start randomly initialized (the documented P2
+    behavior). Applied only under P2, only on ``strict=False`` loads; a matching P2 checkpoint (test / inference /
+    resume) mismatches nothing and loads unchanged.
     """
     global _PRETRAIN_FILTER_PATCHED
     import rfdetr.models.lwdetr as lwdetr_module
@@ -474,14 +464,14 @@ def _patch_pretrain_weight_filter() -> None:
     base_load_state_dict = model_cls.load_state_dict  # inherited nn.Module.load_state_dict
 
     def load_state_dict(self, state_dict, strict=True, *args, **kwargs):
-        backbone = getattr(self, 'backbone', None)
+        backbone = getattr(self, "backbone", None)
         try:
             backbone = backbone[0]
         except (IndexError, KeyError, TypeError):
             pass
-        projector_scale = list(getattr(backbone, 'projector_scale', []) or [])
+        projector_scale = list(getattr(backbone, "projector_scale", []) or [])
         report = None
-        if not strict and 'P2' in projector_scale:
+        if not strict and "P2" in projector_scale:
             model_state = self.state_dict()
             mismatched = [
                 key
@@ -496,32 +486,28 @@ def _patch_pretrain_weight_filter() -> None:
                 state_dict = {k: v for k, v in state_dict.items() if k not in drop}
                 warnings.warn(
                     f"[rf_detr_p2] Dropped {len(mismatched)} known P2 size-mismatched pretrained "
-                    f"tensor(s) so they start randomly initialised (P2 changes the "
+                    f"tensor(s) so they start randomly initialized (P2 changes the "
                     f"feature-level count); e.g. {mismatched[0]}.",
                     stacklevel=2,
                 )
             report = {
-                'schema_version': 1,
-                'projector_scale': projector_scale,
-                'source_tensor_count': len(state_dict),
-                'dropped_p2_mismatches': list(mismatched),
-                'loaded': False,
+                "schema_version": 1,
+                "projector_scale": projector_scale,
+                "source_tensor_count": len(state_dict),
+                "dropped_p2_mismatches": list(mismatched),
+                "loaded": False,
             }
         try:
-            result = base_load_state_dict(
-                self, state_dict, strict, *args, **kwargs
-            )
+            result = base_load_state_dict(self, state_dict, strict, *args, **kwargs)
         except Exception as error:
             if report is not None:
-                report['error'] = f'{type(error).__name__}: {error}'
+                report["error"] = f"{type(error).__name__}: {error}"
                 self._pitchobjectlab_p2_load_report = report
             raise
         if report is not None:
-            report['loaded'] = True
-            report['missing_keys'] = list(getattr(result, 'missing_keys', []))
-            report['unexpected_keys'] = list(
-                getattr(result, 'unexpected_keys', [])
-            )
+            report["loaded"] = True
+            report["missing_keys"] = list(getattr(result, "missing_keys", []))
+            report["unexpected_keys"] = list(getattr(result, "unexpected_keys", []))
             self._pitchobjectlab_p2_load_report = report
         return result
 
@@ -543,30 +529,28 @@ def _suppress_compat_warning() -> None:
 def _find_p2_lwdetr(model: Any) -> Any:
     current = model
     for _ in range(8):
-        optimized = getattr(current, '_orig_mod', None)
+        optimized = getattr(current, "_orig_mod", None)
         if optimized is not None:
             current = optimized
             continue
-        if hasattr(current, 'backbone') and hasattr(current, 'transformer'):
+        if hasattr(current, "backbone") and hasattr(current, "transformer"):
             return current
-        current = getattr(current, 'model', None)
+        current = getattr(current, "model", None)
         if current is None:
             break
     return None
 
 
-def _p2_checkpoint_state(checkpoint: Mapping[str, Any]) -> Dict[str, torch.Tensor]:
-    if isinstance(checkpoint.get('model'), Mapping):
-        state = checkpoint['model']
-    elif isinstance(checkpoint.get('state_dict'), Mapping):
-        state = checkpoint['state_dict']
+def _p2_checkpoint_state(checkpoint: Mapping[str, Any]) -> dict[str, torch.Tensor]:
+    if isinstance(checkpoint.get("model"), Mapping):
+        state = checkpoint["model"]
+    elif isinstance(checkpoint.get("state_dict"), Mapping):
+        state = checkpoint["state_dict"]
     elif checkpoint and all(torch.is_tensor(value) for value in checkpoint.values()):
         state = checkpoint
     else:
-        raise RuntimeError(
-            'P2 checkpoint must contain an RF-DETR model mapping or Lightning state_dict mapping.'
-        )
-    normalized: Dict[str, torch.Tensor] = {}
+        raise RuntimeError("P2 checkpoint must contain an RF-DETR model mapping or Lightning state_dict mapping.")
+    normalized: dict[str, torch.Tensor] = {}
     for raw_key, value in state.items():
         if not torch.is_tensor(value):
             continue
@@ -574,114 +558,103 @@ def _p2_checkpoint_state(checkpoint: Mapping[str, Any]) -> Dict[str, torch.Tenso
         changed = True
         while changed:
             changed = False
-            for prefix in ('module.', 'model.', '_orig_mod.'):
+            for prefix in ("module.", "model.", "_orig_mod."):
                 if key.startswith(prefix):
-                    key = key[len(prefix):]
+                    key = key[len(prefix) :]
                     changed = True
         normalized[key] = value
     return normalized
 
 
-def _checkpoint_architecture_metadata(checkpoint: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
-    metadata = checkpoint.get('pitchobjectlab_architecture')
-    if metadata is None and isinstance(checkpoint.get('args'), Mapping):
-        metadata = checkpoint['args'].get('pitchobjectlab_architecture')
+def _checkpoint_architecture_metadata(checkpoint: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    metadata = checkpoint.get("pitchobjectlab_architecture")
+    if metadata is None and isinstance(checkpoint.get("args"), Mapping):
+        metadata = checkpoint["args"].get("pitchobjectlab_architecture")
     if metadata is None:
         return None
     if not isinstance(metadata, Mapping):
-        raise RuntimeError('Checkpoint pitchobjectlab_architecture metadata must be a mapping.')
+        raise RuntimeError("Checkpoint pitchobjectlab_architecture metadata must be a mapping.")
     return metadata
 
 
 def _assert_p2_metadata_compatible(
     checkpoint: Mapping[str, Any],
-    expected_architecture: Optional[Mapping[str, Any]],
+    expected_architecture: Mapping[str, Any] | None,
 ) -> None:
     metadata = _checkpoint_architecture_metadata(checkpoint)
     if metadata is None or expected_architecture is None:
         return
-    if metadata.get('schema_version') != expected_architecture.get('schema_version'):
+    if metadata.get("schema_version") != expected_architecture.get("schema_version"):
         raise RuntimeError(
-            'Checkpoint architecture metadata schema does not match this runtime: '
+            "Checkpoint architecture metadata schema does not match this runtime: "
             f"checkpoint={metadata.get('schema_version')!r}, "
             f"runtime={expected_architecture.get('schema_version')!r}."
         )
-    if int(metadata.get('schema_version', 0) or 0) >= 3:
-        checkpoint_fingerprint = metadata.get('architecture_fingerprint')
-        expected_fingerprint = expected_architecture.get('architecture_fingerprint')
+    if int(metadata.get("schema_version", 0) or 0) >= 3:
+        checkpoint_fingerprint = metadata.get("architecture_fingerprint")
+        expected_fingerprint = expected_architecture.get("architecture_fingerprint")
         if not checkpoint_fingerprint or not expected_fingerprint:
-            raise RuntimeError(
-                'P2 schema v3 checkpoint/runtime metadata must contain an '
-                'architecture_fingerprint.'
-            )
+            raise RuntimeError("P2 schema v3 checkpoint/runtime metadata must contain an architecture_fingerprint.")
         if checkpoint_fingerprint != expected_fingerprint:
             raise RuntimeError(
-                'Checkpoint P2 architecture fingerprint does not match the '
-                'configured runtime: '
-                f'checkpoint={checkpoint_fingerprint!r}, '
-                f'runtime={expected_fingerprint!r}.'
+                "Checkpoint P2 architecture fingerprint does not match the "
+                "configured runtime: "
+                f"checkpoint={checkpoint_fingerprint!r}, "
+                f"runtime={expected_fingerprint!r}."
             )
-    saved_size = str(metadata.get('model_size', '')).strip().lower()
-    expected_size = str(expected_architecture.get('model_size', '')).strip().lower()
+    saved_size = str(metadata.get("model_size", "")).strip().lower()
+    expected_size = str(expected_architecture.get("model_size", "")).strip().lower()
     if saved_size != expected_size:
         raise RuntimeError(
-            'Checkpoint model size does not match the configured runtime: '
-            f'checkpoint={saved_size!r}, runtime={expected_size!r}.'
+            "Checkpoint model size does not match the configured runtime: "
+            f"checkpoint={saved_size!r}, runtime={expected_size!r}."
         )
-    saved_p2 = metadata.get('p2')
-    expected_p2 = expected_architecture.get('p2')
+    saved_p2 = metadata.get("p2")
+    expected_p2 = expected_architecture.get("p2")
     if saved_p2 != expected_p2:
         raise RuntimeError(
-            'Checkpoint P2 architecture metadata does not match model.p2 in the runtime config: '
-            f'checkpoint={saved_p2!r}, runtime={expected_p2!r}.'
+            "Checkpoint P2 architecture metadata does not match model.p2 in the runtime config: "
+            f"checkpoint={saved_p2!r}, runtime={expected_p2!r}."
         )
 
 
 def _is_p2_architecture_tensor(name: str) -> bool:
     return (
-        name.startswith('backbone.0.projector.')
-        or name.startswith('backbone.0.cross_attn_projector.')
-        or 'cross_attn.sampling_offsets.' in name
-        or 'cross_attn.attention_weights.' in name
-        or name == 'transformer.level_embed'
+        name.startswith(("backbone.0.projector.", "backbone.0.cross_attn_projector."))
+        or "cross_attn.sampling_offsets." in name
+        or "cross_attn.attention_weights." in name
+        or name == "transformer.level_embed"
     )
 
 
 def assert_p2_checkpoint_compatible(
     model: Any,
     checkpoint_path: Any,
-    expected_architecture: Optional[Mapping[str, Any]] = None,
+    expected_architecture: Mapping[str, Any] | None = None,
 ) -> None:
-    '''Require shape-exact P2 architecture tensors for test/inference.'''
-
+    """Require shape-exact P2 architecture tensors for test/inference."""
     lwdetr = _find_p2_lwdetr(model)
     if lwdetr is None:
-        raise RuntimeError(
-            'P2-enabled RF-DETR runtime has no LWDETR model to validate.'
-        )
-    backbone = getattr(lwdetr, 'backbone', None)
+        raise RuntimeError("P2-enabled RF-DETR runtime has no LWDETR model to validate.")
+    backbone = getattr(lwdetr, "backbone", None)
     try:
         backbone = backbone[0]
     except (IndexError, KeyError, TypeError):
         pass
-    projector_scale = list(getattr(backbone, 'projector_scale', []) or [])
-    if 'P2' not in projector_scale:
-        raise RuntimeError(
-            f'P2 validation expected projector_scale containing P2, got {projector_scale}.'
-        )
+    projector_scale = list(getattr(backbone, "projector_scale", []) or [])
+    if "P2" not in projector_scale:
+        raise RuntimeError(f"P2 validation expected projector_scale containing P2, got {projector_scale}.")
     if checkpoint_path is None or not str(checkpoint_path).strip():
-        raise RuntimeError(
-            'P2-enabled RF-DETR test/inference requires a trained P2 checkpoint.'
-        )
+        raise RuntimeError("P2-enabled RF-DETR test/inference requires a trained P2 checkpoint.")
     path = Path(str(checkpoint_path)).expanduser()
     if not path.is_file():
-        raise RuntimeError(f'P2 checkpoint does not exist: {path}')
+        raise RuntimeError(f"P2 checkpoint does not exist: {path}")
     try:
-        checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     except TypeError:
-        checkpoint = torch.load(path, map_location='cpu')
+        checkpoint = torch.load(path, map_location="cpu")
     if not isinstance(checkpoint, Mapping):
-        raise RuntimeError(f'P2 checkpoint must be a mapping: {path}')
+        raise RuntimeError(f"P2 checkpoint must be a mapping: {path}")
 
     _assert_p2_metadata_compatible(checkpoint, expected_architecture)
 
@@ -691,17 +664,11 @@ def assert_p2_checkpoint_compatible(
     # initialization for training, but test/inference must detect every key or
     # shape that loader may have dropped, interpolated, or reinitialized
     # (including positional embeddings, query embeddings, and class heads).
-    expected_state = {
-        key: value
-        for key, value in lwdetr.state_dict().items()
-        if torch.is_tensor(value)
-    }
+    expected_state = {key: value for key, value in lwdetr.state_dict().items() if torch.is_tensor(value)}
     # TrackNet is attached only after this P2 validation in test/inference.
     # Its state is validated independently by assert_motion_checkpoint_compatible.
     checkpoint_architecture = {
-        key: value
-        for key, value in checkpoint_state.items()
-        if not key.startswith('motion_module.')
+        key: value for key, value in checkpoint_state.items() if not key.startswith("motion_module.")
     }
     missing = sorted(set(expected_state) - set(checkpoint_architecture))
     unexpected = sorted(set(checkpoint_architecture) - set(expected_state))
@@ -711,85 +678,78 @@ def assert_p2_checkpoint_compatible(
         if tuple(expected_state[key].shape) != tuple(checkpoint_architecture[key].shape)
     )
     if missing or unexpected or mismatched:
-        details: List[str] = []
+        details: list[str] = []
         if missing:
-            details.append(f'missing={missing[:5]}')
+            details.append(f"missing={missing[:5]}")
         if unexpected:
-            details.append(f'unexpected={unexpected[:5]}')
+            details.append(f"unexpected={unexpected[:5]}")
         if mismatched:
             shape_details = [
-                f'{key}: checkpoint={tuple(checkpoint_architecture[key].shape)}, '
-                f'model={tuple(expected_state[key].shape)}'
+                f"{key}: checkpoint={tuple(checkpoint_architecture[key].shape)}, "
+                f"model={tuple(expected_state[key].shape)}"
                 for key in mismatched[:5]
             ]
-            details.append(f'shape_mismatch={shape_details}')
+            details.append(f"shape_mismatch={shape_details}")
         raise RuntimeError(
-            f'Checkpoint {path} is incompatible with configured P2 architecture '
-            f'{projector_scale}: ' + '; '.join(details)
+            f"Checkpoint {path} is incompatible with configured P2 architecture "
+            f"{projector_scale}: " + "; ".join(details)
         )
 
 
 def assert_p2_training_checkpoint_compatible(
     model: Any,
     checkpoint_path: Any,
-    expected_architecture: Optional[Mapping[str, Any]] = None,
+    expected_architecture: Mapping[str, Any] | None = None,
     *,
     allow_stock_initialization: bool,
 ) -> None:
-    '''Permit mismatch filtering only for an official single-level stock checkpoint.'''
-
+    """Permit mismatch filtering only for an official single-level stock checkpoint."""
     if not allow_stock_initialization:
         assert_p2_checkpoint_compatible(model, checkpoint_path, expected_architecture)
         return
     path = Path(str(checkpoint_path)).expanduser()
     if not path.is_file():
-        raise RuntimeError(f'P2 training checkpoint does not exist: {path}')
+        raise RuntimeError(f"P2 training checkpoint does not exist: {path}")
     try:
-        checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     except TypeError:
-        checkpoint = torch.load(path, map_location='cpu')
+        checkpoint = torch.load(path, map_location="cpu")
     if not isinstance(checkpoint, Mapping):
-        raise RuntimeError(f'P2 training checkpoint must be a mapping: {path}')
+        raise RuntimeError(f"P2 training checkpoint must be a mapping: {path}")
 
     lwdetr = _find_p2_lwdetr(model)
     if lwdetr is None:
-        raise RuntimeError('P2 training runtime has no LWDETR model to validate.')
+        raise RuntimeError("P2 training runtime has no LWDETR model to validate.")
     checkpoint_state = _p2_checkpoint_state(checkpoint)
     model_state = lwdetr.state_dict()
     metadata = _checkpoint_architecture_metadata(checkpoint)
     if metadata is not None:
-        saved_p2 = metadata.get('p2')
+        saved_p2 = metadata.get("p2")
         if not isinstance(saved_p2, Mapping):
-            raise RuntimeError('P2 training checkpoint metadata has no valid p2 mapping.')
-        if bool(saved_p2.get('enabled', False)):
+            raise RuntimeError("P2 training checkpoint metadata has no valid p2 mapping.")
+        if bool(saved_p2.get("enabled", False)):
             assert_p2_checkpoint_compatible(model, checkpoint_path, expected_architecture)
             return
         if expected_architecture is not None:
-            if metadata.get('schema_version') != expected_architecture.get('schema_version'):
-                raise RuntimeError(
-                    'P2 stock checkpoint architecture metadata schema does not match this runtime.'
-                )
-            saved_size = str(metadata.get('model_size', '')).strip().lower()
-            expected_size = str(expected_architecture.get('model_size', '')).strip().lower()
+            if metadata.get("schema_version") != expected_architecture.get("schema_version"):
+                raise RuntimeError("P2 stock checkpoint architecture metadata schema does not match this runtime.")
+            saved_size = str(metadata.get("model_size", "")).strip().lower()
+            expected_size = str(expected_architecture.get("model_size", "")).strip().lower()
             if saved_size != expected_size:
                 raise RuntimeError(
-                    'P2 stock checkpoint model size does not match the configured runtime: '
-                    f'checkpoint={saved_size!r}, runtime={expected_size!r}.'
+                    "P2 stock checkpoint model size does not match the configured runtime: "
+                    f"checkpoint={saved_size!r}, runtime={expected_size!r}."
                 )
     sampling_key = next(
-        (
-            key
-            for key in model_state
-            if key.endswith('cross_attn.sampling_offsets.weight') and key in checkpoint_state
-        ),
+        (key for key in model_state if key.endswith("cross_attn.sampling_offsets.weight") and key in checkpoint_state),
         None,
     )
-    backbone = getattr(lwdetr, 'backbone', None)
+    backbone = getattr(lwdetr, "backbone", None)
     try:
         backbone = backbone[0]
     except (IndexError, KeyError, TypeError):
         pass
-    level_count = len(list(getattr(backbone, 'projector_scale', []) or []))
+    level_count = len(list(getattr(backbone, "projector_scale", []) or []))
     is_single_level_stock = False
     if sampling_key is not None and level_count > 1:
         model_shape = tuple(model_state[sampling_key].shape)
@@ -808,46 +768,39 @@ def assert_p2_training_checkpoint_compatible(
     # The wrapper itself removes only known P2 feature-level tensors. Any other
     # size mismatch still raises inside torch.load_state_dict before a
     # successful report can be recorded.
-    report = getattr(lwdetr, '_pitchobjectlab_p2_load_report', None)
+    report = getattr(lwdetr, "_pitchobjectlab_p2_load_report", None)
     if not isinstance(report, Mapping):
         raise RuntimeError(
-            f'Checkpoint {path} was not accompanied by a P2 pretrained-load '
-            'report. Refusing to infer compatibility from the raw checkpoint.'
+            f"Checkpoint {path} was not accompanied by a P2 pretrained-load "
+            "report. Refusing to infer compatibility from the raw checkpoint."
         )
-    if not bool(report.get('loaded', False)) or report.get('error'):
+    if not bool(report.get("loaded", False)) or report.get("error"):
         raise RuntimeError(
-            f'Checkpoint {path} did not complete the normalized P2 pretrained '
-            f'load: {report.get("error")!r}.'
+            f"Checkpoint {path} did not complete the normalized P2 pretrained load: {report.get('error')!r}."
         )
-    reported_scale = list(report.get('projector_scale', []) or [])
-    runtime_scale = list(getattr(backbone, 'projector_scale', []) or [])
+    reported_scale = list(report.get("projector_scale", []) or [])
+    runtime_scale = list(getattr(backbone, "projector_scale", []) or [])
     if reported_scale != runtime_scale:
         raise RuntimeError(
-            'P2 pretrained-load report projector scale does not match the '
-            f'runtime: report={reported_scale}, runtime={runtime_scale}.'
+            "P2 pretrained-load report projector scale does not match the "
+            f"runtime: report={reported_scale}, runtime={runtime_scale}."
         )
-    dropped = list(report.get('dropped_p2_mismatches', []) or [])
-    invalid_drops = sorted(
-        key for key in dropped if not _is_p2_architecture_tensor(str(key))
-    )
+    dropped = list(report.get("dropped_p2_mismatches", []) or [])
+    invalid_drops = sorted(key for key in dropped if not _is_p2_architecture_tensor(str(key)))
     if invalid_drops:
-        raise RuntimeError(
-            'P2 pretrained-load report contains non-P2 filtered tensors: '
-            f'{invalid_drops[:5]}.'
-        )
+        raise RuntimeError(f"P2 pretrained-load report contains non-P2 filtered tensors: {invalid_drops[:5]}.")
     if not dropped:
         raise RuntimeError(
-            f'Checkpoint {path} looked like single-level stock weights but the '
-            'normalized loader reported no P2 feature-level adaptation.'
+            f"Checkpoint {path} looked like single-level stock weights but the "
+            "normalized loader reported no P2 feature-level adaptation."
         )
 
 
-def ensure_p2_support(p2_config: Optional[Mapping[str, Any]] = None) -> None:
+def ensure_p2_support(p2_config: Mapping[str, Any] | None = None) -> None:
     """Apply the in-process P2 patches and record projector settings (idempotent).
 
-    Safe to call once per process before model construction (training, test,
-    inference, tracking). The class patches run once; P2_SETTINGS is refreshed every
-    call so the most recent config wins, which matters for re-launched DDP ranks.
+    Safe to call once per process before model construction (training, test, inference, tracking). The class patches run
+    once; P2_SETTINGS is refreshed every call so the most recent config wins, which matters for re-launched DDP ranks.
     """
     global _WARN_FILTER_INSTALLED
     p2_config = p2_config or {}

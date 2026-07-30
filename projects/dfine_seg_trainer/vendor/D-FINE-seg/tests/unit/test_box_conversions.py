@@ -5,9 +5,7 @@ writer — any silent change here corrupts both eval and exported labels.
 """
 
 import numpy as np
-import pytest
 import torch
-
 from src.dl.utils import (
     abs_xyxy_to_norm_xywh,
     clip_boxes,
@@ -72,9 +70,7 @@ def test_scale_boxes_ratio_kept_undoes_letterbox():
     # original 100x200, letterboxed into 640x640 with gain = min(640/100, 640/200) = 3.2
     # padded H -> 320, padding 160 top/bot
     boxes = np.array([[160.0, 320.0, 320.0, 480.0]])
-    out = scale_boxes_ratio_kept(
-        boxes.copy(), img0_shape=(100, 200), img1_shape=(640, 640), padding=True
-    )
+    out = scale_boxes_ratio_kept(boxes.copy(), img0_shape=(100, 200), img1_shape=(640, 640), padding=True)
     # gain 3.2, x padding 0, y padding 160 -> ((160-0)/3.2, (320-160)/3.2, ...) = (50, 50, 100, 100)
     np.testing.assert_allclose(out, [[50.0, 50.0, 100.0, 100.0]], atol=1.0)
 
