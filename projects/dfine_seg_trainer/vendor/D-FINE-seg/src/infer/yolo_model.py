@@ -1,8 +1,10 @@
+from __future__ import annotations
+
 from pathlib import Path
-from typing import Dict, List
 
 import torch
 from numpy.typing import NDArray
+
 from ultralytics import YOLO
 
 
@@ -20,9 +22,7 @@ class YOLO_model:
         self.half = half
         self.model = YOLO(str(self.model_path))
 
-    def __call__(
-        self, img: NDArray, return_raw_latency: bool = False
-    ) -> List[Dict[str, torch.Tensor]]:
+    def __call__(self, img: NDArray, return_raw_latency: bool = False) -> list[dict[str, torch.Tensor]]:
         result = self.model(
             img,
             conf=self.conf_thresh,

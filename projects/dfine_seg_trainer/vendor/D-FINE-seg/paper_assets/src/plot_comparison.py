@@ -1,6 +1,6 @@
 """
 Model Comparison Plot: F1-score vs Latency
-Reads data from a CSV file
+Reads data from a CSV file.
 """
 
 import matplotlib.pyplot as plt
@@ -13,15 +13,13 @@ plt.rcParams["axes.linewidth"] = 1.2
 
 
 def plot_comparison(csv_path: str, output_name: str = "model_comparison", task: str = "segment"):
-    """
-    Plot F1-score vs Latency from a CSV file.
+    """Plot F1-score vs Latency from a CSV file.
 
     Expected CSV columns:
     - 'latency' or 'Latency': latency values in ms
     - 'f1' or 'F1-score' or 'f1_score' or 'accuracy': metric values
     - 'model' or 'variant' (optional): labels for each point
     """
-
     # Read CSV
     df = pd.read_csv(csv_path)
 
@@ -67,7 +65,7 @@ def plot_comparison(csv_path: str, output_name: str = "model_comparison", task: 
     df["base_model"] = df[model_col].apply(lambda x: parse_model_name(x)[0])
     df["variant"] = df[model_col].apply(lambda x: parse_model_name(x)[1])
     # Create plot
-    fig, ax = plt.subplots(figsize=(8, 6), dpi=120)
+    _fig, ax = plt.subplots(figsize=(8, 6), dpi=120)
 
     # Colors and markers for different models
     colors = ["#ff6600", "#0b23a9"]
@@ -136,9 +134,7 @@ def plot_comparison(csv_path: str, output_name: str = "model_comparison", task: 
     f1_all = df[f1_col].values
 
     # Format task name for display
-    task_display = {"segment": "Segmentation", "detect": "Detection"}.get(
-        task.lower(), task.capitalize()
-    )
+    task_display = {"segment": "Segmentation", "detect": "Detection"}.get(task.lower(), task.capitalize())
 
     # Labels and title
     ax.set_xlabel("Latency (ms)", fontsize=13, fontweight="medium")
@@ -168,9 +164,7 @@ def plot_comparison(csv_path: str, output_name: str = "model_comparison", task: 
     plt.tight_layout()
 
     # Save
-    plt.savefig(
-        f"{output_name}.png", dpi=150, bbox_inches="tight", facecolor="white", edgecolor="none"
-    )
+    plt.savefig(f"{output_name}.png", dpi=150, bbox_inches="tight", facecolor="white", edgecolor="none")
 
     print(f"✓ Saved: {output_name}.png")
 

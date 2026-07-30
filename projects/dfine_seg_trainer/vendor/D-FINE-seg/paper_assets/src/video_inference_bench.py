@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import multiprocessing as mp
 import os
 import time
@@ -11,11 +13,10 @@ import cv2
 import hydra
 import numpy as np
 from omegaconf import DictConfig
-from tabulate import tabulate
-from tqdm import tqdm
-
 from src.dl.utils import Visualizer, get_latest_experiment_name
 from src.infer.trt_model import TRT_model
+from tabulate import tabulate
+from tqdm import tqdm
 
 
 def open_capture(source) -> cv2.VideoCapture:
@@ -57,10 +58,8 @@ def run_base(model, visualizer, source, save_dir: Path, max_frames: int | None =
 
 
 def run_optimized(model, visualizer, source, save_dir: Path, max_frames: int | None = None) -> int:
-    """
-    Reader thread -> main inference -> drawer thread.
-    Drawer also writes the rendered frame to disk.
-    Pipeline rate = max(decode, infer, draw + imwrite).
+    """Reader thread -> main inference -> drawer thread. Drawer also writes the rendered frame to disk. Pipeline rate =
+    max(decode, infer, draw + imwrite).
     """
     save_dir.mkdir(parents=True, exist_ok=True)
     cap = open_capture(source)
@@ -125,13 +124,9 @@ def run_optimized_v2(
     cpu_frac: float = 0.8,
     n_draw: int | None = None,
 ) -> int:
-    """
-    Pooled drawing:
-      - 1 reader thread (VideoCapture is serial)
-      - main thread runs inference and dispatches to drawers
-      - n_draw worker threads draw and imwrite in parallel
-    n_draw is derived from os.cpu_count(), which on Linux/macOS counts logical
-    (SMT) threads — on a 6c/12t CPU this gives 8 drawers at cpu_frac=0.8.
+    """Pooled drawing: - 1 reader thread (VideoCapture is serial) - main thread runs inference and dispatches to drawers
+    - n_draw worker threads draw and imwrite in parallel n_draw is derived from os.cpu_count(), which on Linux/macOS
+    counts logical (SMT) threads — on a 6c/12t CPU this gives 8 drawers at cpu_frac=0.8.
     """
     if n_draw is None:
         n_draw = max(1, int((os.cpu_count() or 4) * cpu_frac) - 1)
@@ -194,19 +189,17 @@ def run_optimized_v2(
 
 
 def _drawer_proc(
-    in_q: "mp.Queue",
-    free_q: "mp.Queue",
+    in_q: mp.Queue,
+    free_q: mp.Queue,
     save_dir_str: str,
     n_classes: int,
     class_names: dict,
     frame_shape: tuple,
     frame_dtype_str: str,
 ) -> None:
-    """
-    Worker entrypoint for run_optimized_v3. Reads frames from a pool of
-    shared-memory blocks (attached by name) instead of from pickled queue
-    payloads. Returns the block to free_q as soon as visualizer.draw is
-    done with it (draw copies internally).
+    """Worker entrypoint for run_optimized_v3. Reads frames from a pool of shared-memory blocks (attached by name)
+    instead of from pickled queue payloads. Returns the block to free_q as soon as visualizer.draw is done with it
+    (draw copies internally).
     """
     visualizer = Visualizer(n_classes=n_classes, class_names=class_names)
     save_dir = Path(save_dir_str)
@@ -242,17 +235,13 @@ def run_optimized_v3(
     cpu_frac: float = 0.8,
     n_draw: int | None = None,
 ) -> int:
-    """
-    Multiprocessing variant of run_optimized_v2, with shared memory for frames.
-      - 1 reader thread (in main process)
-      - main process runs inference, memcpys the frame into a free shm block,
-        and ships only (idx, shm_name, res) over the mp.Queue
-      - n_draw worker processes attach to the shm block by name, draw, imwrite,
-        and return the block to the free pool
+    """Multiprocessing variant of run_optimized_v2, with shared memory for frames. - 1 reader thread (in main process) -
+    main process runs inference, memcpys the frame into a free shm block, and ships only (idx, shm_name, res) over
+    the mp.Queue - n_draw worker processes attach to the shm block by name, draw, imwrite, and return the block to
+    the free pool.
 
-    Removes the pickling tax of a naive multiprocessing version (which would
-    serialize every ~6MB frame through a pipe). Only the small result dict
-    crosses the queue; the frame travels through a fixed pool of shm blocks.
+    Removes the pickling tax of a naive multiprocessing version (which would serialize every ~6MB frame through a pipe).
+    Only the small result dict crosses the queue; the frame travels through a fixed pool of shm blocks.
     """
     if n_draw is None:
         n_draw = max(1, int((os.cpu_count() or 4) * cpu_frac) - 1)
@@ -272,11 +261,11 @@ def run_optimized_v3(
 
     pool_size = 2 * n_draw + 4
     shms = [shared_memory.SharedMemory(create=True, size=nbytes) for _ in range(pool_size)]
-    free_q: "mp.Queue" = ctx.Queue()
+    free_q: mp.Queue = ctx.Queue()
     for shm in shms:
         free_q.put(shm.name)
 
-    draw_q: "mp.Queue" = ctx.Queue(maxsize=2 * n_draw + 2)
+    draw_q: mp.Queue = ctx.Queue(maxsize=2 * n_draw + 2)
     read_q: Queue = Queue(maxsize=2 * n_draw + 2)
     READ_DONE = object()
 
@@ -321,9 +310,7 @@ def run_optimized_v3(
 
     # Producer-side: keep a numpy view onto every owned shm block so writes
     # are a single memcpy with no re-attach cost.
-    views = {
-        s.name: np.ndarray(frame_shape, dtype=np.dtype(frame_dtype_str), buffer=s.buf) for s in shms
-    }
+    views = {s.name: np.ndarray(frame_shape, dtype=np.dtype(frame_dtype_str), buffer=s.buf) for s in shms}
 
     pbar = tqdm(total=total_frames(cap, max_frames))
     n = 0
@@ -357,9 +344,7 @@ def run_optimized_v3(
 
 
 def profile_stages(model, visualizer, source, save_dir: Path, n_frames: int = 200) -> None:
-    """
-    Run each stage in isolation and print ms/frame.
-    Now includes imwrite so we can see disk-write cost too.
+    """Run each stage in isolation and print ms/frame. Now includes imwrite so we can see disk-write cost too.
     """
     save_dir.mkdir(parents=True, exist_ok=True)
     cap = open_capture(source)
@@ -417,9 +402,7 @@ def main(cfg: DictConfig):
         apply_nms=True,
     )
 
-    visualizer = Visualizer(
-        n_classes=len(cfg.train.label_to_name), class_names=cfg.train.label_to_name
-    )
+    visualizer = Visualizer(n_classes=len(cfg.train.label_to_name), class_names=cfg.train.label_to_name)
 
     output_dir = Path(cfg.train.infer_path)
     profile_dir = output_dir / "profile"

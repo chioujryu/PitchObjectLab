@@ -79,7 +79,6 @@ model:
         # Largest engine batch; larger calls are split into chunks. Options: auto to infer from the task, or a positive integer.
         max_batch_size: auto
 
-
 # Dataset discovery and limiting settings. Options: mapping.
 dataset:
   # Dataset source format. Options: auto, rfdetr, roboflow, ultralytics_yolo, coco_json, pascal_voc, dota, labelme_json.

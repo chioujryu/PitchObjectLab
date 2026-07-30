@@ -28,6 +28,8 @@ Output structure:
         dataset.yaml
 """
 
+from __future__ import annotations
+
 import argparse
 import shutil
 from pathlib import Path
@@ -37,14 +39,14 @@ import yaml
 
 def read_csv_filenames(csv_path: Path) -> list[str]:
     """Read image filenames from a CSV file (no header, one filename per line)."""
-    with open(csv_path, "r") as f:
+    with open(csv_path) as f:
         filenames = [line.strip() for line in f if line.strip()]
     return filenames
 
 
 def read_class_names(labels_txt_path: Path) -> list[str]:
     """Read class names from labels.txt file."""
-    with open(labels_txt_path, "r") as f:
+    with open(labels_txt_path) as f:
         class_names = [line.strip() for line in f if line.strip()]
     return class_names
 
