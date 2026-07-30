@@ -7,21 +7,20 @@ TRACK_FIELDS emission are verified without the dependency. The one real-boxmot s
 gated with skipUnless.
 """
 
-from pathlib import Path
 import sys
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import numpy as np
-
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 REPO_ROOT = PROJECT_DIR.parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-import rf_detr_boxmot_tracker as bt  # noqa: E402
-import rf_detr_video_tracking as vt  # noqa: E402
+import rf_detr_boxmot_tracker as bt
+import rf_detr_video_tracking as vt
 
 CATEGORIES = [
     {"id": 0, "name": "standing_player"},

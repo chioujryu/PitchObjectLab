@@ -1,4 +1,5 @@
 """Unit tests for MotionFilter — requires only opencv and numpy."""
+
 import numpy as np
 import pytest
 from omegaconf import OmegaConf
@@ -26,7 +27,6 @@ def _make_cfg(**overrides):
 
 def _candidate(box, score=0.9):
     H, W = 200, 200
-    import cv2
     mask = np.zeros((H, W), dtype=bool)
     x1, y1, x2, y2 = [int(v) for v in box]
     mask[y1:y2, x1:x2] = True
@@ -65,7 +65,7 @@ class TestMotionFilter:
         cfg = _make_cfg()
         mf = MotionFilter(cfg)
         cands = [_candidate([70, 70, 130, 130])]
-        mf.update_frame(_static_frame())   # only one frame pushed
+        mf.update_frame(_static_frame())  # only one frame pushed
         result = mf.filter(cands, field_mask=None)
         assert len(result) == len(cands)
 
@@ -87,7 +87,7 @@ class TestMotionFilter:
         mf.update_frame(_static_frame())
         mf.update_frame(_static_frame())
         cands = [_candidate([70, 70, 130, 130], score=1.0)]
-        field_mask = np.ones((200, 200), dtype=bool)   # all inside
+        field_mask = np.ones((200, 200), dtype=bool)  # all inside
         result = mf.filter(cands, field_mask=field_mask)
         assert len(result) == 1
         assert result[0].score == pytest.approx(0.4, abs=0.01)
@@ -100,5 +100,5 @@ class TestMotionFilter:
         mf.update_frame(_static_frame())
         cands = [_candidate([70, 70, 130, 130], score=1.0)]
         result = mf.filter(cands, field_mask=None)
-        assert len(result) == 1   # kept but penalised
+        assert len(result) == 1  # kept but penalized
         assert result[0].score < 1.0

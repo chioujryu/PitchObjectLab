@@ -1,19 +1,18 @@
-from concurrent.futures import Future
 import json
-from pathlib import Path
 import sys
 import tempfile
 import types
 import unittest
+from concurrent.futures import Future
+from pathlib import Path
 from unittest import mock
-
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 REPO_ROOT = PROJECT_DIR.parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from projects.object_detection_dataset_evaluator import object_detection_dataset_evaluator as evaluator  # noqa: E402
+from projects.object_detection_dataset_evaluator import object_detection_dataset_evaluator as evaluator
 
 
 def make_dataset(image_count: int) -> evaluator.DatasetBundle:
@@ -206,7 +205,9 @@ class ParallelInferencePlanningTest(unittest.TestCase):
             [submission["device"] for submission in executor.submissions],
             ["cuda:0", "cuda:1", "cuda:0", "cuda:1", "cuda:0", "cuda:1"],
         )
-        self.assertTrue(all(submission["function"] is evaluator.inference_worker for submission in executor.submissions))
+        self.assertTrue(
+            all(submission["function"] is evaluator.inference_worker for submission in executor.submissions)
+        )
         self.assertEqual([prediction["image_id"] for prediction in predictions], [1, 2, 3, 4, 5, 6])
         self.assertEqual([row["image_id"] for row in stats], [1, 2, 3, 4, 5, 6])
         self.assertEqual(visuals, [])
@@ -226,18 +227,17 @@ class ParallelInferencePlanningTest(unittest.TestCase):
 
         RecordingExecutor.result_builder = staticmethod(result_builder)
 
-        with mock.patch.object(evaluator, "ProcessPoolExecutor", RecordingExecutor):
-            with mock.patch.object(
-                evaluator,
-                "as_completed",
-                side_effect=lambda futures: reversed(list(futures)),
-            ):
-                _, _, visuals, _ = evaluator.run_inference(
-                    make_dataset(3),
-                    inference_config(chunks=3),
-                    Path("/unused"),
-                    quiet=True,
-                )
+        with mock.patch.object(evaluator, "ProcessPoolExecutor", RecordingExecutor), mock.patch.object(
+            evaluator,
+            "as_completed",
+            side_effect=lambda futures: reversed(list(futures)),
+        ):
+            _, _, visuals, _ = evaluator.run_inference(
+                make_dataset(3),
+                inference_config(chunks=3),
+                Path("/unused"),
+                quiet=True,
+            )
 
         self.assertEqual(
             visuals,
@@ -388,17 +388,20 @@ class InferenceWorkerMetadataTest(unittest.TestCase):
         self.assertEqual(result["stats"], stats)
         self.assertEqual(result["visuals"], [])
         self.assertEqual(
-            {key: result[key] for key in (
-                "chunk_id",
-                "device",
-                "image_count",
-                "prediction_count",
-                "model_load_seconds",
-                "inference_seconds",
-                "effective_batch_sizes",
-                "status",
-                "error",
-            )},
+            {
+                key: result[key]
+                for key in (
+                    "chunk_id",
+                    "device",
+                    "image_count",
+                    "prediction_count",
+                    "model_load_seconds",
+                    "inference_seconds",
+                    "effective_batch_sizes",
+                    "status",
+                    "error",
+                )
+            },
             {
                 "chunk_id": 7,
                 "device": "cuda:1",
@@ -785,9 +788,15 @@ class ParallelInferenceFailureTest(unittest.TestCase):
                                     side_effect=StubParallelInferenceError(failed_summary),
                                 ):
                                     with mock.patch.object(evaluator, "render_visual_outputs", render_visuals):
-                                        with mock.patch.object(evaluator, "render_dataset_case_outputs", render_dataset_cases):
-                                            with mock.patch.object(evaluator, "render_error_case_outputs", render_error_cases):
-                                                with mock.patch.object(evaluator, "write_metrics_tables", write_metrics):
+                                        with mock.patch.object(
+                                            evaluator, "render_dataset_case_outputs", render_dataset_cases
+                                        ):
+                                            with mock.patch.object(
+                                                evaluator, "render_error_case_outputs", render_error_cases
+                                            ):
+                                                with mock.patch.object(
+                                                    evaluator, "write_metrics_tables", write_metrics
+                                                ):
                                                     with self.assertRaises(StubParallelInferenceError):
                                                         evaluator.run_evaluation(
                                                             config,
@@ -868,7 +877,9 @@ class ParallelInferenceFailureTest(unittest.TestCase):
                                 with mock.patch.object(evaluator, "render_dataset_case_outputs", return_value=[]):
                                     with mock.patch.object(evaluator, "render_visual_outputs", return_value=[]):
                                         with mock.patch.object(evaluator, "render_error_case_outputs", return_value=[]):
-                                            with mock.patch.object(evaluator, "capture_coco_eval", return_value=(object(), "")):
+                                            with mock.patch.object(
+                                                evaluator, "capture_coco_eval", return_value=(object(), "")
+                                            ):
                                                 with mock.patch.object(
                                                     evaluator,
                                                     "match_predictions_at_threshold",

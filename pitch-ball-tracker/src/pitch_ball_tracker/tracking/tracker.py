@@ -11,19 +11,16 @@ from pitch_ball_tracker.tracking.tracklet import Tracklet, TrackState
 
 
 class BotSortTracker:
-    """
-    BoT-SORT–style multi-object tracker adapted for ball tracking.
+    """BoT-SORT–style multi-object tracker adapted for ball tracking.
 
-    Three-stage matching per frame:
-      Stage 1 – High-confidence detections  ↔  CONFIRMED+LOST tracks  (IoU)
-      Stage 2 – Low-confidence detections   ↔  remaining CONFIRMED    (IoU)
-      Stage 3 – Unmatched LOST tracks       ↔  unmatched detections   (ReID)
+    Three-stage matching per frame: Stage 1 – High-confidence detections ↔ CONFIRMED+LOST tracks (IoU) Stage 2 –
+    Low-confidence detections ↔ remaining CONFIRMED (IoU) Stage 3 – Unmatched LOST tracks ↔ unmatched detections (ReID)
 
-    Tracks are confirmed after `min_hits` consecutive detections.
-    LOST tracks are deleted after `max_age + lost_track_buffer` frames.
+    Tracks are confirmed after `min_hits` consecutive detections. LOST tracks are deleted after `max_age +
+    lost_track_buffer` frames.
     """
 
-    _HIGH_CONF = 0.5   # split between high / low confidence detections
+    _HIGH_CONF = 0.5  # split between high / low confidence detections
 
     def __init__(self, cfg: DictConfig, reid: BallReIDExtractor | None) -> None:
         tc = cfg.tracking
@@ -50,12 +47,11 @@ class BotSortTracker:
         candidates: list[BallCandidate],
         frame_bgr: np.ndarray,
     ) -> list[Tracklet]:
-        """
-        Advance the tracker by one frame.
+        """Advance the tracker by one frame.
 
         Args:
             candidates: ball candidates from BallFilter (possibly empty).
-            frame_bgr : current BGR frame (needed by ReID extractor).
+            frame_bgr: current BGR frame (needed by ReID extractor).
 
         Returns:
             List of currently CONFIRMED (and predicted) tracks.
@@ -67,11 +63,7 @@ class BotSortTracker:
         # --- extract ReID embeddings for candidates ---
         boxes = np.array([c.box for c in candidates], dtype=np.float32) if candidates else np.empty((0, 4))
         scores = np.array([c.score for c in candidates], dtype=np.float32) if candidates else np.empty((0,))
-        embeddings = (
-            self._reid.extract(frame_bgr, boxes)
-            if self._use_reid and len(boxes) > 0
-            else None
-        )
+        embeddings = self._reid.extract(frame_bgr, boxes) if self._use_reid and len(boxes) > 0 else None
 
         # --- split candidates into high / low confidence ---
         if len(candidates) > 0:
@@ -99,10 +91,10 @@ class BotSortTracker:
 
         # --- Stage 2: low-conf dets ↔ still-unmatched CONFIRMED tracks (IoU) ---
         remaining_conf = [confirmed[i] for i in unmatched_trk1 if confirmed[i].is_confirmed]
-        remaining_conf_orig_idx = [i for i in unmatched_trk1 if confirmed[i].is_confirmed]
+        [i for i in unmatched_trk1 if confirmed[i].is_confirmed]
         lost_idx = [i for i in unmatched_trk1 if confirmed[i].is_lost]
 
-        matched2, unmatched_trk2, unmatched_det_low = self._match_iou(
+        matched2, _unmatched_trk2, unmatched_det_low = self._match_iou(
             remaining_conf, candidates, low_idx, frame_bgr, embeddings
         )
         for ti, di in matched2:
@@ -116,9 +108,7 @@ class BotSortTracker:
         all_unmatched_det = unmatched_det_high + unmatched_det_low
         lost_tracks = [confirmed[i] for i in lost_idx]
         if self._use_reid and lost_tracks and all_unmatched_det and embeddings is not None:
-            matched3, _, unmatched_det_final = self._match_reid(
-                lost_tracks, candidates, all_unmatched_det, embeddings
-            )
+            matched3, _, unmatched_det_final = self._match_reid(lost_tracks, candidates, all_unmatched_det, embeddings)
             for ti, di in matched3:
                 t = lost_tracks[ti]
                 c = candidates[di]
@@ -172,8 +162,7 @@ class BotSortTracker:
         self._tracks = [t for t in self._tracks if not t.is_deleted]
 
         logger.debug(
-            f"Tracker: {len(self._tracks)} active tracks "
-            f"({sum(1 for t in self._tracks if t.is_confirmed)} confirmed)"
+            f"Tracker: {len(self._tracks)} active tracks ({sum(1 for t in self._tracks if t.is_confirmed)} confirmed)"
         )
         return [t for t in self._tracks if t.is_confirmed]
 
@@ -198,7 +187,7 @@ class BotSortTracker:
 
         pred_boxes = np.array([t.get_bbox() for t in tracks], dtype=np.float32)
         det_boxes = np.array([candidates[i].box for i in det_indices], dtype=np.float32)
-        iou_mat = _box_iou(pred_boxes, det_boxes)   # (|tracks|, |dets|)
+        iou_mat = _box_iou(pred_boxes, det_boxes)  # (|tracks|, |dets|)
         cost = 1.0 - iou_mat
 
         trk_idx, det_idx = linear_sum_assignment(cost)
@@ -256,6 +245,7 @@ class BotSortTracker:
 # ------------------------------------------------------------------
 # Geometry helpers
 # ------------------------------------------------------------------
+
 
 def _box_iou(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """Compute pairwise IoU between two sets of xyxy boxes. Returns (M, N)."""

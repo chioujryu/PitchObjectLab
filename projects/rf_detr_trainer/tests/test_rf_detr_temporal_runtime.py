@@ -8,12 +8,11 @@ from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import torch
-import torch.nn as nn
-from pytorch_lightning import LightningModule
-
 import rf_detr_temporal_runtime as temporal_runtime
+import torch
+from pytorch_lightning import LightningModule
 from rf_detr_temporal_data import TemporalBatch
+from torch import nn
 
 
 class _BaseCriterion(nn.Module):

@@ -7,7 +7,6 @@
 import cv2
 import numpy as np
 import pytest
-
 from src.dl.dataset import CustomDataset
 
 
@@ -19,9 +18,7 @@ def _build(in_channels):
 
 
 def _write_bgr_jpeg(path, r, g, b):
-    bgr = np.dstack(
-        [np.full((4, 4), b, np.uint8), np.full((4, 4), g, np.uint8), np.full((4, 4), r, np.uint8)]
-    )
+    bgr = np.dstack([np.full((4, 4), b, np.uint8), np.full((4, 4), g, np.uint8), np.full((4, 4), r, np.uint8)])
     cv2.imwrite(str(path), bgr)
 
 

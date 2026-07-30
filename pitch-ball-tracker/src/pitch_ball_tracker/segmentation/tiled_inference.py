@@ -8,10 +8,8 @@ from pitch_ball_tracker.segmentation.sam3_segmentor import SAM3Segmentor, Segmen
 
 
 class TiledInference:
-    """
-    Splits a high-resolution frame into overlapping tiles, runs SAM3 on each
-    tile independently, then merges all detections back into frame coordinates
-    using NMS.
+    """Splits a high-resolution frame into overlapping tiles, runs SAM3 on each tile independently, then merges all
+    detections back into frame coordinates using NMS.
 
     Tile layout (stride = tile_size - overlap):
 
@@ -42,7 +40,7 @@ class TiledInference:
         all_boxes: list[np.ndarray] = []
         all_scores: list[np.ndarray] = []
 
-        for (r0, r1, c0, c1) in tiles:
+        for r0, r1, c0, c1 in tiles:
             tile = frame_bgr[r0:r1, c0:c1]
             result = self._seg.segment(tile)
             if len(result.boxes) == 0:

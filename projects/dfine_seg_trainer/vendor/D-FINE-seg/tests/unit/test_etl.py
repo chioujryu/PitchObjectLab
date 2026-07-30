@@ -6,7 +6,6 @@ without any error message.
 
 import cv2
 import numpy as np
-
 from src.etl.png_mask_to_yolo import find_contours, mask_to_yolo_lines, to_yolo_poly
 
 
@@ -68,7 +67,11 @@ def test_mask_to_yolo_lines_filters_small_blobs():
     img = np.zeros((64, 64), dtype=np.uint8)
     img[10:12, 10:12] = 255  # tiny 2x2 region, area = 4
     lines = mask_to_yolo_lines(
-        img, class_id=0, thresh_invert=False, min_area_px=100,
-        epsilon_ratio=0.005, n_points_max=None,
+        img,
+        class_id=0,
+        thresh_invert=False,
+        min_area_px=100,
+        epsilon_ratio=0.005,
+        n_points_max=None,
     )
     assert lines == []
