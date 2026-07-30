@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from pathlib import Path
 
 import hydra
@@ -5,19 +7,17 @@ import torch
 import torch.nn.functional as F
 from loguru import logger
 from omegaconf import DictConfig
-from torch import nn
-
 from src.d_fine.configs import base_cfg
-from src.d_fine.dfine import build_model
+from src.d_fine.define import build_model
 from src.dl.utils import get_latest_experiment_name
+from torch import nn
 
 
 class DFINEPostProcessor(nn.Module):
     """Fused detection postprocessor baked into the exported graph.
 
-    Performs: sigmoid -> topK -> cxcywh -> xyxy (in input-size pixels).
-    Outputs: labels [B,K], boxes [B,K,4], scores [B,K].
-    Masks (if present) are passed through with sigmoid applied.
+    Performs: sigmoid -> topK -> cxcywh -> xyxy (in input-size pixels). Outputs: labels [B,K], boxes [B,K,4], scores
+    [B,K]. Masks (if present) are passed through with sigmoid applied.
     """
 
     def __init__(self, num_classes: int, num_top_queries: int = 300, use_focal_loss: bool = True):
@@ -27,10 +27,8 @@ class DFINEPostProcessor(nn.Module):
         self.use_focal_loss = use_focal_loss
 
     @staticmethod
-    def norm_xywh_to_abs_xyxy(
-        boxes: torch.Tensor, height: int, width: int, to_round=True
-    ) -> torch.Tensor:
-        """Converts boxes: [N, 4] normalized xywh -> [N, 4] absolute xyxy"""
+    def norm_xywh_to_abs_xyxy(boxes: torch.Tensor, height: int, width: int, to_round=True) -> torch.Tensor:
+        """Converts boxes: [N, 4] normalized xywh -> [N, 4] absolute xyxy."""
         x_center = boxes[:, 0] * width
         y_center = boxes[:, 1] * height
         box_width = boxes[:, 2] * width
@@ -55,10 +53,10 @@ class DFINEPostProcessor(nn.Module):
 
     def forward(self, outputs: dict, input_h: int, input_w: int):
         logits = outputs["pred_logits"]  # [B, Q, C]
-        boxes = outputs["pred_boxes"]  # [B, Q, 4]  normalised cxcywh
+        boxes = outputs["pred_boxes"]  # [B, Q, 4]  normalized cxcywh
         pred_masks = outputs.get("pred_masks", None)  # [B, Q, Hm, Wm] or None
 
-        # box conversion: normalised cxcywh -> absolute xyxy in input-size space
+        # box conversion: normalized cxcywh -> absolute xyxy in input-size space
         abs_boxes = self.norm_xywh_to_abs_xyxy(boxes.flatten(0, 1), input_h, input_w).view(
             boxes.shape[0], boxes.shape[1], 4
         )
@@ -80,11 +78,7 @@ class DFINEPostProcessor(nn.Module):
             topk_qidx = order
 
         # gather boxes for top-K queries using advanced indexing (CoreML-friendly)
-        batch_idx = (
-            torch.arange(abs_boxes.shape[0], device=abs_boxes.device)
-            .unsqueeze(1)
-            .expand_as(topk_qidx)
-        )
+        batch_idx = torch.arange(abs_boxes.shape[0], device=abs_boxes.device).unsqueeze(1).expand_as(topk_qidx)
         topk_boxes = abs_boxes[batch_idx, topk_qidx]  # [B, K, 4]
 
         result = (topk_labels, topk_boxes, topk_scores)
@@ -92,7 +86,7 @@ class DFINEPostProcessor(nn.Module):
         if pred_masks is not None:
             # Gather masks for top-K queries: [B, Q, Hm, Wm] -> [B, K, Hm, Wm]
             topk_masks = pred_masks[batch_idx, topk_qidx]
-            result = result + (topk_masks,)
+            result = (*result, topk_masks)
 
         return result
 
@@ -142,7 +136,7 @@ def export_to_onnx(
 
     dynamic_axes = {}
     if max_batch_size > 1:
-        for name in [input_name] + output_names:
+        for name in [input_name, *output_names]:
             dynamic_axes[name] = {0: "batch_size"}
     if dynamic_input:
         if input_name not in dynamic_axes:
@@ -203,10 +197,9 @@ def export_to_coreml(
 ) -> None:
     """Convert PyTorch model to CoreML (.mlpackage) for iOS / macOS.
 
-    Mirrors the TensorRT path: converts the fused model (with postprocessor).
-    Uses torch.jit.trace + coremltools PyTorch converter.
+    Mirrors the TensorRT path: converts the fused model (with postprocessor). Uses torch.jit.trace + coremltools PyTorch
+    converter.
     """
-
     import coremltools as ct
     from coremltools.optimize.coreml import (
         OpLinearQuantizerConfig,
@@ -223,9 +216,7 @@ def export_to_coreml(
         ct_inputs = [
             ct.TensorType(
                 name="input",
-                shape=ct.Shape(
-                    shape=[ct.RangeDim(lower_bound=1, upper_bound=max_batch_size), *input_shape[1:]]
-                ),
+                shape=ct.Shape(shape=[ct.RangeDim(lower_bound=1, upper_bound=max_batch_size), *input_shape[1:]]),
             )
         ]
     else:
@@ -259,12 +250,11 @@ def export_to_litert(
 ) -> None:
     """Convert PyTorch model to LiteRT (.tflite) for on-device inference.
 
-    Uses litert_torch for direct PyTorch -> TFLite conversion.
-    Exports FP32 and INT8 (weight-only quantization via ai_edge_quantizer) variants.
-    Converts raw model dict output to tensor tuple via a local adapter.
+    Uses litert_torch for direct PyTorch -> TFLite conversion. Exports FP32 and INT8 (weight-only quantization via
+    ai_edge_quantizer) variants. Converts raw model dict output to tensor tuple via a local adapter.
 
-    Imports are deferred to avoid tensorflow/flatbuffers native library
-    conflicts that cause segfaults during ONNX/TRT export.
+    Imports are deferred to avoid tensorflow/flatbuffers native library conflicts that cause segfaults during ONNX/TRT
+    export.
     """
     import litert_torch
     from ai_edge_quantizer import quantizer as aeq
@@ -280,7 +270,7 @@ def export_to_litert(
             result = (outputs["pred_logits"], outputs["pred_boxes"])
             pred_masks = outputs.get("pred_masks", None)
             if pred_masks is not None:
-                result = result + (pred_masks,)
+                result = (*result, pred_masks)
             return result
 
     sample = x_test[:1].cpu()
@@ -371,8 +361,7 @@ def export_to_tensorrt(
                 )
             else:
                 raise ValueError(
-                    f"Cannot create TensorRT optimization profile: input shape dimension at "
-                    f"index {i} is undefined."
+                    f"Cannot create TensorRT optimization profile: input shape dimension at index {i} is undefined."
                 )
 
         # Set the minimum and optimal batch size to 1, and allow the maximum batch size as provided.
@@ -423,9 +412,7 @@ def main(cfg: DictConfig):
     model.eval()
     raw_model.eval()
 
-    x_test = torch.randn(
-        cfg.export.max_batch_size, cfg.train.in_channels, *cfg.train.img_size
-    ).to(device)
+    x_test = torch.randn(cfg.export.max_batch_size, cfg.train.in_channels, *cfg.train.img_size).to(device)
     _ = model(x_test)
 
     # Openvino currently doesn't supprort some operations in postprocessor
@@ -456,9 +443,7 @@ def main(cfg: DictConfig):
     )
     export_to_tensorrt(full_onnx_path, cfg.export.half, cfg.export.max_batch_size)
 
-    export_to_coreml(
-        model, model_path, x_test, half=False, max_batch_size=cfg.export.max_batch_size
-    )
+    export_to_coreml(model, model_path, x_test, half=False, max_batch_size=cfg.export.max_batch_size)
 
     export_to_litert(raw_model, model_path, x_test)
 

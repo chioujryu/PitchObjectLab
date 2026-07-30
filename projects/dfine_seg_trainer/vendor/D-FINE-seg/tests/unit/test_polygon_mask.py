@@ -6,7 +6,6 @@ shift mask boundaries — and silently degrade mask mAP.
 """
 
 import numpy as np
-
 from src.dl.utils import (
     clip_polygon_to_rect,
     norm_poly_to_abs,

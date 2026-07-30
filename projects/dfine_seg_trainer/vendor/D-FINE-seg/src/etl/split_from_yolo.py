@@ -12,16 +12,11 @@ def main(cfg: DictConfig) -> None:
     for split in ["train", "val"]:
         f_paths = []
         f_paths.extend(
-            [
-                x.name
-                for x in (yolo_data_path / "images" / split).iterdir()
-                if not str(x.name).startswith(".")
-            ]
+            [x.name for x in (yolo_data_path / "images" / split).iterdir() if not str(x.name).startswith(".")]
         )
 
         with open(data_path / f"{split}.csv", "w") as f:
-            for f_path in f_paths:
-                f.write(str(f_path) + "\n")
+            f.writelines(str(f_path) + "\n" for f_path in f_paths)
 
 
 if __name__ == "__main__":

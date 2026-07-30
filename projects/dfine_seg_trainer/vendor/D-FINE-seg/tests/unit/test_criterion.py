@@ -6,15 +6,12 @@ approaches the target.
 """
 
 import torch
-
 from src.d_fine.dfine_criterion import DFINECriterion
 from src.d_fine.matcher import HungarianMatcher
 
 
 def _criterion(num_classes=5):
-    matcher = HungarianMatcher(
-        weight_dict={"cost_class": 2, "cost_bbox": 5, "cost_giou": 2}, use_focal_loss=True
-    )
+    matcher = HungarianMatcher(weight_dict={"cost_class": 2, "cost_bbox": 5, "cost_giou": 2}, use_focal_loss=True)
     return DFINECriterion(
         matcher,
         weight_dict={"loss_vfl": 1, "loss_bbox": 5, "loss_giou": 2},
@@ -56,8 +53,7 @@ def test_loss_labels_focal_finite_and_nonnegative():
         {"labels": torch.tensor([1]), "boxes": torch.zeros(1, 4)},
         {"labels": torch.tensor([0, 3]), "boxes": torch.zeros(2, 4)},
     ]
-    indices = [(torch.tensor([0]), torch.tensor([0])),
-               (torch.tensor([0, 1]), torch.tensor([0, 1]))]
+    indices = [(torch.tensor([0]), torch.tensor([0])), (torch.tensor([0, 1]), torch.tensor([0, 1]))]
     losses = crit.loss_labels_focal(outputs, targets, indices=indices, num_boxes=3)
     val = losses["loss_focal"].item()
     assert val >= 0 and torch.isfinite(losses["loss_focal"])

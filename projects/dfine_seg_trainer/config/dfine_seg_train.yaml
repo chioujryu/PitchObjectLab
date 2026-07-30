@@ -54,7 +54,7 @@ dataset:
   image_dir: ""
   # Explicit class names. Options: [] to infer, or list/dict such as [person, ball].
   names: []
-  # Cache root for converted D-FINE COCO layout. Options: dataset_cache, D:/cache/dfine, /mnt/cache/dfine.
+  # Cache root for converted D-FINE COCO layout. Options: dataset_cache, D:/cache/define, /mnt/cache/define.
   cache_root: dataset_cache
   # Rebuild cache even when fingerprint matches. Options: true, false.
   refresh_cache: false
