@@ -69,7 +69,7 @@ dataset:
   dataset_dir: "C:/Users/XBOT/Documents/Datasets/soccer_ball_merged_v1/datasets/spatiotemporal/frame_label_process_result_smoke"
   data_yaml: "C:/Users/XBOT/Documents/Datasets/soccer_ball_merged_v1/datasets/spatiotemporal/frame_label_process_result_smoke/dataset.yaml"
   temporal:
-    max_windows_per_split: {train: 1, val: 1, test: 1}
+    max_windows_per_split: { train: 1, val: 1, test: 1 }
 
 inference:
   temporal_split: test

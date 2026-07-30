@@ -1,6 +1,6 @@
 """Unit tests for KalmanBoxTracker — pure numpy, no GPU required."""
+
 import numpy as np
-import pytest
 
 from pitch_ball_tracker.tracking.kalman import KalmanBoxTracker
 
@@ -45,7 +45,6 @@ class TestKalmanBoxTracker:
         assert abs(cx_est - 145) < 10.0
 
     def test_unique_ids(self):
-        before = KalmanBoxTracker._next_id
         kf1 = KalmanBoxTracker(_bbox(0, 0, 10, 10))
         kf2 = KalmanBoxTracker(_bbox(0, 0, 10, 10))
         assert kf2.id == kf1.id + 1
