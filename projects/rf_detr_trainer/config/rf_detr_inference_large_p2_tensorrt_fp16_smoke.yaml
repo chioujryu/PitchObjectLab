@@ -114,7 +114,7 @@ model:
 
 dataset:
   # Class names embedded in rendered outputs. Must match num_classes. Options: ordered list.
-  class_names: [soccer_ball]
+  class_names: [football]
   # Optional Ultralytics dataset YAML used only for class-name lookup. Options: empty or path.
   data_yaml: ""
 
@@ -149,6 +149,14 @@ inference:
   render_class_names: []
   # Persist machine-readable predictions beside rendered media. Options: true, false.
   save_predictions_jsonl: true
+  # Concise per-football center-coordinate JSONL output. Options: mapping.
+  football_output:
+    # Write football_predictions.jsonl beside the full predictions file. Options: true, false.
+    enabled: true
+    # Category IDs to export. Non-empty IDs take precedence over names. Options: list of category IDs.
+    target_class_ids: []
+    # Category names to export when IDs are empty. Empty defaults to football. Options: names such as [football].
+    target_class_names: [football]
   video:
     # null processes every source frame. Options: null or positive FPS.
     detection_fps: null

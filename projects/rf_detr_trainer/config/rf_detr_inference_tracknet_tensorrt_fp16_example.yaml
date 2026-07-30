@@ -68,7 +68,8 @@ model:
       gradient_checkpointing: true
 
 dataset:
-  class_names: []
+  # Display/export class names supplied independently from checkpoint tensor shapes.
+  class_names: [football]
   data_yaml: ''
 
 output:
@@ -90,6 +91,14 @@ inference:
   render_class_ids: []
   render_class_names: []
   save_predictions_jsonl: true
+  # Concise per-football center-coordinate JSONL output. Options: mapping.
+  football_output:
+    # Write football_predictions.jsonl beside the full predictions file. Options: true, false.
+    enabled: true
+    # Category IDs to export. Non-empty IDs take precedence over names. Options: list of category IDs.
+    target_class_ids: []
+    # Category names to export when IDs are empty. Empty defaults to football. Options: names such as [football].
+    target_class_names: [football]
   video:
     detection_fps: null
     batch_size: null

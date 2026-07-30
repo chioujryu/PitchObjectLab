@@ -36,13 +36,13 @@ model:
   # RF-DETR model size. Detection: base, nano, small, medium, large. Segmentation: seg-preview, seg-nano, seg-small, seg-medium, seg-large, seg-xlarge, seg-2xlarge.
   size: small
   # Required custom-architecture checkpoint. Keep null only when supplying --checkpoint. Options: null or a matching local .pth/.pt/.ckpt path.
-  pretrain_weights: /home/new_users/zhiyu/trash/small/checkpoint_best_ema.pth
+  pretrain_weights: null
   # Input resolution override. Options: null for model default, or an int divisible by model window requirements.
   resolution: null
   # Class count override. Options: null to infer from dataset, or positive integer.
   num_classes: null
   # Device selector. Options: auto, cpu, cuda, cuda:0, 0, 1, "0,1" for round-robin multi-GPU, mps, -1.
-  device: cuda:5
+  device: auto
   # RF-DETR AMP construction setting; separate from standalone inference_optimization. Options: true, false.
   amp: true
   # Prediction confidence threshold used by inference and operating metrics. Options: 0.0-1.0.
@@ -54,7 +54,7 @@ model:
   # Standalone inference/test acceleration settings. This does not change training-time AMP. Options: mapping.
   inference_optimization:
     # Inference runtime. Options: pytorch, tensorrt. PyTorch FP32 preserves the legacy behavior.
-    backend: tensorrt
+    backend: pytorch
     # PyTorch-only inference settings. Options: mapping.
     pytorch:
       # PyTorch compute precision. Options: fp32, bf16.

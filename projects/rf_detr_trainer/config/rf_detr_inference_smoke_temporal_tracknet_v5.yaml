@@ -74,6 +74,14 @@ dataset:
 inference:
   temporal_split: test
   save_predictions_jsonl: true
+  # Concise per-football center-coordinate JSONL output. Options: mapping.
+  football_output:
+    # Write football_predictions.jsonl beside the temporal prediction file. Options: true, false.
+    enabled: true
+    # Category IDs to export. Non-empty IDs take precedence over names. Options: list of category IDs.
+    target_class_ids: []
+    # Category names to export when IDs are empty. Empty defaults to football. Options: names such as [football].
+    target_class_names: [football]
   save_heatmaps: true
   batch_size: 1
   num_workers: 0

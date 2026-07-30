@@ -265,6 +265,14 @@ inference:
   render_class_names: []
   # Save line-delimited prediction records. Options: true, false.
   save_predictions_jsonl: true
+  # Concise per-football center-coordinate JSONL output. Options: mapping.
+  football_output:
+    # Write football_predictions.jsonl beside the full predictions file. Options: true, false.
+    enabled: true
+    # Category IDs to export. Non-empty IDs take precedence over names. Options: list of category IDs.
+    target_class_ids: []
+    # Category names to export when IDs are empty. Empty defaults to football. Options: names such as [football].
+    target_class_names: [football]
   # Video inference settings. Options: mapping.
   video:
     # Detection FPS for videos. Options: null to detect every frame, or positive float such as 5.

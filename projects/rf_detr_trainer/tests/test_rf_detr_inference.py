@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -107,6 +108,198 @@ class RfDetrInferenceTest(unittest.TestCase):
         prediction_config = inference_runner.build_prediction_config(config, [{"id": 0, "name": "ball"}])
 
         self.assertEqual(prediction_config["inference"]["batch_size"], 7)
+
+    def test_football_output_resolves_default_name_case_insensitively(self):
+        categories = [{"id": 0, "name": "Football"}, {"id": 1, "name": "player"}]
+
+        resolved = inference_runner.parse_football_output_config(
+            {"inference": {"football_output": {"enabled": True}}},
+            categories,
+        )
+
+        self.assertTrue(resolved.enabled)
+        self.assertEqual(resolved.target_class_ids, frozenset({0}))
+
+    def test_football_output_ids_take_precedence_over_names(self):
+        categories = [{"id": 0, "name": "football"}, {"id": 1, "name": "ball"}]
+        config = {
+            "inference": {
+                "football_output": {
+                    "enabled": True,
+                    "target_class_ids": [1],
+                    "target_class_names": ["does-not-exist"],
+                }
+            }
+        }
+
+        resolved = inference_runner.parse_football_output_config(config, categories)
+
+        self.assertEqual(resolved.target_class_ids, frozenset({1}))
+
+    def test_football_output_rejects_unknown_names_and_ids(self):
+        categories = [{"id": 0, "name": "football"}]
+        configs = [
+            {"inference": {"football_output": {"target_class_names": ["soccer-ball"]}}},
+            {"inference": {"football_output": {"target_class_ids": [9]}}},
+        ]
+
+        for config in configs:
+            with self.subTest(config=config), self.assertRaisesRegex(ValueError, "available categories"):
+                inference_runner.parse_football_output_config(config, categories)
+
+    def test_football_coordinate_conversions_preserve_float_precision(self):
+        self.assertEqual(
+            inference_runner.coco_xywh_to_center_xywh([10.25, 20.5, 5.5, 7.25]),
+            [13.0, 24.125, 5.5, 7.25],
+        )
+        self.assertEqual(
+            inference_runner.xyxy_to_center_xywh([10.25, 20.5, 15.75, 27.75]),
+            [13.0, 24.125, 5.5, 7.25],
+        )
+
+    def test_standard_football_rows_filter_classes_and_keep_nullable_track_id(self):
+        categories = [{"id": 0, "name": "football"}, {"id": 1, "name": "player"}]
+        output_config = inference_runner.FootballOutputConfig(True, frozenset({0}))
+        predictions = [
+            {
+                "image_id": 7,
+                "category_id": 0,
+                "bbox": [10.0, 20.0, 4.0, 6.0],
+                "score": 0.8,
+                "source": "image.jpg",
+            },
+            {
+                "image_id": 8,
+                "category_id": 1,
+                "bbox": [0.0, 0.0, 20.0, 40.0],
+                "score": 0.9,
+                "source": "video.mp4",
+                "frame_index": 3,
+                "timestamp_seconds": 0.1,
+            },
+            {
+                "image_id": 8,
+                "category_id": 0,
+                "bbox": [30.0, 40.0, 8.0, 10.0],
+                "score": 0.7,
+                "track_id": 5,
+                "source": "video.mp4",
+                "frame_index": 3,
+                "timestamp_seconds": 0.1,
+            },
+        ]
+
+        rows = inference_runner.build_standard_football_rows(predictions, output_config, categories)
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["kind"], "image")
+        self.assertEqual(rows[0]["xywh"], [12.0, 23.0, 4.0, 6.0])
+        self.assertIsNone(rows[0]["frame_index"])
+        self.assertIsNone(rows[0]["timestamp_seconds"])
+        self.assertIsNone(rows[0]["track_id"])
+        self.assertEqual(rows[1]["kind"], "video")
+        self.assertEqual(rows[1]["xywh"], [34.0, 45.0, 8.0, 10.0])
+        self.assertEqual(rows[1]["track_id"], 5)
+        self.assertEqual(
+            set(rows[0]),
+            {
+                "kind",
+                "source",
+                "image_id",
+                "frame_index",
+                "timestamp_seconds",
+                "category_id",
+                "category_name",
+                "score",
+                "xywh",
+                "track_id",
+            },
+        )
+
+    def test_temporal_football_rows_use_anchor_and_threshold(self):
+        categories = [{"id": 0, "name": "football"}, {"id": 1, "name": "player"}]
+        output_config = inference_runner.FootballOutputConfig(True, frozenset({0}))
+        temporal_rows = [
+            {
+                "source": "/data/sequence/frame_0003.jpg",
+                "anchor_frame_index": 3,
+                "detections": {
+                    "boxes": [[10.0, 20.0, 14.0, 26.0], [0.0, 0.0, 8.0, 8.0], [2.0, 4.0, 6.0, 10.0]],
+                    "scores": [0.5, 0.9, 0.49],
+                    "labels": [0, 1, 0],
+                },
+            }
+        ]
+
+        rows = inference_runner.build_temporal_football_rows(
+            temporal_rows,
+            output_config,
+            categories,
+            confidence_threshold=0.5,
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "temporal")
+        self.assertEqual(rows[0]["source"], "/data/sequence/frame_0003.jpg")
+        self.assertEqual(rows[0]["frame_index"], 3)
+        self.assertEqual(rows[0]["xywh"], [12.0, 23.0, 4.0, 6.0])
+        self.assertIsNone(rows[0]["image_id"])
+        self.assertIsNone(rows[0]["timestamp_seconds"])
+        self.assertIsNone(rows[0]["track_id"])
+
+    def test_write_empty_football_jsonl_creates_empty_utf8_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / inference_runner.FOOTBALL_PREDICTIONS_FILENAME
+
+            inference_runner.write_predictions_jsonl(path, [])
+
+            self.assertTrue(path.is_file())
+            self.assertEqual(path.read_text(encoding="utf-8"), "")
+            unicode_path = Path(tmp) / "unicode.jsonl"
+            inference_runner.write_predictions_jsonl(unicode_path, [{"category_name": "足球"}])
+            self.assertEqual(
+                json.loads(unicode_path.read_text(encoding="utf-8"))["category_name"],
+                "足球",
+            )
+
+    def test_write_football_output_reports_enabled_and_disabled_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            enabled_summary = inference_runner.write_football_predictions_output(
+                root,
+                [{"category_name": "football"}],
+                inference_runner.FootballOutputConfig(True, frozenset({0})),
+            )
+            disabled_summary = inference_runner.write_football_predictions_output(
+                root / "disabled",
+                [],
+                inference_runner.FootballOutputConfig(False, frozenset()),
+            )
+
+            self.assertEqual(enabled_summary["football_prediction_count"], 1)
+            self.assertEqual(
+                enabled_summary["football_predictions_file"],
+                inference_runner.FOOTBALL_PREDICTIONS_FILENAME,
+            )
+            self.assertTrue((root / inference_runner.FOOTBALL_PREDICTIONS_FILENAME).is_file())
+            self.assertEqual(
+                disabled_summary,
+                {"football_prediction_count": 0, "football_predictions_file": None},
+            )
+            self.assertFalse((root / "disabled").exists())
+
+    def test_football_output_adds_one_estimated_file(self):
+        output_dir = PROJECT_DIR / "runs" / "test-estimate"
+        disabled = {"inference": {"football_output": {"enabled": False}}}
+        enabled = {"inference": {"football_output": {"enabled": True}}}
+
+        disabled_estimate = inference_runner.estimate_outputs([], output_dir, disabled)
+        enabled_estimate = inference_runner.estimate_outputs([], output_dir, enabled)
+
+        self.assertEqual(
+            enabled_estimate["estimated_total_files"],
+            disabled_estimate["estimated_total_files"] + 1,
+        )
 
     def test_stage_timing_summary_includes_sahi_and_recheck_ratios(self):
         model = SimpleNamespace()
@@ -262,6 +455,7 @@ class RfDetrInferenceTest(unittest.TestCase):
         tensorrt_presets = {
             "rf_detr_inference_tracknet_tensorrt_fp16_example.yaml",
             "rf_detr_inference_large_p2_tensorrt_fp16_smoke.yaml",
+            "rf_detr_inference_small_p2.yaml",
         }
         real_temporal_tracknet_presets = {
             "rf_detr_inference_small_tracknet_v5.yaml",
@@ -278,6 +472,15 @@ class RfDetrInferenceTest(unittest.TestCase):
                 self.assertIn("inference_optimization", model)
                 self.assertIn("enabled", model["p2"])
                 self.assertIn("enabled", model["motion"])
+                football_output = config["inference"]["football_output"]
+                self.assertTrue(football_output["enabled"])
+                self.assertEqual(football_output["target_class_ids"], [])
+                self.assertEqual(football_output["target_class_names"], ["football"])
+                resolved_football = inference_runner.parse_football_output_config(
+                    config,
+                    inference_runner.build_categories(config),
+                )
+                self.assertTrue(resolved_football.target_class_ids)
                 expected_backend = "tensorrt" if path.name in tensorrt_presets else "pytorch"
                 self.assertEqual(model["inference_optimization"]["backend"], expected_backend)
                 self.assertEqual(model["inference_optimization"]["pytorch"]["precision"], "fp32")

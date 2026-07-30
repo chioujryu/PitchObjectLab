@@ -647,8 +647,47 @@ uv run python inference_rf_detr_model.py --config config/rf_detr_inference.yaml 
 uv run python inference_rf_detr_model.py --config config/rf_detr_inference.yaml --source D:/clips/match.mp4 --yes
 ```
 
-Each run writes rendered media, `predictions.jsonl`, `class_colors.json`, an
-`inference_summary.json`, and a config snapshot into the output folder.
+Each run writes rendered media, `predictions.jsonl`, `football_predictions.jsonl`,
+`class_colors.json`, an `inference_summary.json`, and a config snapshot into the
+output folder.
+
+`football_predictions.jsonl` is the concise downstream interface for ball
+coordinates. It keeps one row per detected football (multiple footballs in one
+frame produce multiple rows) and uses absolute source-image pixels with
+center-point `xywh = [center_x, center_y, width, height]`. It does not repeat the
+last detection on video frames skipped by `inference.video.detection_fps`, and
+frames with no football detection produce no row. The full `predictions.jsonl`
+remains unchanged and continues to use COCO top-left
+`bbox = [x, y, width, height]`.
+
+Every concise row has the same keys:
+
+```json
+{"kind":"video","source":"match.mp4","image_id":42,"frame_index":123,"timestamp_seconds":4.1,"category_id":0,"category_name":"football","score":0.91,"xywh":[100.5,200.25,8.0,7.5],"track_id":3}
+```
+
+`track_id` is always present. It is an integer after a tracker assigns the
+detection, and `null` when tracking is disabled or the active tracker has not
+assigned that detection. Image rows use `null` for frame/time fields. Temporal
+TrackNetV5 rows use the anchor image path and frame index, with
+`kind: temporal`, `image_id: null`, `timestamp_seconds: null`, and
+`track_id: null`.
+
+The exported classes are independent of rendering and tracking filters:
+
+```yaml
+inference:
+  football_output:
+    enabled: true
+    target_class_ids: []           # non-empty IDs take precedence
+    target_class_names: [football] # case-insensitive; empty defaults to football
+```
+
+When enabled, every configured ID/name must resolve against the dataset
+categories before the confirmation prompt or any output is created. For
+numeric-only class metadata, set `target_class_ids` explicitly. The summaries
+report `football_prediction_count` and `football_predictions_file`; the
+pre-run estimate includes the additional JSONL file.
 
 When `inference.mode: sahi` and `sahi.recheck.enabled: true`,
 `sahi.recheck.fused_confidence_threshold` is the final minimum score for every

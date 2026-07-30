@@ -514,6 +514,7 @@ def run_temporal_split(
                         "window_index": global_index,
                         "split": metadata["split"],
                         "sequence_id": metadata["sequence_id"],
+                        "source": str(metadata["image_paths"][int(metadata["anchor_index"])]),
                         "anchor_frame_index": int(metadata["anchor_frame_index"]),
                         "boundary_padding": bool(metadata.get("boundary_padding", False)),
                         "detections": {

@@ -47,6 +47,7 @@ DEFAULT_CONFIG = PROJECT_DIR / "config" / "rf_detr_inference.yaml"
 TIMESTAMP_FORMAT = "%Y%m%d%H%M%S"
 IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 VIDEO_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".webm"}
+FOOTBALL_PREDICTIONS_FILENAME = "football_predictions.jsonl"
 COLOR_PALETTE = [
     (239, 68, 68),
     (34, 197, 94),
@@ -78,6 +79,14 @@ class VideoFrameWindow:
     start_frame: int
     end_frame: Optional[int]
     output_frames: Optional[int]
+
+
+@dataclass(frozen=True)
+class FootballOutputConfig:
+    """Resolved settings for the concise football-coordinate JSONL artifact."""
+
+    enabled: bool
+    target_class_ids: frozenset[int]
 
 
 def load_yaml(path: Path) -> Dict[str, Any]:
@@ -466,6 +475,10 @@ def estimate_outputs(items: Sequence[SourceItem], output_dir: Path, config: Mapp
     output_files = 5 + image_count + video_count
     if bool(config.get("inference", {}).get("save_predictions_jsonl", True)):
         output_files += 1
+    if bool(
+        ((config.get("inference", {}).get("football_output", {}) or {}).get("enabled", True))
+    ):
+        output_files += 1
     if bool((config.get("inference", {}).get("tracking", {}) or {}).get("enabled", False)):
         output_files += 1  # tracking_summary.json
     tensorrt_artifacts = trainer.estimate_tensorrt_cache_artifacts(config)
@@ -527,7 +540,7 @@ def class_names_from_config(config: Mapping[str, Any]) -> Dict[int, str]:
     if not names and dataset.get("data_yaml"):
         data_yaml = Path(str(dataset["data_yaml"])).expanduser()
         if not data_yaml.is_absolute():
-            data_yaml = (Path.cwd() / data_yaml).resolve()
+            data_yaml = (PROJECT_DIR / data_yaml).resolve()
         if data_yaml.exists():
             data = load_yaml(data_yaml)
             names = data.get("names", [])
@@ -545,6 +558,187 @@ def build_categories(config: Mapping[str, Any]) -> List[Dict[str, Any]]:
         for index in range(int(num_classes)):
             names.setdefault(index, str(index))
     return [{"id": int(index), "name": name} for index, name in sorted(names.items())]
+
+
+def parse_football_output_config(
+    config: Mapping[str, Any],
+    categories: Sequence[Mapping[str, Any]],
+) -> FootballOutputConfig:
+    """Resolve and validate the independently configured football output classes."""
+    raw = dict((config.get("inference", {}) or {}).get("football_output", {}) or {})
+    enabled = raw.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ValueError("inference.football_output.enabled must be true or false.")
+    if not enabled:
+        return FootballOutputConfig(enabled=False, target_class_ids=frozenset())
+
+    id_to_name = {
+        int(category["id"]): str(category.get("name", category["id"]))
+        for category in categories
+    }
+    available = ", ".join(f"{category_id}={name}" for category_id, name in sorted(id_to_name.items()))
+    available = available or "(none)"
+
+    raw_ids = config_list(raw.get("target_class_ids"))
+    if raw_ids:
+        if any(isinstance(value, bool) for value in raw_ids):
+            raise ValueError("inference.football_output.target_class_ids must contain integer category IDs.")
+        try:
+            target_ids = {int(value) for value in raw_ids}
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "inference.football_output.target_class_ids must contain integer category IDs."
+            ) from exc
+        unknown_ids = sorted(target_ids.difference(id_to_name))
+        if unknown_ids:
+            raise ValueError(
+                "inference.football_output.target_class_ids contains unknown category IDs "
+                f"{unknown_ids}; available categories: {available}."
+            )
+        return FootballOutputConfig(enabled=True, target_class_ids=frozenset(target_ids))
+
+    requested_names = [str(value).strip() for value in config_list(raw.get("target_class_names"))]
+    if not requested_names:
+        requested_names = ["football"]
+    name_to_id = {name.casefold(): category_id for category_id, name in id_to_name.items()}
+    missing_names = [name for name in requested_names if name.casefold() not in name_to_id]
+    if missing_names:
+        raise ValueError(
+            "inference.football_output.target_class_names contains unknown category names "
+            f"{missing_names}; available categories: {available}. "
+            "Set target_class_ids explicitly when the dataset uses numeric-only class names."
+        )
+    return FootballOutputConfig(
+        enabled=True,
+        target_class_ids=frozenset(name_to_id[name.casefold()] for name in requested_names),
+    )
+
+
+def coco_xywh_to_center_xywh(bbox: Sequence[Any]) -> List[float]:
+    """Convert absolute COCO top-left xywh to absolute center-point xywh."""
+    if len(bbox) < 4:
+        raise ValueError(f"Expected a four-value COCO bbox, got {bbox!r}.")
+    x, y, width, height = (float(value) for value in bbox[:4])
+    return [x + width / 2.0, y + height / 2.0, width, height]
+
+
+def xyxy_to_center_xywh(box: Sequence[Any]) -> List[float]:
+    """Convert an absolute xyxy box to absolute center-point xywh."""
+    if len(box) < 4:
+        raise ValueError(f"Expected a four-value xyxy box, got {box!r}.")
+    x1, y1, x2, y2 = (float(value) for value in box[:4])
+    width = x2 - x1
+    height = y2 - y1
+    return [(x1 + x2) / 2.0, (y1 + y2) / 2.0, width, height]
+
+
+def _football_prediction_row(
+    *,
+    kind: str,
+    source: Any,
+    image_id: Any,
+    frame_index: Any,
+    timestamp_seconds: Any,
+    category_id: int,
+    category_name: str,
+    score: Any,
+    xywh: Sequence[Any],
+    track_id: Any,
+) -> Dict[str, Any]:
+    """Build the stable, compact football output schema."""
+    return {
+        "kind": str(kind),
+        "source": None if source is None else str(source),
+        "image_id": None if image_id is None else int(image_id),
+        "frame_index": None if frame_index is None else int(frame_index),
+        "timestamp_seconds": None if timestamp_seconds is None else float(timestamp_seconds),
+        "category_id": int(category_id),
+        "category_name": str(category_name),
+        "score": float(score),
+        "xywh": [float(value) for value in xywh[:4]],
+        "track_id": None if track_id is None else int(track_id),
+    }
+
+
+def build_standard_football_rows(
+    predictions: Sequence[Mapping[str, Any]],
+    football_config: FootballOutputConfig,
+    categories: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Select final image/video football detections after tracking and convert their boxes."""
+    if not football_config.enabled:
+        return []
+    id_to_name = {
+        int(category["id"]): str(category.get("name", category["id"]))
+        for category in categories
+    }
+    rows: List[Dict[str, Any]] = []
+    for prediction in predictions:
+        category_id = int(prediction.get("category_id", -1))
+        if category_id not in football_config.target_class_ids:
+            continue
+        is_video = prediction.get("frame_index") is not None
+        rows.append(
+            _football_prediction_row(
+                kind="video" if is_video else "image",
+                source=prediction.get("source"),
+                image_id=prediction.get("image_id"),
+                frame_index=prediction.get("frame_index"),
+                timestamp_seconds=prediction.get("timestamp_seconds"),
+                category_id=category_id,
+                category_name=id_to_name[category_id],
+                score=prediction.get("score", 0.0),
+                xywh=coco_xywh_to_center_xywh(prediction.get("bbox", [])),
+                track_id=prediction.get("track_id"),
+            )
+        )
+    return rows
+
+
+def build_temporal_football_rows(
+    temporal_rows: Sequence[Mapping[str, Any]],
+    football_config: FootballOutputConfig,
+    categories: Sequence[Mapping[str, Any]],
+    confidence_threshold: float,
+) -> List[Dict[str, Any]]:
+    """Convert RF-DETR temporal absolute-xyxy detections for each anchor frame."""
+    if not football_config.enabled:
+        return []
+    id_to_name = {
+        int(category["id"]): str(category.get("name", category["id"]))
+        for category in categories
+    }
+    rows: List[Dict[str, Any]] = []
+    for temporal_row in temporal_rows:
+        detections = dict(temporal_row.get("detections", {}) or {})
+        boxes = list(detections.get("boxes", []) or [])
+        scores = list(detections.get("scores", []) or [])
+        labels = list(detections.get("labels", []) or [])
+        if not (len(boxes) == len(scores) == len(labels)):
+            raise ValueError(
+                "Temporal detection boxes, scores, and labels must have equal lengths, got "
+                f"{len(boxes)}, {len(scores)}, and {len(labels)}."
+            )
+        for box, score_value, label_value in zip(boxes, scores, labels):
+            category_id = int(label_value)
+            score = float(score_value)
+            if category_id not in football_config.target_class_ids or score < confidence_threshold:
+                continue
+            rows.append(
+                _football_prediction_row(
+                    kind="temporal",
+                    source=temporal_row.get("source"),
+                    image_id=None,
+                    frame_index=temporal_row.get("anchor_frame_index"),
+                    timestamp_seconds=None,
+                    category_id=category_id,
+                    category_name=id_to_name[category_id],
+                    score=score,
+                    xywh=xyxy_to_center_xywh(box),
+                    track_id=None,
+                )
+            )
+    return rows
 
 
 def class_color(category_id: int) -> Tuple[int, int, int]:
@@ -1316,6 +1510,24 @@ def write_predictions_jsonl(path: Path, rows: Sequence[Mapping[str, Any]]) -> No
             file.write(json.dumps(row, ensure_ascii=False, default=trainer.json_safe_value) + "\n")
 
 
+def write_football_predictions_output(
+    output_dir: Path,
+    rows: Sequence[Mapping[str, Any]],
+    football_config: FootballOutputConfig,
+) -> Dict[str, Any]:
+    """Write the optional concise artifact and return its stable summary fields."""
+    filename: Optional[str] = None
+    count = 0
+    if football_config.enabled:
+        filename = FOOTBALL_PREDICTIONS_FILENAME
+        write_predictions_jsonl(output_dir / filename, rows)
+        count = len(rows)
+    return {
+        "football_prediction_count": count,
+        "football_predictions_file": filename,
+    }
+
+
 def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int:
     parser = argparse.ArgumentParser(description="RF-DETR image/video inference runner.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="Path to rf_detr_inference.yaml.")
@@ -1371,6 +1583,8 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
     apply_cli_overrides(config, args)
     trainer._require_custom_architecture_checkpoint(config, "Inference")
     trainer.validate_inference_acceleration_config(config)
+    categories = build_categories(config)
+    football_output_config = parse_football_output_config(config, categories)
     verbose = bool(config.get("runtime", {}).get("verbose", True))
     if timing_context is not None:
         timing_context["verbose"] = verbose
@@ -1415,7 +1629,6 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
     )
     cache_dir = output_dir / "source_cache"
     resolved_items = [download_url(item, cache_dir) if item.is_url else item for item in items]
-    categories = build_categories(config)
     prediction_config = build_prediction_config(config, categories)
     model = load_rfdetr_model(config)
     if timing_context is not None:
@@ -1432,7 +1645,19 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
             split=str(config.get("inference", {}).get("temporal_split", "test")),
             save_heatmaps=bool(config.get("inference", {}).get("save_heatmaps", True)),
         )
+        football_rows = build_temporal_football_rows(
+            temporal_result["rows"],
+            football_output_config,
+            categories,
+            float(config.get("model", {}).get("confidence_threshold", 0.25)),
+        )
+        football_summary = write_football_predictions_output(
+            output_dir,
+            football_rows,
+            football_output_config,
+        )
         temporal_summary = dict(temporal_result["summary"])
+        temporal_summary.update(football_summary)
         stage_timing = {
             "images_or_frames": int(temporal_summary.get("windows", 0)),
             "total_seconds": float(temporal_summary.get("total_seconds", 0.0)),
@@ -1453,6 +1678,7 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
         stage_timing["recheck_model_forward_ratio"] = 0.0
         if timing_context is not None:
             timing_context["stage_timing"] = stage_timing
+        trainer.write_json(output_dir / "temporal_summary.json", temporal_summary)
         trainer.write_json(output_dir / "inference_summary.json", temporal_summary)
         trainer.dump_config_snapshot(
             output_dir=output_dir,
@@ -1516,12 +1742,23 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
     trainer.write_json(output_dir / "class_colors.json", {"categories": categories, "colors": colors})
     if bool(config.get("inference", {}).get("save_predictions_jsonl", True)):
         write_predictions_jsonl(output_dir / "predictions.jsonl", all_predictions)
+    football_rows = build_standard_football_rows(all_predictions, football_output_config, categories)
+    football_summary = write_football_predictions_output(
+        output_dir,
+        football_rows,
+        football_output_config,
+    )
     stage_timing = summarize_inference_timing_rows(model)
     if timing_context is not None:
         timing_context["stage_timing"] = stage_timing
     trainer.write_json(
         output_dir / "inference_summary.json",
-        {"outputs": outputs, "prediction_count": len(all_predictions), "stage_timing": stage_timing},
+        {
+            "outputs": outputs,
+            "prediction_count": len(all_predictions),
+            **football_summary,
+            "stage_timing": stage_timing,
+        },
     )
     if verbose and stage_timing["images_or_frames"]:
         print(
