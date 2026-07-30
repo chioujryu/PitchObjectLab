@@ -1,11 +1,11 @@
+from __future__ import annotations
+
 import math
-from typing import List
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from loguru import logger
-from torch import Tensor
+from torch import Tensor, nn
 from torchvision.ops.boxes import box_area
 
 
@@ -26,13 +26,11 @@ def box_iou(boxes1: Tensor, boxes2: Tensor):
 
 
 def generalized_box_iou(boxes1, boxes2):
-    """
-    Generalized IoU from https://giou.stanford.edu/
+    """Generalized IoU from https://giou.stanford.edu/.
 
     The boxes should be in [x0, y0, x1, y1] format
 
-    Returns a [N, M] pairwise matrix, where N = len(boxes1)
-    and M = len(boxes2)
+    Returns a [N, M] pairwise matrix, where N = len(boxes1) and M = len(boxes2)
     """
     # degenerate boxes gives inf / nan results
     # so do an early check
@@ -74,13 +72,13 @@ def box_xyxy_to_cxcywh(x: Tensor) -> Tensor:
 
 
 def bias_init_with_prob(prior_prob=0.01):
-    """initialize conv/fc bias value according to a given probability value."""
+    """Initialize conv/fc bias value according to a given probability value."""
     bias_init = float(-math.log((1 - prior_prob) / prior_prob))
     return bias_init
 
 
 def get_activation(act: str, inpace: bool = True):
-    """get activation"""
+    """Get activation."""
     if act is None:
         return nn.Identity()
 
@@ -117,15 +115,13 @@ def get_activation(act: str, inpace: bool = True):
 
 
 def distance2bbox(points, distance, reg_scale, deploy=False):
-    """
-    Decodes edge-distances into bounding box coordinates.
+    """Decodes edge-distances into bounding box coordinates.
 
     Args:
-        points (Tensor): (B, N, 4) or (N, 4) format, representing [x, y, w, h],
-                         where (x, y) is the center and (w, h) are width and height.
-        distance (Tensor): (B, N, 4) or (N, 4), representing distances from the
-                           point to the left, top, right, and bottom boundaries.
-
+        points (Tensor): (B, N, 4) or (N, 4) format, representing [x, y, w, h], where (x, y) is the center and (w, h)
+            are width and height.
+        distance (Tensor): (B, N, 4) or (N, 4), representing distances from the point to the left, top, right, and
+            bottom boundaries.
         reg_scale (float): Controls the curvature of the Weighting Function.
         deploy (bool): If True, skip abs() (assumes reg_scale is already positive).
 
@@ -145,16 +141,13 @@ def distance2bbox(points, distance, reg_scale, deploy=False):
 
 
 def weighting_function(reg_max, up, reg_scale, deploy=False):
-    """
-    Generates the non-uniform Weighting Function W(n) for bounding box regression.
+    """Generates the non-uniform Weighting Function W(n) for bounding box regression.
 
     Args:
         reg_max (int): Max number of the discrete bins.
-        up (Tensor): Controls upper bounds of the sequence,
-                     where maximum offset is ±up * H / W.
-        reg_scale (float): Controls the curvature of the Weighting Function.
-                           Larger values result in flatter weights near the central axis W(reg_max/2)=0
-                           and steeper weights at both ends.
+        up (Tensor): Controls upper bounds of the sequence, where maximum offset is ±up * H / W.
+        reg_scale (float): Controls the curvature of the Weighting Function. Larger values result in flatter weights
+            near the central axis W(reg_max/2)=0 and steeper weights at both ends.
         deploy (bool): If True, uses deployment mode settings.
 
     Returns:
@@ -166,13 +159,7 @@ def weighting_function(reg_max, up, reg_scale, deploy=False):
         step = (upper_bound1 + 1) ** (2 / (reg_max - 2))
         left_values = [-((step) ** i) + 1 for i in range(reg_max // 2 - 1, 0, -1)]
         right_values = [(step) ** i - 1 for i in range(1, reg_max // 2)]
-        values = (
-            [-upper_bound2]
-            + left_values
-            + [torch.zeros_like(up[0][None])]
-            + right_values
-            + [upper_bound2]
-        )
+        values = [-upper_bound2, *left_values, torch.zeros_like(up[0][None]), *right_values, upper_bound2]
         return torch.tensor(values, dtype=up.dtype, device=up.device)
     else:
         upper_bound1 = abs(up[0]) * abs(reg_scale)
@@ -180,13 +167,7 @@ def weighting_function(reg_max, up, reg_scale, deploy=False):
         step = (upper_bound1 + 1) ** (2 / (reg_max - 2))
         left_values = [-((step) ** i) + 1 for i in range(reg_max // 2 - 1, 0, -1)]
         right_values = [(step) ** i - 1 for i in range(1, reg_max // 2)]
-        values = (
-            [-upper_bound2]
-            + left_values
-            + [torch.zeros_like(up[0][None])]
-            + right_values
-            + [upper_bound2]
-        )
+        values = [-upper_bound2, *left_values, torch.zeros_like(up[0][None]), *right_values, upper_bound2]
         return torch.cat(values, 0)
 
 
@@ -195,7 +176,7 @@ def deformable_attention_core_func_v2(
     value_spatial_shapes,
     sampling_locations: torch.Tensor,
     attention_weights: torch.Tensor,
-    num_points_list: List[int],
+    num_points_list: list[int],
     method="default",
 ):
     """
@@ -204,7 +185,7 @@ def deformable_attention_core_func_v2(
         value_spatial_shapes (Tensor|List): [n_levels, 2]
         value_level_start_index (Tensor|List): [n_levels]
         sampling_locations (Tensor): [bs, query_length, n_head, n_levels * n_points, 2]
-        attention_weights (Tensor): [bs, query_length, n_head, n_levels * n_points]
+        attention_weights (Tensor): [bs, query_length, n_head, n_levels * n_points].
 
     Returns:
         output (Tensor): [bs, Length_{query}, C]
@@ -234,9 +215,7 @@ def deformable_attention_core_func_v2(
 
         elif method == "discrete":
             # n * m, seq, n, 2
-            sampling_coord = (
-                sampling_grid_l * torch.tensor([[w, h]], device=value_l.device) + 0.5
-            ).to(torch.int64)
+            sampling_coord = (sampling_grid_l * torch.tensor([[w, h]], device=value_l.device) + 0.5).to(torch.int64)
 
             # FIX ME? for rectangle input
             sampling_coord = sampling_coord.clamp(0, h - 1)
@@ -247,19 +226,13 @@ def deformable_attention_core_func_v2(
                 .unsqueeze(-1)
                 .repeat(1, sampling_coord.shape[1])
             )
-            sampling_value_l: torch.Tensor = value_l[
-                s_idx, :, sampling_coord[..., 1], sampling_coord[..., 0]
-            ]  # n l c
+            sampling_value_l: torch.Tensor = value_l[s_idx, :, sampling_coord[..., 1], sampling_coord[..., 0]]  # n l c
 
-            sampling_value_l = sampling_value_l.permute(0, 2, 1).reshape(
-                bs * n_head, c, Len_q, num_points_list[level]
-            )
+            sampling_value_l = sampling_value_l.permute(0, 2, 1).reshape(bs * n_head, c, Len_q, num_points_list[level])
 
         sampling_value_list.append(sampling_value_l)
 
-    attn_weights = attention_weights.permute(0, 2, 1, 3).reshape(
-        bs * n_head, 1, Len_q, sum(num_points_list)
-    )
+    attn_weights = attention_weights.permute(0, 2, 1, 3).reshape(bs * n_head, 1, Len_q, sum(num_points_list))
     weighted_sample_locs = torch.concat(sampling_value_list, dim=-1) * attn_weights
     output = weighted_sample_locs.sum(-1).reshape(bs, n_head * c, Len_q)
 
@@ -267,13 +240,11 @@ def deformable_attention_core_func_v2(
 
 
 def translate_gt(gt, reg_max, reg_scale, up):
-    """
-    Decodes bounding box ground truth (GT) values into distribution-based GT representations.
+    """Decodes bounding box ground truth (GT) values into distribution-based GT representations.
 
-    This function maps continuous GT values into discrete distribution bins, which can be used
-    for regression tasks in object detection models. It calculates the indices of the closest
-    bins to each GT value and assigns interpolation weights to these bins based on their proximity
-    to the GT value.
+    This function maps continuous GT values into discrete distribution bins, which can be used for regression tasks in
+    object detection models. It calculates the indices of the closest bins to each GT value and assigns interpolation
+    weights to these bins based on their proximity to the GT value.
 
     Args:
         gt (Tensor): Ground truth bounding box values, shape (N, ).
@@ -330,15 +301,14 @@ def translate_gt(gt, reg_max, reg_scale, up):
 
 
 def bbox2distance(points, bbox, reg_max, reg_scale, up, eps=0.1):
-    """
-    Converts bounding box coordinates to distances from a reference point.
+    """Converts bounding box coordinates to distances from a reference point.
 
     Args:
         points (Tensor): (n, 4) [x, y, w, h], where (x, y) is the center.
         bbox (Tensor): (n, 4) bounding boxes in "xyxy" format.
         reg_max (float): Maximum bin value.
-        reg_scale (float): Controling curvarture of W(n).
-        up (Tensor): Controling upper bounds of W(n).
+        reg_scale (float): Controlling curvarture of W(n).
+        up (Tensor): Controlling upper bounds of W(n).
         eps (float): Small value to ensure target < reg_max.
 
     Returns:
@@ -365,7 +335,7 @@ def get_contrastive_denoising_training_group(
     label_noise_ratio=0.5,
     box_noise_scale=1.0,
 ):
-    """cnd"""
+    """Cnd."""
     if num_denoising <= 0:
         return None, None, None, None
 
@@ -424,7 +394,7 @@ def get_contrastive_denoising_training_group(
         # shrink_mask[:, :, :2] = (rand_sign[:, :, :2] == 1)  # rand_sign == 1 → (x1, y1) ↘ →  smaller bbox
         # shrink_mask[:, :, 2:] = (rand_sign[:, :, 2:] == -1)  # rand_sign == -1 →  (x2, y2) ↖ →  smaller bbox
         # mask = rand_part > (upper_bound / (upper_bound+1))
-        # # this is to make sure the dn bbox can be reversed to the original bbox by dfine head.
+        # # this is to make sure the dn bbox can be reversed to the original bbox by define head.
         # rand_sign = torch.where((shrink_mask * (1 - negative_gt_mask) * mask).bool(), \
         #                         rand_sign * upper_bound / (upper_bound+1) / rand_part, rand_sign)
         known_bbox += rand_sign * rand_part * diff

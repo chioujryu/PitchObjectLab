@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import os
 import sys
@@ -11,7 +13,7 @@ from PIL import Image
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_DIR))
 
-from rf_detr_temporal_data import (  # noqa: E402
+from rf_detr_temporal_data import (
     TemporalDataset,
     TemporalRFDETRDataModule,
     TemporalSample,
@@ -42,11 +44,7 @@ def _write_image(path: Path, *, frame_index: int, size: tuple[int, int] = (6, 4)
 
 def _write_fixture(root: Path, *, missing_primary: bool = False) -> Path:
     (root / "dataset.yaml").write_text(
-        "path: .\n"
-        "train: images/train\n"
-        "val: images/val\n"
-        "test: images/test\n"
-        "names: [ball]\n",
+        "path: .\ntrain: images/train\nval: images/val\ntest: images/test\nnames: [ball]\n",
         encoding="utf-8",
     )
     rows = []
@@ -136,18 +134,12 @@ class TemporalIndexTest(unittest.TestCase):
             yaml_path = _write_fixture(root)
             rows = [
                 json.loads(line)
-                for line in (root / "metadata" / "temporal_index.jsonl").read_text(
-                    encoding="utf-8"
-                ).splitlines()
+                for line in (root / "metadata" / "temporal_index.jsonl").read_text(encoding="utf-8").splitlines()
             ]
             rows = [
                 row
                 for row in rows
-                if not (
-                    row["split"] == "train"
-                    and row["sequence_id"] == "cut-a/clip-a"
-                    and row["frame_index"] == 2
-                )
+                if not (row["split"] == "train" and row["sequence_id"] == "cut-a/clip-a" and row["frame_index"] == 2)
             ]
             (root / "metadata" / "temporal_index.jsonl").write_text(
                 "".join(json.dumps(row) + "\n" for row in rows),
@@ -158,9 +150,7 @@ class TemporalIndexTest(unittest.TestCase):
 
             # cut-a no longer has a complete 3-frame run; cut-b still has two.
             self.assertEqual(len(dataset), 2)
-            self.assertTrue(
-                all(window.sequence_id == "cut-b/clip-b" for window in dataset.windows)
-            )
+            self.assertTrue(all(window.sequence_id == "cut-b/clip-b" for window in dataset.windows))
 
 
 class TemporalDatasetTest(unittest.TestCase):
@@ -212,16 +202,10 @@ class TemporalDatasetTest(unittest.TestCase):
             )[0]
 
             torch.testing.assert_close(flipped.frames, unflipped.frames.flip(-1))
-            for original, transformed in zip(
-                unflipped.frame_targets, flipped.frame_targets
-            ):
+            for original, transformed in zip(unflipped.frame_targets, flipped.frame_targets):
                 if original["boxes"].numel():
-                    torch.testing.assert_close(
-                        transformed["boxes"][:, 0], 1.0 - original["boxes"][:, 0]
-                    )
-                    torch.testing.assert_close(
-                        transformed["boxes"][:, 1:], original["boxes"][:, 1:]
-                    )
+                    torch.testing.assert_close(transformed["boxes"][:, 0], 1.0 - original["boxes"][:, 0])
+                    torch.testing.assert_close(transformed["boxes"][:, 1:], original["boxes"][:, 1:])
                 torch.testing.assert_close(
                     transformed["tracknet_heatmap"],
                     original["tracknet_heatmap"].flip(-1),
@@ -342,9 +326,7 @@ class TemporalCollateTest(unittest.TestCase):
             self.assertTrue(
                 torch.equal(
                     batch.mdd_frames.masked_select(batch.padding_masks.unsqueeze(2)),
-                    torch.zeros_like(
-                        batch.mdd_frames.masked_select(batch.padding_masks.unsqueeze(2))
-                    ),
+                    torch.zeros_like(batch.mdd_frames.masked_select(batch.padding_masks.unsqueeze(2))),
                 )
             )
             self.assertEqual(targets[0]["temporal_heatmaps"].shape, (3, 4, 8))

@@ -1,17 +1,16 @@
-from pathlib import Path
-from types import SimpleNamespace
-from contextlib import nullcontext
 import hashlib
 import json
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import nullcontext
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import torch
-
 import rf_detr_acceleration as acceleration
+import torch
 
 
 class _RawModule(torch.nn.Module):
@@ -58,15 +57,15 @@ class _FakeRFDETR:
 
 
 class _FakeONNXDimension:
-    def __init__(self, value=None, symbolic=''):
+    def __init__(self, value=None, symbolic=""):
         self.dim_value = 0 if value is None else value
         self.dim_param = symbolic
         self._has_value = value is not None
 
     def HasField(self, field):
-        if field == 'dim_value':
+        if field == "dim_value":
             return self._has_value
-        if field == 'dim_param':
+        if field == "dim_param":
             return bool(self.dim_param)
         raise ValueError(field)
 
@@ -82,43 +81,38 @@ def _fake_onnx_value_info(name, dimensions):
             resolved.append(_FakeONNXDimension())
     return SimpleNamespace(
         name=name,
-        type=SimpleNamespace(
-            tensor_type=SimpleNamespace(shape=SimpleNamespace(dim=resolved))
-        ),
+        type=SimpleNamespace(tensor_type=SimpleNamespace(shape=SimpleNamespace(dim=resolved))),
     )
 
 
 def _fake_p2_onnx_graph(*, p2_channel=384, label_slots=2):
     features = {
-        'p2_feature': ['batch', p2_channel, 8, 8],
-        'p3_feature': ['batch', 384, 4, 4],
-        'p4_feature': ['batch', 384, 2, 2],
+        "p2_feature": ["batch", p2_channel, 8, 8],
+        "p3_feature": ["batch", 384, 4, 4],
+        "p4_feature": ["batch", 384, 2, 2],
     }
     return SimpleNamespace(
-        input=[_fake_onnx_value_info('input', ['batch', 3, 32, 32])],
+        input=[_fake_onnx_value_info("input", ["batch", 3, 32, 32])],
         output=[
-            _fake_onnx_value_info('dets', ['batch', 10, 4]),
-            _fake_onnx_value_info('labels', ['batch', 10, label_slots]),
+            _fake_onnx_value_info("dets", ["batch", 10, 4]),
+            _fake_onnx_value_info("labels", ["batch", 10, label_slots]),
         ],
-        value_info=[
-            _fake_onnx_value_info(name, dimensions)
-            for name, dimensions in features.items()
-        ],
-        initializer=[SimpleNamespace(name=f'{level}_weight') for level in ('p2', 'p3', 'p4')],
+        value_info=[_fake_onnx_value_info(name, dimensions) for name, dimensions in features.items()],
+        initializer=[SimpleNamespace(name=f"{level}_weight") for level in ("p2", "p3", "p4")],
         node=[
             SimpleNamespace(
-                op_type='ConvTranspose',
-                name=f'{level}_upsample',
-                input=[f'{level}_feature', f'{level}_weight'],
+                op_type="ConvTranspose",
+                name=f"{level}_upsample",
+                input=[f"{level}_feature", f"{level}_weight"],
             )
-            for level in ('p2', 'p3', 'p4')
+            for level in ("p2", "p3", "p4")
         ],
     )
 
 
 def _fake_onnx_module(model_proto):
     def save_model(_model, destination):
-        Path(destination).write_bytes(b'shape-inferred-onnx')
+        Path(destination).write_bytes(b"shape-inferred-onnx")
 
     return SimpleNamespace(
         load=MagicMock(return_value=model_proto),
@@ -312,7 +306,7 @@ class TensorRTUtilityTest(unittest.TestCase):
 
     @patch.object(
         acceleration,
-        '_validate_onnx_export_contract',
+        "_validate_onnx_export_contract",
         side_effect=lambda path, **_kwargs: Path(path),
     )
     def test_dynamic_onnx_trace_always_uses_single_sample(self, validate):
@@ -349,20 +343,20 @@ class TensorRTUtilityTest(unittest.TestCase):
         self.assertTrue(calls[0]["dynamic_batch"])
 
         validate.assert_called_once()
-        self.assertEqual(validate.call_args.kwargs['resolution'], 32)
-        self.assertEqual(validate.call_args.kwargs['num_channels'], 3)
-        self.assertFalse(validate.call_args.kwargs['segmentation'])
-        self.assertEqual(validate.call_args.kwargs['num_queries'], 10)
-        self.assertEqual(validate.call_args.kwargs['num_logit_slots'], 2)
-        self.assertEqual(validate.call_args.kwargs['onnx_module'].__version__, '1.17.0')
+        self.assertEqual(validate.call_args.kwargs["resolution"], 32)
+        self.assertEqual(validate.call_args.kwargs["num_channels"], 3)
+        self.assertFalse(validate.call_args.kwargs["segmentation"])
+        self.assertEqual(validate.call_args.kwargs["num_queries"], 10)
+        self.assertEqual(validate.call_args.kwargs["num_logit_slots"], 2)
+        self.assertEqual(validate.call_args.kwargs["onnx_module"].__version__, "1.17.0")
 
     def test_onnx_contract_accepts_three_p2_levels_with_only_dynamic_batch(self):
         model_proto = SimpleNamespace(graph=_fake_p2_onnx_graph())
         fake_onnx = _fake_onnx_module(model_proto)
 
         with tempfile.TemporaryDirectory() as temporary:
-            source = Path(temporary) / 'model.onnx'
-            source.write_bytes(b'original-onnx')
+            source = Path(temporary) / "model.onnx"
+            source.write_bytes(b"original-onnx")
 
             validated = acceleration._validate_onnx_export_contract(
                 source,
@@ -373,7 +367,7 @@ class TensorRTUtilityTest(unittest.TestCase):
             )
 
             self.assertEqual(validated, source)
-            self.assertEqual(source.read_bytes(), b'shape-inferred-onnx')
+            self.assertEqual(source.read_bytes(), b"shape-inferred-onnx")
         self.assertEqual(fake_onnx.checker.check_model.call_count, 2)
         fake_onnx.shape_inference.infer_shapes.assert_called_once_with(
             model_proto,
@@ -383,13 +377,13 @@ class TensorRTUtilityTest(unittest.TestCase):
         )
 
     def test_onnx_contract_rejects_symbolic_non_batch_io_axis(self):
-        graph = _fake_p2_onnx_graph(label_slots='classes')
+        graph = _fake_p2_onnx_graph(label_slots="classes")
         model_proto = SimpleNamespace(graph=graph)
         fake_onnx = _fake_onnx_module(model_proto)
 
         with tempfile.TemporaryDirectory() as temporary:
-            source = Path(temporary) / 'model.onnx'
-            source.write_bytes(b'original-onnx')
+            source = Path(temporary) / "model.onnx"
+            source.write_bytes(b"original-onnx")
 
             with self.assertRaises(RuntimeError) as raised:
                 acceleration._validate_onnx_export_contract(
@@ -400,18 +394,18 @@ class TensorRTUtilityTest(unittest.TestCase):
                     onnx_module=fake_onnx,
                 )
 
-        self.assertIn('labels', str(raised.exception))
-        self.assertIn('axis 2 must be static, got classes', str(raised.exception))
+        self.assertIn("labels", str(raised.exception))
+        self.assertIn("axis 2 must be static, got classes", str(raised.exception))
         fake_onnx.save_model.assert_not_called()
 
     def test_onnx_contract_reports_dynamic_convtranspose_channel_with_node_and_tensor(self):
-        graph = _fake_p2_onnx_graph(p2_channel='p2_channels')
+        graph = _fake_p2_onnx_graph(p2_channel="p2_channels")
         model_proto = SimpleNamespace(graph=graph)
         fake_onnx = _fake_onnx_module(model_proto)
 
         with tempfile.TemporaryDirectory() as temporary:
-            source = Path(temporary) / 'model.onnx'
-            source.write_bytes(b'original-onnx')
+            source = Path(temporary) / "model.onnx"
+            source.write_bytes(b"original-onnx")
 
             with self.assertRaises(RuntimeError) as raised:
                 acceleration._validate_onnx_export_contract(
@@ -423,39 +417,39 @@ class TensorRTUtilityTest(unittest.TestCase):
                 )
 
         message = str(raised.exception)
-        self.assertIn('ConvTranspose', message)
-        self.assertIn('p2_upsample', message)
-        self.assertIn('p2_feature', message)
-        self.assertIn('channel axis must be static', message)
-        self.assertIn('p2_channels', message)
+        self.assertIn("ConvTranspose", message)
+        self.assertIn("p2_upsample", message)
+        self.assertIn("p2_feature", message)
+        self.assertIn("channel axis must be static", message)
+        self.assertIn("p2_channels", message)
 
     def test_onnx_contract_checks_conv_channels_too(self):
-        graph = _fake_p2_onnx_graph(p2_channel='conv_channels')
-        graph.node[0].op_type = 'Conv'
+        graph = _fake_p2_onnx_graph(p2_channel="conv_channels")
+        graph.node[0].op_type = "Conv"
 
         issues = acceleration._onnx_convolution_contract_issues(graph)
 
-        self.assertTrue(any('Conv node' in issue for issue in issues))
-        self.assertTrue(any('p2_feature' in issue for issue in issues))
-        self.assertTrue(any('conv_channels' in issue for issue in issues))
+        self.assertTrue(any("Conv node" in issue for issue in issues))
+        self.assertTrue(any("p2_feature" in issue for issue in issues))
+        self.assertTrue(any("conv_channels" in issue for issue in issues))
 
     def test_onnx_contract_rejects_legacy_scatternd_shape_rewrite(self):
         graph = _fake_p2_onnx_graph()
         graph.node.append(
             SimpleNamespace(
-                op_type='ScatterND',
-                name='legacy_dynamic_shape',
-                input=['shape', 'indices', 'updates'],
-                output=['rewritten_shape'],
+                op_type="ScatterND",
+                name="legacy_dynamic_shape",
+                input=["shape", "indices", "updates"],
+                output=["rewritten_shape"],
             )
         )
         model_proto = SimpleNamespace(graph=graph)
         fake_onnx = _fake_onnx_module(model_proto)
 
         with tempfile.TemporaryDirectory() as temporary:
-            source = Path(temporary) / 'model.onnx'
-            source.write_bytes(b'original-onnx')
-            with self.assertRaisesRegex(RuntimeError, 'ScatterND.*rfdetr==1.8.3'):
+            source = Path(temporary) / "model.onnx"
+            source.write_bytes(b"original-onnx")
+            with self.assertRaisesRegex(RuntimeError, "ScatterND.*rfdetr==1.8.3"):
                 acceleration._validate_onnx_export_contract(
                     source,
                     resolution=32,
@@ -592,7 +586,7 @@ class TensorRTUtilityTest(unittest.TestCase):
             manifest = root / "model.engine.manifest.json"
             engine.write_bytes(b"valid-engine")
             expected = {"schema_version": 1, "cache_key": "abc", "identity": {"model": "x"}}
-            expected['schema_version'] = acceleration._MANIFEST_SCHEMA_VERSION
+            expected["schema_version"] = acceleration._MANIFEST_SCHEMA_VERSION
             manifest.write_text(
                 json.dumps(
                     {
@@ -667,21 +661,21 @@ class TensorRTArtifactCacheTest(unittest.TestCase):
 
     def test_manifest_schema_and_export_abi_change_cache_key(self):
         identity = self._identity()
-        identity['export_abi'] = {
-            'version': acceleration._TENSORRT_EXPORT_ABI_VERSION,
-            'shape_contract': acceleration._TENSORRT_EXPORT_SHAPE_CONTRACT,
-            'dynamic_axes': ['batch'],
+        identity["export_abi"] = {
+            "version": acceleration._TENSORRT_EXPORT_ABI_VERSION,
+            "shape_contract": acceleration._TENSORRT_EXPORT_SHAPE_CONTRACT,
+            "dynamic_axes": ["batch"],
         }
 
         current = acceleration._manifest_template(identity)
         repeated = acceleration._manifest_template(identity)
         old_identity = dict(identity)
-        old_identity['export_abi'] = dict(identity['export_abi'], version=1)
+        old_identity["export_abi"] = dict(identity["export_abi"], version=1)
         old = acceleration._manifest_template(old_identity)
 
-        self.assertEqual(current['schema_version'], 2)
-        self.assertEqual(current['cache_key'], repeated['cache_key'])
-        self.assertNotEqual(current['cache_key'], old['cache_key'])
+        self.assertEqual(current["schema_version"], 2)
+        self.assertEqual(current["cache_key"], repeated["cache_key"])
+        self.assertNotEqual(current["cache_key"], old["cache_key"])
 
     def test_cache_miss_hit_force_rebuild_and_manifest_last_atomic_publish(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -742,42 +736,36 @@ class TensorRTArtifactCacheTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             settings = self._settings(Path(temporary))
             old_identity = self._identity()
-            old_identity['export_abi'] = {'version': 1}
+            old_identity["export_abi"] = {"version": 1}
             current_identity = self._identity()
-            current_identity['export_abi'] = {
-                'version': acceleration._TENSORRT_EXPORT_ABI_VERSION,
-                'shape_contract': acceleration._TENSORRT_EXPORT_SHAPE_CONTRACT,
-                'dynamic_axes': ['batch'],
+            current_identity["export_abi"] = {
+                "version": acceleration._TENSORRT_EXPORT_ABI_VERSION,
+                "shape_contract": acceleration._TENSORRT_EXPORT_SHAPE_CONTRACT,
+                "dynamic_axes": ["batch"],
             }
             identities = [old_identity, current_identity, current_identity]
             builds = []
 
             def fake_export(_model, output_dir, _settings):
-                exported = Path(output_dir) / 'exported.onnx'
-                exported.write_bytes(b'fake-onnx')
+                exported = Path(output_dir) / "exported.onnx"
+                exported.write_bytes(b"fake-onnx")
                 return exported
 
             def fake_build(_onnx_path, engine_path, _settings, **_kwargs):
-                payload = f'engine-{len(builds) + 1}'.encode('ascii')
+                payload = f"engine-{len(builds) + 1}".encode("ascii")
                 builds.append(payload)
                 Path(engine_path).write_bytes(payload)
                 return Path(engine_path)
 
             with patch.object(
                 acceleration,
-                '_import_tensorrt',
-                return_value=SimpleNamespace(__version__='10.16.0'),
-            ), patch.object(
-                acceleration, '_build_identity', side_effect=identities
-            ), patch.object(
-                acceleration, '_export_dynamic_onnx', side_effect=fake_export
-            ), patch.object(
-                acceleration, 'build_tensorrt_engine', side_effect=fake_build
-            ), patch.object(
-                acceleration, '_model_device', return_value=torch.device('cuda:0')
-            ), patch.object(
-                acceleration.torch.cuda, 'device', return_value=nullcontext()
-            ):
+                "_import_tensorrt",
+                return_value=SimpleNamespace(__version__="10.16.0"),
+            ), patch.object(acceleration, "_build_identity", side_effect=identities), patch.object(
+                acceleration, "_export_dynamic_onnx", side_effect=fake_export
+            ), patch.object(acceleration, "build_tensorrt_engine", side_effect=fake_build), patch.object(
+                acceleration, "_model_device", return_value=torch.device("cuda:0")
+            ), patch.object(acceleration.torch.cuda, "device", return_value=nullcontext()):
                 old = acceleration.prepare_tensorrt_engine(object(), settings, segmentation=False)
                 rebuilt = acceleration.prepare_tensorrt_engine(object(), settings, segmentation=False)
                 hit = acceleration.prepare_tensorrt_engine(object(), settings, segmentation=False)
@@ -785,7 +773,7 @@ class TensorRTArtifactCacheTest(unittest.TestCase):
         self.assertFalse(old.cache_hit)
         self.assertFalse(rebuilt.cache_hit)
         self.assertTrue(hit.cache_hit)
-        self.assertEqual(builds, [b'engine-1', b'engine-2'])
+        self.assertEqual(builds, [b"engine-1", b"engine-2"])
         self.assertNotEqual(old.engine_path, rebuilt.engine_path)
         self.assertEqual(rebuilt.engine_path, hit.engine_path)
 
@@ -871,9 +859,8 @@ with _ArtifactLock(Path({quoted_path}), timeout=10.0, stale_after=60.0):
                 acceleration, "_build_identity", return_value=self._identity("different-checkpoint")
             ), patch.object(acceleration, "_export_dynamic_onnx") as export_onnx, patch.object(
                 acceleration, "build_tensorrt_engine"
-            ) as build_engine:
-                with self.assertRaisesRegex(RuntimeError, "manifest (cache_key|identity)"):
-                    acceleration.prepare_tensorrt_engine(object(), settings, segmentation=False)
+            ) as build_engine, self.assertRaisesRegex(RuntimeError, "manifest (cache_key|identity)"):
+                acceleration.prepare_tensorrt_engine(object(), settings, segmentation=False)
 
             export_onnx.assert_not_called()
             build_engine.assert_not_called()
