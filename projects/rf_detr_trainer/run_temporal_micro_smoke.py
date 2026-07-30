@@ -23,7 +23,6 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import torch
-
     from rf_detr_temporal_runtime import TemporalCriterion
 
 os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
@@ -33,11 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--config",
-        default=str(
-            Path(__file__).resolve().parent
-            / "config"
-            / "rf_detr_train_smoke_temporal_tracknet_v5.yaml"
-        ),
+        default=str(Path(__file__).resolve().parent / "config" / "rf_detr_train_smoke_temporal_tracknet_v5.yaml"),
     )
     parser.add_argument("--focus", choices=("single", "all"), default="all")
     parser.add_argument("--steps", type=int, default=25)
@@ -83,7 +78,6 @@ def validate_args(args: argparse.Namespace) -> None:
 
 def terminate_process_tree(process: subprocess.Popen[Any]) -> None:
     """Terminate the worker and every descendant it may have spawned."""
-
     if process.poll() is not None:
         return
 
@@ -119,7 +113,6 @@ def terminate_process_tree(process: subprocess.Popen[Any]) -> None:
 
 def supervise_worker(args: argparse.Namespace) -> int:
     """Run one worker under a wall-clock timeout without recursive spawning."""
-
     command = [
         sys.executable,
         str(Path(__file__).resolve()),
@@ -128,9 +121,7 @@ def supervise_worker(args: argparse.Namespace) -> int:
     ]
     popen_kwargs: dict[str, Any] = {}
     if os.name == "nt":
-        popen_kwargs["creationflags"] = getattr(
-            subprocess, "CREATE_NEW_PROCESS_GROUP", 0
-        )
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     else:
         popen_kwargs["start_new_session"] = True
 
@@ -152,16 +143,11 @@ def supervise_worker(args: argparse.Namespace) -> int:
         return 124
 
 
-def move_targets(
-    targets: list[dict[str, torch.Tensor]], device: torch.device
-) -> list[dict[str, torch.Tensor]]:
+def move_targets(targets: list[dict[str, torch.Tensor]], device: torch.device) -> list[dict[str, torch.Tensor]]:
     import torch
 
     return [
-        {
-            key: value.to(device, non_blocking=True) if torch.is_tensor(value) else value
-            for key, value in target.items()
-        }
+        {key: value.to(device, non_blocking=True) if torch.is_tensor(value) else value for key, value in target.items()}
         for target in targets
     ]
 
@@ -172,11 +158,7 @@ def weighted_total(
     targets: list[dict[str, torch.Tensor]],
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     losses = criterion(outputs, targets)
-    total = sum(
-        value * criterion.weight_dict[key]
-        for key, value in losses.items()
-        if key in criterion.weight_dict
-    )
+    total = sum(value * criterion.weight_dict[key] for key, value in losses.items() if key in criterion.weight_dict)
     return total, losses
 
 
@@ -190,11 +172,7 @@ def sync(device: torch.device) -> None:
 def _gradient_norm(parameters: list[torch.nn.Parameter]) -> float:
     import torch
 
-    squared = [
-        parameter.grad.detach().float().square().sum()
-        for parameter in parameters
-        if parameter.grad is not None
-    ]
+    squared = [parameter.grad.detach().float().square().sum() for parameter in parameters if parameter.grad is not None]
     if not squared:
         return 0.0
     return float(torch.stack(squared).sum().sqrt())
@@ -221,7 +199,6 @@ def run_case(
 ) -> dict[str, Any]:
     import numpy as np
     import torch
-
     import train_rf_detr_model as trainer
     from rf_detr_motion import (
         _find_lwdetr,
@@ -245,9 +222,11 @@ def run_case(
     model["resolution"] = None if args.official_resolution else 128
     model.setdefault("p2", {})["enabled"] = p2_enabled
     model.setdefault("motion", {}).setdefault("focus", {})["mode"] = args.focus
-    config.setdefault("dataset", {}).setdefault("temporal", {})[
-        "max_windows_per_split"
-    ] = {"train": 1, "val": 1, "test": 1}
+    config.setdefault("dataset", {}).setdefault("temporal", {})["max_windows_per_split"] = {
+        "train": 1,
+        "val": 1,
+        "test": 1,
+    }
 
     case_name = f"{model_size}_{'p2_' if p2_enabled else ''}tracknet_{args.focus}"
     output_dir = Path(args.output_dir).expanduser().resolve() / case_name
@@ -325,11 +304,7 @@ def run_case(
         weight_decay=0.0,
     )
     amp_enabled = device.type == "cuda"
-    amp_dtype = (
-        torch.bfloat16
-        if amp_enabled and torch.cuda.is_bf16_supported()
-        else torch.float16
-    )
+    amp_dtype = torch.bfloat16 if amp_enabled and torch.cuda.is_bf16_supported() else torch.float16
     scaler = torch.amp.GradScaler(
         "cuda",
         enabled=amp_enabled and amp_dtype == torch.float16,
@@ -367,9 +342,7 @@ def run_case(
     )
     for step in range(args.steps):
         if time.monotonic() >= deadline:
-            raise TimeoutError(
-                f"Micro-smoke exceeded its {args.max_minutes:g}-minute safety limit"
-            )
+            raise TimeoutError(f"Micro-smoke exceeded its {args.max_minutes:g}-minute safety limit")
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(
             device_type=device.type,
@@ -383,13 +356,9 @@ def run_case(
         tracknet_gradient_norm = _gradient_norm(tracknet_parameters)
         detector_gradient_norm = _gradient_norm(detector_parameters)
         if not np.isfinite(tracknet_gradient_norm) or tracknet_gradient_norm <= 0:
-            raise RuntimeError(
-                f"Invalid TrackNet gradient norm at step {step}: {tracknet_gradient_norm}"
-            )
+            raise RuntimeError(f"Invalid TrackNet gradient norm at step {step}: {tracknet_gradient_norm}")
         if not np.isfinite(detector_gradient_norm) or detector_gradient_norm <= 0:
-            raise RuntimeError(
-                f"Invalid detector gradient norm at step {step}: {detector_gradient_norm}"
-            )
+            raise RuntimeError(f"Invalid detector gradient norm at step {step}: {detector_gradient_norm}")
         torch.nn.utils.clip_grad_norm_(trainable, 5.0)
         scaler.step(optimizer)
         scaler.update()
@@ -421,13 +390,9 @@ def run_case(
     acceptance_checked = args.steps >= 25 and not args.matrix
     if acceptance_checked:
         if heatmap_reduction_ratio < 0.20:
-            raise RuntimeError(
-                f"Heatmap loss reduction {heatmap_reduction_ratio:.1%} is below 20%"
-            )
+            raise RuntimeError(f"Heatmap loss reduction {heatmap_reduction_ratio:.1%} is below 20%")
         if total_reduction_ratio < 0.10:
-            raise RuntimeError(
-                f"Total loss reduction {total_reduction_ratio:.1%} is below 10%"
-            )
+            raise RuntimeError(f"Total loss reduction {total_reduction_ratio:.1%} is below 10%")
         if final_iou - initial_iou < 0.05 and not (not initial_matched and final_matched):
             raise RuntimeError(
                 "Best-box IoU neither improved by 0.05 nor crossed the 0.5 match "
@@ -472,9 +437,7 @@ def run_case(
         del fresh_lwdetr, fresh_model, saved
 
     sync(device)
-    peak_vram_bytes = (
-        int(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else 0
-    )
+    peak_vram_bytes = int(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else 0
     result: dict[str, Any] = {
         "success": True,
         "model_size": model_size,

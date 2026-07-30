@@ -1,17 +1,16 @@
-from pathlib import Path
-from types import SimpleNamespace
 import sys
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
-
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 REPO_ROOT = PROJECT_DIR.parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from projects.object_detection_dataset_evaluator import object_detection_dataset_evaluator as evaluator  # noqa: E402
+from projects.object_detection_dataset_evaluator import object_detection_dataset_evaluator as evaluator
 
 
 class CocoMetricsSummaryTest(unittest.TestCase):
