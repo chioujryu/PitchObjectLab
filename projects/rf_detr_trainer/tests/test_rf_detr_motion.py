@@ -14,28 +14,28 @@ All tests run with CPU-only torch; no rfdetr install required for the pure-modul
 tests.  Tests that need rfdetr are guarded with unittest.skipIf.
 """
 
-from copy import deepcopy
-from pathlib import Path
 import sys
 import tempfile
-from types import SimpleNamespace
 import unittest
+from copy import deepcopy
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
-import rf_detr_motion as motion  # noqa: E402
-import train_rf_detr_model as trainer  # noqa: E402
-
+import rf_detr_motion as motion
+import train_rf_detr_model as trainer
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _make_nested_tensor(B: int, C: int, H: int, W: int):
     """Build a minimal NestedTensor-like object for testing without rfdetr."""
@@ -66,9 +66,7 @@ def _small_motion_config(fallback_mode="identity"):
 class _FakeProjector(nn.Module):
     def __init__(self, levels, width):
         super().__init__()
-        self.stages = nn.ModuleList(
-            [nn.Sequential(nn.Identity(), nn.LayerNorm(width)) for _ in range(levels)]
-        )
+        self.stages = nn.ModuleList([nn.Sequential(nn.Identity(), nn.LayerNorm(width)) for _ in range(levels)])
 
 
 class _FakeBackboneLevel(nn.Module):
@@ -81,9 +79,7 @@ class _FakeBackboneLevel(nn.Module):
 
     def forward(self, tensors):
         feature = tensors[:, :1]
-        mask = torch.zeros(
-            tensors.shape[0], tensors.shape[2], tensors.shape[3], dtype=torch.bool
-        )
+        mask = torch.zeros(tensors.shape[0], tensors.shape[2], tensors.shape[3], dtype=torch.bool)
         position = torch.zeros_like(feature)
         return [feature], [mask], [position], None
 
@@ -109,6 +105,7 @@ _FakeLWDETR.forward_export._motion_patched = True
 # ---------------------------------------------------------------------------
 # LearnableSigmoidAttention
 # ---------------------------------------------------------------------------
+
 
 class LearnableSigmoidAttentionTest(unittest.TestCase):
     def test_output_shape(self):
@@ -151,6 +148,7 @@ class LearnableSigmoidAttentionTest(unittest.TestCase):
 # MotionDirectionDecoupling
 # ---------------------------------------------------------------------------
 
+
 class MDDTest(unittest.TestCase):
     def _make_mdd(self, learnable=False):
         return motion.MotionDirectionDecoupling(
@@ -180,8 +178,8 @@ class MDDTest(unittest.TestCase):
     def test_uses_luminance_and_both_adjacent_pairs(self):
         mdd = self._make_mdd()
         frames = torch.zeros(1, 3, 3, 2, 2)
-        frames[:, 1, 0] = 1.0  # red increases from previous to centre
-        frames[:, 2, 0] = 0.25  # red decreases from centre to next
+        frames[:, 1, 0] = 1.0  # red increases from previous to center
+        frames[:, 2, 0] = 0.25  # red decreases from center to next
         raw = mdd.raw_polarities(frames)
         self.assertTrue(torch.allclose(raw[:, 0], torch.full_like(raw[:, 0], 0.299)))
         self.assertTrue(torch.equal(raw[:, 1], torch.zeros_like(raw[:, 1])))
@@ -204,6 +202,7 @@ class MDDTest(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # RSTRHead
 # ---------------------------------------------------------------------------
+
 
 class RSTRHeadTest(unittest.TestCase):
     @staticmethod
@@ -239,10 +238,12 @@ class RSTRHeadTest(unittest.TestCase):
         out = head(drafts, torch.rand(1, 4, 12, 12))
         out.square().mean().backward()
         self.assertTrue(torch.isfinite(drafts.grad).all())
-        self.assertTrue(any(
-            parameter.grad is not None and parameter.grad.abs().sum() > 0
-            for parameter in head.temporal_blocks.parameters()
-        ))
+        self.assertTrue(
+            any(
+                parameter.grad is not None and parameter.grad.abs().sum() > 0
+                for parameter in head.temporal_blocks.parameters()
+            )
+        )
 
     def test_eval_is_deterministic_and_training_context_mask_is_supported(self):
         head = self._make_head(context_mask_prob=0.5)
@@ -281,18 +282,14 @@ class HeatmapUtilitiesTest(unittest.TestCase):
         return [[target, target, target]]
 
     def test_gaussian_all_focus_contains_both_centres(self):
-        heatmaps = motion.build_gaussian_heatmap_targets(
-            self._two_ball_targets(), (32, 64), focus_mode="all"
-        )
+        heatmaps = motion.build_gaussian_heatmap_targets(self._two_ball_targets(), (32, 64), focus_mode="all")
         self.assertEqual(heatmaps.shape, (1, 3, 32, 64))
         self.assertGreater(float(heatmaps[0, 1, 16, 16]), 0.95)
         self.assertGreater(float(heatmaps[0, 1, 16, 48]), 0.95)
 
     def test_gaussian_single_focus_requires_explicit_primary_for_multiball(self):
         with self.assertRaisesRegex(ValueError, "without 'primary_label_index'"):
-            motion.build_gaussian_heatmap_targets(
-                self._two_ball_targets(), (32, 64), focus_mode="single"
-            )
+            motion.build_gaussian_heatmap_targets(self._two_ball_targets(), (32, 64), focus_mode="single")
         heatmaps = motion.build_gaussian_heatmap_targets(
             self._two_ball_targets(primary=1), (32, 64), focus_mode="single"
         )
@@ -312,12 +309,8 @@ class HeatmapUtilitiesTest(unittest.TestCase):
         heatmaps = torch.zeros(1, 1, 12, 12)
         heatmaps[0, 0, 3, 4] = 0.8
         heatmaps[0, 0, 8, 9] = 0.9
-        all_peaks = motion.extract_heatmap_peaks(
-            heatmaps, focus_mode="all", threshold=0.5, max_peaks=20
-        )
-        single_peak = motion.extract_heatmap_peaks(
-            heatmaps, focus_mode="single", threshold=0.5
-        )
+        all_peaks = motion.extract_heatmap_peaks(heatmaps, focus_mode="all", threshold=0.5, max_peaks=20)
+        single_peak = motion.extract_heatmap_peaks(heatmaps, focus_mode="single", threshold=0.5)
         self.assertEqual(all_peaks[0][0].shape, (2, 3))
         self.assertEqual(single_peak[0][0].shape, (1, 3))
         self.assertTrue(torch.equal(single_peak[0][0][0, :2], torch.tensor([9.0, 8.0])))
@@ -327,14 +320,27 @@ class HeatmapUtilitiesTest(unittest.TestCase):
 # MotionModule
 # ---------------------------------------------------------------------------
 
+
 class MotionModuleTest(unittest.TestCase):
     _BASE_CFG = {
         "enabled": True,
         "type": "tracknet_v5",
         "temporal": {"num_frames": 3, "fallback_mode": "identity", "noise_std": 0.02},
         "tracknet_v5": {
-            "mdd": {"enabled": True, "polarity_channels": 4, "attention": {"learnable": True, "init_alpha": 0.2, "init_beta": 0.15, "epsilon": 1.0e-6}},
-            "rstr": {"enabled": True, "num_blocks": 1, "hidden_dim": 32, "num_heads": 4, "dropout": 0.0, "patch_size": 4, "context_mask_prob": 0.0},
+            "mdd": {
+                "enabled": True,
+                "polarity_channels": 4,
+                "attention": {"learnable": True, "init_alpha": 0.2, "init_beta": 0.15, "epsilon": 1.0e-6},
+            },
+            "rstr": {
+                "enabled": True,
+                "num_blocks": 1,
+                "hidden_dim": 32,
+                "num_heads": 4,
+                "dropout": 0.0,
+                "patch_size": 4,
+                "context_mask_prob": 0.0,
+            },
         },
         "loss": {"motion_attention_weight": 0.0},
     }
@@ -346,7 +352,7 @@ class MotionModuleTest(unittest.TestCase):
         )
 
     def _make_fake_features(self, B=2, C=32, H=20, W=20, num_levels=3):
-        return [_make_nested_tensor(B, C, H // (2 ** i), W // (2 ** i)) for i in range(num_levels)]
+        return [_make_nested_tensor(B, C, H // (2**i), W // (2**i)) for i in range(num_levels)]
 
     def test_output_length_matches_input(self):
         mod = self._make_module()
@@ -375,7 +381,7 @@ class MotionModuleTest(unittest.TestCase):
             self.assertEqual(result.tensors.shape, orig.tensors.shape, f"Level {i} shape mismatch")
 
     def test_noise_fallback_differs_from_identity(self):
-        """noise fallback should produce different synthetic frames on repeated calls (stochastic)."""
+        """Noise fallback should produce different synthetic frames on repeated calls (stochastic)."""
         cfg = dict(self._BASE_CFG)
         cfg["temporal"] = {"num_frames": 3, "fallback_mode": "noise", "noise_std": 1.0}
         mod = motion.MotionModule(feature_channels_per_scale=[8], motion_cfg=cfg)
@@ -403,10 +409,13 @@ class MotionModuleTest(unittest.TestCase):
         self.assertIs(out, frames)
 
     def test_mdd_disabled_skips_motion_maps(self):
-        cfg = {**self._BASE_CFG, "tracknet_v5": {
-            "mdd": {"enabled": False, "polarity_channels": 4, "attention": {}},
-            "rstr": {"enabled": False},
-        }}
+        cfg = {
+            **self._BASE_CFG,
+            "tracknet_v5": {
+                "mdd": {"enabled": False, "polarity_channels": 4, "attention": {}},
+                "rstr": {"enabled": False},
+            },
+        }
         mod = motion.MotionModule(feature_channels_per_scale=[8, 8], motion_cfg=cfg)
         self.assertIsNone(mod.mdd)
         images = torch.rand(1, 3, 16, 16)
@@ -427,7 +436,6 @@ class MotionModuleTest(unittest.TestCase):
         for nested, exported in zip(nested_result, export_result):
             self.assertTrue(torch.allclose(nested.tensors, exported, atol=1e-6))
 
-
     def test_true_temporal_forward_returns_full_resolution_heatmaps(self):
         mod = self._make_module()
         mod.eval()
@@ -440,9 +448,7 @@ class MotionModuleTest(unittest.TestCase):
         output = mod.forward_temporal(frames, temporal_features)
         self.assertEqual(output.heatmap_logits.shape, (2, 3, 32, 40))
         self.assertEqual(output.motion_maps.shape, (2, 4, 32, 40))
-        self.assertEqual([item.shape for item in output.features], [
-            (2, 32, 8, 10), (2, 32, 4, 5), (2, 32, 2, 3)
-        ])
+        self.assertEqual([item.shape for item in output.features], [(2, 32, 8, 10), (2, 32, 4, 5), (2, 32, 2, 3)])
 
     def test_zero_init_fusion_is_exact_centre_feature_identity(self):
         mod = self._make_module()
@@ -473,6 +479,7 @@ class MotionModuleTest(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Config helpers
 # ---------------------------------------------------------------------------
+
 
 class ConfigHelpersTest(unittest.TestCase):
     def test_resolve_motion_type_default(self):
@@ -519,6 +526,7 @@ class ConfigHelpersTest(unittest.TestCase):
 # build_model_kwargs wiring (trainer integration)
 # ---------------------------------------------------------------------------
 
+
 class BuildModelKwargsMotionTest(unittest.TestCase):
     def test_disabled_is_completely_inert(self):
         """motion.enabled: false must not trigger any motion imports or kwargs."""
@@ -527,9 +535,7 @@ class BuildModelKwargsMotionTest(unittest.TestCase):
         self.assertNotIn("motion_config", kwargs)
 
     def test_disabled_explicit_false_is_inert(self):
-        kwargs = trainer.build_model_kwargs({
-            "model": {"size": "medium", "motion": {"enabled": False}}
-        })
+        kwargs = trainer.build_model_kwargs({"model": {"size": "medium", "motion": {"enabled": False}}})
         self.assertNotIn("motion_config", kwargs)
 
     def test_type_none_is_inert_even_when_enabled_flag_is_true(self):
@@ -546,43 +552,44 @@ class BuildModelKwargsMotionTest(unittest.TestCase):
             }
         )
         self.assertNotIn("num_queries", kwargs)
-        self.assertFalse(
-            trainer.motion_module_enabled(
-                {"model": {"motion": {"enabled": True, "type": "none"}}}
-            )
-        )
+        self.assertFalse(trainer.motion_module_enabled({"model": {"motion": {"enabled": True, "type": "none"}}}))
 
     def test_enabled_applies_overrides(self):
         """When enabled, apply_motion_overrides must inject non-null override values."""
-        kwargs = trainer.build_model_kwargs({
-            "model": {
-                "size": "medium",
-                "motion": {
-                    "enabled": True,
-                    "type": "tracknet_v5",
-                    "overrides": {"num_queries": 500},
-                },
+        kwargs = trainer.build_model_kwargs(
+            {
+                "model": {
+                    "size": "medium",
+                    "motion": {
+                        "enabled": True,
+                        "type": "tracknet_v5",
+                        "overrides": {"num_queries": 500},
+                    },
+                }
             }
-        })
+        )
         self.assertEqual(kwargs.get("num_queries"), 500)
 
     def test_enabled_sets_gradient_checkpointing(self):
-        kwargs = trainer.build_model_kwargs({
-            "model": {
-                "size": "large",
-                "motion": {
-                    "enabled": True,
-                    "type": "tracknet_v5",
-                    "overrides": {"gradient_checkpointing": True},
-                },
+        kwargs = trainer.build_model_kwargs(
+            {
+                "model": {
+                    "size": "large",
+                    "motion": {
+                        "enabled": True,
+                        "type": "tracknet_v5",
+                        "overrides": {"gradient_checkpointing": True},
+                    },
+                }
             }
-        })
+        )
         self.assertIs(kwargs.get("gradient_checkpointing"), True)
 
 
 # ---------------------------------------------------------------------------
 # ensure_motion_support idempotency
 # ---------------------------------------------------------------------------
+
 
 class EnsureMotionSupportTest(unittest.TestCase):
     def test_disabled_support_is_completely_non_mutating(self):
@@ -625,9 +632,7 @@ class EnsureMotionSupportTest(unittest.TestCase):
             for key in path[:-1]:
                 cursor = cursor.setdefault(key, {})
             cursor[path[-1]] = unsupported_value
-            with self.subTest(field=expected_field), patch.object(
-                motion, "_check_version"
-            ) as version_check:
+            with self.subTest(field=expected_field), patch.object(motion, "_check_version") as version_check:
                 with self.assertRaisesRegex(ValueError, expected_field):
                     motion.ensure_motion_support(config)
                 version_check.assert_not_called()
@@ -637,9 +642,7 @@ class EnsureMotionSupportTest(unittest.TestCase):
 
         original_methods = (LWDETR.__init__, LWDETR.forward, LWDETR.forward_export)
         motion.ensure_motion_support({"enabled": True, "type": "tracknet_v5"})
-        self.assertEqual(
-            (LWDETR.__init__, LWDETR.forward, LWDETR.forward_export), original_methods
-        )
+        self.assertEqual((LWDETR.__init__, LWDETR.forward, LWDETR.forward_export), original_methods)
 
     def test_attachment_is_explicit_and_instance_bound(self):
         import rfdetr.models.lwdetr as lwdetr_module
@@ -797,9 +800,7 @@ class MotionCheckpointCompatibilityTest(unittest.TestCase):
                 torch.save(
                     {
                         "model": model.state_dict(),
-                        "pitchobjectlab_architecture": self._metadata(
-                            _small_motion_config()
-                        ),
+                        "pitchobjectlab_architecture": self._metadata(_small_motion_config()),
                     },
                     checkpoint,
                 )
@@ -816,9 +817,7 @@ class MotionCheckpointCompatibilityTest(unittest.TestCase):
                 checkpoint = Path(directory) / "legacy_motion.pth"
                 torch.save({"model": model.state_dict()}, checkpoint)
 
-                with self.assertRaisesRegex(
-                    RuntimeError, "legacy TrackNet prototype checkpoint"
-                ):
+                with self.assertRaisesRegex(RuntimeError, "legacy TrackNet prototype checkpoint"):
                     motion.assert_motion_checkpoint_compatible(model, checkpoint)
 
     def test_stock_checkpoint_without_motion_tensors_does_not_require_metadata(self):
@@ -834,10 +833,7 @@ class MotionCheckpointCompatibilityTest(unittest.TestCase):
         with patch.object(lwdetr_module, "LWDETR", _FakeLWDETR):
             model = _FakeLWDETR(scales=("P4",), width=24)
             motion.attach_motion_module(model, config)
-            before = {
-                key: value.detach().clone()
-                for key, value in model.motion_module.state_dict().items()
-            }
+            before = {key: value.detach().clone() for key, value in model.motion_module.state_dict().items()}
 
             optimizer = torch.optim.SGD(model.motion_module.parameters(), lr=0.1)
             frames = torch.stack(
@@ -854,10 +850,7 @@ class MotionCheckpointCompatibilityTest(unittest.TestCase):
             loss.backward()
             optimizer.step()
 
-            updated = {
-                key: value.detach().clone()
-                for key, value in model.motion_module.state_dict().items()
-            }
+            updated = {key: value.detach().clone() for key, value in model.motion_module.state_dict().items()}
             changed = [key for key in before if not torch.equal(before[key], updated[key])]
             self.assertTrue(changed, "One optimizer step must update motion_module weights")
             self.assertIn("fusions.0.projection.weight", changed)
@@ -917,9 +910,7 @@ class MotionCheckpointCompatibilityTest(unittest.TestCase):
                 torch.save(
                     {
                         "model": state,
-                        "pitchobjectlab_architecture": self._metadata(
-                            _small_motion_config()
-                        ),
+                        "pitchobjectlab_architecture": self._metadata(_small_motion_config()),
                     },
                     checkpoint,
                 )
@@ -952,7 +943,6 @@ class MotionCheckpointCompatibilityTest(unittest.TestCase):
                         expected_architecture=self._metadata(expected_config),
                     )
 
-
     def test_load_motion_checkpoint_weights_only_restores_tracknet(self):
         import rfdetr.models.lwdetr as lwdetr_module
 
@@ -973,20 +963,25 @@ class MotionCheckpointCompatibilityTest(unittest.TestCase):
 
                 destination = _FakeLWDETR()
                 motion.attach_motion_module(destination, config)
-                self.assertFalse(torch.equal(
-                    destination.motion_module.fusions[0].projection.bias,
-                    source.motion_module.fusions[0].projection.bias,
-                ))
+                self.assertFalse(
+                    torch.equal(
+                        destination.motion_module.fusions[0].projection.bias,
+                        source.motion_module.fusions[0].projection.bias,
+                    )
+                )
                 motion.load_motion_checkpoint_weights(destination, checkpoint)
-                self.assertTrue(torch.equal(
-                    destination.motion_module.fusions[0].projection.bias,
-                    source.motion_module.fusions[0].projection.bias,
-                ))
+                self.assertTrue(
+                    torch.equal(
+                        destination.motion_module.fusions[0].projection.bias,
+                        source.motion_module.fusions[0].projection.bias,
+                    )
+                )
 
 
 # ---------------------------------------------------------------------------
 # attach_motion_module guard
 # ---------------------------------------------------------------------------
+
 
 class AttachMotionModuleTest(unittest.TestCase):
     def test_disabled_does_not_attach(self):

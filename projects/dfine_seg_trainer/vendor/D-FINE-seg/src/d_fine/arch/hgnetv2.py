@@ -1,16 +1,17 @@
 """
 reference
-- https://github.com/PaddlePaddle/PaddleDetection/blob/develop/ppdet/modeling/backbones/hgnet_v2.py
+- https://github.com/PaddlePaddle/PaddleDetection/blob/develop/ppdet/modeling/backbones/hgnet_v2.py.
 
 Copyright (c) 2024 The D-FINE Authors. All Rights Reserved.
 """
 
 import logging
 import os
+import sys
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 from .common import FrozenBatchNorm2d
 
@@ -313,7 +314,7 @@ class HG_Stage(nn.Module):
                     mid_chs,
                     out_chs,
                     layer_num,
-                    residual=False if i == 0 else True,
+                    residual=i != 0,
                     kernel_size=kernel_size,
                     light_block=light_block,
                     use_lab=use_lab,
@@ -330,13 +331,14 @@ class HG_Stage(nn.Module):
 
 
 class HGNetv2(nn.Module):
-    """
-    HGNetV2
+    """HGNetV2.
+
     Args:
         stem_channels: list. Number of channels for the stem block.
         stage_type: str. The stage configuration of HGNet. such as the number of channels, stride, etc.
         use_lab: boolean. Whether to use LearnableAffineBlock in network.
         lr_mult_list: list. Control the learning rate of different stages.
+
     Returns:
         model: nn.Layer. Specific HGNetV2 model depends on args.
     """
@@ -425,7 +427,7 @@ class HGNetv2(nn.Module):
         self,
         name,
         use_lab=False,
-        return_idx=[1, 2, 3],
+        return_idx=None,
         freeze_stem_only=True,
         freeze_at=0,
         freeze_norm=True,
@@ -433,6 +435,8 @@ class HGNetv2(nn.Module):
         local_model_dir="weight/hgnetv2/",
         in_channels: int = 3,
     ):
+        if return_idx is None:
+            return_idx = [1, 2, 3]
         super().__init__()
         self.use_lab = use_lab
         self.return_idx = return_idx
@@ -532,10 +536,8 @@ class HGNetv2(nn.Module):
 
             except (Exception, KeyboardInterrupt) as e:
                 if torch.distributed.get_rank() == 0:
-                    print(f"{str(e)}")
-                    logging.error(
-                        RED + "CRITICAL WARNING: Failed to load pretrained HGNetV2 model" + RESET
-                    )
+                    print(f"{e!s}")
+                    logging.error(RED + "CRITICAL WARNING: Failed to load pretrained HGNetV2 model" + RESET)
                     logging.error(
                         GREEN
                         + "Please check your network connection. Or download the model manually from "
@@ -547,7 +549,7 @@ class HGNetv2(nn.Module):
                         + f"{local_model_dir}."
                         + RESET
                     )
-                exit()
+                sys.exit()
 
     def _freeze_norm(self, m: nn.Module):
         if isinstance(m, nn.BatchNorm2d):

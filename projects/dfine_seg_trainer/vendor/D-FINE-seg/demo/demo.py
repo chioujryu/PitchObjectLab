@@ -1,5 +1,5 @@
 """
-D-FINE-seg Gradio Demo — Object Detection & Instance Segmentation
+D-FINE-seg Gradio Demo — Object Detection & Instance Segmentation.
 
 Supports three backends (chosen automatically by file extension):
   .pt      -> PyTorch   (CUDA / MPS / CPU)
@@ -14,11 +14,12 @@ Configure the variables below, then run:
     python -m demo.demo
 """
 
+from __future__ import annotations
+
 import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
 import cv2
 import gradio as gr
@@ -39,12 +40,12 @@ ENABLE_MASK_HEAD = False  # only for .pt; auto-detected for .engine / .xml
 class Visualizer:
     """Draws detection / segmentation results with consistent per-class colors."""
 
-    def __init__(self, n_classes: int, class_names: Optional[Dict[int, str]] = None):
+    def __init__(self, n_classes: int, class_names: dict[int, str] | None = None):
         self.class_names = class_names or {i: str(i) for i in range(n_classes)}
         self.colors = self._generate_colors(n_classes)
 
     @staticmethod
-    def _generate_colors(n: int) -> List[Tuple[int, int, int]]:
+    def _generate_colors(n: int) -> list[tuple[int, int, int]]:
         """Evenly spaced hues on the HSV wheel → BGR tuples."""
         colors = []
         n = max(n, 1)
@@ -56,9 +57,7 @@ class Visualizer:
         return colors
 
     # ── public API ──────────────────────────────────────────────────────
-    def draw(
-        self, img: np.ndarray, results: Dict[str, torch.Tensor], minimize: bool = False
-    ) -> np.ndarray:
+    def draw(self, img: np.ndarray, results: dict[str, torch.Tensor], minimize: bool = False) -> np.ndarray:
         img = img.copy()
         labels = results["labels"]
         boxes = results["boxes"]
@@ -108,7 +107,7 @@ class Visualizer:
         text: str,
         x: int,
         y: int,
-        bg_color: Tuple[int, int, int],
+        bg_color: tuple[int, int, int],
         font_scale: float,
         font_thick: int,
     ):
@@ -133,7 +132,7 @@ class Visualizer:
     def _draw_mask(
         img: np.ndarray,
         mask: np.ndarray,
-        color: Tuple[int, int, int],
+        color: tuple[int, int, int],
         body_alpha: float = 0.25,
         edge_alpha: float = 0.70,
         edge_thickness: int = 2,
@@ -218,9 +217,7 @@ def load_model(
 
 # ─── Initialization ─────────────────────────────────────────────────────
 device = get_device()
-model = load_model(
-    MODEL_PATH, MODEL_NAME, CLASSES, IM_WIDTH, IM_HEIGHT, CONF_THRESH, ENABLE_MASK_HEAD
-)
+model = load_model(MODEL_PATH, MODEL_NAME, CLASSES, IM_WIDTH, IM_HEIGHT, CONF_THRESH, ENABLE_MASK_HEAD)
 visualizer = Visualizer(n_classes=len(CLASSES), class_names=CLASSES)
 
 

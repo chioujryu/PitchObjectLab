@@ -32,7 +32,6 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 import pandas as pd
 import yaml
@@ -89,9 +88,8 @@ def load_train_root(config_path: Path) -> Path:
 def ensure_labels_active(data_path: Path, target: str) -> None:
     """Make sure data_path/labels holds the `target` label set.
 
-    `target` is "labels_det" or "labels_seg". The other set lives in the
-    sibling directory of the same name when not active. Idempotent: if labels/
-    already holds the target (no sibling target dir present), do nothing.
+    `target` is "labels_det" or "labels_seg". The other set lives in the sibling directory of the same name when not
+    active. Idempotent: if labels/ already holds the target (no sibling target dir present), do nothing.
     """
     if target not in {"labels_det", "labels_seg"}:
         raise ValueError(f"unexpected target: {target!r}")
@@ -103,9 +101,7 @@ def ensure_labels_active(data_path: Path, target: str) -> None:
 
     if target_dir.exists():
         if labels.exists() and other_dir.exists():
-            raise RuntimeError(
-                f"ambiguous state in {data_path}: labels/, {target}/, and {other}/ all exist"
-            )
+            raise RuntimeError(f"ambiguous state in {data_path}: labels/, {target}/, and {other}/ all exist")
         if labels.exists():
             labels.rename(other_dir)
         target_dir.rename(labels)
@@ -116,14 +112,12 @@ def ensure_labels_active(data_path: Path, target: str) -> None:
         raise RuntimeError(f"neither labels/ nor {target}/ exists in {data_path}")
 
 
-def find_exp_dir(prefix: str, size: str, train_root: Path) -> Optional[Path]:
+def find_exp_dir(prefix: str, size: str, train_root: Path) -> Path | None:
     """Pick the most recent <prefix>_<size>_<date> dir under <root>/output/models."""
     base = train_root / "output" / "models"
     if not base.exists():
         return None
-    candidates = [
-        d for d in base.iterdir() if d.is_dir() and d.name.startswith(f"{prefix}_{size}_")
-    ]
+    candidates = [d for d in base.iterdir() if d.is_dir() and d.name.startswith(f"{prefix}_{size}_")]
     if not candidates:
         return None
     candidates.sort(key=lambda d: d.name.rsplit("_", 1)[-1])
@@ -169,7 +163,7 @@ def bench_one(phase: dict, size: str) -> tuple[str, int, Path]:
     return exp_name, rc, log_path
 
 
-def read_bench_metrics(exp_dir: Path) -> Optional[pd.DataFrame]:
+def read_bench_metrics(exp_dir: Path) -> pd.DataFrame | None:
     csv_path = exp_dir / "bench_metrics.csv"
     if not csv_path.exists():
         return None
@@ -242,9 +236,7 @@ def run_phase(phase: dict) -> dict[str, pd.DataFrame]:
             futures = {ex.submit(export_one, phase, s): s for s in MODEL_SIZES}
             for fut in as_completed(futures):
                 exp_name, rc, log_path = fut.result()
-                status = (
-                    "ok" if rc == 0 else f"FAIL (rc={rc}, see {log_path.relative_to(REPO_ROOT)})"
-                )
+                status = "ok" if rc == 0 else f"FAIL (rc={rc}, see {log_path.relative_to(REPO_ROOT)})"
                 log(f"    export {exp_name}: {status}")
     else:
         log("  skipping exports (TO_EXPORT=False)")

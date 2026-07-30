@@ -23,7 +23,7 @@ import subprocess
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 import colorama
 from colorama import Fore, Style
@@ -62,14 +62,14 @@ def blue(message: str) -> None:
     print(Fore.BLUE + Style.BRIGHT + message)
 
 
-def fetch_json(url: str, timeout: float = 6.0) -> Dict[str, Any]:
+def fetch_json(url: str, timeout: float = 6.0) -> dict[str, Any]:
     """Fetch JSON from a public IP location API."""
     request = urllib.request.Request(url, headers={"User-Agent": "rf-detr-trainer-setup/1.0"})
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
-def detect_region() -> Tuple[str, str]:
+def detect_region() -> tuple[str, str]:
     """Return country/region code and provider label from public IP services."""
     providers = (
         ("ipinfo", "https://ipinfo.io/json", "country"),
@@ -86,7 +86,7 @@ def detect_region() -> Tuple[str, str]:
     return "UNKNOWN", "unavailable"
 
 
-def detect_cuda_version() -> Optional[str]:
+def detect_cuda_version() -> str | None:
     """Return CUDA version reported by nvidia-smi, or None when unavailable."""
     try:
         result = subprocess.run(["nvidia-smi"], check=False, capture_output=True, text=True, timeout=8)
@@ -97,7 +97,7 @@ def detect_cuda_version() -> Optional[str]:
     return match.group(1) if match else None
 
 
-def choose_cuda_tag(cuda_version: Optional[str], forced: Optional[str], device: str) -> str:
+def choose_cuda_tag(cuda_version: str | None, forced: str | None, device: str) -> str:
     """Choose the PyTorch wheel CUDA tag from hardware and user preference."""
     if forced:
         return forced
@@ -132,7 +132,7 @@ def index_has_pinned_torch(index_url: str, cuda_tag: str, timeout: float = 8.0) 
     return expected in html or expected.replace("+", "%2B") in html
 
 
-def resolve_index_urls(region: str, cuda_tag: str) -> Tuple[str, str, Optional[str]]:
+def resolve_index_urls(region: str, cuda_tag: str) -> tuple[str, str, str | None]:
     """Choose package indexes, falling back when a regional PyTorch mirror lacks the pinned wheel."""
     index_url = PYTORCH_INDEXES[region][cuda_tag]
     note = None
@@ -215,9 +215,20 @@ def run_uv_sync(index_url: str, default_index_url: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Auto-configure uv PyTorch wheels for this RF-DETR project.")
-    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto", help="Force CPU, CUDA, or auto detection.")
-    parser.add_argument("--cuda-tag", choices=["cpu", "cu118", "cu124", "cu126", "cu128"], help="Override the selected PyTorch wheel tag.")
-    parser.add_argument("--region", choices=["auto", "official", "china", "cn"], default="auto", help="Force official or China mirror indexes.")
+    parser.add_argument(
+        "--device", choices=["auto", "cpu", "cuda"], default="auto", help="Force CPU, CUDA, or auto detection."
+    )
+    parser.add_argument(
+        "--cuda-tag",
+        choices=["cpu", "cu118", "cu124", "cu126", "cu128"],
+        help="Override the selected PyTorch wheel tag.",
+    )
+    parser.add_argument(
+        "--region",
+        choices=["auto", "official", "china", "cn"],
+        default="auto",
+        help="Force official or China mirror indexes.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print the selected setup without changing files.")
     parser.add_argument("--no-sync", action="store_true", help="Update pyproject.toml but do not run uv sync.")
     parser.add_argument("--yes", action="store_true", help="Skip confirmation.")
@@ -254,7 +265,11 @@ def main() -> int:
     if args.dry_run:
         return 0
     if not args.yes:
-        answer = input(Fore.BLUE + Style.BRIGHT + "Update pyproject.toml and install with uv? [y/N]: " + Style.RESET_ALL).strip().lower()
+        answer = (
+            input(Fore.BLUE + Style.BRIGHT + "Update pyproject.toml and install with uv? [y/N]: " + Style.RESET_ALL)
+            .strip()
+            .lower()
+        )
         if answer not in {"y", "yes"}:
             raise SystemExit("Cancelled before changing pyproject.toml.")
 
