@@ -122,7 +122,7 @@ uv run python train_rf_detr_model.py --config config/rf_detr_train_large_p2_trac
 
 The defaults target an 8 GB GPU: BF16/AMP and gradient checkpointing are on,
 `model.motion.temporal.backbone_grad_mode: center_only` retains backbone
-activations only for the centre frame, Small uses batch 4, and Medium/Large
+activations only for the center frame, Small uses batch 4, and Medium/Large
 use batch 1. Context frames still use the same updated backbone weights, but
 their feature extraction runs sequentially under `no_grad`.
 
@@ -236,11 +236,11 @@ Small detection keeps the official RF-DETR 512 x 512 default and is provided
 as a complete Stock/P2/TrackNetV5 matrix for training, standalone test, and
 inference:
 
-| Architecture | Train | Test | Inference |
-| --- | --- | --- | --- |
-| Stock | `config/rf_detr_train_small.yaml` | `config/rf_detr_test_small.yaml` | `config/rf_detr_inference_small.yaml` |
-| P2 only | `config/rf_detr_train_small_p2.yaml` | `config/rf_detr_test_small_p2.yaml` | `config/rf_detr_inference_small_p2.yaml` |
-| TrackNetV5 only | `config/rf_detr_train_small_tracknet_v5.yaml` | `config/rf_detr_test_small_tracknet_v5.yaml` | `config/rf_detr_inference_small_tracknet_v5.yaml` |
+| Architecture    | Train                                            | Test                                            | Inference                                            |
+| --------------- | ------------------------------------------------ | ----------------------------------------------- | ---------------------------------------------------- |
+| Stock           | `config/rf_detr_train_small.yaml`                | `config/rf_detr_test_small.yaml`                | `config/rf_detr_inference_small.yaml`                |
+| P2 only         | `config/rf_detr_train_small_p2.yaml`             | `config/rf_detr_test_small_p2.yaml`             | `config/rf_detr_inference_small_p2.yaml`             |
+| TrackNetV5 only | `config/rf_detr_train_small_tracknet_v5.yaml`    | `config/rf_detr_test_small_tracknet_v5.yaml`    | `config/rf_detr_inference_small_tracknet_v5.yaml`    |
 | P2 + TrackNetV5 | `config/rf_detr_train_small_p2_tracknet_v5.yaml` | `config/rf_detr_test_small_p2_tracknet_v5.yaml` | `config/rf_detr_inference_small_p2_tracknet_v5.yaml` |
 
 Stock uses the official Small initialization. P2 presets use
@@ -285,7 +285,7 @@ periodic_test:
   enabled: true
   split: test
   test_mode:
-    mode: full_image   # full_image, sahi, class_crop
+    mode: full_image # full_image, sahi, class_crop
   test_interval_epochs: 30
 run_final_test: true
 classwise: true
@@ -364,18 +364,18 @@ supported modes:
 model:
   # model.amp remains a separate RF-DETR construction/training setting.
   inference_optimization:
-    backend: pytorch       # pytorch, tensorrt
+    backend: pytorch # pytorch, tensorrt
     pytorch:
-      precision: fp32      # fp32, bf16
+      precision: fp32 # fp32, bf16
     tensorrt:
-      precision: fp16      # fp16, bf16
-      engine_path: ""      # empty => build/load the automatic cache
-      manifest_path: ""    # explicit engine: empty derives <engine>.manifest.json
-      cache_dir: "runs/rf_detr/tensorrt_cache"  # relative => projects/rf_detr_trainer/...
+      precision: fp16 # fp16, bf16
+      engine_path: "" # empty => build/load the automatic cache
+      manifest_path: "" # explicit engine: empty derives <engine>.manifest.json
+      cache_dir: "runs/rf_detr/tensorrt_cache" # relative => projects/rf_detr_trainer/...
       workspace_gib: 4
       force_rebuild: false
       profile:
-        min_batch_size: 1  # fixed: real tail batches are not padded
+        min_batch_size: 1 # fixed: real tail batches are not padded
         opt_batch_size: auto
         max_batch_size: auto
 ```
@@ -650,8 +650,8 @@ trajectory trails, and writes a `tracking_summary.json`. The tracker is selected
 inference:
   tracking:
     enabled: true
-    algorithm: circle     # default; or ocsort / deepocsort / botsort / bytetrack (via boxmot)
-    target_class_names: [football]   # which class(es) to track (default football)
+    algorithm: circle # default; or ocsort / deepocsort / botsort / bytetrack (via boxmot)
+    target_class_names: [football] # which class(es) to track (default football)
 ```
 
 - `circle` (**default**) — the built-in, dependency-free centroid/search-circle ball tracker
@@ -697,10 +697,10 @@ or use a motion-only tracker:
 ```yaml
 inference:
   tracking:
-    reid_weights: D:/weights/osnet_x0_25_msmt17.pt   # local file => no download
+    reid_weights: D:/weights/osnet_x0_25_msmt17.pt # local file => no download
     # or: algorithm: ocsort        # motion-only, no ReID
     botsort:
-      with_reid: false             # BoT-SORT without appearance (no download)
+      with_reid: false # BoT-SORT without appearance (no download)
 ```
 
 The ReID device follows `model.device` (override with `inference.tracking.reid_device`);

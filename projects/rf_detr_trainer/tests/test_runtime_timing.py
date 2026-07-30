@@ -1,18 +1,17 @@
-from pathlib import Path
 import io
 import json
 import sys
 import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import patch
-
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
-import train_rf_detr_model as trainer  # noqa: E402
+import train_rf_detr_model as trainer
 
 
 class RuntimeTimingTest(unittest.TestCase):

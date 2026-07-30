@@ -2,7 +2,6 @@
 
 import pytest
 import torch
-
 from src.d_fine.utils import inflate_stem_weight, maybe_inflate_stem
 
 
