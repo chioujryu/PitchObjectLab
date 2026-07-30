@@ -9,8 +9,7 @@ import time
 
 import pytest
 import torch
-
-from src.d_fine.dfine import build_model
+from src.d_fine.define import build_model
 
 
 @pytest.fixture(scope="module")
@@ -66,8 +65,8 @@ def test_forward_shapes_cpu_segment(model_n_segment_cpu):
 def test_cpu_forward_latency_smoke(model_n_detect_cpu):
     """Loose ceiling: catches O(N^2) regressions, not microbenchmarks.
 
-    The `n` model on CPU with batch=1 / 640x640 should land well under 10s/iter
-    on any sane machine. The hard latency budgets live in `bench.py`.
+    The `n` model on CPU with batch=1 / 640x640 should land well under 10s/iter on any sane machine. The hard latency
+    budgets live in `bench.py`.
     """
     x = torch.randn(1, 3, 640, 640)
     with torch.no_grad():

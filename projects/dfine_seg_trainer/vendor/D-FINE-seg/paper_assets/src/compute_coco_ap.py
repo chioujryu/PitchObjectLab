@@ -1,5 +1,5 @@
 """
-COCO-Style AP Computation Script for Paper
+COCO-Style AP Computation Script for Paper.
 
 Computes proper COCO-style metrics:
 - Detection: AP@[.50:.95], AP50, AP75, AR (average recall)
@@ -20,10 +20,11 @@ Usage:
 Author: Generated for paper evaluation
 """
 
+from __future__ import annotations
+
 import gc
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
 import cv2
 import hydra
@@ -33,22 +34,21 @@ import torch
 from faster_coco_eval.core import mask as mask_utils
 from loguru import logger
 from omegaconf import DictConfig
+from src.dl.dataset import CustomDataset, Loader
+from src.dl.utils import get_latest_experiment_name, process_boxes, process_masks, seed_worker
+from src.infer.trt_model import TRT_model
 from src.infer.yolo_trt_model import YOLO_TRT_model
 from tabulate import tabulate
 from torch.utils.data import DataLoader
 from torchmetrics.detection.mean_ap import MeanAveragePrecision
 from tqdm import tqdm
 
-from src.dl.dataset import CustomDataset, Loader
-from src.dl.utils import get_latest_experiment_name, process_boxes, process_masks, seed_worker
-from src.infer.trt_model import TRT_model
-
 torch.multiprocessing.set_sharing_strategy("file_system")
 
 
 @dataclass
 class EvalConfig:
-    """Configuration for evaluation"""
+    """Configuration for evaluation."""
 
     # Confidence thresholds for COCO mAP
     # Note: With 0.001, models output 100s of detections causing OOM during mask processing
@@ -67,9 +67,8 @@ class EvalConfig:
     compute_per_class: bool = True
 
 
-def masks_to_rle(masks: torch.Tensor) -> List[Dict]:
-    """
-    Convert dense masks to RLE format using faster_coco_eval.
+def masks_to_rle(masks: torch.Tensor) -> list[dict]:
+    """Convert dense masks to RLE format using faster_coco_eval.
 
     Args:
         masks: [N, H, W] uint8 binary masks
@@ -95,9 +94,8 @@ def masks_to_rle(masks: torch.Tensor) -> List[Dict]:
     return rles
 
 
-def rle_to_masks(rles: List[Dict], device: str = "cpu") -> torch.Tensor:
-    """
-    Convert RLE-encoded masks back to dense format.
+def rle_to_masks(rles: list[dict], device: str = "cpu") -> torch.Tensor:
+    """Convert RLE-encoded masks back to dense format.
 
     Args:
         rles: List of RLE dicts from masks_to_rle()
@@ -122,9 +120,7 @@ def rle_to_masks(rles: List[Dict], device: str = "cpu") -> torch.Tensor:
 
 
 class SingleImageLoader(Loader):
-    """
-    DataLoader that processes one image at a time for minimal memory footprint.
-    """
+    """DataLoader that processes one image at a time for minimal memory footprint."""
 
     def build_dataloaders(self):
         val_ds = CustomDataset(
@@ -173,17 +169,15 @@ class SingleImageLoader(Loader):
 
 
 class COCOAPEvaluator:
-    """
-    Memory-efficient COCO-style AP evaluator.
+    """Memory-efficient COCO-style AP evaluator.
 
-    Stores predictions and ground truth as RLE-encoded masks,
-    and batches updates to torchmetrics.
+    Stores predictions and ground truth as RLE-encoded masks, and batches updates to torchmetrics.
     """
 
     def __init__(
         self,
         n_classes: int,
-        label_to_name: Dict[int, str],
+        label_to_name: dict[int, str],
         max_detections: int = 300,
         update_batch_size: int = 10,
     ):
@@ -193,8 +187,8 @@ class COCOAPEvaluator:
         self.update_batch_size = update_batch_size
 
         # Buffers for batched updates
-        self.preds_buffer: List[Dict] = []
-        self.gt_buffer: List[Dict] = []
+        self.preds_buffer: list[dict] = []
+        self.gt_buffer: list[dict] = []
 
         # Initialize torchmetrics with faster_coco_eval backend (numpy 2.x compatible)
         self.bbox_metric = MeanAveragePrecision(
@@ -228,15 +222,13 @@ class COCOAPEvaluator:
         pred_boxes: torch.Tensor,  # [N, 4] xyxy absolute
         pred_scores: torch.Tensor,  # [N]
         pred_labels: torch.Tensor,  # [N]
-        pred_masks: Optional[torch.Tensor],  # [N, H, W] float probabilities or None
+        pred_masks: torch.Tensor | None,  # [N, H, W] float probabilities or None
         gt_boxes: torch.Tensor,  # [M, 4] xyxy absolute
         gt_labels: torch.Tensor,  # [M]
-        gt_masks: Optional[torch.Tensor],  # [M, H, W] uint8 or None
+        gt_masks: torch.Tensor | None,  # [M, H, W] uint8 or None
         mask_binarize_thresh: float = 0.5,
     ):
-        """
-        Add one image's predictions and ground truth.
-        Masks are converted to RLE immediately to save memory.
+        """Add one image's predictions and ground truth. Masks are converted to RLE immediately to save memory.
         """
         # Limit to max detections (keep highest scoring)
         if pred_scores.numel() > self.max_detections:
@@ -301,7 +293,7 @@ class COCOAPEvaluator:
         if len(self.preds_buffer) >= self.update_batch_size:
             self._flush_buffer()
 
-    def _decode_rle_to_dense_bbox(self, samples: List[Dict]) -> List[Dict]:
+    def _decode_rle_to_dense_bbox(self, samples: list[dict]) -> list[dict]:
         """Convert samples to format for bbox metric (no masks needed)."""
         decoded = []
         for s in samples:
@@ -314,7 +306,7 @@ class COCOAPEvaluator:
             decoded.append(d)
         return decoded
 
-    def _decode_rle_to_dense_mask(self, samples: List[Dict]) -> List[Dict]:
+    def _decode_rle_to_dense_mask(self, samples: list[dict]) -> list[dict]:
         """Convert RLE-encoded masks back to dense for mask metric."""
         decoded = []
         for s in samples:
@@ -363,7 +355,7 @@ class COCOAPEvaluator:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def compute(self) -> Dict[str, float]:
+    def compute(self) -> dict[str, float]:
         """Compute all metrics and return results dict."""
         # Flush remaining samples
         self._flush_buffer()
@@ -394,24 +386,12 @@ class COCOAPEvaluator:
             "bbox_AP_large": bbox_results.get("map_large", torch.tensor(0.0)).item(),
             # Mask metrics (Instance segmentation) - only if masks available
             "mask_AP": mask_results.get("map", torch.tensor(-1.0)).item() if mask_results else -1.0,
-            "mask_AP50": mask_results.get("map_50", torch.tensor(-1.0)).item()
-            if mask_results
-            else -1.0,
-            "mask_AP75": mask_results.get("map_75", torch.tensor(-1.0)).item()
-            if mask_results
-            else -1.0,
-            "mask_AR_100": mask_results.get("mar_100", torch.tensor(-1.0)).item()
-            if mask_results
-            else -1.0,
-            "mask_AP_small": mask_results.get("map_small", torch.tensor(-1.0)).item()
-            if mask_results
-            else -1.0,
-            "mask_AP_medium": mask_results.get("map_medium", torch.tensor(-1.0)).item()
-            if mask_results
-            else -1.0,
-            "mask_AP_large": mask_results.get("map_large", torch.tensor(-1.0)).item()
-            if mask_results
-            else -1.0,
+            "mask_AP50": mask_results.get("map_50", torch.tensor(-1.0)).item() if mask_results else -1.0,
+            "mask_AP75": mask_results.get("map_75", torch.tensor(-1.0)).item() if mask_results else -1.0,
+            "mask_AR_100": mask_results.get("mar_100", torch.tensor(-1.0)).item() if mask_results else -1.0,
+            "mask_AP_small": mask_results.get("map_small", torch.tensor(-1.0)).item() if mask_results else -1.0,
+            "mask_AP_medium": mask_results.get("map_medium", torch.tensor(-1.0)).item() if mask_results else -1.0,
+            "mask_AP_large": mask_results.get("map_large", torch.tensor(-1.0)).item() if mask_results else -1.0,
             # Flag for whether masks were evaluated
             "has_masks": self.has_masks,
             # Stats
@@ -428,11 +408,7 @@ class COCOAPEvaluator:
                     name = self.label_to_name.get(i, str(i))
                     metrics[f"bbox_AP_{name}"] = class_ap.item()
 
-        if (
-            mask_results
-            and "map_per_class" in mask_results
-            and mask_results["map_per_class"].numel() > 0
-        ):
+        if mask_results and "map_per_class" in mask_results and mask_results["map_per_class"].numel() > 0:
             per_class_map = mask_results["map_per_class"]
             for i, class_ap in enumerate(per_class_map):
                 if i < len(self.label_to_name):
@@ -482,14 +458,13 @@ def evaluate_single_model(
     model_name: str,
     data_loader: DataLoader,
     data_path: Path,
-    processed_size: Tuple[int, int],
+    processed_size: tuple[int, int],
     keep_ratio: bool,
     device: str,
-    label_to_name: Dict[int, str],
+    label_to_name: dict[int, str],
     eval_config: EvalConfig,
-) -> Dict[str, float]:
-    """
-    Evaluate a model and return COCO-style AP metrics.
+) -> dict[str, float]:
+    """Evaluate a model and return COCO-style AP metrics.
 
     Args:
         model: Inference model (TRT_model or YOLO_TRT_model)
@@ -530,7 +505,7 @@ def evaluate_single_model(
                 logger.warning(f"Could not load image: {img_path}")
                 continue
 
-            orig_h, orig_w = img.shape[:2]
+            _orig_h, _orig_w = img.shape[:2]
 
             # Prepare ground truth
             gt_boxes = process_boxes(
@@ -590,7 +565,7 @@ def evaluate_single_model(
     return metrics
 
 
-def format_results(metrics: Dict[str, float], model_name: str) -> str:
+def format_results(metrics: dict[str, float], model_name: str) -> str:
     """Format metrics for display."""
     has_masks = metrics.get("has_masks", False)
 
@@ -641,7 +616,7 @@ def format_results(metrics: Dict[str, float], model_name: str) -> str:
     return "\n".join(lines)
 
 
-def create_summary_table(all_metrics: Dict[str, Dict[str, float]]) -> pd.DataFrame:
+def create_summary_table(all_metrics: dict[str, dict[str, float]]) -> pd.DataFrame:
     """Create a summary table of key metrics for all models."""
     summary_data = []
     for model_name, metrics in all_metrics.items():
@@ -692,7 +667,7 @@ def main(cfg: DictConfig):
         model_configs.append(
             {
                 "name": "D-FINE-seg",
-                "type": "dfine",
+                "type": "define",
                 "path": dfine_path,
                 "conf_thresh": eval_config.conf_thresh_dfine,
             }
@@ -723,7 +698,7 @@ def main(cfg: DictConfig):
     data_path = Path(cfg.train.data_path)
     logger.info(f"Dataset path: {data_path}")
 
-    val_loader, test_loader = SingleImageLoader(
+    val_loader, _test_loader = SingleImageLoader(
         root_path=data_path,
         img_size=tuple(cfg.train.img_size),
         batch_size=1,
@@ -746,7 +721,7 @@ def main(cfg: DictConfig):
         try:
             # Load model just-in-time
             logger.info(f"Loading {model_name} from: {model_cfg['path']}")
-            if model_cfg["type"] == "dfine":
+            if model_cfg["type"] == "define":
                 model = TRT_model(
                     model_path=model_cfg["path"],
                     n_outputs=len(cfg.train.label_to_name),

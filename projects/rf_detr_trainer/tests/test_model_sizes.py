@@ -1,19 +1,18 @@
-from pathlib import Path
 import json
 import sys
 import tempfile
-from types import SimpleNamespace
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 
 import yaml
-
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
-import test_rf_detr_model as tester  # noqa: E402
-import train_rf_detr_model as trainer  # noqa: E402
+import test_rf_detr_model as tester
+import train_rf_detr_model as trainer
 
 TEMP_ROOT = Path(r"C:\tmp")
 TEMP_ROOT.mkdir(parents=True, exist_ok=True)
@@ -180,12 +179,16 @@ class RFDETRModelSizeTest(unittest.TestCase):
 
     def test_train_eval_interval_controls_lightning_validation_frequency(self):
         trainer_kwargs = {}
-        trainer.apply_validation_interval_to_trainer_kwargs({"train": {"eval_interval": 5}}, trainer_kwargs, verbose=False)
+        trainer.apply_validation_interval_to_trainer_kwargs(
+            {"train": {"eval_interval": 5}}, trainer_kwargs, verbose=False
+        )
         self.assertEqual(trainer_kwargs["check_val_every_n_epoch"], 5)
 
     def test_explicit_lightning_validation_frequency_is_preserved(self):
         trainer_kwargs = {"check_val_every_n_epoch": 2}
-        trainer.apply_validation_interval_to_trainer_kwargs({"train": {"eval_interval": 5}}, trainer_kwargs, verbose=False)
+        trainer.apply_validation_interval_to_trainer_kwargs(
+            {"train": {"eval_interval": 5}}, trainer_kwargs, verbose=False
+        )
         self.assertEqual(trainer_kwargs["check_val_every_n_epoch"], 2)
 
     def test_single_gpu_training_does_not_force_ddp_strategy(self):
@@ -209,9 +212,7 @@ class RFDETRModelSizeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as temp:
             output_dir = Path(temp)
             (output_dir / "inference_stats.csv").write_text(
-                "image_id,file_name,elapsed_seconds\n"
-                "1,a.jpg,0.10\n"
-                "2,b.jpg,0.30\n",
+                "image_id,file_name,elapsed_seconds\n1,a.jpg,0.10\n2,b.jpg,0.30\n",
                 encoding="utf-8",
             )
 

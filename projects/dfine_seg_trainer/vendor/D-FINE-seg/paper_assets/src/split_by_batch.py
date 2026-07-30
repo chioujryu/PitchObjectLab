@@ -8,6 +8,8 @@ Usage:
     python split_by_batch.py --images_dir /path/to/images --labels_dir /path/to/labels --output_dir /path/to/output --val_ratio 0.15
 """
 
+from __future__ import annotations
+
 import argparse
 import os
 import random
@@ -16,18 +18,12 @@ import shutil
 from collections import defaultdict
 from pathlib import Path
 
-from tqdm import tqdm
-
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Split TACO dataset by batch numbers")
     parser.add_argument("--images_dir", type=str, required=True, help="Directory containing images")
-    parser.add_argument(
-        "--labels_dir", type=str, required=True, help="Directory containing YOLO label files"
-    )
-    parser.add_argument(
-        "--output_dir", type=str, required=True, help="Output directory for split dataset"
-    )
+    parser.add_argument("--labels_dir", type=str, required=True, help="Directory containing YOLO label files")
+    parser.add_argument("--output_dir", type=str, required=True, help="Output directory for split dataset")
     parser.add_argument(
         "--val_ratio",
         type=float,
@@ -36,15 +32,12 @@ def parse_args():
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--copy", action="store_true", help="Copy files instead of moving them")
-    parser.add_argument(
-        "--dry_run", action="store_true", help="Show what would be done without actually doing it"
-    )
+    parser.add_argument("--dry_run", action="store_true", help="Show what would be done without actually doing it")
     return parser.parse_args()
 
 
 def extract_batch_number(filename: str) -> str:
-    """
-    Extract batch identifier from filename.
+    """Extract batch identifier from filename.
 
     Handles patterns like:
     - batch_2_000012.JPG -> batch_2
@@ -111,8 +104,7 @@ def find_matching_image(label_path: Path, images_dir: Path) -> Path | None:
 
 
 def group_by_batch(images_dir: str, labels_dir: str) -> dict:
-    """
-    Group image-label pairs by batch number.
+    """Group image-label pairs by batch number.
 
     Returns:
         dict: {batch_id: [(image_path, label_path), ...]}
@@ -148,8 +140,7 @@ def group_by_batch(images_dir: str, labels_dir: str) -> dict:
 
 
 def split_batches(batches: dict, val_ratio: float, seed: int) -> tuple:
-    """
-    Split batches into train and val sets.
+    """Split batches into train and val sets.
 
     Ensures entire batches stay together to prevent data leakage.
     """
@@ -233,7 +224,7 @@ def transfer_files(
     return file_count
 
 
-def create_dataset_yaml(output_dir: str, classes_file: str = None):
+def create_dataset_yaml(output_dir: str, classes_file: str | None = None):
     """Create dataset.yaml file for YOLO training."""
     yaml_content = f"""# TACO Dataset - Split by batch
 path: {os.path.abspath(output_dir)}
@@ -246,7 +237,7 @@ names:
 
     # Try to read classes from file
     if classes_file and os.path.exists(classes_file):
-        with open(classes_file, "r") as f:
+        with open(classes_file) as f:
             for idx, line in enumerate(f):
                 class_name = line.strip()
                 if class_name:
@@ -289,20 +280,14 @@ def main():
         print(f"⚠️  Found {len(orphan_labels)} labels without images")
 
     # Split batches
-    train_batches, val_batches, val_count, total_images = split_batches(
-        batches, args.val_ratio, args.seed
-    )
+    train_batches, val_batches, val_count, total_images = split_batches(batches, args.val_ratio, args.seed)
 
     train_count = total_images - val_count
     actual_val_ratio = val_count / total_images if total_images > 0 else 0
 
-    print(f"\nSplit Summary:")
-    print(
-        f"  Train: {len(train_batches)} batches, {train_count} images ({100 - actual_val_ratio * 100:.1f}%)"
-    )
-    print(
-        f"  Val:   {len(val_batches)} batches, {val_count} images ({actual_val_ratio * 100:.1f}%)"
-    )
+    print("\nSplit Summary:")
+    print(f"  Train: {len(train_batches)} batches, {train_count} images ({100 - actual_val_ratio * 100:.1f}%)")
+    print(f"  Val:   {len(val_batches)} batches, {val_count} images ({actual_val_ratio * 100:.1f}%)")
     print(f"\n  Train batches: {sorted(train_batches)}")
     print(f"  Val batches:   {sorted(val_batches)}")
 
