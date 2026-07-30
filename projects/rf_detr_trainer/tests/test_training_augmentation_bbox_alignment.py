@@ -1,20 +1,21 @@
-from pathlib import Path
+from __future__ import annotations
+
 import sys
 import tempfile
-from types import SimpleNamespace
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
-from PIL import Image, ImageDraw
 import torch
-
+from PIL import Image, ImageDraw
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
-import train_rf_detr_model as trainer  # noqa: E402
+import train_rf_detr_model as trainer
 
 
 def _fake_detection_args(dataset_dir: Path, *, include_keypoints: bool = False) -> SimpleNamespace:

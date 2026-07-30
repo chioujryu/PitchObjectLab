@@ -2,7 +2,6 @@
 
 import pytest
 import torch
-
 from src.infer.torch_model import cleanup_masks, filter_preds
 
 
