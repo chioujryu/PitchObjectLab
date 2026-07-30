@@ -5,7 +5,6 @@ on the keep_ratio path. If either drifts, predictions land in the wrong place.
 """
 
 import numpy as np
-
 from src.dl.utils import scale_boxes_ratio_kept
 from src.infer.torch_model import letterbox
 
@@ -40,7 +39,5 @@ def test_scale_boxes_ratio_kept_round_trips_letterbox():
     fwd[:, [0, 2]] += pad_x
     fwd[:, [1, 3]] += pad_y
 
-    back = scale_boxes_ratio_kept(
-        fwd.copy(), img0_shape=(100, 200), img1_shape=(640, 640), padding=True
-    )
+    back = scale_boxes_ratio_kept(fwd.copy(), img0_shape=(100, 200), img1_shape=(640, 640), padding=True)
     np.testing.assert_allclose(back, orig_box, atol=0.5)

@@ -11,8 +11,9 @@ Usage:
     make trt_int8          # or:  python -m src.dl.trt_int8
 """
 
+from __future__ import annotations
+
 from pathlib import Path
-from typing import Dict, List
 
 import hydra
 import numpy as np
@@ -21,22 +22,19 @@ import tensorrt as trt
 import torch
 from loguru import logger
 from omegaconf import DictConfig
-from tqdm import tqdm
-
 from src.dl.dataset import Loader
 from src.dl.train import Trainer
 from src.dl.utils import get_latest_experiment_name
 from src.dl.validator import Validator
+from tqdm import tqdm
 
 
 # ---------------------------------------------------------------------------
 # INT8 Entropy Calibrator
 # ---------------------------------------------------------------------------
 class Int8EntropyCalibrator(trt.IInt8EntropyCalibrator2):
-    """
-    Feeds batches from a PyTorch DataLoader to TensorRT for INT8 calibration.
-    Caches the calibration table so the engine can be rebuilt without re-running
-    calibration.
+    """Feeds batches from a PyTorch DataLoader to TensorRT for INT8 calibration. Caches the calibration table so the
+    engine can be rebuilt without re-running calibration.
     """
 
     def __init__(
@@ -60,7 +58,7 @@ class Int8EntropyCalibrator(trt.IInt8EntropyCalibrator2):
     def get_batch_size(self) -> int:
         return self.batch_size
 
-    def get_batch(self, names):  # noqa: ARG002
+    def get_batch(self, names):
         try:
             images, _, _ = next(self.batch_iter)  # images: [B, C, H, W] float32
         except StopIteration:
@@ -154,9 +152,7 @@ def build_int8_engine(
             else:
                 raise ValueError(f"Dynamic dim at index {i} (beyond batch) not supported")
 
-        profile.set_shape(
-            inp_name, (1, *static_dims), (1, *static_dims), (max_batch_size, *static_dims)
-        )
+        profile.set_shape(inp_name, (1, *static_dims), (1, *static_dims), (max_batch_size, *static_dims))
         config.add_optimization_profile(profile)
 
     engine_bytes = builder.build_serialized_network(network, config)
@@ -183,10 +179,8 @@ def validate_engine(
     enable_mask_head: bool,
     input_size: tuple,  # (H, W)
 ) -> float:
-    """
-    Load an engine, run the val set through it, return the F1 score.
-    Auto-detects whether the engine has raw outputs (logits, boxes) or
-    postprocessed outputs (labels, boxes, scores) and handles both.
+    """Load an engine, run the val set through it, return the F1 score. Auto-detects whether the engine has raw outputs
+    (logits, boxes) or postprocessed outputs (labels, boxes, scores) and handles both.
     """
     trt_logger = trt.Logger(trt.Logger.WARNING)
     with open(engine_path, "rb") as f, trt.Runtime(trt_logger) as runtime:
@@ -195,7 +189,7 @@ def validate_engine(
 
     # Discover I/O by name
     input_idx = None
-    output_name_to_idx: Dict[str, int] = {}
+    output_name_to_idx: dict[str, int] = {}
     for i in range(engine.num_io_tensors):
         name = engine.get_tensor_name(i)
         mode = engine.get_tensor_mode(name)
@@ -212,8 +206,8 @@ def validate_engine(
         f"postprocessed={is_postprocessed}"
     )
 
-    all_preds: List[Dict[str, torch.Tensor]] = []
-    all_gt: List[Dict[str, torch.Tensor]] = []
+    all_preds: list[dict[str, torch.Tensor]] = []
+    all_gt: list[dict[str, torch.Tensor]] = []
 
     for inputs, targets, _ in tqdm(val_loader, desc="Validating TRT INT8", leave=False):
         inputs_gpu = inputs.to("cuda", dtype=torch.float32).contiguous()
@@ -221,7 +215,7 @@ def validate_engine(
 
         # Allocate output buffers & run
         bindings: list = [None] * engine.num_io_tensors
-        outputs_dict: Dict[str, torch.Tensor] = {}
+        outputs_dict: dict[str, torch.Tensor] = {}
 
         for i in range(engine.num_io_tensors):
             name = engine.get_tensor_name(i)
@@ -230,7 +224,7 @@ def validate_engine(
                 bindings[i] = inputs_gpu.data_ptr()
             else:
                 dims = tuple(engine.get_tensor_shape(name))
-                out_shape = (batch_shape[0],) + dims[1:]
+                out_shape = (batch_shape[0], *dims[1:])
                 dt = engine.get_tensor_dtype(name)
                 buf = torch.empty(out_shape, dtype=_trt_to_torch_dtype(dt), device="cuda")
                 outputs_dict[name] = buf
@@ -275,7 +269,7 @@ def validate_engine(
                     }
                 )
         else:
-            # Raw outputs: logits [B,Q,C], boxes [B,Q,4] normalised cxcywh
+            # Raw outputs: logits [B,Q,C], boxes [B,Q,4] normalized cxcywh
             model_out = {
                 "pred_logits": outputs_dict["logits"],
                 "pred_boxes": outputs_dict["boxes"],
@@ -327,9 +321,8 @@ def _trt_to_torch_dtype(trt_dtype):
 # ---------------------------------------------------------------------------
 @hydra.main(version_base=None, config_path="../../", config_name="config")
 def main(cfg: DictConfig):
-    """
-    Build a TensorRT INT8 engine from the ONNX model using the val set for calibration.
-    Expects the ONNX file at <save_dir>/model.onnx (the raw one exported by export.py).
+    """Build a TensorRT INT8 engine from the ONNX model using the val set for calibration. Expects the ONNX file at
+    <save_dir>/model.onnx (the raw one exported by export.py).
     """
     cfg.exp = get_latest_experiment_name(cfg.exp, cfg.train.path_to_save)
     save_dir = Path(cfg.train.path_to_save)
