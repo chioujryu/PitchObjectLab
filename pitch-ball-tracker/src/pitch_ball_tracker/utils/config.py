@@ -6,11 +6,10 @@ from omegaconf import DictConfig, OmegaConf
 
 
 def load_config(config_path: str | Path, overrides: dict | None = None) -> DictConfig:
-    """
-    Load a YAML config, optionally merging a second defaults block first.
+    """Load a YAML config, optionally merging a second defaults block first.
 
-    If the file contains a `defaults` key listing another config name, that
-    base config is loaded from the same directory and merged first.
+    If the file contains a `defaults` key listing another config name, that base config is loaded from the same
+    directory and merged first.
     """
     path = Path(config_path)
     cfg: DictConfig = OmegaConf.load(path)

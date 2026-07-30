@@ -14,7 +14,7 @@ Using the existing inference class from the repo I am going to run TensorRT mode
 
 Just sequentially read the frame -> inference the model -> draw bboxes and save to the disk. Simple, minimum code written, but not very efficient. See, while we are reading the frame or drawing bboxes - our GPU is not doing anything, that is not optimal.
 
-``` python
+```python
 def run_base(model, visualizer, source, save_dir: Path, max_frames: int | None = None) -> int:
     save_dir.mkdir(parents=True, exist_ok=True)
     cap = open_capture(source)
@@ -41,7 +41,7 @@ def run_base(model, visualizer, source, save_dir: Path, max_frames: int | None =
 Let's do some simple profiling to get the numbers:
 
 | stage   | ms/frame | max fps |
-|---------|---------:|--------:|
+| ------- | -------: | ------: |
 | decode  |    10.72 |    93.3 |
 | infer   |     2.10 |   476.2 |
 | draw    |    15.45 |    64.7 |
@@ -50,7 +50,7 @@ Let's do some simple profiling to get the numbers:
 Now, if we run the naive approach and run everything sequentially, we should get 10.7 (decode) + 2.1 (infer) + 38.7 (draw + imwrite) = 51ms or ~20 fps. In fact I get 21.8 fps (see table below).
 
 | run        | frames | time (s) |  fps |
-|------------|-------:|---------:|-----:|
+| ---------- | -----: | -------: | ---: |
 | Sequential |   1450 |    66.64 | 21.8 |
 
 Hardware usage: GPU util - 3%, CPU util - 160% (less than one full physical core).
@@ -65,7 +65,7 @@ As I mentioned, the baseline (naive approach) has everything running sequentiall
 2. Main loop - inference the model popping the oldest frame from the frames queue. Then put the results (bboxes, labels, scores) and the original frame to a drawing queue.
 3. Draw and save in another thread - pop the oldest frame + results and do the postprocessing.
 
-``` python
+```python
 def run_optimized(model, visualizer, source, save_dir: Path, max_frames: int | None = None) -> int:
     """
     Reader thread -> main inference -> drawer thread.
@@ -129,7 +129,7 @@ def run_optimized(model, visualizer, source, save_dir: Path, max_frames: int | N
 Let's call this approach "pipelined". This way the overall latency in theory will be the single slowest part of the system. From the profiling it should be draw + imwrite part, which is 38.7ms or 26 fps. In fact - 23.8 fps.
 
 | run               | frames | time (s) |  fps |
-|-------------------|-------:|---------:|-----:|
+| ----------------- | -----: | -------: | ---: |
 | Sequential        |   1450 |    66.64 | 21.8 |
 | Pipelined (1r/1d) |   1450 |    60.93 | 23.8 |
 
@@ -139,7 +139,7 @@ Hardware usage: GPU util - 3%, CPU util - 200% (a full core).
 
 Now, we still get low GPU and CPU utilization and still can do better. This time we just need to throw more CPU cores and we can do it on the postprocessing part (drawing and saving). The logic is very similar to what we had above, but this time we create N workers for the postprocessing (each pulling from the same drawing queue). The worker count is derived from `os.cpu_count()`, which on Linux/macOS returns logical cores including SMT threads — so on a 6c/12t CPU we get `int(12 * 0.8) - 1 = 8` drawers.
 
-``` python
+```python
 def run_optimized_v2(
     model,
     visualizer,
@@ -218,7 +218,7 @@ def run_optimized_v2(
 ```
 
 | run               | frames | time (s) |  fps |
-|-------------------|-------:|---------:|-----:|
+| ----------------- | -----: | -------: | ---: |
 | Sequential        |   1450 |    66.64 | 21.8 |
 | Pipelined (1r/1d) |   1450 |    60.93 | 23.8 |
 | Pooled (1r/8d)    |   1450 |    19.80 | 73.2 |
@@ -238,7 +238,7 @@ Same idea, now segmentation model. Visualization part is now a lot heavier becau
 per-stage profile over 200 frames:
 
 | stage   | ms/frame | max fps |
-|---------|---------:|--------:|
+| ------- | -------: | ------: |
 | decode  |    10.57 |    94.6 |
 | infer   |     3.74 |   267.6 |
 | draw    |   230.31 |     4.3 |
@@ -247,7 +247,7 @@ per-stage profile over 200 frames:
 And here are all three inference approaches:
 
 | run               | frames | time (s) |  fps |
-|-------------------|-------:|---------:|-----:|
+| ----------------- | -----: | -------: | ---: |
 | Sequential        |   1450 |   370.92 |  3.9 |
 | Pipelined (1r/1d) |   1450 |   367.16 |  3.9 |
 | Pooled (1r/8d)    |   1450 |    68.49 | 21.2 |

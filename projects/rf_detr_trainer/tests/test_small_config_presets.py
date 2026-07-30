@@ -1,14 +1,12 @@
 """Regression tests for RF-DETR Small presets and project-local output defaults."""
 
-from pathlib import Path, PurePosixPath, PureWindowsPath
 import unittest
-
-import yaml
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import rf_detr_acceleration
 import rf_detr_runtime
 import train_rf_detr_model
-
+import yaml
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 CONFIG_DIR = PROJECT_DIR / "config"

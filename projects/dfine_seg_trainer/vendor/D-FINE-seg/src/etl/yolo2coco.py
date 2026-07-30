@@ -3,7 +3,6 @@ import os
 from pathlib import Path
 
 import hydra
-import pandas as pd
 from PIL import Image
 
 
@@ -50,7 +49,7 @@ def yolo_to_coco(labels_dir, images_dir, output_file, split, categories_list=Non
         data_coco["images"].append(image_info)
 
         # Read label file
-        with open(os.path.join(labels_dir, label_file), "r") as f:
+        with open(os.path.join(labels_dir, label_file)) as f:
             lines = f.read().splitlines()
 
         for line in lines:

@@ -1,4 +1,4 @@
-"""
+r"""
 Train RF-DETR with a config-first, Ultralytics-style workflow.
 
 This project wraps the official RF-DETR PyTorch Lightning training stack and adds:
@@ -62,7 +62,7 @@ from copy import deepcopy
 from datetime import datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from string import Formatter
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+from typing import Any, Iterable, Mapping, MutableMapping, Sequence
 
 import colorama
 import yaml
@@ -78,7 +78,7 @@ REPO_ROOT = PROJECT_DIR.parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from projects.object_detection_common import test_modes as shared_modes  # noqa: E402
+from projects.object_detection_common import test_modes as shared_modes
 
 DEFAULT_CONFIG = PROJECT_DIR / "config" / "rf_detr_train.yaml"
 TIMESTAMP_FORMAT = "%Y%m%d%H%M%S"
@@ -87,7 +87,7 @@ DDP_OUTPUT_DIR_ENV = "RF_DETR_TRAIN_OUTPUT_DIR"
 DDP_DATASET_DIR_ENV = "RF_DETR_TRAIN_DATASET_DIR"
 DDP_DATASET_FILE_ENV = "RF_DETR_TRAIN_DATASET_FILE"
 IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
-PITCHOBJECTLAB_ARCHITECTURE_KEY = 'pitchobjectlab_architecture'
+PITCHOBJECTLAB_ARCHITECTURE_KEY = "pitchobjectlab_architecture"
 PITCHOBJECTLAB_ARCHITECTURE_SCHEMA_VERSION = 3
 PITCHOBJECTLAB_TENSORRT_EXPORT_ABI = 3
 LEGACY_TRACKNET_CONFIG_ALIASES = {
@@ -224,7 +224,7 @@ class TeeTextStream:
         return stream is None or bool(getattr(stream, "closed", False))
 
     @classmethod
-    def _write_if_open(cls, stream: Any, data: str) -> Optional[int]:
+    def _write_if_open(cls, stream: Any, data: str) -> int | None:
         """Best-effort write for exit-time cleanup paths."""
         if cls._is_closed(stream):
             return None
@@ -262,9 +262,9 @@ class TeeTextStream:
 def start_run_log_capture(
     output_dir: Path,
     task: str,
-    context: Optional[MutableMapping[str, Any]] = None,
+    context: MutableMapping[str, Any] | None = None,
     enabled: bool = True,
-) -> Optional[Path]:
+) -> Path | None:
     """Mirror stdout/stderr into output_dir/run.log for output-producing runs."""
     if not enabled:
         return None
@@ -289,7 +289,7 @@ def start_run_log_capture(
     return log_path
 
 
-def stop_run_log_capture(context: Optional[MutableMapping[str, Any]]) -> None:
+def stop_run_log_capture(context: MutableMapping[str, Any] | None) -> None:
     """Restore stdout/stderr and close the active run log capture."""
     if context is None:
         return
@@ -326,7 +326,7 @@ def parse_scalar(value: str) -> Any:
         return value
 
 
-def parse_limit_value(value: Any, field_name: str = "limit") -> Optional[int]:
+def parse_limit_value(value: Any, field_name: str = "limit") -> int | None:
     """Parse a positive count limit; null/all/empty means no limit."""
     if value is None:
         return None
@@ -349,9 +349,9 @@ def parse_limit_value(value: Any, field_name: str = "limit") -> Optional[int]:
     return limit
 
 
-def parse_extra_args(values: Optional[Sequence[str]]) -> Dict[str, Any]:
+def parse_extra_args(values: Sequence[str] | None) -> dict[str, Any]:
     """Parse repeated key=value CLI entries."""
-    parsed: Dict[str, Any] = {}
+    parsed: dict[str, Any] = {}
     for item in values or []:
         if "=" not in item:
             raise argparse.ArgumentTypeError(f"Expected key=value, got {item!r}.")
@@ -373,13 +373,12 @@ def deep_update(base: MutableMapping[str, Any], updates: Mapping[str, Any]) -> M
     return base
 
 
-def load_yaml(path: Path, _seen: Optional[set[Path]] = None) -> Dict[str, Any]:
+def load_yaml(path: Path, _seen: set[Path] | None = None) -> dict[str, Any]:
     """Load a YAML mapping, resolving an optional relative ``extends`` chain."""
     path = path.expanduser().resolve()
     if _seen is None and path.name in LEGACY_TRACKNET_CONFIG_ALIASES:
         warnings.warn(
-            f"{path.name} is deprecated; use "
-            f"{LEGACY_TRACKNET_CONFIG_ALIASES[path.name]} instead.",
+            f"{path.name} is deprecated; use {LEGACY_TRACKNET_CONFIG_ALIASES[path.name]} instead.",
             FutureWarning,
             stacklevel=2,
         )
@@ -409,7 +408,7 @@ def save_yaml(path: Path, data: Mapping[str, Any]) -> None:
         yaml.safe_dump(dict(data), file, sort_keys=False, allow_unicode=True)
 
 
-def parse_rank_value(value: Any) -> Optional[int]:
+def parse_rank_value(value: Any) -> int | None:
     """Parse a distributed rank environment value."""
     if value is None:
         return None
@@ -421,7 +420,7 @@ def parse_rank_value(value: Any) -> Optional[int]:
     return None
 
 
-def is_nonzero_distributed_process(env: Optional[Mapping[str, str]] = None) -> bool:
+def is_nonzero_distributed_process(env: Mapping[str, str] | None = None) -> bool:
     """Return True for Lightning/DDP child processes that should not run parent-only setup."""
     source = os.environ if env is None else env
     for key in ("RANK", "GLOBAL_RANK", "LOCAL_RANK"):
@@ -431,7 +430,7 @@ def is_nonzero_distributed_process(env: Optional[Mapping[str, str]] = None) -> b
     return False
 
 
-def apply_distributed_child_runtime_overrides(config: MutableMapping[str, Any]) -> Dict[str, Any]:
+def apply_distributed_child_runtime_overrides(config: MutableMapping[str, Any]) -> dict[str, Any]:
     """Use parent-exported runtime paths in a re-launched non-zero DDP rank."""
     output_dir = os.environ.get(DDP_OUTPUT_DIR_ENV)
     if output_dir:
@@ -507,10 +506,9 @@ def resolve_existing_or_raw(value: Any, bases: Sequence[Path]) -> Any:
 def resolve_path_for_output(value: Any, bases: Sequence[Path] = ()) -> Path:
     """Resolve relative output paths from the RF-DETR trainer project directory.
 
-    ``bases`` is retained for compatibility with older callers, but output
-    location no longer depends on the process CWD or whether a candidate path
-    already exists. Absolute paths remain unchanged, while ``..`` components
-    in relative paths intentionally allow an explicit project-external target.
+    ``bases`` is retained for compatibility with older callers, but output location no longer depends on the process CWD
+    or whether a candidate path already exists. Absolute paths remain unchanged, while ``..`` components in relative
+    paths intentionally allow an explicit project-external target.
     """
     del bases
     text = str(value).strip()
@@ -566,7 +564,7 @@ def path_name_or_default(value: Any, default: str) -> str:
     return Path(str(value)).expanduser().name or default
 
 
-def build_output_template_context(config: Mapping[str, Any], timestamp: str) -> Dict[str, str]:
+def build_output_template_context(config: Mapping[str, Any], timestamp: str) -> dict[str, str]:
     """Build supported placeholders for output.root/output.name/output.output_dir templates."""
     model = config.get("model", {})
     dataset = config.get("dataset", {})
@@ -581,7 +579,7 @@ def build_output_template_context(config: Mapping[str, Any], timestamp: str) -> 
     except (TypeError, ValueError):
         effective_batch = f"{batch}x{grad_accum}"
 
-    raw_context: Dict[str, Any] = {
+    raw_context: dict[str, Any] = {
         "timestamp": timestamp,
         "date": timestamp[:8],
         "time": timestamp[8:],
@@ -589,7 +587,8 @@ def build_output_template_context(config: Mapping[str, Any], timestamp: str) -> 
         "resolution": model.get("resolution") or "default",
         "tracknet_focus": (
             ((model.get("motion", {}) or {}).get("focus", {}) or {}).get("mode", "disabled")
-            if bool((model.get("motion", {}) or {}).get("enabled", False)) else "disabled"
+            if bool((model.get("motion", {}) or {}).get("enabled", False))
+            else "disabled"
         ),
         "pretrain": path_name_or_default(model.get("pretrain_weights", "default"), "default"),
         "num_classes": model.get("num_classes") or "auto",
@@ -620,11 +619,7 @@ def render_output_template(value: Any, config: Mapping[str, Any], timestamp: str
     """Render output folder templates with supported config placeholders."""
     if not isinstance(value, str):
         return value
-    fields = {
-        field_name
-        for _, field_name, _, _ in Formatter().parse(value)
-        if field_name
-    }
+    fields = {field_name for _, field_name, _, _ in Formatter().parse(value) if field_name}
     if not fields:
         return value
 
@@ -633,8 +628,7 @@ def render_output_template(value: Any, config: Mapping[str, Any], timestamp: str
     if unknown:
         available = ", ".join(sorted(context))
         raise ValueError(
-            f"Unknown output path placeholder(s): {', '.join(unknown)}. "
-            f"Available placeholders: {available}."
+            f"Unknown output path placeholder(s): {', '.join(unknown)}. Available placeholders: {available}."
         )
     return value.format_map(context)
 
@@ -684,7 +678,7 @@ def write_rows(path: Path, rows: Sequence[Mapping[str, Any]], fieldnames: Sequen
             writer.writerow({key: json_safe_value(row.get(key)) for key in fieldnames})
 
 
-def metric_scalar_value(value: Any) -> Optional[Any]:
+def metric_scalar_value(value: Any) -> Any | None:
     """Return a JSON-safe scalar metric value, or None for non-scalar objects."""
     safe = json_safe_value(value)
     if isinstance(safe, list) and len(safe) == 1:
@@ -701,24 +695,21 @@ class EpochValidationResultsCallback(Callback):
         self.output_dir = output_dir
         self.verbose = verbose
         self.results_dir = output_dir / "epoch_results"
-        self.rows: List[Dict[str, Any]] = self._load_existing_rows()
+        self.rows: list[dict[str, Any]] = self._load_existing_rows()
         self.written_epochs: set[int] = set()
-        self._first_batch_started_at: Optional[float] = None
-        self._first_batch_seconds: Dict[int, float] = {}
-        self._train_diagnostic_sums: Dict[int, Dict[str, float]] = {}
-        self._train_diagnostic_counts: Dict[int, int] = {}
+        self._first_batch_started_at: float | None = None
+        self._first_batch_seconds: dict[int, float] = {}
+        self._train_diagnostic_sums: dict[int, dict[str, float]] = {}
+        self._train_diagnostic_counts: dict[int, int] = {}
 
-    def _load_existing_rows(self) -> List[Dict[str, Any]]:
+    def _load_existing_rows(self) -> list[dict[str, Any]]:
         """Load existing epoch metric rows so resumed runs preserve earlier results."""
         path = self.results_dir / "epoch_metrics.csv"
         if not path.exists():
             return []
         with path.open("r", encoding="utf-8", newline="") as file:
             reader = csv.DictReader(file)
-            return [
-                {field: row.get(field) for field in EPOCH_VAL_METRIC_FIELDS}
-                for row in reader
-            ]
+            return [{field: row.get(field) for field in EPOCH_VAL_METRIC_FIELDS} for row in reader]
 
     @staticmethod
     def _row_epoch(row: Mapping[str, Any]) -> int:
@@ -728,8 +719,8 @@ class EpochValidationResultsCallback(Callback):
         except (TypeError, ValueError):
             return -1
 
-    def _collect_epoch_metrics(self, trainer: Any) -> Dict[str, Any]:
-        metrics: Dict[str, Any] = {}
+    def _collect_epoch_metrics(self, trainer: Any) -> dict[str, Any]:
+        metrics: dict[str, Any] = {}
         for source in (getattr(trainer, "callback_metrics", {}), getattr(trainer, "logged_metrics", {})):
             if not isinstance(source, Mapping):
                 continue
@@ -775,9 +766,7 @@ class EpochValidationResultsCallback(Callback):
                 scalar = metric_scalar_value(value)
                 if isinstance(scalar, (int, float)):
                     sums[str(key)] = sums.get(str(key), 0.0) + float(scalar)
-            self._train_diagnostic_counts[epoch_number] = (
-                self._train_diagnostic_counts.get(epoch_number, 0) + 1
-            )
+            self._train_diagnostic_counts[epoch_number] = self._train_diagnostic_counts.get(epoch_number, 0) + 1
 
     def on_validation_epoch_end(self, trainer: Any, pl_module: Any) -> None:
         """Write per-epoch validation metrics after RF-DETR logs them."""
@@ -850,14 +839,13 @@ class EpochValidationResultsCallback(Callback):
             if isinstance(metrics.get(key), (int, float))
         )
         blue(
-            f"Epoch {epoch_number} summary: global_step={global_step}"
-            + (f", {summary}" if summary else ""),
+            f"Epoch {epoch_number} summary: global_step={global_step}" + (f", {summary}" if summary else ""),
             verbose=self.verbose,
             force=True,
         )
 
 
-def copy_if_exists(src: Optional[Path], dst: Path) -> None:
+def copy_if_exists(src: Path | None, dst: Path) -> None:
     """Copy a file if it exists."""
     if src and src.exists():
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -868,9 +856,9 @@ def dump_config_snapshot(
     output_dir: Path,
     merged_config: Mapping[str, Any],
     metadata: Mapping[str, Any],
-    source_config: Optional[Path],
-    train_config: Optional[Any] = None,
-    model_config: Optional[Any] = None,
+    source_config: Path | None,
+    train_config: Any | None = None,
+    model_config: Any | None = None,
 ) -> None:
     """Save reproducibility config files inside an output folder."""
     config_dir = output_dir / "config"
@@ -886,7 +874,7 @@ def dump_config_snapshot(
         save_yaml(config_dir / "rfdetr_model_config.yaml", json_safe_value(model_dump))
 
 
-def format_bytes(num_bytes: Optional[float]) -> str:
+def format_bytes(num_bytes: float | None) -> str:
     """Format bytes for display."""
     if num_bytes is None:
         return "unknown"
@@ -909,7 +897,7 @@ RUNTIME_TIME_ESTIMATE_DEFAULTS = {
 }
 
 
-def format_duration_hms(seconds: Optional[float]) -> str:
+def format_duration_hms(seconds: float | None) -> str:
     """Format seconds as HH:MM:SS for estimates and elapsed runtime."""
     if seconds is None:
         return "unknown"
@@ -919,7 +907,7 @@ def format_duration_hms(seconds: Optional[float]) -> str:
         return "unknown"
     if not math.isfinite(value):
         return "unknown"
-    total = int(math.ceil(max(0.0, value)))
+    total = math.ceil(max(0.0, value))
     if 0.0 < value < 1.0:
         total = 1
     hours, remainder = divmod(total, 3600)
@@ -927,7 +915,7 @@ def format_duration_hms(seconds: Optional[float]) -> str:
     return f"{hours:02d}:{minutes:02d}:{sec:02d}"
 
 
-def runtime_time_estimate_settings(config: Mapping[str, Any]) -> Dict[str, Any]:
+def runtime_time_estimate_settings(config: Mapping[str, Any]) -> dict[str, Any]:
     """Return merged runtime.time_estimate settings with stable defaults."""
     settings = dict(RUNTIME_TIME_ESTIMATE_DEFAULTS)
     runtime = config.get("runtime", {}) if isinstance(config.get("runtime", {}), Mapping) else {}
@@ -948,7 +936,7 @@ def positive_float_setting(settings: Mapping[str, Any], key: str) -> float:
     return parsed
 
 
-def inference_execution_profile(config: Mapping[str, Any]) -> Dict[str, Any]:
+def inference_execution_profile(config: Mapping[str, Any]) -> dict[str, Any]:
     """Return the stable backend/model profile used to partition timing history."""
     model = config.get("model", {})
     if not isinstance(model, Mapping):
@@ -961,7 +949,7 @@ def inference_execution_profile(config: Mapping[str, Any]) -> Dict[str, Any]:
     if not isinstance(backend_settings, Mapping):
         backend_settings = {}
     default_precision = "fp32" if backend == "pytorch" else "fp16"
-    batch_values: List[int] = []
+    batch_values: list[int] = []
 
     def add_batch(value: Any) -> None:
         if isinstance(value, bool):
@@ -1056,8 +1044,8 @@ def inference_execution_profile(config: Mapping[str, Any]) -> Dict[str, Any]:
 def load_latest_timing_history(
     output_root: Path,
     task: str,
-    execution_profile: Optional[Mapping[str, Any]] = None,
-) -> Optional[Dict[str, Any]]:
+    execution_profile: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
     """Load the newest sibling timing record matching task and execution profile."""
     if not output_root.exists():
         return None
@@ -1132,7 +1120,7 @@ def add_runtime_estimate(
     return estimate
 
 
-def start_run_timing(task: str, verbose: bool = True) -> Dict[str, Any]:
+def start_run_timing(task: str, verbose: bool = True) -> dict[str, Any]:
     """Create a mutable timing context for an entrypoint run."""
     return {
         "task": task,
@@ -1195,7 +1183,7 @@ def finish_run_timing(context: MutableMapping[str, Any]) -> None:
                     throughput_units = stage_units
                     throughput_source = "stage_timing"
 
-        throughput: Dict[str, Any] = {
+        throughput: dict[str, Any] = {
             "runtime_units": throughput_units,
             "requested_runtime_units": units,
             "steady_state_seconds": steady_state_seconds,
@@ -1242,7 +1230,7 @@ def finish_run_timing(context: MutableMapping[str, Any]) -> None:
         stop_run_log_capture(context)
 
 
-def maybe_count_images(path: Optional[Path]) -> Optional[int]:
+def maybe_count_images(path: Path | None) -> int | None:
     """Count image files under a local directory, returning None when unavailable."""
     if path is None or not path.exists():
         return None
@@ -1255,7 +1243,7 @@ def maybe_count_images(path: Optional[Path]) -> Optional[int]:
     return total
 
 
-def dataset_split_dir(dataset_dir: Path, split: str) -> Optional[Path]:
+def dataset_split_dir(dataset_dir: Path, split: str) -> Path | None:
     """Return a likely split image directory for Roboflow COCO/YOLO layouts."""
     candidates = [
         dataset_dir / split,
@@ -1276,7 +1264,7 @@ def get_dataset_dir_value(config: Mapping[str, Any]) -> str:
     return str(train.get("dataset_dir") or dataset.get("dataset_dir") or "").strip()
 
 
-def config_path_bases(source_config: Optional[Path] = None) -> List[Path]:
+def config_path_bases(source_config: Path | None = None) -> list[Path]:
     """Return common bases for resolving local config paths."""
     bases = [Path.cwd(), PROJECT_DIR, REPO_ROOT]
     if source_config is not None:
@@ -1295,14 +1283,14 @@ def resolve_existing_path(value: Any, bases: Sequence[Path], field_name: str) ->
     return path.resolve()
 
 
-def resolve_optional_existing_path(value: Any, bases: Sequence[Path], field_name: str) -> Optional[Path]:
+def resolve_optional_existing_path(value: Any, bases: Sequence[Path], field_name: str) -> Path | None:
     """Resolve an optional existing local path."""
     if value is None or str(value).strip() == "":
         return None
     return resolve_existing_path(value, bases, field_name)
 
 
-def resolve_cache_root(value: Any, source_config: Optional[Path] = None) -> Path:
+def resolve_cache_root(value: Any, source_config: Path | None = None) -> Path:
     """Resolve dataset cache root. Relative values default inside this trainer project."""
     text = str(value or "dataset_cache").strip()
     if not text:
@@ -1313,7 +1301,7 @@ def resolve_cache_root(value: Any, source_config: Optional[Path] = None) -> Path
     return (PROJECT_DIR / path).resolve()
 
 
-def find_dataset_yaml(config: Mapping[str, Any], source_config: Optional[Path] = None) -> Optional[Path]:
+def find_dataset_yaml(config: Mapping[str, Any], source_config: Path | None = None) -> Path | None:
     """Find an Ultralytics-style dataset YAML from config or dataset_dir."""
     dataset = config.get("dataset", {})
     bases = config_path_bases(source_config)
@@ -1352,13 +1340,12 @@ def normalize_source_format(value: Any) -> str:
 
 def is_rfdetr_coco_layout(dataset_dir: Path) -> bool:
     """Return True when a dataset already looks like RF-DETR/Roboflow COCO layout."""
-    return (
-        (dataset_dir / "train" / "_annotations.coco.json").exists()
-        and (dataset_dir / "valid" / "_annotations.coco.json").exists()
-    )
+    return (dataset_dir / "train" / "_annotations.coco.json").exists() and (
+        dataset_dir / "valid" / "_annotations.coco.json"
+    ).exists()
 
 
-def is_ultralytics_yolo_layout(dataset_dir: Path, data_yaml: Optional[Path]) -> bool:
+def is_ultralytics_yolo_layout(dataset_dir: Path, data_yaml: Path | None) -> bool:
     """Return True when a dataset looks like an Ultralytics YOLO directory layout."""
     if data_yaml is None or not data_yaml.exists():
         return False
@@ -1369,7 +1356,7 @@ def is_ultralytics_yolo_layout(dataset_dir: Path, data_yaml: Optional[Path]) -> 
     )
 
 
-def yaml_looks_like_yolo_dataset(data_yaml: Optional[Path]) -> bool:
+def yaml_looks_like_yolo_dataset(data_yaml: Path | None) -> bool:
     """Return True when a YAML has the expected Ultralytics YOLO dataset fields."""
     if data_yaml is None or not data_yaml.exists():
         return False
@@ -1424,7 +1411,10 @@ def looks_like_dota_layout(dataset_dir: Path) -> bool:
     label_roots = [dataset_dir / "labelTxt", dataset_dir / "labels"]
     image_roots = [dataset_dir / "images", dataset_dir]
     has_labels = any(root.exists() and any(root.rglob("*.txt")) for root in label_roots)
-    has_images = any(root.exists() and any(file.suffix.lower() in IMAGE_EXTENSIONS for file in root.rglob("*")) for root in image_roots)
+    has_images = any(
+        root.exists() and any(file.suffix.lower() in IMAGE_EXTENSIONS for file in root.rglob("*"))
+        for root in image_roots
+    )
     return has_labels and has_images
 
 
@@ -1436,7 +1426,7 @@ def looks_like_labelme_layout(dataset_dir: Path) -> bool:
     return False
 
 
-def find_coco_jsons(config: Mapping[str, Any], dataset_dir: Optional[Path], source_config: Optional[Path]) -> Dict[str, Path]:
+def find_coco_jsons(config: Mapping[str, Any], dataset_dir: Path | None, source_config: Path | None) -> dict[str, Path]:
     """Find COCO JSON annotation files from explicit config or common directories."""
     dataset = config.get("dataset", {})
     bases = config_path_bases(source_config)
@@ -1446,11 +1436,11 @@ def find_coco_jsons(config: Mapping[str, Any], dataset_dir: Optional[Path], sour
     if dataset_dir is None:
         return {}
 
-    candidates: List[Path] = []
+    candidates: list[Path] = []
     for root in (dataset_dir / "annotations", dataset_dir):
         if root.exists():
             candidates.extend(sorted(root.glob("*.json")))
-    result: Dict[str, Path] = {}
+    result: dict[str, Path] = {}
     for path in candidates:
         if not is_coco_json_file(path):
             continue
@@ -1461,17 +1451,16 @@ def find_coco_jsons(config: Mapping[str, Any], dataset_dir: Optional[Path], sour
 
 def resolve_dataset_source_format(
     config: Mapping[str, Any],
-    dataset_dir: Optional[Path],
-    data_yaml: Optional[Path],
-    source_config: Optional[Path] = None,
+    dataset_dir: Path | None,
+    data_yaml: Path | None,
+    source_config: Path | None = None,
 ) -> str:
     """Resolve dataset.source_format, with auto-detection for supported adapters."""
     dataset = config.get("dataset", {})
     requested = normalize_source_format(dataset.get("source_format", "auto"))
     if requested not in DATASET_SOURCE_FORMATS:
         raise ValueError(
-            f"Unsupported dataset.source_format={requested!r}. "
-            f"Options: {', '.join(sorted(DATASET_SOURCE_FORMATS))}."
+            f"Unsupported dataset.source_format={requested!r}. Options: {', '.join(sorted(DATASET_SOURCE_FORMATS))}."
         )
     if requested != "auto":
         return requested
@@ -1507,12 +1496,12 @@ def resolve_path_from_yaml(value: Any, base_dir: Path, field_name: str) -> Path:
     return (base_dir / text).resolve()
 
 
-def resolve_yaml_path_values(value: Any, base_dir: Path, field_name: str) -> List[Path]:
+def resolve_yaml_path_values(value: Any, base_dir: Path, field_name: str) -> list[Path]:
     """Resolve YAML split values, including list and .txt image-list formats."""
     if value is None or str(value).strip() == "":
         return []
     if isinstance(value, (list, tuple)):
-        paths: List[Path] = []
+        paths: list[Path] = []
         for index, item in enumerate(value):
             paths.extend(resolve_yaml_path_values(item, base_dir, f"{field_name}[{index}]"))
         return paths
@@ -1521,7 +1510,7 @@ def resolve_yaml_path_values(value: Any, base_dir: Path, field_name: str) -> Lis
     path = Path(text).expanduser()
     resolved = path if is_abs_any_os(text) else (base_dir / path).resolve()
     if resolved.suffix.lower() == ".txt":
-        output: List[Path] = []
+        output: list[Path] = []
         with resolved.open("r", encoding="utf-8") as file:
             for line in file:
                 item = line.strip()
@@ -1533,7 +1522,7 @@ def resolve_yaml_path_values(value: Any, base_dir: Path, field_name: str) -> Lis
     return [resolved]
 
 
-def replace_path_part(path: Path, old: str, new: str) -> Optional[Path]:
+def replace_path_part(path: Path, old: str, new: str) -> Path | None:
     """Replace one path component case-insensitively."""
     parts = list(path.parts)
     for index in range(len(parts) - 1, -1, -1):
@@ -1562,14 +1551,15 @@ def normalize_yolo_names(names: Any) -> Any:
     raise ValueError("Ultralytics dataset YAML must contain names as a list or mapping.")
 
 
-def coerce_class_names(names: Any, default: Optional[Sequence[str]] = None) -> List[str]:
+def coerce_class_names(names: Any, default: Sequence[str] | None = None) -> list[str]:
     """Coerce list/dict class names into an ordered list."""
     if names is None:
         if default is None:
             return []
         return [str(item) for item in default]
     if isinstance(names, Mapping):
-        def key_fn(item: Tuple[Any, Any]) -> Tuple[int, Any]:
+
+        def key_fn(item: tuple[Any, Any]) -> tuple[int, Any]:
             key = item[0]
             try:
                 return (0, int(key))
@@ -1601,7 +1591,7 @@ def normalize_split_name(value: Any) -> str:
     return mapping.get(text, text or "all")
 
 
-def split_from_path_or_name(path: Path) -> Optional[str]:
+def split_from_path_or_name(path: Path) -> str | None:
     """Infer split name from a path's filename or directory components."""
     parts = [part.lower() for part in path.parts]
     name = path.name.lower()
@@ -1611,16 +1601,18 @@ def split_from_path_or_name(path: Path) -> Optional[str]:
     return None
 
 
-def iter_image_files(path: Path) -> List[Path]:
+def iter_image_files(path: Path) -> list[Path]:
     """Return image files under a file or directory path."""
     if path.is_file():
         return [path.absolute()] if path.suffix.lower() in IMAGE_EXTENSIONS else []
     if not path.exists():
         return []
-    return sorted(file.absolute() for file in path.rglob("*") if file.is_file() and file.suffix.lower() in IMAGE_EXTENSIONS)
+    return sorted(
+        file.absolute() for file in path.rglob("*") if file.is_file() and file.suffix.lower() in IMAGE_EXTENSIONS
+    )
 
 
-def read_image_size(path: Path) -> Tuple[int, int]:
+def read_image_size(path: Path) -> tuple[int, int]:
     """Read image width and height without mutating the source file."""
     try:
         from PIL import Image
@@ -1637,7 +1629,9 @@ def read_image_size(path: Path) -> Tuple[int, int]:
         return int(width), int(height)
 
 
-def clamp_coco_bbox(x: float, y: float, width: float, height: float, image_width: int, image_height: int) -> Optional[List[float]]:
+def clamp_coco_bbox(
+    x: float, y: float, width: float, height: float, image_width: int, image_height: int
+) -> list[float] | None:
     """Clamp a COCO xywh bbox to image boundaries and drop degenerate boxes."""
     x1 = max(0.0, min(float(image_width), float(x)))
     y1 = max(0.0, min(float(image_height), float(y)))
@@ -1648,7 +1642,7 @@ def clamp_coco_bbox(x: float, y: float, width: float, height: float, image_width
     return [round(x1, 6), round(y1, 6), round(x2 - x1, 6), round(y2 - y1, 6)]
 
 
-def bbox_from_points(points: Sequence[Sequence[float]], image_width: int, image_height: int) -> Optional[List[float]]:
+def bbox_from_points(points: Sequence[Sequence[float]], image_width: int, image_height: int) -> list[float] | None:
     """Build an axis-aligned COCO bbox from polygon points."""
     if not points:
         return None
@@ -1657,7 +1651,7 @@ def bbox_from_points(points: Sequence[Sequence[float]], image_width: int, image_
     return clamp_coco_bbox(min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys), image_width, image_height)
 
 
-def make_record(source_image: Path, annotations: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+def make_record(source_image: Path, annotations: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Create a source image record used by the cache materializer."""
     width, height = read_image_size(source_image)
     return {
@@ -1668,12 +1662,12 @@ def make_record(source_image: Path, annotations: Optional[List[Dict[str, Any]]] 
     }
 
 
-def add_record(records_by_split: Dict[str, List[Dict[str, Any]]], split: str, record: Dict[str, Any]) -> None:
+def add_record(records_by_split: dict[str, list[dict[str, Any]]], split: str, record: dict[str, Any]) -> None:
     """Append a record to a normalized split bucket."""
     records_by_split.setdefault(normalize_split_name(split), []).append(record)
 
 
-def parse_split_ratio(value: Any) -> Tuple[int, int, int]:
+def parse_split_ratio(value: Any) -> tuple[int, int, int]:
     """Parse dataset.split_ratio into train/valid/test integer weights."""
     if value in (None, ""):
         return (8, 1, 1)
@@ -1689,12 +1683,14 @@ def parse_split_ratio(value: Any) -> Tuple[int, int, int]:
     return ratio  # type: ignore[return-value]
 
 
-def parse_split_ratio_arg(value: Any) -> List[int]:
+def parse_split_ratio_arg(value: Any) -> list[int]:
     """Parse CLI split ratio into a YAML-friendly list."""
     return list(parse_split_ratio(value))
 
 
-def deterministic_unsplit(records: Sequence[Dict[str, Any]], ratio: Tuple[int, int, int], seed: Any = 0) -> Dict[str, List[Dict[str, Any]]]:
+def deterministic_unsplit(
+    records: Sequence[dict[str, Any]], ratio: tuple[int, int, int], seed: Any = 0
+) -> dict[str, list[dict[str, Any]]]:
     """Split unsplit records deterministically according to train/valid/test weights."""
     positive_splits = sum(1 for item in ratio if item > 0)
     if len(records) < positive_splits:
@@ -1704,11 +1700,11 @@ def deterministic_unsplit(records: Sequence[Dict[str, Any]], ratio: Tuple[int, i
         )
     sorted_records = sorted(
         records,
-        key=lambda record: hashlib.sha256(f"{seed}:{record['source_image']}".encode("utf-8")).hexdigest(),
+        key=lambda record: hashlib.sha256(f"{seed}:{record['source_image']}".encode()).hexdigest(),
     )
     total = len(sorted_records)
     ratio_sum = sum(ratio)
-    counts = [max(1, int(math.floor(total * weight / ratio_sum))) if weight > 0 else 0 for weight in ratio]
+    counts = [max(1, math.floor(total * weight / ratio_sum)) if weight > 0 else 0 for weight in ratio]
     while sum(counts) > total:
         largest = max((count, index) for index, count in enumerate(counts) if count > 1)[1]
         counts[largest] -= 1
@@ -1728,14 +1724,14 @@ def deterministic_unsplit(records: Sequence[Dict[str, Any]], ratio: Tuple[int, i
 
 
 def ensure_split_records(
-    records_by_split: Mapping[str, List[Dict[str, Any]]],
-    ratio: Tuple[int, int, int],
+    records_by_split: Mapping[str, list[dict[str, Any]]],
+    ratio: tuple[int, int, int],
     seed: Any = 0,
-) -> Dict[str, List[Dict[str, Any]]]:
+) -> dict[str, list[dict[str, Any]]]:
     """Preserve explicit train/valid splits or split unsplit data deterministically."""
-    normalized: Dict[str, List[Dict[str, Any]]] = {"train": [], "valid": [], "test": []}
-    extra: Dict[str, List[Dict[str, Any]]] = {}
-    unsplit: List[Dict[str, Any]] = []
+    normalized: dict[str, list[dict[str, Any]]] = {"train": [], "valid": [], "test": []}
+    extra: dict[str, list[dict[str, Any]]] = {}
+    unsplit: list[dict[str, Any]] = []
     for split, records in records_by_split.items():
         normalized_split = normalize_split_name(split)
         if normalized_split in normalized:
@@ -1761,12 +1757,12 @@ def ensure_split_records(
     return result
 
 
-def dataset_limit_config(config: Mapping[str, Any]) -> Dict[str, Optional[int]]:
+def dataset_limit_config(config: Mapping[str, Any]) -> dict[str, int | None]:
     """Return per-split dataset image limits from dataset.* max fields."""
     dataset = config.get("dataset", {})
     default_limit = parse_limit_value(dataset.get("max_images"), "dataset.max_images")
 
-    def split_limit(key: str, field_name: str) -> Optional[int]:
+    def split_limit(key: str, field_name: str) -> int | None:
         if key not in dataset or dataset.get(key) is None:
             return default_limit
         return parse_limit_value(dataset.get(key), field_name)
@@ -1790,12 +1786,12 @@ def has_dataset_limits(config: Mapping[str, Any]) -> bool:
 
 
 def limit_records_by_split(
-    records_by_split: Mapping[str, List[Dict[str, Any]]],
+    records_by_split: Mapping[str, list[dict[str, Any]]],
     config: Mapping[str, Any],
-) -> Dict[str, List[Dict[str, Any]]]:
+) -> dict[str, list[dict[str, Any]]]:
     """Apply dataset first-N image limits after split assignment."""
     limits = dataset_limit_config(config)
-    limited: Dict[str, List[Dict[str, Any]]] = {}
+    limited: dict[str, list[dict[str, Any]]] = {}
     for split, records in records_by_split.items():
         normalized = normalize_split_name(split)
         limit = limits.get(normalized)
@@ -1803,7 +1799,7 @@ def limit_records_by_split(
     return limited
 
 
-def assign_cache_file_names(records_by_split: Mapping[str, List[Dict[str, Any]]]) -> None:
+def assign_cache_file_names(records_by_split: Mapping[str, list[dict[str, Any]]]) -> None:
     """Assign unique flat file names for each cache split directory."""
     for records in records_by_split.values():
         used: set[str] = set()
@@ -1819,9 +1815,11 @@ def assign_cache_file_names(records_by_split: Mapping[str, List[Dict[str, Any]]]
             record["file_name"] = name
 
 
-def finalize_categories(records_by_split: Mapping[str, List[Dict[str, Any]]], class_names: Sequence[str]) -> List[Dict[str, Any]]:
+def finalize_categories(
+    records_by_split: Mapping[str, list[dict[str, Any]]], class_names: Sequence[str]
+) -> list[dict[str, Any]]:
     """Create COCO categories and attach category_id to every annotation."""
-    names: List[str] = []
+    names: list[str] = []
     seen: set[str] = set()
     for name in class_names:
         text = str(name)
@@ -1845,7 +1843,7 @@ def finalize_categories(records_by_split: Mapping[str, List[Dict[str, Any]]], cl
     return [{"id": index + 1, "name": name, "supercategory": "object"} for index, name in enumerate(names)]
 
 
-def directory_file_stats(paths: Iterable[Path]) -> Tuple[int, int]:
+def directory_file_stats(paths: Iterable[Path]) -> tuple[int, int]:
     """Count files and bytes under unique directories."""
     total_files = 0
     total_bytes = 0
@@ -1865,9 +1863,9 @@ def directory_file_stats(paths: Iterable[Path]) -> Tuple[int, int]:
     return total_files, total_bytes
 
 
-def unique_source_images(records_by_split: Mapping[str, List[Dict[str, Any]]]) -> List[Path]:
+def unique_source_images(records_by_split: Mapping[str, list[dict[str, Any]]]) -> list[Path]:
     """Return unique source image paths from split records."""
-    paths: Dict[str, Path] = {}
+    paths: dict[str, Path] = {}
     for records in records_by_split.values():
         for record in records:
             path = Path(record["source_image"]).resolve()
@@ -1875,9 +1873,9 @@ def unique_source_images(records_by_split: Mapping[str, List[Dict[str, Any]]]) -
     return list(paths.values())
 
 
-def file_stats_digest(paths: Iterable[Path]) -> Tuple[str, int]:
+def file_stats_digest(paths: Iterable[Path]) -> tuple[str, int]:
     """Hash file paths, sizes, and mtimes without reading file contents."""
-    entries: List[Dict[str, Any]] = []
+    entries: list[dict[str, Any]] = []
     for path in sorted({str(Path(item).resolve()) for item in paths}):
         file_path = Path(path)
         stat = file_path.stat()
@@ -1913,7 +1911,7 @@ def yolo_annotation_from_values(
     values: Sequence[float],
     image_width: int,
     image_height: int,
-) -> Optional[Tuple[List[float], Optional[List[List[float]]]]]:
+) -> tuple[list[float], list[list[float]] | None] | None:
     """Convert YOLO bbox/segment/OBB coordinates into COCO bbox and optional polygon."""
     if len(values) == 4:
         cx, cy, width, height = [float(item) for item in values]
@@ -1941,9 +1939,11 @@ def yolo_annotation_from_values(
     return None
 
 
-def parse_yolo_label_file(label_file: Path, class_names: Sequence[str], image_width: int, image_height: int) -> List[Dict[str, Any]]:
+def parse_yolo_label_file(
+    label_file: Path, class_names: Sequence[str], image_width: int, image_height: int
+) -> list[dict[str, Any]]:
     """Parse one YOLO label file into cache annotations."""
-    annotations: List[Dict[str, Any]] = []
+    annotations: list[dict[str, Any]] = []
     if not label_file.exists():
         return annotations
     with label_file.open("r", encoding="utf-8") as file:
@@ -1971,8 +1971,8 @@ def parse_yolo_label_file(label_file: Path, class_names: Sequence[str], image_wi
 
 def build_ultralytics_yolo_source(
     config: Mapping[str, Any],
-    source_config: Optional[Path],
-) -> Dict[str, Any]:
+    source_config: Path | None,
+) -> dict[str, Any]:
     """Read an Ultralytics YOLO dataset into generic split records."""
     data_yaml = find_dataset_yaml(config, source_config)
     if data_yaml is None:
@@ -1980,8 +1980,8 @@ def build_ultralytics_yolo_source(
 
     data = load_yaml(data_yaml)
     yaml_base = data_yaml.parent
-    warnings: List[str] = []
-    configured_dataset_dir: Optional[Path] = None
+    warnings: list[str] = []
+    configured_dataset_dir: Path | None = None
     dataset_dir_value = get_dataset_dir_value(config)
     if dataset_dir_value:
         with contextlib.suppress(Exception):
@@ -2010,8 +2010,8 @@ def build_ultralytics_yolo_source(
         if data.get(key) is not None:
             split_values["test-original"] = data.get(key)
             break
-    records_by_split: Dict[str, List[Dict[str, Any]]] = {}
-    annotation_files: List[Path] = [data_yaml]
+    records_by_split: dict[str, list[dict[str, Any]]] = {}
+    annotation_files: list[Path] = [data_yaml]
 
     for split, split_value in split_values.items():
         for split_path in resolve_yaml_path_values(split_value, dataset_base, split):
@@ -2049,8 +2049,8 @@ def build_ultralytics_yolo_source(
 
 def resolve_coco_image_path(
     file_name: str,
-    dataset_dir: Optional[Path],
-    image_dir: Optional[Path],
+    dataset_dir: Path | None,
+    image_dir: Path | None,
     annotation_file: Path,
     split: str,
 ) -> Path:
@@ -2058,7 +2058,7 @@ def resolve_coco_image_path(
     raw = Path(str(file_name)).expanduser()
     if is_abs_any_os(str(file_name)) and raw.exists():
         return raw.resolve()
-    candidates: List[Path] = []
+    candidates: list[Path] = []
     if image_dir is not None:
         candidates.append(image_dir / raw)
         candidates.append(image_dir / raw.name)
@@ -2079,7 +2079,9 @@ def resolve_coco_image_path(
                 dataset_dir / f"{'val' if split == 'valid' else split}2017" / raw.name,
             ]
         )
-    candidates.extend([annotation_file.parent / raw, annotation_file.parent.parent / raw, annotation_file.parent / raw.name])
+    candidates.extend(
+        [annotation_file.parent / raw, annotation_file.parent.parent / raw, annotation_file.parent / raw.name]
+    )
     for candidate in candidates:
         if candidate.exists():
             return candidate.resolve()
@@ -2091,19 +2093,23 @@ def resolve_coco_image_path(
     raise FileNotFoundError(f"Could not resolve COCO image {file_name!r} referenced by {annotation_file}.")
 
 
-def build_coco_json_source(config: Mapping[str, Any], dataset_dir: Optional[Path], source_config: Optional[Path]) -> Dict[str, Any]:
+def build_coco_json_source(
+    config: Mapping[str, Any], dataset_dir: Path | None, source_config: Path | None
+) -> dict[str, Any]:
     """Read COCO JSON annotations into generic split records."""
     dataset = config.get("dataset", {})
-    image_dir = resolve_optional_existing_path(dataset.get("image_dir"), config_path_bases(source_config), "dataset.image_dir")
+    image_dir = resolve_optional_existing_path(
+        dataset.get("image_dir"), config_path_bases(source_config), "dataset.image_dir"
+    )
     annotation_files = find_coco_jsons(config, dataset_dir, source_config)
     if not annotation_files:
         raise ValueError("No COCO JSON annotations found. Set dataset.coco_json or dataset.dataset_dir.")
 
-    records_by_split: Dict[str, List[Dict[str, Any]]] = {}
-    class_names: List[str] = []
+    records_by_split: dict[str, list[dict[str, Any]]] = {}
+    class_names: list[str] = []
     class_seen: set[str] = set()
-    warnings: List[str] = []
-    source_files: List[Path] = list(annotation_files.values())
+    warnings: list[str] = []
+    source_files: list[Path] = list(annotation_files.values())
 
     for raw_split, annotation_file in annotation_files.items():
         split = normalize_split_name(raw_split)
@@ -2114,25 +2120,31 @@ def build_coco_json_source(config: Mapping[str, Any], dataset_dir: Optional[Path
             if name not in class_seen:
                 class_names.append(name)
                 class_seen.add(name)
-        annotations_by_image: Dict[int, List[Mapping[str, Any]]] = {}
+        annotations_by_image: dict[int, list[Mapping[str, Any]]] = {}
         for annotation in coco.get("annotations", []):
             annotations_by_image.setdefault(int(annotation["image_id"]), []).append(annotation)
         for image in coco.get("images", []):
             image_id = int(image["id"])
-            source_image = resolve_coco_image_path(str(image["file_name"]), dataset_dir, image_dir, annotation_file, split)
+            source_image = resolve_coco_image_path(
+                str(image["file_name"]), dataset_dir, image_dir, annotation_file, split
+            )
             width = int(image.get("width") or 0)
             height = int(image.get("height") or 0)
             if width <= 0 or height <= 0:
                 width, height = read_image_size(source_image)
-            annotations: List[Dict[str, Any]] = []
+            annotations: list[dict[str, Any]] = []
             for annotation in annotations_by_image.get(image_id, []):
                 bbox_raw = annotation.get("bbox")
                 if not bbox_raw or len(bbox_raw) != 4:
                     continue
-                bbox = clamp_coco_bbox(float(bbox_raw[0]), float(bbox_raw[1]), float(bbox_raw[2]), float(bbox_raw[3]), width, height)
+                bbox = clamp_coco_bbox(
+                    float(bbox_raw[0]), float(bbox_raw[1]), float(bbox_raw[2]), float(bbox_raw[3]), width, height
+                )
                 if bbox is None:
                     continue
-                name = source_categories.get(int(annotation.get("category_id", 0)), str(annotation.get("category_id", "object")))
+                name = source_categories.get(
+                    int(annotation.get("category_id", 0)), str(annotation.get("category_id", "object"))
+                )
                 converted = {
                     "category_name": name,
                     "bbox": bbox,
@@ -2158,7 +2170,7 @@ def build_coco_json_source(config: Mapping[str, Any], dataset_dir: Optional[Path
     }
 
 
-def find_image_by_stem(stem: str, roots: Sequence[Path], fallback_name: Optional[str] = None) -> Path:
+def find_image_by_stem(stem: str, roots: Sequence[Path], fallback_name: str | None = None) -> Path:
     """Find an image by stem or filename under candidate roots."""
     names = [fallback_name] if fallback_name else []
     names.extend(f"{stem}{suffix}" for suffix in sorted(IMAGE_EXTENSIONS))
@@ -2169,35 +2181,43 @@ def find_image_by_stem(stem: str, roots: Sequence[Path], fallback_name: Optional
             candidate = root / name
             if candidate.exists():
                 return candidate.resolve()
-        matches = [path for path in root.rglob("*") if path.is_file() and path.stem == stem and path.suffix.lower() in IMAGE_EXTENSIONS]
+        matches = [
+            path
+            for path in root.rglob("*")
+            if path.is_file() and path.stem == stem and path.suffix.lower() in IMAGE_EXTENSIONS
+        ]
         if matches:
             return matches[0].resolve()
     raise FileNotFoundError(f"Could not find image for annotation stem {stem!r}.")
 
 
-def build_pascal_voc_source(config: Mapping[str, Any], dataset_dir: Optional[Path]) -> Dict[str, Any]:
+def build_pascal_voc_source(config: Mapping[str, Any], dataset_dir: Path | None) -> dict[str, Any]:
     """Read Pascal VOC XML annotations into generic split records."""
     if dataset_dir is None:
         raise ValueError("dataset.dataset_dir is required for Pascal VOC conversion.")
     import xml.etree.ElementTree as ET
 
-    annotation_dir = next((path for path in (dataset_dir / "Annotations", dataset_dir / "annotations") if path.exists()), None)
+    annotation_dir = next(
+        (path for path in (dataset_dir / "Annotations", dataset_dir / "annotations") if path.exists()), None
+    )
     if annotation_dir is None:
         raise FileNotFoundError(f"Pascal VOC annotations directory not found under {dataset_dir}.")
     image_roots = [path for path in (dataset_dir / "JPEGImages", dataset_dir / "images", dataset_dir) if path.exists()]
     split_dir = dataset_dir / "ImageSets" / "Main"
-    split_ids: Dict[str, List[str]] = {}
+    split_ids: dict[str, list[str]] = {}
     for split_name, file_name in {"train": "train.txt", "valid": "val.txt", "test": "test.txt"}.items():
         path = split_dir / file_name
         if path.exists():
-            split_ids[split_name] = [line.strip().split()[0] for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            split_ids[split_name] = [
+                line.strip().split()[0] for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
+            ]
 
     xml_by_stem = {path.stem: path.resolve() for path in sorted(annotation_dir.glob("*.xml"))}
     split_to_stems = split_ids or {"all": sorted(xml_by_stem)}
-    records_by_split: Dict[str, List[Dict[str, Any]]] = {}
-    class_names: List[str] = []
+    records_by_split: dict[str, list[dict[str, Any]]] = {}
+    class_names: list[str] = []
     seen: set[str] = set()
-    annotation_files: List[Path] = []
+    annotation_files: list[Path] = []
 
     for split, stems in split_to_stems.items():
         for stem in stems:
@@ -2213,7 +2233,7 @@ def build_pascal_voc_source(config: Mapping[str, Any], dataset_dir: Optional[Pat
                 width, height = int(float(size.findtext("width"))), int(float(size.findtext("height")))
             else:
                 width, height = read_image_size(source_image)
-            annotations: List[Dict[str, Any]] = []
+            annotations: list[dict[str, Any]] = []
             for obj in root.findall("object"):
                 if obj.findtext("difficult", "0") == "1":
                     continue
@@ -2231,7 +2251,11 @@ def build_pascal_voc_source(config: Mapping[str, Any], dataset_dir: Optional[Pat
                 bbox = clamp_coco_bbox(xmin, ymin, xmax - xmin, ymax - ymin, width, height)
                 if bbox is not None:
                     annotations.append({"category_name": name, "bbox": bbox, "source": str(xml_file)})
-            add_record(records_by_split, split, {"source_image": source_image, "width": width, "height": height, "annotations": annotations})
+            add_record(
+                records_by_split,
+                split,
+                {"source_image": source_image, "width": width, "height": height, "annotations": annotations},
+            )
             annotation_files.append(xml_file)
             annotation_files.append(source_image)
     return {
@@ -2244,9 +2268,9 @@ def build_pascal_voc_source(config: Mapping[str, Any], dataset_dir: Optional[Pat
     }
 
 
-def dota_label_dirs(dataset_dir: Path) -> Dict[str, Tuple[Path, Path]]:
+def dota_label_dirs(dataset_dir: Path) -> dict[str, tuple[Path, Path]]:
     """Find common DOTA split image and label directories."""
-    result: Dict[str, Tuple[Path, Path]] = {}
+    result: dict[str, tuple[Path, Path]] = {}
     split_aliases = {"train": ("train",), "valid": ("valid", "val"), "test": ("test",)}
     for split, aliases in split_aliases.items():
         image_dir = next(
@@ -2289,25 +2313,27 @@ def normalize_dota_class_name(value: str) -> str:
     return value.strip().replace("-", " ")
 
 
-def build_dota_source(config: Mapping[str, Any], dataset_dir: Optional[Path], data_yaml: Optional[Path]) -> Dict[str, Any]:
+def build_dota_source(config: Mapping[str, Any], dataset_dir: Path | None, data_yaml: Path | None) -> dict[str, Any]:
     """Read native DOTA annotations and reduce OBB boxes to axis-aligned bboxes."""
     if dataset_dir is None:
         raise ValueError("dataset.dataset_dir is required for DOTA conversion.")
-    names_from_yaml = coerce_class_names(load_yaml(data_yaml).get("names"), DOTA_CLASS_NAMES) if data_yaml else list(DOTA_CLASS_NAMES)
+    names_from_yaml = (
+        coerce_class_names(load_yaml(data_yaml).get("names"), DOTA_CLASS_NAMES) if data_yaml else list(DOTA_CLASS_NAMES)
+    )
     split_dirs = dota_label_dirs(dataset_dir)
     if not split_dirs:
         raise FileNotFoundError(f"DOTA images/labels were not found under {dataset_dir}.")
 
-    records_by_split: Dict[str, List[Dict[str, Any]]] = {}
+    records_by_split: dict[str, list[dict[str, Any]]] = {}
     class_names = list(names_from_yaml)
     seen = set(class_names)
-    annotation_files: List[Path] = []
+    annotation_files: list[Path] = []
     warnings = ["DOTA oriented boxes were converted to axis-aligned enclosing boxes for RF-DETR detection training."]
     for split, (image_dir, label_dir) in split_dirs.items():
         for label_file in sorted(label_dir.glob("*.txt")):
             source_image = find_image_by_stem(label_file.stem, [image_dir])
             width, height = read_image_size(source_image)
-            annotations: List[Dict[str, Any]] = []
+            annotations: list[dict[str, Any]] = []
             with label_file.open("r", encoding="utf-8") as file:
                 for line_number, line in enumerate(file, start=1):
                     parts = line.strip().split()
@@ -2332,7 +2358,11 @@ def build_dota_source(config: Mapping[str, Any], dataset_dir: Optional[Path], da
                                 "dota_obb_points": points,
                             }
                         )
-            add_record(records_by_split, split, {"source_image": source_image, "width": width, "height": height, "annotations": annotations})
+            add_record(
+                records_by_split,
+                split,
+                {"source_image": source_image, "width": width, "height": height, "annotations": annotations},
+            )
             annotation_files.extend([label_file, source_image])
     return {
         "source_format": "dota",
@@ -2344,7 +2374,7 @@ def build_dota_source(config: Mapping[str, Any], dataset_dir: Optional[Path], da
     }
 
 
-def build_labelme_source(config: Mapping[str, Any], dataset_dir: Optional[Path]) -> Dict[str, Any]:
+def build_labelme_source(config: Mapping[str, Any], dataset_dir: Path | None) -> dict[str, Any]:
     """Read LabelMe JSON annotations into generic split records."""
     if dataset_dir is None:
         raise ValueError("dataset.dataset_dir is required for LabelMe JSON conversion.")
@@ -2352,23 +2382,25 @@ def build_labelme_source(config: Mapping[str, Any], dataset_dir: Optional[Path])
     if not json_files:
         raise FileNotFoundError(f"No LabelMe JSON files found under {dataset_dir}.")
 
-    records_by_split: Dict[str, List[Dict[str, Any]]] = {}
-    class_names: List[str] = []
+    records_by_split: dict[str, list[dict[str, Any]]] = {}
+    class_names: list[str] = []
     seen: set[str] = set()
-    source_files: List[Path] = []
+    source_files: list[Path] = []
     for json_file in json_files:
         with json_file.open("r", encoding="utf-8") as file:
             data = json.load(file)
         image_path = Path(str(data.get("imagePath", ""))).expanduser()
         source_image = image_path if is_abs_any_os(str(image_path)) else (json_file.parent / image_path)
         if not source_image.exists():
-            source_image = find_image_by_stem(json_file.stem, [json_file.parent, dataset_dir], image_path.name if image_path.name else None)
+            source_image = find_image_by_stem(
+                json_file.stem, [json_file.parent, dataset_dir], image_path.name if image_path.name else None
+            )
         source_image = source_image.resolve()
         width = int(data.get("imageWidth") or 0)
         height = int(data.get("imageHeight") or 0)
         if width <= 0 or height <= 0:
             width, height = read_image_size(source_image)
-        annotations: List[Dict[str, Any]] = []
+        annotations: list[dict[str, Any]] = []
         for index, shape in enumerate(data.get("shapes", []), start=1):
             points = shape.get("points") or []
             if len(points) < 2:
@@ -2389,7 +2421,11 @@ def build_labelme_source(config: Mapping[str, Any], dataset_dir: Optional[Path])
                 annotation["segmentation"] = [[float(coord) for point in points for coord in point]]
             annotations.append(annotation)
         split = split_from_path_or_name(json_file) or "all"
-        add_record(records_by_split, split, {"source_image": source_image, "width": width, "height": height, "annotations": annotations})
+        add_record(
+            records_by_split,
+            split,
+            {"source_image": source_image, "width": width, "height": height, "annotations": annotations},
+        )
         source_files.extend([json_file, source_image])
     return {
         "source_format": "labelme_json",
@@ -2404,10 +2440,10 @@ def build_labelme_source(config: Mapping[str, Any], dataset_dir: Optional[Path])
 def build_cache_source(
     config: Mapping[str, Any],
     source_format: str,
-    dataset_dir: Optional[Path],
-    data_yaml: Optional[Path],
-    source_config: Optional[Path],
-) -> Dict[str, Any]:
+    dataset_dir: Path | None,
+    data_yaml: Path | None,
+    source_config: Path | None,
+) -> dict[str, Any]:
     """Read a supported source dataset into generic split records."""
     if source_format == "ultralytics_yolo":
         return build_ultralytics_yolo_source(config, source_config)
@@ -2425,11 +2461,11 @@ def build_cache_source(
 def build_source_fingerprint(
     source_format: str,
     source: Mapping[str, Any],
-    records_by_split: Mapping[str, List[Dict[str, Any]]],
+    records_by_split: Mapping[str, list[dict[str, Any]]],
     categories: Sequence[Mapping[str, Any]],
-    split_ratio: Tuple[int, int, int],
+    split_ratio: tuple[int, int, int],
     config: Mapping[str, Any],
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Build a stable fingerprint from converter version, files, classes, and split policy."""
     files = list(source.get("annotation_files", [])) + unique_source_images(records_by_split)
     files_digest, file_count = file_stats_digest(Path(path) for path in files)
@@ -2444,7 +2480,9 @@ def build_source_fingerprint(
         "files_digest": files_digest,
         "file_count": file_count,
     }
-    payload["hash"] = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+    payload["hash"] = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
     return payload
 
 
@@ -2459,10 +2497,10 @@ def normalize_link_mode(value: Any) -> str:
 def build_cache_dataset_plan(
     config: Mapping[str, Any],
     source_format: str,
-    dataset_dir: Optional[Path],
-    data_yaml: Optional[Path],
-    source_config: Optional[Path],
-) -> Dict[str, Any]:
+    dataset_dir: Path | None,
+    data_yaml: Path | None,
+    source_config: Path | None,
+) -> dict[str, Any]:
     """Build a no-write plan for converting a source dataset into RF-DETR cache."""
     dataset = config.get("dataset", {})
     source = build_cache_source(config, source_format, dataset_dir, data_yaml, source_config)
@@ -2501,7 +2539,7 @@ def build_cache_dataset_plan(
     }
 
 
-def find_rfdetr_coco_split_files(dataset_dir: Path) -> Dict[str, Path]:
+def find_rfdetr_coco_split_files(dataset_dir: Path) -> dict[str, Path]:
     """Find RF-DETR/Roboflow COCO split annotation files."""
     candidates = [
         ("train", "train"),
@@ -2511,7 +2549,7 @@ def find_rfdetr_coco_split_files(dataset_dir: Path) -> Dict[str, Path]:
         ("test-original", "test-original"),
         ("test_original", "test-original"),
     ]
-    found: Dict[str, Path] = {}
+    found: dict[str, Path] = {}
     for folder_name, split in candidates:
         if split in found:
             continue
@@ -2521,7 +2559,7 @@ def find_rfdetr_coco_split_files(dataset_dir: Path) -> Dict[str, Path]:
     return found
 
 
-def build_rfdetr_coco_split_source(dataset_dir: Path) -> Dict[str, Any]:
+def build_rfdetr_coco_split_source(dataset_dir: Path) -> dict[str, Any]:
     """Read an existing RF-DETR COCO split dataset into cache records."""
     annotation_files = find_rfdetr_coco_split_files(dataset_dir)
     if not annotation_files:
@@ -2530,10 +2568,10 @@ def build_rfdetr_coco_split_source(dataset_dir: Path) -> Dict[str, Any]:
             "or a Roboflow/RF-DETR YOLO layout with data.yaml."
         )
 
-    records_by_split: Dict[str, List[Dict[str, Any]]] = {}
-    class_names: List[str] = []
+    records_by_split: dict[str, list[dict[str, Any]]] = {}
+    class_names: list[str] = []
     class_seen: set[str] = set()
-    source_files: List[Path] = list(annotation_files.values())
+    source_files: list[Path] = list(annotation_files.values())
 
     for split, annotation_file in annotation_files.items():
         split_dir = annotation_file.parent
@@ -2545,24 +2583,28 @@ def build_rfdetr_coco_split_source(dataset_dir: Path) -> Dict[str, Any]:
                 class_names.append(name)
                 class_seen.add(name)
 
-        annotations_by_image: Dict[int, List[Mapping[str, Any]]] = {}
+        annotations_by_image: dict[int, list[Mapping[str, Any]]] = {}
         for annotation in coco.get("annotations", []):
             annotations_by_image.setdefault(int(annotation["image_id"]), []).append(annotation)
 
         images = sorted(coco.get("images", []), key=lambda image: str(image.get("file_name", "")))
         for image in images:
             image_id = int(image["id"])
-            source_image = resolve_coco_image_path(str(image["file_name"]), dataset_dir, split_dir, annotation_file, split)
+            source_image = resolve_coco_image_path(
+                str(image["file_name"]), dataset_dir, split_dir, annotation_file, split
+            )
             width = int(image.get("width") or 0)
             height = int(image.get("height") or 0)
             if width <= 0 or height <= 0:
                 width, height = read_image_size(source_image)
-            annotations: List[Dict[str, Any]] = []
+            annotations: list[dict[str, Any]] = []
             for annotation in annotations_by_image.get(image_id, []):
                 bbox_raw = annotation.get("bbox")
                 if not bbox_raw or len(bbox_raw) != 4:
                     continue
-                bbox = clamp_coco_bbox(float(bbox_raw[0]), float(bbox_raw[1]), float(bbox_raw[2]), float(bbox_raw[3]), width, height)
+                bbox = clamp_coco_bbox(
+                    float(bbox_raw[0]), float(bbox_raw[1]), float(bbox_raw[2]), float(bbox_raw[3]), width, height
+                )
                 if bbox is None:
                     continue
                 category_id = int(annotation.get("category_id", 0))
@@ -2594,14 +2636,18 @@ def build_rfdetr_coco_split_source(dataset_dir: Path) -> Dict[str, Any]:
 
 def build_rfdetr_limited_dataset_plan(
     config: Mapping[str, Any],
-    dataset_dir: Optional[Path],
-    source_config: Optional[Path],
-) -> Dict[str, Any]:
+    dataset_dir: Path | None,
+    source_config: Path | None,
+) -> dict[str, Any]:
     """Build a cache plan that limits an existing RF-DETR-readable dataset."""
     if dataset_dir is None:
         raise ValueError("dataset.dataset_dir/train.dataset_dir is required when dataset limits are enabled.")
     dataset = config.get("dataset", {})
-    source = build_ultralytics_yolo_source(config, source_config) if is_rfdetr_yolo_layout(dataset_dir) else build_rfdetr_coco_split_source(dataset_dir)
+    source = (
+        build_ultralytics_yolo_source(config, source_config)
+        if is_rfdetr_yolo_layout(dataset_dir)
+        else build_rfdetr_coco_split_source(dataset_dir)
+    )
     records_by_split = limit_records_by_split(source["records_by_split"], config)
     assign_cache_file_names(records_by_split)
     categories = finalize_categories(records_by_split, source.get("class_names", []))
@@ -2644,7 +2690,6 @@ def motion_module_enabled(config: Mapping[str, Any]) -> bool:
 
 def temporal_motion_enabled(config: Mapping[str, Any]) -> bool:
     """Return whether this run requires real indexed temporal windows."""
-
     if not motion_module_enabled(config):
         return False
     motion = config["model"]["motion"]
@@ -2655,7 +2700,6 @@ def temporal_motion_enabled(config: Mapping[str, Any]) -> bool:
 
 def _align_temporal_num_classes(rf_model: Any, class_names: Sequence[str]) -> None:
     """Align an unset RF-DETR class head to the temporal dataset vocabulary."""
-
     if not class_names:
         raise ValueError("Temporal training requires at least one dataset class name.")
     model_config = rf_model.model_config
@@ -2685,8 +2729,8 @@ def _align_temporal_num_classes(rf_model: Any, class_names: Sequence[str]) -> No
 def build_dataset_plan(
     config: Mapping[str, Any],
     output_dir: Path,
-    source_config: Optional[Path],
-) -> Dict[str, Any]:
+    source_config: Path | None,
+) -> dict[str, Any]:
     """Build a dataset preparation plan without writing output."""
     dataset_dir_value = get_dataset_dir_value(config)
     dataset_dir = None
@@ -2715,11 +2759,7 @@ def build_dataset_plan(
         )
         complete_split_counts = dict(split_counts)
         temporal_dataset = (config.get("dataset", {}) or {}).get("temporal", {}) or {}
-        max_windows = (
-            temporal_dataset.get("max_windows_per_split", {})
-            if isinstance(temporal_dataset, Mapping)
-            else {}
-        )
+        max_windows = temporal_dataset.get("max_windows_per_split", {}) if isinstance(temporal_dataset, Mapping) else {}
         if isinstance(max_windows, int):
             max_windows = {
                 "train": max_windows,
@@ -2727,19 +2767,15 @@ def build_dataset_plan(
                 "test": max_windows,
             }
         if not isinstance(max_windows, Mapping):
-            raise ValueError(
-                "dataset.temporal.max_windows_per_split must be an integer or mapping"
-            )
-        normalised_limits: Dict[str, int] = {}
+            raise ValueError("dataset.temporal.max_windows_per_split must be an integer or mapping")
+        normalised_limits: dict[str, int] = {}
         for raw_split, raw_limit in max_windows.items():
             split = str(raw_split).strip().lower()
             if split == "valid":
                 split = "val"
             limit = int(raw_limit)
             if limit < 1:
-                raise ValueError(
-                    "dataset.temporal.max_windows_per_split values must be positive"
-                )
+                raise ValueError("dataset.temporal.max_windows_per_split values must be positive")
             normalised_limits[split] = limit
         split_counts = {
             split: min(int(count), normalised_limits.get(split, int(count)))
@@ -2763,7 +2799,7 @@ def build_dataset_plan(
         return build_cache_dataset_plan(config, source_format, dataset_dir, data_yaml, source_config)
     if has_dataset_limits(config):
         return build_rfdetr_limited_dataset_plan(config, dataset_dir, source_config)
-    split_counts: Dict[str, Optional[int]] = {}
+    split_counts: dict[str, int | None] = {}
     if dataset_dir is not None:
         split_counts = {
             split: maybe_count_images(dataset_split_dir(dataset_dir, split))
@@ -2849,7 +2885,7 @@ def create_directory_link(source: Path, target: Path, mode: str) -> str:
         create_directory_junction(source, target)
         return "junction"
 
-    errors: List[str] = []
+    errors: list[str] = []
     preferred = ("junction", "symlink") if os.name == "nt" else ("symlink",)
     for candidate in preferred:
         try:
@@ -2911,7 +2947,7 @@ def create_file_link(source: Path, target: Path, mode: str) -> str:
         create_file_symlink(source, target)
         return "symlink"
 
-    errors: List[str] = []
+    errors: list[str] = []
     preferred = ("hardlink", "symlink") if mode in {"auto", "junction"} else (mode,)
     for candidate in preferred:
         try:
@@ -2948,10 +2984,12 @@ def cache_is_ready(plan: Mapping[str, Any]) -> bool:
     return False
 
 
-def write_cache_split_coco(split_dir: Path, records: Sequence[Mapping[str, Any]], categories: Sequence[Mapping[str, Any]]) -> None:
+def write_cache_split_coco(
+    split_dir: Path, records: Sequence[Mapping[str, Any]], categories: Sequence[Mapping[str, Any]]
+) -> None:
     """Write one split's Roboflow COCO annotation file."""
-    images: List[Dict[str, Any]] = []
-    annotations: List[Dict[str, Any]] = []
+    images: list[dict[str, Any]] = []
+    annotations: list[dict[str, Any]] = []
     annotation_id = 1
     for image_id, record in enumerate(records, start=1):
         images.append(
@@ -2993,13 +3031,13 @@ def materialize_cache_dataset_plan(
     config: MutableMapping[str, Any],
     output_dir: Path,
     verbose: bool,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Create or reuse an RF-DETR-readable Roboflow COCO cache dataset."""
     cache_dir = Path(plan["cache_dir"])
     cache_root = Path(plan["cache_root"])
     link_mode = str(plan.get("link_mode", "auto"))
     cache_reused = cache_is_ready(plan) and not bool(plan.get("refresh_cache", False))
-    image_modes: Dict[str, Dict[str, str]] = {}
+    image_modes: dict[str, dict[str, str]] = {}
     if cache_reused:
         blue(f"Reusing RF-DETR dataset cache at {cache_dir}.", verbose)
     else:
@@ -3010,7 +3048,7 @@ def materialize_cache_dataset_plan(
             for split, records in plan.get("records_by_split", {}).items():
                 split_dir = cache_dir / split
                 split_dir.mkdir(parents=True, exist_ok=True)
-                split_modes: Dict[str, str] = {}
+                split_modes: dict[str, str] = {}
                 for record in records:
                     source_image = Path(record["source_image"])
                     target_image = split_dir / str(record["file_name"])
@@ -3054,7 +3092,7 @@ def materialize_dataset_plan(
     config: MutableMapping[str, Any],
     output_dir: Path,
     verbose: bool,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Create any dataset adapter outputs required by the plan."""
     if plan.get("action") == "prepare_cache":
         return materialize_cache_dataset_plan(plan, config, output_dir, verbose)
@@ -3071,7 +3109,7 @@ def materialize_dataset_plan(
     return {}
 
 
-def estimate_periodic_tests(config: Mapping[str, Any]) -> Tuple[Optional[int], str]:
+def estimate_periodic_tests(config: Mapping[str, Any]) -> tuple[int | None, str]:
     """Estimate how many scheduled test runs will be produced."""
     periodic = config.get("periodic_test", {})
     if not periodic.get("enabled", True):
@@ -3081,9 +3119,9 @@ def estimate_periodic_tests(config: Mapping[str, Any]) -> Tuple[Optional[int], s
     by_epoch = int(periodic.get("test_interval_epochs") or 0)
     by_minutes = float(periodic.get("test_interval_minutes") or 0.0)
     if epochs and by_epoch > 0:
-        return int(math.floor(float(epochs) / by_epoch)), "estimated from epochs"
+        return math.floor(float(epochs) / by_epoch), "estimated from epochs"
     if train.get("max_time_minutes") and by_minutes > 0:
-        return int(math.floor(float(train["max_time_minutes"]) / by_minutes)), "estimated from time"
+        return math.floor(float(train["max_time_minutes"]) / by_minutes), "estimated from time"
     if by_minutes > 0:
         return None, "unknown because runtime depends on training speed"
     return 0, "no interval configured"
@@ -3092,9 +3130,9 @@ def estimate_periodic_tests(config: Mapping[str, Any]) -> Tuple[Optional[int], s
 def estimate_outputs(
     config: Mapping[str, Any],
     output_dir: Path,
-    periodic_count: Optional[int],
-    dataset_plan: Optional[Mapping[str, Any]] = None,
-) -> Dict[str, Any]:
+    periodic_count: int | None,
+    dataset_plan: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """Estimate output files and disk usage before training."""
     train = config.get("train", {})
     periodic = config.get("periodic_test", {})
@@ -3110,7 +3148,7 @@ def estimate_outputs(
 
     epochs = int(train.get("epochs") or 100)
     checkpoint_interval = max(1, int(train.get("checkpoint_interval") or 10))
-    checkpoint_files = 4 + int(math.ceil(epochs / checkpoint_interval))
+    checkpoint_files = 4 + math.ceil(epochs / checkpoint_interval)
     logger_files = 4
     train_batch_grid_files = TRAIN_BATCH_GRID_MAX_BATCHES
     validation_label_grid_files = VALIDATION_PREDICTION_GRID_MAX_BATCHES
@@ -3143,29 +3181,29 @@ def estimate_outputs(
 
     train_images = split_counts.get("train") or 0
     try:
-        batch_size = int(train.get("batch_size") if train.get("batch_size") != "auto" else train.get("auto_batch_target_effective", 1))
+        batch_size = int(
+            train.get("batch_size")
+            if train.get("batch_size") != "auto"
+            else train.get("auto_batch_target_effective", 1)
+        )
     except (TypeError, ValueError):
         batch_size = int(train.get("auto_batch_target_effective", 1) or 1)
     batch_size = max(1, batch_size)
-    train_batches = max(1, int(math.ceil(float(train_images or 0) / batch_size))) if train_images else 1
+    train_batches = max(1, math.ceil(float(train_images or 0) / batch_size)) if train_images else 1
     try:
         grad_accum_steps = max(1, int(train.get("grad_accum_steps", 1) or 1))
     except (TypeError, ValueError):
         grad_accum_steps = 1
-    optimizer_steps_per_epoch = int(
-        math.ceil(float(train_batches) / grad_accum_steps)
-    )
+    optimizer_steps_per_epoch = math.ceil(float(train_batches) / grad_accum_steps)
     total_optimizer_steps = epochs * optimizer_steps_per_epoch
-    training_sanity_warnings: List[str] = []
+    training_sanity_warnings: list[str] = []
     if grad_accum_steps > train_batches:
         training_sanity_warnings.append(
-            "grad_accum_steps exceeds train batches per epoch; this produces "
-            "only one optimizer update per epoch."
+            "grad_accum_steps exceeds train batches per epoch; this produces only one optimizer update per epoch."
         )
     if optimizer_steps_per_epoch < 5:
         training_sanity_warnings.append(
-            "Fewer than five optimizer updates are expected per epoch; "
-            "loss/mAP may appear stationary for many epochs."
+            "Fewer than five optimizer updates are expected per epoch; loss/mAP may appear stationary for many epochs."
         )
     if total_optimizer_steps < 100:
         training_sanity_warnings.append(
@@ -3178,7 +3216,9 @@ def estimate_outputs(
         "output_dir": str(output_dir),
         "dataset_source_format": dataset_source_format,
         "dataset_link_mode": dataset_link_mode,
-        "dataset_cache_dir": str(dataset_plan.get("cache_dir")) if dataset_plan and dataset_plan.get("cache_dir") else None,
+        "dataset_cache_dir": str(dataset_plan.get("cache_dir"))
+        if dataset_plan and dataset_plan.get("cache_dir")
+        else None,
         "dataset_cache_files": dataset_cache_files,
         "dataset_cache_disk_usage": format_bytes(dataset_cache_bytes),
         "split_image_counts": split_counts,
@@ -3204,9 +3244,7 @@ def estimate_outputs(
     }
     if dataset_plan and dataset_plan.get("action") == "temporal_direct":
         estimate["split_window_counts"] = split_counts
-        estimate["complete_temporal_window_counts"] = dict(
-            dataset_plan.get("complete_split_counts", split_counts)
-        )
+        estimate["complete_temporal_window_counts"] = dict(dataset_plan.get("complete_split_counts", split_counts))
     add_runtime_estimate(
         estimate=estimate,
         config=config,
@@ -3255,11 +3293,11 @@ def normalize_model_size(size: Any) -> str:
     return MODEL_SIZE_ALIASES.get(text, text)
 
 
-def get_available_model_classes() -> Dict[str, Any]:
+def get_available_model_classes() -> dict[str, Any]:
     """Return canonical RF-DETR model sizes supported by the installed package."""
     import rfdetr
 
-    mapping: Dict[str, Any] = {}
+    mapping: dict[str, Any] = {}
     for size, class_name in MODEL_SIZE_CLASS_NAMES.items():
         model_cls = getattr(rfdetr, class_name, None)
         if model_cls is not None:
@@ -3287,7 +3325,9 @@ def get_model_class(size: str) -> Any:
     mapping = get_available_model_classes()
     if normalized in mapping:
         return mapping[normalized]
-    raise ValueError(f"Unsupported RF-DETR model size {size!r}. Options for this rfdetr install: {available_model_size_options()}.")
+    raise ValueError(
+        f"Unsupported RF-DETR model size {size!r}. Options for this rfdetr install: {available_model_size_options()}."
+    )
 
 
 def build_output_dir(config: Mapping[str, Any], timestamp: str) -> Path:
@@ -3301,7 +3341,7 @@ def build_output_dir(config: Mapping[str, Any], timestamp: str) -> Path:
     return resolve_path_for_output(root) / sanitize_name(str(name))
 
 
-def normalize_pretrain_weights(value: Any) -> Tuple[bool, Optional[str]]:
+def normalize_pretrain_weights(value: Any) -> tuple[bool, str | None]:
     """Return whether to pass pretrain_weights plus its normalized value."""
     if isinstance(value, str):
         text = value.strip().lower()
@@ -3319,9 +3359,8 @@ def normalize_pretrain_weights(value: Any) -> Tuple[bool, Optional[str]]:
     return True, str(resolved)
 
 
-def temporal_dataset_manifest_sha256(config: Mapping[str, Any]) -> Optional[str]:
+def temporal_dataset_manifest_sha256(config: Mapping[str, Any]) -> str | None:
     """Hash the canonical temporal index for checkpoint provenance."""
-
     if not temporal_motion_enabled(config):
         return None
     dataset = config.get("dataset", {})
@@ -3352,168 +3391,153 @@ def temporal_dataset_manifest_sha256(config: Mapping[str, Any]) -> Optional[str]
 
 def build_pitchobjectlab_architecture(
     config: Mapping[str, Any],
-    model_config: Optional[Any] = None,
-) -> Dict[str, Any]:
-    '''Serialize only graph-affecting project architecture settings.'''
-
-    model = config.get('model', {})
+    model_config: Any | None = None,
+) -> dict[str, Any]:
+    """Serialize only graph-affecting project architecture settings."""
+    model = config.get("model", {})
     if not isinstance(model, Mapping):
         model = {}
-    p2 = model.get('p2', {}) or {}
-    motion = model.get('motion', {}) or {}
-    projector = p2.get('projector', {}) or {}
-    p2_enabled = bool(p2.get('enabled', False))
+    p2 = model.get("p2", {}) or {}
+    motion = model.get("motion", {}) or {}
+    projector = p2.get("projector", {}) or {}
+    p2_enabled = bool(p2.get("enabled", False))
     motion_enabled = motion_module_enabled(config)
     resolved_resolution = (
-        getattr(model_config, 'resolution', None)
-        if model_config is not None
-        else model.get('resolution')
+        getattr(model_config, "resolution", None) if model_config is not None else model.get("resolution")
     )
     resolved_num_classes = (
-        getattr(model_config, 'num_classes', None)
-        if model_config is not None
-        else model.get('num_classes')
+        getattr(model_config, "num_classes", None) if model_config is not None else model.get("num_classes")
     )
     resolved_num_queries = (
-        getattr(model_config, 'num_queries', None)
+        getattr(model_config, "num_queries", None)
         if model_config is not None
         else (
-            (motion.get('overrides', {}) or {}).get('num_queries')
-            or (p2.get('overrides', {}) or {}).get('num_queries')
-            or (model.get('extra_model_args', {}) or {}).get('num_queries')
+            (motion.get("overrides", {}) or {}).get("num_queries")
+            or (p2.get("overrides", {}) or {}).get("num_queries")
+            or (model.get("extra_model_args", {}) or {}).get("num_queries")
         )
     )
     resolved_num_select = (
-        getattr(model_config, 'num_select', None)
+        getattr(model_config, "num_select", None)
         if model_config is not None
         else (
-            (motion.get('overrides', {}) or {}).get('num_select')
-            or (p2.get('overrides', {}) or {}).get('num_select')
-            or (model.get('extra_model_args', {}) or {}).get('num_select')
+            (motion.get("overrides", {}) or {}).get("num_select")
+            or (p2.get("overrides", {}) or {}).get("num_select")
+            or (model.get("extra_model_args", {}) or {}).get("num_select")
         )
     )
     resolved_dec_n_points = (
-        getattr(model_config, 'dec_n_points', None)
+        getattr(model_config, "dec_n_points", None)
         if model_config is not None
-        else (p2.get('overrides', {}) or {}).get('dec_n_points')
+        else (p2.get("overrides", {}) or {}).get("dec_n_points")
     )
-    projector_scale = (
-        list(p2.get('projector_scale', ['P2', 'P3', 'P4']) or [])
-        if p2_enabled
-        else []
-    )
+    projector_scale = list(p2.get("projector_scale", ["P2", "P3", "P4"]) or []) if p2_enabled else []
     p2_metadata = {
-        'enabled': p2_enabled,
-        'projector_scale': projector_scale,
-        'projector': {
+        "enabled": p2_enabled,
+        "projector_scale": projector_scale,
+        "projector": {
             key: deepcopy(projector.get(key))
             for key in (
-                'num_blocks',
-                'survival_prob',
-                'force_drop_last_n_features',
-                'layer_norm',
-                'rms_norm',
+                "num_blocks",
+                "survival_prob",
+                "force_drop_last_n_features",
+                "layer_norm",
+                "rms_norm",
             )
             if projector.get(key) is not None
         },
     }
     motion_metadata = {
-        'enabled': motion_enabled,
-        'type': str(motion.get('type', 'tracknet_v5')),
-        'temporal': deepcopy(dict(motion.get('temporal', {}) or {})),
-        'focus': deepcopy(dict(motion.get('focus', {}) or {})),
-        'tracknet_v5': deepcopy(dict(motion.get('tracknet_v5', {}) or {})),
-        'loss': deepcopy(dict(motion.get('loss', {}) or {})),
+        "enabled": motion_enabled,
+        "type": str(motion.get("type", "tracknet_v5")),
+        "temporal": deepcopy(dict(motion.get("temporal", {}) or {})),
+        "focus": deepcopy(dict(motion.get("focus", {}) or {})),
+        "tracknet_v5": deepcopy(dict(motion.get("tracknet_v5", {}) or {})),
+        "loss": deepcopy(dict(motion.get("loss", {}) or {})),
     }
     graph = {
-        'model_size': str(model.get('size', 'medium')).strip().lower(),
-        'resolution': resolved_resolution,
-        'num_queries': resolved_num_queries,
-        'num_select': resolved_num_select,
-        'num_classes': resolved_num_classes,
-        'dec_n_points': resolved_dec_n_points,
-        'p2': p2_metadata,
-        'motion': motion_metadata,
+        "model_size": str(model.get("size", "medium")).strip().lower(),
+        "resolution": resolved_resolution,
+        "num_queries": resolved_num_queries,
+        "num_select": resolved_num_select,
+        "num_classes": resolved_num_classes,
+        "dec_n_points": resolved_dec_n_points,
+        "p2": p2_metadata,
+        "motion": motion_metadata,
     }
     graph_json = json.dumps(
         graph,
         ensure_ascii=False,
         sort_keys=True,
-        separators=(',', ':'),
+        separators=(",", ":"),
         default=str,
     )
     return {
-        'schema_version': PITCHOBJECTLAB_ARCHITECTURE_SCHEMA_VERSION,
-        'model_size': str(model.get('size', 'medium')),
-        'rf_detr_version': '1.8.3',
-        'graph': graph,
-        'architecture_fingerprint': hashlib.sha256(
-            graph_json.encode('utf-8')
-        ).hexdigest(),
-        'p2': p2_metadata,
-        'motion': motion_metadata,
-        'dataset_manifest_sha256': temporal_dataset_manifest_sha256(config),
-        'tensorrt_export_abi': PITCHOBJECTLAB_TENSORRT_EXPORT_ABI,
+        "schema_version": PITCHOBJECTLAB_ARCHITECTURE_SCHEMA_VERSION,
+        "model_size": str(model.get("size", "medium")),
+        "rf_detr_version": "1.8.3",
+        "graph": graph,
+        "architecture_fingerprint": hashlib.sha256(graph_json.encode("utf-8")).hexdigest(),
+        "p2": p2_metadata,
+        "motion": motion_metadata,
+        "dataset_manifest_sha256": temporal_dataset_manifest_sha256(config),
+        "tensorrt_export_abi": PITCHOBJECTLAB_TENSORRT_EXPORT_ABI,
     }
 
 
 def install_best_checkpoint_metadata(trainer: Any, metadata: Mapping[str, Any]) -> None:
-    '''Inject architecture metadata into regular and EMA checkpoint payloads.'''
-
+    """Inject architecture metadata into regular and EMA checkpoint payloads."""
     installed = False
-    for callback in getattr(trainer, 'callbacks', []):
-        if type(callback).__name__ != 'BestModelCallback':
+    for callback in getattr(trainer, "callbacks", []):
+        if type(callback).__name__ != "BestModelCallback":
             continue
         original = callback._build_checkpoint_payload
         frozen_metadata = deepcopy(dict(metadata))
 
-        def build_payload(*args: Any, _original: Any = original, **kwargs: Any) -> Dict[str, Any]:
+        def build_payload(*args: Any, _original: Any = original, **kwargs: Any) -> dict[str, Any]:
             payload = dict(_original(*args, **kwargs))
             payload[PITCHOBJECTLAB_ARCHITECTURE_KEY] = deepcopy(frozen_metadata)
-            args_payload = payload.get('args')
+            args_payload = payload.get("args")
             if isinstance(args_payload, Mapping):
                 nested_args = dict(args_payload)
                 nested_args[PITCHOBJECTLAB_ARCHITECTURE_KEY] = deepcopy(frozen_metadata)
-                payload['args'] = nested_args
+                payload["args"] = nested_args
             return payload
 
         callback._build_checkpoint_payload = build_payload
         installed = True
     if not installed:
-        raise RuntimeError(
-            'RF-DETR trainer has no BestModelCallback; cannot preserve project architecture metadata.'
-        )
+        raise RuntimeError("RF-DETR trainer has no BestModelCallback; cannot preserve project architecture metadata.")
 
 
 def enrich_best_checkpoint_metadata(output_dir: Path) -> None:
-    '''Restore top-level metadata after RF-DETR strips the total checkpoint.'''
-
+    """Restore top-level metadata after RF-DETR strips the total checkpoint."""
     import torch
 
     for name in (
-        'checkpoint_best_regular.pth',
-        'checkpoint_best_ema.pth',
-        'checkpoint_best_total.pth',
+        "checkpoint_best_regular.pth",
+        "checkpoint_best_ema.pth",
+        "checkpoint_best_total.pth",
     ):
         path = output_dir / name
         if not path.is_file():
             continue
         try:
-            checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+            checkpoint = torch.load(path, map_location="cpu", weights_only=False)
         except TypeError:
-            checkpoint = torch.load(path, map_location='cpu')
+            checkpoint = torch.load(path, map_location="cpu")
         if not isinstance(checkpoint, MutableMapping):
             continue
         metadata = checkpoint.get(PITCHOBJECTLAB_ARCHITECTURE_KEY)
-        args_payload = checkpoint.get('args')
+        args_payload = checkpoint.get("args")
         if metadata is None and isinstance(args_payload, Mapping):
             metadata = args_payload.get(PITCHOBJECTLAB_ARCHITECTURE_KEY)
         if not isinstance(metadata, Mapping):
             continue
         checkpoint[PITCHOBJECTLAB_ARCHITECTURE_KEY] = deepcopy(dict(metadata))
         descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f'.{path.name}.',
-            suffix='.metadata.tmp',
+            prefix=f".{path.name}.",
+            suffix=".metadata.tmp",
             dir=path.parent,
         )
         os.close(descriptor)
@@ -3526,7 +3550,7 @@ def enrich_best_checkpoint_metadata(output_dir: Path) -> None:
             raise
 
 
-def build_model_kwargs(config: Mapping[str, Any]) -> Dict[str, Any]:
+def build_model_kwargs(config: Mapping[str, Any]) -> dict[str, Any]:
     """Build RF-DETR model constructor kwargs."""
     model_cfg = deepcopy(config.get("model", {}))
     kwargs = deepcopy(model_cfg.get("extra_model_args", {}) or {})
@@ -3570,7 +3594,7 @@ def build_model_kwargs(config: Mapping[str, Any]) -> Dict[str, Any]:
     return kwargs
 
 
-def _rfdetr_keypoint_flip_pairs_for_task(args: Any) -> Optional[List[int]]:
+def _rfdetr_keypoint_flip_pairs_for_task(args: Any) -> list[int] | None:
     """Return RF-DETR keypoint flip pairs only for keypoint tasks."""
     if bool(getattr(args, "use_grouppose_keypoints", False)):
         return list(getattr(args, "keypoint_flip_pairs", []) or [])
@@ -3606,7 +3630,9 @@ def ensure_rfdetr_detection_hflip_support() -> None:
         img_folder, ann_file = paths[image_set.split("_")[0]]
 
         include_keypoints = has_keypoints
-        resolved_backend = coco_module._resolve_runtime_augmentation_backend(getattr(args, "augmentation_backend", "cpu"))
+        resolved_backend = coco_module._resolve_runtime_augmentation_backend(
+            getattr(args, "augmentation_backend", "cpu")
+        )
         gpu_postprocess = resolved_backend != "cpu"
         make_transforms = (
             coco_module.make_coco_transforms_square_div_64
@@ -3651,7 +3677,9 @@ def ensure_rfdetr_detection_hflip_support() -> None:
         }
         img_folder, ann_file = paths[image_set.split("_")[0]]
 
-        resolved_backend = coco_module._resolve_runtime_augmentation_backend(getattr(args, "augmentation_backend", "cpu"))
+        resolved_backend = coco_module._resolve_runtime_augmentation_backend(
+            getattr(args, "augmentation_backend", "cpu")
+        )
         gpu_postprocess = resolved_backend != "cpu"
         make_transforms = (
             coco_module.make_coco_transforms_square_div_64
@@ -3694,7 +3722,7 @@ def ensure_rfdetr_detection_hflip_support() -> None:
     _RFDETR_DETECTION_HFLIP_PATCHED = True
 
 
-def normalize_model_constructor_device(value: Any) -> Optional[str]:
+def normalize_model_constructor_device(value: Any) -> str | None:
     """Normalize config/CLI shortcuts into RF-DETR model constructor device strings."""
     if value is None:
         return None
@@ -3723,17 +3751,19 @@ def normalize_model_constructor_device(value: Any) -> Optional[str]:
     return text
 
 
-def build_train_kwargs(config: Mapping[str, Any], output_dir: Path) -> Dict[str, Any]:
+def build_train_kwargs(config: Mapping[str, Any], output_dir: Path) -> dict[str, Any]:
     """Build RF-DETR TrainConfig kwargs."""
     train = deepcopy(config.get("train", {}))
     extra = train.pop("extra_train_args", {}) or {}
     device = train.pop("device", None)
     train.pop("max_time_minutes", None)
-    train_kwargs: Dict[str, Any] = {}
+    train_kwargs: dict[str, Any] = {}
     train_kwargs.update(train)
     train_kwargs.update(extra)
     train_kwargs.setdefault("num_workers", 2)
-    train_kwargs["dataset_dir"] = str(resolve_existing_or_raw(train_kwargs["dataset_dir"], [Path.cwd(), REPO_ROOT, PROJECT_DIR]))
+    train_kwargs["dataset_dir"] = str(
+        resolve_existing_or_raw(train_kwargs["dataset_dir"], [Path.cwd(), REPO_ROOT, PROJECT_DIR])
+    )
     train_kwargs["output_dir"] = str(output_dir)
     if device not in (None, "", "auto"):
         train_kwargs["_device"] = str(device)
@@ -3741,7 +3771,7 @@ def build_train_kwargs(config: Mapping[str, Any], output_dir: Path) -> Dict[str,
     return train_kwargs
 
 
-def size_hw(value: Any) -> Optional[Tuple[float, float]]:
+def size_hw(value: Any) -> tuple[float, float] | None:
     """Return a positive (height, width) pair from tensor/list-like values."""
     values = flatten_tensor(value)
     if len(values) < 2:
@@ -3756,7 +3786,7 @@ def size_hw(value: Any) -> Optional[Tuple[float, float]]:
     return height, width
 
 
-def tensor_image_size_hw(tensor: Any) -> Optional[Tuple[float, float]]:
+def tensor_image_size_hw(tensor: Any) -> tuple[float, float] | None:
     """Return (height, width) from a CHW/HW image tensor-like value."""
     shape = getattr(tensor, "shape", None)
     if shape is None:
@@ -3776,7 +3806,7 @@ def tensor_image_size_hw(tensor: Any) -> Optional[Tuple[float, float]]:
     return float(height), float(width)
 
 
-def mask_valid_size_hw(mask: Any) -> Optional[Tuple[float, float]]:
+def mask_valid_size_hw(mask: Any) -> tuple[float, float] | None:
     """Return the visible (height, width) from an RF-DETR padding mask."""
     if mask is None:
         return None
@@ -3815,10 +3845,14 @@ def mask_valid_size_hw(mask: Any) -> Optional[Tuple[float, float]]:
     return float(valid_height), float(valid_width)
 
 
-def batch_item_valid_size_hw(single_image: Any, mask: Any = None, target: Optional[Mapping[str, Any]] = None) -> Optional[Tuple[float, float]]:
+def batch_item_valid_size_hw(
+    single_image: Any, mask: Any = None, target: Mapping[str, Any] | None = None
+) -> tuple[float, float] | None:
     """Return the coordinate size that matches a rendered batch-grid image."""
-    return mask_valid_size_hw(mask) or tensor_image_size_hw(single_image) or (
-        size_hw(target.get("size")) if isinstance(target, Mapping) else None
+    return (
+        mask_valid_size_hw(mask)
+        or tensor_image_size_hw(single_image)
+        or (size_hw(target.get("size")) if isinstance(target, Mapping) else None)
     )
 
 
@@ -3860,7 +3894,7 @@ def batch_grid_font() -> Any:
         return ImageFont.load_default()
 
 
-def make_batch_grid_tile(image: Any) -> Tuple[Any, Any, Any, float, int, int]:
+def make_batch_grid_tile(image: Any) -> tuple[Any, Any, Any, float, int, int]:
     """Create a fixed-size tile and return drawing primitives for annotation."""
     from PIL import Image, ImageDraw
 
@@ -3876,13 +3910,13 @@ def make_batch_grid_tile(image: Any) -> Tuple[Any, Any, Any, float, int, int]:
     return tile, draw, font, scale, paste_x, paste_y
 
 
-def box_rows(value: Any) -> List[List[float]]:
+def box_rows(value: Any) -> list[list[float]]:
     """Return a list of [x1, y1, x2, y2]-style box rows from tensor/list values."""
     safe = json_safe_value(value)
     if not isinstance(safe, list) or not safe:
         return []
     raw_rows = safe if isinstance(safe[0], list) else [safe[index : index + 4] for index in range(0, len(safe), 4)]
-    rows: List[List[float]] = []
+    rows: list[list[float]] = []
     for row in raw_rows:
         if not isinstance(row, list) or len(row) < 4:
             continue
@@ -3893,9 +3927,9 @@ def box_rows(value: Any) -> List[List[float]]:
     return rows
 
 
-def labels_list(value: Any) -> List[int]:
+def labels_list(value: Any) -> list[int]:
     """Return integer labels from tensor/list values."""
-    labels: List[int] = []
+    labels: list[int] = []
     for item in flatten_tensor(value):
         try:
             labels.append(int(item))
@@ -3904,9 +3938,9 @@ def labels_list(value: Any) -> List[int]:
     return labels
 
 
-def scores_list(value: Any) -> List[float]:
+def scores_list(value: Any) -> list[float]:
     """Return float scores from tensor/list values."""
-    scores: List[float] = []
+    scores: list[float] = []
     for item in flatten_tensor(value):
         try:
             scores.append(float(item))
@@ -3917,8 +3951,8 @@ def scores_list(value: Any) -> List[float]:
 
 def prediction_rows_at_min_score(
     result: Mapping[str, Any],
-    min_score: Optional[float] = VALIDATION_PREDICTION_GRID_MIN_SCORE,
-) -> Tuple[List[List[float]], List[int], List[float]]:
+    min_score: float | None = VALIDATION_PREDICTION_GRID_MIN_SCORE,
+) -> tuple[list[list[float]], list[int], list[float]]:
     """Return prediction boxes, labels, and scores whose score passes the grid threshold."""
     boxes = box_rows(result.get("boxes", []))
     labels = labels_list(result.get("labels", []))
@@ -3927,9 +3961,9 @@ def prediction_rows_at_min_score(
         return boxes, labels, scores
 
     threshold = float(min_score)
-    kept_boxes: List[List[float]] = []
-    kept_labels: List[int] = []
-    kept_scores: List[float] = []
+    kept_boxes: list[list[float]] = []
+    kept_labels: list[int] = []
+    kept_scores: list[float] = []
     for index, box in enumerate(boxes):
         if index >= len(scores):
             continue
@@ -3944,8 +3978,8 @@ def prediction_rows_at_min_score(
 
 def normalized_cxcywh_to_xyxy(
     box: Sequence[float],
-    valid_size: Optional[Tuple[float, float]],
-) -> Optional[List[float]]:
+    valid_size: tuple[float, float] | None,
+) -> list[float] | None:
     """Convert RF-DETR normalized cxcywh target boxes to xyxy pixels."""
     if len(box) < 4:
         return None
@@ -3965,10 +3999,10 @@ def normalized_cxcywh_to_xyxy(
     return [x1, y1, x2, y2]
 
 
-def target_boxes_xyxy(target: Mapping[str, Any]) -> List[List[float]]:
+def target_boxes_xyxy(target: Mapping[str, Any]) -> list[list[float]]:
     """Return RF-DETR target boxes as xyxy pixels in target.size coordinates."""
     valid_size = size_hw(target.get("size")) or size_hw(target.get("orig_size"))
-    boxes: List[List[float]] = []
+    boxes: list[list[float]] = []
     for box in box_rows(target.get("boxes", [])):
         converted = normalized_cxcywh_to_xyxy(box, valid_size)
         if converted is not None:
@@ -3981,13 +4015,13 @@ def draw_boxes_on_tile(
     font: Any,
     boxes: Sequence[Sequence[float]],
     labels: Sequence[int],
-    scores: Optional[Sequence[float]],
-    source_size: Optional[Tuple[float, float]],
-    valid_size: Optional[Tuple[float, float]],
+    scores: Sequence[float] | None,
+    source_size: tuple[float, float] | None,
+    valid_size: tuple[float, float] | None,
     scale: float,
     paste_x: int,
     paste_y: int,
-    color: Tuple[int, int, int],
+    color: tuple[int, int, int],
 ) -> None:
     """Draw boxes in source coordinates onto a model-input tile."""
     source_h, source_w = source_size or valid_size or (1.0, 1.0)
@@ -4019,8 +4053,8 @@ def draw_boxes_on_tile(
 def draw_validation_predictions_on_tile(
     image: Any,
     result: Mapping[str, Any],
-    source_size: Optional[Tuple[float, float]],
-    valid_size: Optional[Tuple[float, float]],
+    source_size: tuple[float, float] | None,
+    valid_size: tuple[float, float] | None,
     min_score: float = VALIDATION_PREDICTION_GRID_MIN_SCORE,
 ) -> Any:
     """Draw one validation prediction result onto a fixed-size tile."""
@@ -4046,13 +4080,18 @@ def draw_validation_predictions_on_tile(
 def draw_target_labels_on_tile(
     image: Any,
     target: Mapping[str, Any],
-    valid_size: Optional[Tuple[float, float]] = None,
-    color: Tuple[int, int, int] = (37, 99, 235),
+    valid_size: tuple[float, float] | None = None,
+    color: tuple[int, int, int] = (37, 99, 235),
 ) -> Any:
     """Draw one RF-DETR target label set onto a fixed-size tile."""
     tile, draw, font, scale, paste_x, paste_y = make_batch_grid_tile(image)
-    valid_size = valid_size or size_hw(target.get("size")) or size_hw(target.get("orig_size")) or (float(image.height), float(image.width))
-    boxes: List[List[float]] = []
+    valid_size = (
+        valid_size
+        or size_hw(target.get("size"))
+        or size_hw(target.get("orig_size"))
+        or (float(image.height), float(image.width))
+    )
+    boxes: list[list[float]] = []
     for box in box_rows(target.get("boxes", [])):
         converted = normalized_cxcywh_to_xyxy(box, valid_size)
         if converted is not None:
@@ -4073,7 +4112,7 @@ def draw_target_labels_on_tile(
     return tile
 
 
-def make_batch_grid_canvas() -> Tuple[Any, Any]:
+def make_batch_grid_canvas() -> tuple[Any, Any]:
     """Create a 3x3 batch grid canvas."""
     from PIL import Image, ImageDraw
 
@@ -4094,7 +4133,9 @@ def save_batch_label_grid(batch: Any, output_dir: Path, path_name: str, caption_
     output_dir.mkdir(parents=True, exist_ok=True)
     canvas, draw = make_batch_grid_canvas()
     row_height = BATCH_GRID_TILE_SIZE + BATCH_GRID_CAPTION_HEIGHT
-    for sample_index, (single_image, target) in enumerate(zip(tensors[:BATCH_GRID_MAX_ITEMS], targets[:BATCH_GRID_MAX_ITEMS])):
+    for sample_index, (single_image, target) in enumerate(
+        zip(tensors[:BATCH_GRID_MAX_ITEMS], targets[:BATCH_GRID_MAX_ITEMS])
+    ):
         col = sample_index % BATCH_GRID_COLUMNS
         row = sample_index // BATCH_GRID_COLUMNS
         x0 = col * BATCH_GRID_TILE_SIZE
@@ -4120,7 +4161,9 @@ def save_validation_label_grid(batch: Any, output_dir: Path, batch_idx: int) -> 
     return save_batch_label_grid(batch, output_dir, f"val_batch{batch_idx}_labels.jpg", f"val labels batch={batch_idx}")
 
 
-def save_validation_prediction_grid(batch: Any, outputs: Mapping[str, Any], output_dir: Path, batch_idx: int) -> Optional[Path]:
+def save_validation_prediction_grid(
+    batch: Any, outputs: Mapping[str, Any], output_dir: Path, batch_idx: int
+) -> Path | None:
     """Render one validation batch prediction grid and overwrite its fixed output path."""
     results = outputs.get("results") if isinstance(outputs, Mapping) else None
     if results is None:
@@ -4130,7 +4173,9 @@ def save_validation_prediction_grid(batch: Any, outputs: Mapping[str, Any], outp
     output_dir.mkdir(parents=True, exist_ok=True)
     canvas, draw = make_batch_grid_canvas()
     row_height = BATCH_GRID_TILE_SIZE + BATCH_GRID_CAPTION_HEIGHT
-    for sample_index, (single_image, result, target) in enumerate(zip(tensors[:BATCH_GRID_MAX_ITEMS], results[:BATCH_GRID_MAX_ITEMS], targets[:BATCH_GRID_MAX_ITEMS])):
+    for sample_index, (single_image, result, target) in enumerate(
+        zip(tensors[:BATCH_GRID_MAX_ITEMS], results[:BATCH_GRID_MAX_ITEMS], targets[:BATCH_GRID_MAX_ITEMS])
+    ):
         col = sample_index % BATCH_GRID_COLUMNS
         row = sample_index // BATCH_GRID_COLUMNS
         x0 = col * BATCH_GRID_TILE_SIZE
@@ -4140,7 +4185,11 @@ def save_validation_prediction_grid(batch: Any, outputs: Mapping[str, Any], outp
         valid_size = size_hw(target.get("size")) if isinstance(target, Mapping) else None
         tile = draw_validation_predictions_on_tile(image, result, source_size, valid_size)
         canvas.paste(tile, (x0, y0))
-        draw.text((x0 + 6, y0 + BATCH_GRID_TILE_SIZE + 6), f"val pred batch={batch_idx} item={sample_index}", fill=(20, 20, 20))
+        draw.text(
+            (x0 + 6, y0 + BATCH_GRID_TILE_SIZE + 6),
+            f"val pred batch={batch_idx} item={sample_index}",
+            fill=(20, 20, 20),
+        )
     path = output_dir / f"val_batch{batch_idx}_pred.jpg"
     canvas.save(path, quality=92)
     return path
@@ -4183,11 +4232,13 @@ class TrainBatchGridCallback(Callback):
 class ValidationPredictionGridCallback(Callback):
     """Refresh top-level validation label and prediction grid images after each validation."""
 
-    def __init__(self, output_dir: Path, verbose: bool, max_batches: int = VALIDATION_PREDICTION_GRID_MAX_BATCHES) -> None:
+    def __init__(
+        self, output_dir: Path, verbose: bool, max_batches: int = VALIDATION_PREDICTION_GRID_MAX_BATCHES
+    ) -> None:
         self.output_dir = output_dir
         self.verbose = verbose
         self.max_batches = max(0, int(max_batches))
-        self.saved_paths: List[Path] = []
+        self.saved_paths: list[Path] = []
         self.error_reported = False
 
     def on_validation_epoch_start(self, trainer: Any, pl_module: Any) -> None:
@@ -4240,7 +4291,7 @@ class ValidationPredictionGridCallback(Callback):
             )
 
 
-def parse_device_to_trainer_kwargs(device: Optional[str]) -> Dict[str, Any]:
+def parse_device_to_trainer_kwargs(device: str | None) -> dict[str, Any]:
     """Parse CPU/GPU device strings into PyTorch Lightning kwargs."""
     if device is None or str(device).strip().lower() in {"", "auto"}:
         return {}
@@ -4294,7 +4345,9 @@ def strategy_allows_find_unused_override(value: Any) -> bool:
     return value.strip().lower() in {"", "auto", "ddp"}
 
 
-def apply_multigpu_ddp_strategy(config: Mapping[str, Any], trainer_kwargs: MutableMapping[str, Any], verbose: bool) -> None:
+def apply_multigpu_ddp_strategy(
+    config: Mapping[str, Any], trainer_kwargs: MutableMapping[str, Any], verbose: bool
+) -> None:
     """Use DDP unused-parameter detection for RF-DETR multi-GPU training unless explicitly overridden."""
     explicit_trainer_strategy = trainer_kwargs.get("strategy")
     train_strategy = config.get("train", {}).get("strategy", "auto")
@@ -4341,7 +4394,7 @@ def apply_validation_interval_to_trainer_kwargs(
         blue(f"Lightning validation loader will run every {interval} epoch(s).", verbose)
 
 
-def flatten_tensor(value: Any) -> List[Any]:
+def flatten_tensor(value: Any) -> list[Any]:
     """Return a 1-D Python list from a scalar/list/tensor-like value."""
     safe = json_safe_value(value)
     if isinstance(safe, list):
@@ -4365,7 +4418,7 @@ def scalar_metric(metrics: Mapping[str, Any], key: str, default: float = 0.0) ->
     return result if math.isfinite(result) else default
 
 
-def cat_id_to_name_from_dataset(dataset: Any, datamodule: Any) -> Dict[int, str]:
+def cat_id_to_name_from_dataset(dataset: Any, datamodule: Any) -> dict[int, str]:
     """Build an O(1) class-id to class-name lookup table."""
     coco = getattr(dataset, "coco", None)
     if coco is not None and hasattr(coco, "cats"):
@@ -4376,14 +4429,13 @@ def cat_id_to_name_from_dataset(dataset: Any, datamodule: Any) -> Dict[int, str]
     return {index: str(name) for index, name in enumerate(names)}
 
 
-def build_eval_dataloader(datamodule: Any, model_config: Any, train_config: Any, split: str) -> Tuple[Any, Any]:
+def build_eval_dataloader(datamodule: Any, model_config: Any, train_config: Any, split: str) -> tuple[Any, Any]:
     """Build an evaluation dataloader for a specific split."""
     import torch
-    from torch.utils.data import DataLoader
-
     from rfdetr._namespace import build_namespace
     from rfdetr.datasets import build_dataset
     from rfdetr.utilities.tensors import collate_fn
+    from torch.utils.data import DataLoader
 
     dataset = build_dataset(split, build_namespace(model_config, train_config), model_config.resolution)
     num_workers = int(getattr(train_config, "num_workers", 2) or 2)
@@ -4424,7 +4476,7 @@ class RFDETRLightningPredictor:
         self,
         images: Any,
         threshold: float = 0.5,
-        shape: Optional[Tuple[int, int]] = None,
+        shape: tuple[int, int] | None = None,
         **_: Any,
     ) -> Any:
         """Predict boxes for PIL/path/numpy/tensor inputs."""
@@ -4437,15 +4489,16 @@ class RFDETRLightningPredictor:
         image_list = [images] if single else images
         pil_images = []
         for image in image_list:
-            if isinstance(image, str):
-                image = Image.open(image)
-            elif isinstance(image, Path):
+            if isinstance(image, (str, Path)):
                 image = Image.open(image)
             elif isinstance(image, np.ndarray):
                 image = Image.fromarray(image.astype(np.uint8))
             pil_images.append(image.convert("RGB") if hasattr(image, "convert") else image)
 
-        resize_to = shape or (int(getattr(self.model_config, "resolution", 560)), int(getattr(self.model_config, "resolution", 560)))
+        resize_to = shape or (
+            int(getattr(self.model_config, "resolution", 560)),
+            int(getattr(self.model_config, "resolution", 560)),
+        )
         tensors = []
         orig_sizes = []
         for image in pil_images:
@@ -4483,7 +4536,7 @@ def periodic_test_mode(periodic: Mapping[str, Any]) -> str:
     return shared_modes.canonical_test_mode({"test_mode": mode_cfg})
 
 
-def normalize_rfdetr_test_settings(merged_config: Mapping[str, Any], section: str = "periodic_test") -> Dict[str, Any]:
+def normalize_rfdetr_test_settings(merged_config: Mapping[str, Any], section: str = "periodic_test") -> dict[str, Any]:
     """Normalize periodic or standalone RF-DETR test settings into one shape."""
     source = dict(merged_config.get(section, {}) or {})
     model = merged_config.get("model", {})
@@ -4520,9 +4573,9 @@ def normalize_rfdetr_test_settings(merged_config: Mapping[str, Any], section: st
     }
 
 
-def resolve_eval_dataset_config(train_config: Any, split: str) -> Dict[str, Any]:
+def resolve_eval_dataset_config(train_config: Any, split: str) -> dict[str, Any]:
     """Build evaluator dataset config from an RF-DETR-readable dataset directory."""
-    dataset_dir = Path(str(getattr(train_config, "dataset_dir"))).expanduser()
+    dataset_dir = Path(str(train_config.dataset_dir)).expanduser()
     split_aliases = {
         "val": ["valid", "val"],
         "valid": ["valid", "val"],
@@ -4540,16 +4593,22 @@ def resolve_eval_dataset_config(train_config: Any, split: str) -> Dict[str, Any]
     for name in DATA_YAML_NAMES:
         data_yaml = dataset_dir / name
         if data_yaml.exists():
-            return {"format": "yolo", "data_yaml": str(data_yaml), "split": "val" if split in {"valid", "validation"} else split}
-    raise FileNotFoundError(f"Could not find COCO annotations or data.yaml for RF-DETR split={split!r} in {dataset_dir}.")
+            return {
+                "format": "yolo",
+                "data_yaml": str(data_yaml),
+                "split": "val" if split in {"valid", "validation"} else split,
+            }
+    raise FileNotFoundError(
+        f"Could not find COCO annotations or data.yaml for RF-DETR split={split!r} in {dataset_dir}."
+    )
 
 
-def normalize_category_remapping(value: Mapping[Any, Any]) -> Dict[int, int]:
+def normalize_category_remapping(value: Mapping[Any, Any]) -> dict[int, int]:
     """Normalize model label to dataset category-id remapping keys and values."""
     return {int(key): int(remapped) for key, remapped in value.items()}
 
 
-def infer_rfdetr_category_remapping(merged_config: Mapping[str, Any], dataset_cfg: Mapping[str, Any]) -> Dict[int, int]:
+def infer_rfdetr_category_remapping(merged_config: Mapping[str, Any], dataset_cfg: Mapping[str, Any]) -> dict[int, int]:
     """Map RF-DETR contiguous output labels back to evaluator dataset category ids."""
     explicit = merged_config.get("model", {}).get("category_remapping")
     if explicit is False:
@@ -4575,7 +4634,7 @@ def build_rfdetr_evaluator_config(
     output_dir: Path,
     split: str,
     test_section: str = "periodic_test",
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Build shared evaluator config for RF-DETR tests."""
     test_settings = normalize_rfdetr_test_settings(merged_config, test_section)
     mode = periodic_test_mode(test_settings)
@@ -4599,7 +4658,9 @@ def build_rfdetr_evaluator_config(
     }
     sahi_cfg.update(test_settings.get("sahi", {}) or {})
     dataset_cfg = resolve_eval_dataset_config(train_config, split)
-    dataset_cfg.update({"include_empty_images": True, "sort_images": True, "max_images": test_settings.get("max_images")})
+    dataset_cfg.update(
+        {"include_empty_images": True, "sort_images": True, "max_images": test_settings.get("max_images")}
+    )
     category_remapping = infer_rfdetr_category_remapping(merged_config, dataset_cfg)
     visual_cfg = dict(test_settings.get("visual_samples", {}) or {})
     visual_max_images = visual_cfg.get("max_images")
@@ -4617,7 +4678,11 @@ def build_rfdetr_evaluator_config(
             "banner": "RF-DETR TEST EVALUATION",
             "seed": int(merged_config.get("runtime", {}).get("seed", 0) or 0),
         },
-        "inference": {"mode": mode, "use_sahi": mode == shared_modes.SAHI_MODE, "batch_size": int(test_settings.get("batch_size", 4) or 4)},
+        "inference": {
+            "mode": mode,
+            "use_sahi": mode == shared_modes.SAHI_MODE,
+            "batch_size": int(test_settings.get("batch_size", 4) or 4),
+        },
         "test_mode": {"mode": mode},
         "dataset": dataset_cfg,
         "model": {
@@ -4692,7 +4757,7 @@ def write_rfdetr_evaluator_aliases(output_dir: Path, result: Mapping[str, Any]) 
     write_rows(output_dir / "test_metrics.csv", metric_rows, METRIC_FIELDS)
     per_class = list(result.get("per_class", []) or [])
     if per_class:
-        fields = sorted({key for row in per_class for key in row.keys()})
+        fields = sorted({key for row in per_class for key in row})
         write_json(output_dir / "test_per_class_metrics.json", per_class)
         write_rows(output_dir / "test_per_class_metrics.csv", per_class, fields)
 
@@ -4706,25 +4771,35 @@ def run_rfdetr_shared_evaluation(
     event: str,
     metadata: Mapping[str, Any],
     merged_config: Mapping[str, Any],
-    source_config: Optional[Path],
+    source_config: Path | None,
     verbose: bool,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Run RF-DETR test through the shared image-level evaluator."""
     from projects.object_detection_dataset_evaluator.object_detection_dataset_evaluator import run_evaluation
 
     evaluator_config = build_rfdetr_evaluator_config(merged_config, model_config, train_config, output_dir, split)
     predictor = RFDETRLightningPredictor(pl_module, model_config)
-    result = run_evaluation(evaluator_config, source_config or DEFAULT_CONFIG, prebuilt_model=predictor, print_summary=False)
+    result = run_evaluation(
+        evaluator_config, source_config or DEFAULT_CONFIG, prebuilt_model=predictor, print_summary=False
+    )
     write_rfdetr_evaluator_aliases(output_dir, result)
     dump_config_snapshot(
         output_dir=output_dir,
         merged_config=merged_config,
-        metadata={**dict(metadata), "event": event, "split": split, "output_dir": str(output_dir), "shared_evaluator": True},
+        metadata={
+            **dict(metadata),
+            "event": event,
+            "split": split,
+            "output_dir": str(output_dir),
+            "shared_evaluator": True,
+        },
         source_config=source_config,
         train_config=train_config,
         model_config=model_config,
     )
-    blue(f"{event} {periodic_test_mode(merged_config.get('periodic_test', {}))} metrics saved to {output_dir}.", verbose)
+    blue(
+        f"{event} {periodic_test_mode(merged_config.get('periodic_test', {}))} metrics saved to {output_dir}.", verbose
+    )
     return {
         "event": event,
         "split": split,
@@ -4735,10 +4810,9 @@ def run_rfdetr_shared_evaluation(
     }
 
 
-def compute_f1_by_class(f1_local: Dict[int, Dict[str, Any]]) -> Tuple[Dict[str, float], Dict[int, Dict[str, float]]]:
+def compute_f1_by_class(f1_local: dict[int, dict[str, Any]]) -> tuple[dict[str, float], dict[int, dict[str, float]]]:
     """Compute macro F1/precision/recall and per-class values from matching data."""
     import numpy as np
-
     from rfdetr.evaluation.f1_sweep import sweep_confidence_thresholds
 
     if not f1_local:
@@ -4748,13 +4822,16 @@ def compute_f1_by_class(f1_local: Dict[int, Dict[str, Any]]) -> Tuple[Dict[str, 
     classes_with_gt = [i for i, cid in enumerate(sorted_ids) if f1_local[cid]["total_gt"] > 0]
     if not classes_with_gt:
         return {"F1": 0.0, "Precision": 0.0, "Recall": 0.0}, {}
-    best = max(sweep_confidence_thresholds(per_class_list, np.linspace(0, 1, 101), classes_with_gt), key=lambda row: row["macro_f1"])
+    best = max(
+        sweep_confidence_thresholds(per_class_list, np.linspace(0, 1, 101), classes_with_gt),
+        key=lambda row: row["macro_f1"],
+    )
     overall = {
         "F1": float(best["macro_f1"]),
         "Precision": float(best["macro_precision"]),
         "Recall": float(best["macro_recall"]),
     }
-    per_class: Dict[int, Dict[str, float]] = {}
+    per_class: dict[int, dict[str, float]] = {}
     for index, class_id in enumerate(sorted_ids):
         per_class[class_id] = {
             "f1": float(best["per_class_f1"][index]),
@@ -4775,16 +4852,15 @@ def manual_test_evaluation(
     event: str,
     metadata: Mapping[str, Any],
     merged_config: Mapping[str, Any],
-    source_config: Optional[Path],
+    source_config: Path | None,
     verbose: bool,
     progress_bar: bool,
     inference_runtime: Any = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Run a single-process RF-DETR test evaluation and write metrics.
 
-    ``inference_runtime`` is reserved for the standalone test entrypoint.  When
-    supplied, raw batches run through the selected FP32/BF16/TensorRT backend;
-    scheduled and final training evaluations keep the original Lightning path.
+    ``inference_runtime`` is reserved for the standalone test entrypoint. When supplied, raw batches run through the
+    selected FP32/BF16/TensorRT backend; scheduled and final training evaluations keep the original Lightning path.
     """
     periodic = merged_config.get("periodic_test", {})
     segmentation = bool(getattr(model_config, "segmentation_head", False))
@@ -4810,10 +4886,9 @@ def manual_test_evaluation(
         )
 
     import torch
-    from torchmetrics.detection import MeanAveragePrecision
-
     from rfdetr.evaluation.matching import build_matching_data, init_matching_accumulator, merge_matching_data
     from rfdetr.training.callbacks.coco_eval import COCOEvalCallback
+    from torchmetrics.detection import MeanAveragePrecision
 
     output_dir.mkdir(parents=True, exist_ok=True)
     blue(f"Running {event} evaluation on split={split}.", verbose)
@@ -4827,7 +4902,9 @@ def manual_test_evaluation(
         max_detection_thresholds=[1, 10, max_dets],
         backend="faster_coco_eval",
     )
-    converter = COCOEvalCallback(max_dets=max_dets, segmentation=segmentation, eval_interval=1, log_per_class_metrics=True)
+    converter = COCOEvalCallback(
+        max_dets=max_dets, segmentation=segmentation, eval_interval=1, log_per_class_metrics=True
+    )
     f1_local = init_matching_accumulator()
     using_inference_runtime = inference_runtime is not None
     if using_inference_runtime:
@@ -4860,15 +4937,12 @@ def manual_test_evaluation(
                 samples, targets = batch
                 samples = samples.to(device)
                 targets = [
-                    {
-                        key: value.to(device) if torch.is_tensor(value) else value
-                        for key, value in target.items()
-                    }
+                    {key: value.to(device) if torch.is_tensor(value) else value for key, value in target.items()}
                     for target in targets
                 ]
                 if str(getattr(inference_runtime, "backend", "pytorch")) == "tensorrt":
                     tensors = samples.tensors
-                    expected_resolution = int(getattr(model_config, "resolution"))
+                    expected_resolution = int(model_config.resolution)
                     if tensors.shape[-2:] != (expected_resolution, expected_resolution):
                         raise ValueError(
                             "TensorRT segmentation evaluation requires fixed square inputs at the model "
@@ -4928,7 +5002,7 @@ def manual_test_evaluation(
     raw_metrics = map_metric.compute()
     pfx = "bbox_" if segmentation else ""
     mar_key = f"{pfx}mar_{max_dets}"
-    overall: Dict[str, float] = {
+    overall: dict[str, float] = {
         "mAP_50_95": scalar_metric(raw_metrics, f"{pfx}map"),
         "mAP_50": scalar_metric(raw_metrics, f"{pfx}map_50"),
         "mAP_75": scalar_metric(raw_metrics, f"{pfx}map_75"),
@@ -4944,7 +5018,7 @@ def manual_test_evaluation(
     ap_values = [float(item) for item in flatten_tensor(raw_metrics.get(f"{pfx}map_per_class", []))]
     ar_values = [float(item) for item in flatten_tensor(raw_metrics.get(f"{pfx}mar_{max_dets}_per_class", []))]
     ar_by_class = {class_id: ar_values[index] for index, class_id in enumerate(class_ids) if index < len(ar_values)}
-    per_class_rows: List[Dict[str, Any]] = []
+    per_class_rows: list[dict[str, Any]] = []
     for index, class_id in enumerate(class_ids):
         ap_value = ap_values[index] if index < len(ap_values) else float("nan")
         ar_value = ar_by_class.get(class_id, float("nan"))
@@ -4974,11 +5048,7 @@ def manual_test_evaluation(
         "raw_torchmetrics": json_safe_value(raw_metrics),
     }
     if using_inference_runtime:
-        timed_total = (
-            standalone_preprocess_seconds
-            + standalone_forward_seconds
-            + standalone_postprocess_seconds
-        )
+        timed_total = standalone_preprocess_seconds + standalone_forward_seconds + standalone_postprocess_seconds
         payload["stage_timing"] = {
             "images_or_frames": standalone_image_count,
             "total_seconds": timed_total,
@@ -5015,7 +5085,7 @@ class PeriodicManualTestCallback(Callback):
     def __init__(
         self,
         merged_config: Mapping[str, Any],
-        source_config: Optional[Path],
+        source_config: Path | None,
         output_dir: Path,
         model_config: Any,
         train_config: Any,
@@ -5043,9 +5113,7 @@ class PeriodicManualTestCallback(Callback):
         by_minutes = float(periodic.get("test_interval_minutes") or 0.0)
         if by_epoch > 0 and epoch_number % by_epoch == 0:
             return True
-        if by_minutes > 0 and (time.monotonic() - self.last_test_time) >= by_minutes * 60.0:
-            return True
-        return False
+        return bool(by_minutes > 0 and time.monotonic() - self.last_test_time >= by_minutes * 60.0)
 
     def on_train_epoch_end(self, trainer: Any, pl_module: Any) -> None:
         """Run test evaluation at configured intervals."""
@@ -5054,7 +5122,10 @@ class PeriodicManualTestCallback(Callback):
         world_size = int(getattr(trainer, "world_size", 1) or 1)
         if world_size > 1:
             if not self.ddp_skip_reported:
-                blue("Scheduled test is skipped during multi-process training; final test still runs after fit.", self.verbose)
+                blue(
+                    "Scheduled test is skipped during multi-process training; final test still runs after fit.",
+                    self.verbose,
+                )
                 self.ddp_skip_reported = True
             return
         epoch_number = int(getattr(trainer, "current_epoch", -1)) + 1
@@ -5094,7 +5165,7 @@ class PeriodicManualTestCallback(Callback):
             self.tested_epochs.add(epoch_number)
 
 
-def load_best_checkpoint_if_available(pl_module: Any, output_dir: Path, verbose: bool) -> Optional[Path]:
+def load_best_checkpoint_if_available(pl_module: Any, output_dir: Path, verbose: bool) -> Path | None:
     """Load RF-DETR best-total weights into the live module when available."""
     import torch
 
@@ -5115,10 +5186,10 @@ def load_best_checkpoint_if_available(pl_module: Any, output_dir: Path, verbose:
 def validate_requirements(
     config: Mapping[str, Any],
     output_dir: Path,
-    dataset_plan: Optional[Mapping[str, Any]] = None,
-) -> List[str]:
+    dataset_plan: Mapping[str, Any] | None = None,
+) -> list[str]:
     """Return warnings for ambiguous or risky settings."""
-    warnings: List[str] = []
+    warnings: list[str] = []
     dataset = config.get("dataset", {})
     train = config.get("train", {})
     periodic = config.get("periodic_test", {})
@@ -5145,7 +5216,11 @@ def validate_requirements(
         warnings.append(f"dataset.dataset_dir does not exist on this machine: {dataset_dir}")
     if int(train.get("eval_interval") or 1) < 1:
         warnings.append("train.eval_interval must be >= 1 for RF-DETR.")
-    if periodic.get("enabled", True) and not periodic.get("test_interval_epochs") and not periodic.get("test_interval_minutes"):
+    if (
+        periodic.get("enabled", True)
+        and not periodic.get("test_interval_epochs")
+        and not periodic.get("test_interval_minutes")
+    ):
         warnings.append("periodic_test.enabled=true but no interval is configured; only final test can run.")
     if periodic.get("enabled", True) and "," in str(train.get("device", "")):
         warnings.append("Scheduled in-fit test is skipped for multi-GPU training; final test still runs.")
@@ -5163,7 +5238,9 @@ def validate_requirements(
         not (dataset_plan and dataset_plan.get("action") == "prepare_cache")
         and str(train.get("dataset_file", "roboflow")) != "roboflow"
     ):
-        warnings.append("For RF-DETR test split support, dataset_file=roboflow is recommended because it auto-detects COCO/YOLO.")
+        warnings.append(
+            "For RF-DETR test split support, dataset_file=roboflow is recommended because it auto-detects COCO/YOLO."
+        )
     if output_dir.exists() and not bool(config.get("output", {}).get("exist_ok", False)):
         warnings.append(f"output directory already exists and output.exist_ok=false: {output_dir}")
     if str(normalized_model_size).startswith("seg-"):
@@ -5173,7 +5250,9 @@ def validate_requirements(
             warnings.append(str(exc))
             mode = shared_modes.FULL_IMAGE_MODE
         if mode != shared_modes.FULL_IMAGE_MODE:
-            warnings.append("Segmentation mask metrics are available for full_image tests; sahi/class_crop tests evaluate boxes only.")
+            warnings.append(
+                "Segmentation mask metrics are available for full_image tests; sahi/class_crop tests evaluate boxes only."
+            )
     return warnings
 
 
@@ -5186,7 +5265,9 @@ def apply_demo_mode(config: MutableMapping[str, Any], timestamp: str, verbose: b
     output = config.setdefault("output", {})
     periodic = config.setdefault("periodic_test", {})
     train["epochs"] = min(int(train.get("epochs") or demo.get("max_epochs", 2)), int(demo.get("max_epochs", 2)))
-    train["batch_size"] = min(int(train.get("batch_size") or demo.get("max_batch_size", 2)), int(demo.get("max_batch_size", 2)))
+    train["batch_size"] = min(
+        int(train.get("batch_size") or demo.get("max_batch_size", 2)), int(demo.get("max_batch_size", 2))
+    )
     train["grad_accum_steps"] = min(
         int(train.get("grad_accum_steps") or demo.get("max_grad_accum_steps", 1)),
         int(demo.get("max_grad_accum_steps", 1)),
@@ -5343,9 +5424,13 @@ Example usage:
     parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="Path to YAML config.")
     parser.add_argument("--yes", action="store_true", help="Skip interactive confirmation.")
     parser.add_argument("--dry-run", action="store_true", default=None, help="Validate and estimate outputs only.")
-    parser.add_argument("--verbose", dest="verbose", action="store_true", default=None, help="Enable blue wrapper logs.")
+    parser.add_argument(
+        "--verbose", dest="verbose", action="store_true", default=None, help="Enable blue wrapper logs."
+    )
     parser.add_argument("--quiet", dest="verbose", action="store_false", help="Disable blue wrapper logs.")
-    parser.add_argument("--confirm-before-run", type=parse_bool, default=None, help="Ask before heavy output is created.")
+    parser.add_argument(
+        "--confirm-before-run", type=parse_bool, default=None, help="Ask before heavy output is created."
+    )
     parser.add_argument("--demo", action="store_true", default=None, help="Enable demo mode.")
     parser.add_argument("--no-demo", dest="demo", action="store_false", help="Disable demo mode.")
 
@@ -5363,7 +5448,9 @@ Example usage:
     parser.add_argument("--dataset-dir", default=None, help="Dataset root or RF-DETR dataset root.")
     parser.add_argument("--data-yaml", default=None, help="Ultralytics YOLO dataset YAML path.")
     parser.add_argument("--coco-json", default=None, help="COCO JSON annotation file for single-file COCO datasets.")
-    parser.add_argument("--image-dir", default=None, help="Image directory used with --coco-json when image paths are relative.")
+    parser.add_argument(
+        "--image-dir", default=None, help="Image directory used with --coco-json when image paths are relative."
+    )
     parser.add_argument(
         "--dataset-source-format",
         choices=sorted(DATASET_SOURCE_FORMATS),
@@ -5376,21 +5463,40 @@ Example usage:
         default=None,
         help="How to store cache images: auto, hardlink, symlink, junction alias, or copy.",
     )
-    parser.add_argument("--cache-root", default=None, help="Dataset cache root. Relative paths resolve under rf_detr_trainer.")
-    parser.add_argument("--refresh-cache", type=parse_bool, default=None, help="Rebuild the dataset cache even if fingerprint matches.")
-    parser.add_argument("--split-ratio", type=parse_split_ratio_arg, default=None, help="Unsplit data split ratio as train,valid,test, e.g. 8,1,1.")
+    parser.add_argument(
+        "--cache-root", default=None, help="Dataset cache root. Relative paths resolve under rf_detr_trainer."
+    )
+    parser.add_argument(
+        "--refresh-cache", type=parse_bool, default=None, help="Rebuild the dataset cache even if fingerprint matches."
+    )
+    parser.add_argument(
+        "--split-ratio",
+        type=parse_split_ratio_arg,
+        default=None,
+        help="Unsplit data split ratio as train,valid,test, e.g. 8,1,1.",
+    )
     parser.add_argument("--split-seed", type=int, default=None, help="Deterministic split seed for unsplit datasets.")
-    parser.add_argument("--prepared-dir-name", default=None, help="Legacy option retained for old configs; cache conversion ignores it.")
+    parser.add_argument(
+        "--prepared-dir-name", default=None, help="Legacy option retained for old configs; cache conversion ignores it."
+    )
     parser.add_argument(
         "--overwrite-prepared-dataset",
         type=parse_bool,
         default=None,
         help="Legacy option retained for old configs; use --refresh-cache for cache rebuilds.",
     )
-    parser.add_argument("--dataset-file", choices=["roboflow", "coco", "yolo", "o365"], default=None, help="RF-DETR dataset_file.")
-    parser.add_argument("--output-dir", default=None, help="Exact custom output directory. Supports output placeholders.")
-    parser.add_argument("--project", default=None, help="Output root when output-dir is not used. Supports output placeholders.")
-    parser.add_argument("--name", default=None, help="Run name when output-dir is not used. Supports output placeholders.")
+    parser.add_argument(
+        "--dataset-file", choices=["roboflow", "coco", "yolo", "o365"], default=None, help="RF-DETR dataset_file."
+    )
+    parser.add_argument(
+        "--output-dir", default=None, help="Exact custom output directory. Supports output placeholders."
+    )
+    parser.add_argument(
+        "--project", default=None, help="Output root when output-dir is not used. Supports output placeholders."
+    )
+    parser.add_argument(
+        "--name", default=None, help="Run name when output-dir is not used. Supports output placeholders."
+    )
     parser.add_argument("--exist-ok", type=parse_bool, default=None, help="Allow existing output directory.")
 
     parser.add_argument("--device", default=None, help="auto, cpu, cuda, 0, 0,1, cuda:0, mps, or -1.")
@@ -5405,7 +5511,9 @@ Example usage:
     parser.add_argument("--eval-interval", type=int, default=None, help="Run validation metrics every N epochs.")
     parser.add_argument("--early-stopping", type=parse_bool, default=None, help="Enable early stopping.")
     parser.add_argument("--early-stopping-patience", type=int, default=None, help="Early stopping patience.")
-    parser.add_argument("--progress-bar", choices=["tqdm", "rich", "none"], default=None, help="RF-DETR progress bar style.")
+    parser.add_argument(
+        "--progress-bar", choices=["tqdm", "rich", "none"], default=None, help="RF-DETR progress bar style."
+    )
 
     parser.add_argument("--periodic-test", type=parse_bool, default=None, help="Enable scheduled in-training test.")
     parser.add_argument("--test-interval-epochs", type=int, default=None, help="Run test every N epochs.")
@@ -5413,17 +5521,20 @@ Example usage:
     parser.add_argument("--test-split", default=None, help="Dataset split used for scheduled/final test, usually test.")
     parser.add_argument("--final-test", dest="final_test", action="store_true", default=None, help="Run final test.")
     parser.add_argument("--no-final-test", dest="final_test", action="store_false", help="Skip final test.")
-    parser.add_argument("--classwise", dest="classwise", action="store_true", default=None, help="Write per-class metrics.")
+    parser.add_argument(
+        "--classwise", dest="classwise", action="store_true", default=None, help="Write per-class metrics."
+    )
     parser.add_argument("--no-classwise", dest="classwise", action="store_false", help="Skip per-class metrics files.")
-    parser.add_argument("--extra", action="append", default=None, help="Additional RF-DETR TrainConfig key=value. Repeatable.")
+    parser.add_argument(
+        "--extra", action="append", default=None, help="Additional RF-DETR TrainConfig key=value. Repeatable."
+    )
     return parser
 
 
-def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int:
-    """
-    Main entry point for RF-DETR training.
+def _main_impl(timing_context: MutableMapping[str, Any] | None = None) -> int:
+    r"""Main entry point for RF-DETR training.
 
-    Usage:
+    Examples:
       1. Edit config/rf_detr_train.yaml.
       2. Run a dry run:
          uv run python train_rf_detr_model.py --dry-run --yes
@@ -5478,7 +5589,7 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
         if timing_context is not None:
             timing_context["verbose"] = verbose and not distributed_child
         apply_demo_mode(config, timestamp, verbose)
-        child_metadata: Dict[str, Any] = {}
+        child_metadata: dict[str, Any] = {}
         if distributed_child:
             child_metadata = apply_distributed_child_runtime_overrides(config)
         bar.update(1)
@@ -5573,11 +5684,11 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
         rf_model = model_cls(**model_kwargs)
         # Validate stock -> P2 before project-owned modules add their own state.
         # TrackNet is intentionally absent from the official RF-DETR checkpoint.
-        _p2_cfg = config.get('model', {}).get('p2', {}) or {}
-        if bool(_p2_cfg.get('enabled', False)):
+        _p2_cfg = config.get("model", {}).get("p2", {}) or {}
+        if bool(_p2_cfg.get("enabled", False)):
             from rf_detr_p2 import assert_p2_training_checkpoint_compatible
 
-            pretrain_path = getattr(rf_model.model_config, 'pretrain_weights', None)
+            pretrain_path = getattr(rf_model.model_config, "pretrain_weights", None)
             if pretrain_path is not None and Path(str(pretrain_path)).is_file():
                 assert_p2_training_checkpoint_compatible(
                     rf_model.model,
@@ -5637,7 +5748,7 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
                 train_config.resume,
                 build_pitchobjectlab_architecture(config, rf_model.model_config),
             )
-        if bool(_p2_cfg.get('enabled', False)) and train_config.resume:
+        if bool(_p2_cfg.get("enabled", False)) and train_config.resume:
             assert_p2_training_checkpoint_compatible(
                 module.model,
                 train_config.resume,
@@ -5676,8 +5787,7 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
                     "output_dir": str(output_dir),
                     "device": device_value or "auto",
                     "train_batch_grid_files": [
-                        str(output_dir / f"train_batch{index}.jpg")
-                        for index in range(TRAIN_BATCH_GRID_MAX_BATCHES)
+                        str(output_dir / f"train_batch{index}.jpg") for index in range(TRAIN_BATCH_GRID_MAX_BATCHES)
                     ],
                     "validation_label_grid_files": [
                         str(output_dir / f"val_batch{index}_labels.jpg")
@@ -5698,7 +5808,7 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
 
         blue("Starting RF-DETR training.", verbose)
         trainer.fit(module, datamodule, ckpt_path=train_config.resume or None)
-        if bool(getattr(trainer, 'is_global_zero', True)):
+        if bool(getattr(trainer, "is_global_zero", True)):
             enrich_best_checkpoint_metadata(output_dir)
         rf_model.model.model = module.model
         if getattr(datamodule, "class_names", None) is not None:
