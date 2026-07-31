@@ -17,10 +17,8 @@ from pathlib import Path
 from typing import Any, Mapping, MutableMapping, Sequence
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
-
 from rf_detr_motion import (
     MotionModule,
     _find_lwdetr,
@@ -31,17 +29,16 @@ from rf_detr_motion import (
     weighted_heatmap_bce,
 )
 from rf_detr_temporal_data import TemporalBatch, TemporalRFDETRDataModule
-
+from torch import nn
 
 HEATMAP_LOSS_KEY = "loss_tracknet_heatmap"
 
 
 def _box_cxcywh_to_xyxy(boxes: torch.Tensor) -> torch.Tensor:
     """Convert normalized centre-size boxes without torchvision."""
-
-    centre = boxes[..., :2]
+    center = boxes[..., :2]
     half_size = boxes[..., 2:] / 2
-    return torch.cat((centre - half_size, centre + half_size), dim=-1)
+    return torch.cat((center - half_size, center + half_size), dim=-1)
 
 
 def _best_box_iou(
@@ -49,7 +46,6 @@ def _best_box_iou(
     targets: Sequence[Mapping[str, torch.Tensor]],
 ) -> torch.Tensor:
     """Return mean per-image best IoU as a cheap calibration diagnostic."""
-
     predicted = outputs.get("pred_boxes")
     if predicted is None:
         return torch.tensor(0.0)
@@ -83,7 +79,6 @@ def _motion_config(config: Mapping[str, Any]) -> Mapping[str, Any]:
 
 def temporal_data_yaml(config: Mapping[str, Any]) -> Path:
     """Resolve the canonical dataset descriptor used by the temporal loader."""
-
     dataset = config.get("dataset", {})
     if not isinstance(dataset, Mapping):
         raise ValueError("dataset config must be a mapping")
@@ -165,9 +160,7 @@ class TemporalCriterion(nn.Module):
         loss_dict[HEATMAP_LOSS_KEY] = heatmap_loss
         pred_logits = outputs.get("pred_logits")
         top_query_score = (
-            pred_logits.sigmoid().amax()
-            if pred_logits is not None and pred_logits.numel()
-            else logits.new_zeros(())
+            pred_logits.sigmoid().amax() if pred_logits is not None and pred_logits.numel() else logits.new_zeros(())
         )
         self.last_diagnostics = {
             "detector_loss": detector_loss.detach(),
@@ -180,7 +173,6 @@ class TemporalCriterion(nn.Module):
 
 def checkpoint_contains_motion(checkpoint_path: Any) -> bool:
     """Return whether a local RF-DETR checkpoint contains TrackNet tensors."""
-
     if checkpoint_path is None or not str(checkpoint_path).strip():
         return False
     path = Path(str(checkpoint_path)).expanduser()
@@ -200,7 +192,6 @@ def checkpoint_contains_motion(checkpoint_path: Any) -> bool:
 
 def maybe_load_motion_checkpoint(model: nn.Module, checkpoint_path: Any, *, required: bool) -> bool:
     """Restore TrackNet tensors after the module has been attached."""
-
     has_motion = checkpoint_contains_motion(checkpoint_path)
     if not has_motion:
         if required:
@@ -215,7 +206,6 @@ def maybe_load_motion_checkpoint(model: nn.Module, checkpoint_path: Any, *, requ
 
 def build_temporal_model_module(model_config: Any, train_config: Any, config: Mapping[str, Any]) -> Any:
     """Build the upstream Lightning module, then attach instance-local TrackNet."""
-
     from rfdetr.training import RFDETRModelModule
     from rfdetr.training.module_model import compute_multi_scale_scales
 
@@ -295,9 +285,7 @@ def build_temporal_model_module(model_config: Any, train_config: Any, config: Ma
             self._log_tracknet_diagnostics("train", batch_size=len(targets))
             diagnostics = getattr(self.criterion, "last_diagnostics", {})
             if diagnostics:
-                total = diagnostics["detector_loss"] + (
-                    diagnostics["heatmap_loss"] * self.criterion.heatmap_weight
-                )
+                total = diagnostics["detector_loss"] + (diagnostics["heatmap_loss"] * self.criterion.heatmap_weight)
                 self._pitchobjectlab_last_train_diagnostics = {
                     "loss": total.detach(),
                     **{key: value.detach() for key, value in diagnostics.items()},
@@ -333,7 +321,6 @@ def build_temporal_datamodule(
     train_config: Any,
 ) -> TemporalRFDETRDataModule:
     """Construct the project-local complete-window DataModule."""
-
     motion = _motion_config(config)
     temporal = motion.get("temporal", {}) or {}
     focus = motion.get("focus", {}) or {}
@@ -351,12 +338,12 @@ def build_temporal_datamodule(
         max_windows = {"train": max_windows, "val": max_windows, "test": max_windows}
     if not isinstance(max_windows, Mapping):
         raise ValueError("dataset.temporal.max_windows_per_split must be an integer or mapping")
-    block_size = int(getattr(model_config, "patch_size")) * int(getattr(model_config, "num_windows"))
+    block_size = int(model_config.patch_size) * int(model_config.num_windows)
     pin_memory = getattr(train_config, "pin_memory", None)
     return TemporalRFDETRDataModule(
         temporal_data_yaml(config),
-        image_size=int(getattr(model_config, "resolution")),
-        batch_size=int(getattr(train_config, "batch_size")),
+        image_size=int(model_config.resolution),
+        batch_size=int(train_config.batch_size),
         num_workers=int(getattr(train_config, "num_workers", 2)),
         num_frames=int(temporal.get("num_frames", 3)),
         frame_stride=int(temporal.get("frame_stride", 1)),
@@ -410,10 +397,9 @@ def run_temporal_split(
     save_heatmaps: bool = True,
 ) -> dict[str, Any]:
     """Run every complete temporal window and write smoke diagnostics."""
-
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
-    model_config = getattr(rf_model, "model_config")
+    model_config = rf_model.model_config
     test_settings = config.get("test", {}) or {}
     inference_settings = config.get("inference", {}) or {}
     raw_batch_size = test_settings.get("batch_size", inference_settings.get("batch_size", 1))
@@ -489,13 +475,13 @@ def run_temporal_split(
                 frame_diagnostics = []
                 for frame_offset, (frame_target, frame_peaks) in enumerate(zip(frame_targets, sample_peaks)):
                     height, width = heatmaps.shape[-2:]
-                    centres = _window_target_centres(frame_target, height, width)
-                    if centres.numel() == 0:
+                    centers = _window_target_centres(frame_target, height, width)
+                    if centers.numel() == 0:
                         empty_frames += 1
                         if frame_peaks.numel() > 0:
                             empty_false_positive_frames += 1
                     elif frame_peaks.numel() > 0:
-                        distances = torch.cdist(centres, frame_peaks[:, :2])
+                        distances = torch.cdist(centers, frame_peaks[:, :2])
                         centre_errors.extend(distances.min(dim=1).values.detach().cpu().tolist())
                     heatmap_file = None
                     if save_heatmaps:
@@ -505,7 +491,7 @@ def run_temporal_split(
                         {
                             "frame_index": int(metadata["frame_indices"][frame_offset]),
                             "peaks": _tensor_rows(frame_peaks),
-                            "target_centres": _tensor_rows(centres),
+                            "target_centres": _tensor_rows(centers),
                             "heatmap": str(heatmap_file) if heatmap_file else None,
                         }
                     )

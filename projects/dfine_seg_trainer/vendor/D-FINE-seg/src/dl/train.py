@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import collections
 import gc
 import math
@@ -6,7 +8,6 @@ from contextlib import nullcontext
 from copy import deepcopy
 from pathlib import Path
 from shutil import rmtree
-from typing import Dict, List, Tuple
 
 import hydra
 import numpy as np
@@ -14,15 +15,7 @@ import torch
 import wandb
 from loguru import logger
 from omegaconf import DictConfig, OmegaConf
-from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
-from torch.amp import GradScaler, autocast
-from torch.nn import SyncBatchNorm
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.optim.lr_scheduler import OneCycleLR
-from torch.utils.data import DataLoader
-from tqdm import tqdm
-
-from src.d_fine.dfine import build_loss, build_model, build_optimizer
+from src.d_fine.define import build_loss, build_model, build_optimizer
 from src.d_fine.dist_utils import (
     broadcast_scalar,
     cleanup_distributed,
@@ -53,6 +46,13 @@ from src.dl.utils import (
     wandb_logger,
 )
 from src.dl.validator import Validator
+from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+from torch.amp import GradScaler, autocast
+from torch.nn import SyncBatchNorm
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.optim.lr_scheduler import OneCycleLR
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 
 class ModelEMA:
@@ -84,11 +84,7 @@ class Trainer:
         self.cfg = cfg
 
         # Only consider distributed if config says DDP enabled AND process group was initialized
-        self.distributed = (
-            hasattr(cfg.train, "ddp")
-            and cfg.train.ddp.enabled
-            and is_dist_available_and_initialized()
-        )
+        self.distributed = hasattr(cfg.train, "ddp") and cfg.train.ddp.enabled and is_dist_available_and_initialized()
         self.rank = get_rank()
         self.world_size = get_world_size()
         self.is_main = self.rank == 0
@@ -149,9 +145,7 @@ class Trainer:
         if (not self.distributed) or self.is_main:
             log_file.unlink(missing_ok=True)
             logger.add(log_file, format="{message}", level="INFO", rotation="10 MB")
-            logger.info(
-                f"Experiment: {cfg.exp}, Task: {self.task}, Annotations: {self.annotations_format}"
-            )
+            logger.info(f"Experiment: {cfg.exp}, Task: {self.task}, Annotations: {self.annotations_format}")
 
         seed = cfg.train.seed + self.rank if self.distributed else cfg.train.seed
         set_seeds(seed, cfg.train.cudnn_fixed)
@@ -259,26 +253,22 @@ class Trainer:
     @staticmethod
     def preds_postprocess(
         inputs: torch.Tensor,
-        outputs: Dict[str, torch.Tensor],
+        outputs: dict[str, torch.Tensor],
         orig_sizes: torch.Tensor,
         num_labels: int,
         keep_ratio: bool,
         conf_thresh: float,
         num_top_queries: int = 300,
         use_focal_loss: bool = True,
-    ) -> List[Dict[str, torch.Tensor]]:
-        """
-        returns List with BS length. Each element is a dict {"labels", "boxes", "scores"}
-        """
+    ) -> list[dict[str, torch.Tensor]]:
+        """Returns List with BS length. Each element is a dict {"labels", "boxes", "scores"}."""
         logits, boxes = outputs["pred_logits"], outputs["pred_boxes"]
         has_masks = ("pred_masks" in outputs) and (outputs["pred_masks"] is not None)
         pred_masks = outputs["pred_masks"] if has_masks else None  # [B,Q,Hm,Wm]
         B, Q = logits.shape[:2]
 
         # Map boxes back to original size
-        boxes = process_boxes(
-            boxes, inputs.shape[2:], orig_sizes, keep_ratio, inputs.device
-        )  # B x TopQ x 4
+        boxes = process_boxes(boxes, inputs.shape[2:], orig_sizes, keep_ratio, inputs.device)  # B x TopQ x 4
 
         # scores/labels and preliminary topK over all Q*C
         if use_focal_loss:
@@ -337,9 +327,7 @@ class Trainer:
                 )
 
                 # binarize masks
-                out["masks"] = (
-                    (masks_list[0].clamp(0, 1) >= conf_thresh).to(torch.uint8).detach().cpu()
-                )  # [N, H, W]
+                out["masks"] = (masks_list[0].clamp(0, 1) >= conf_thresh).to(torch.uint8).detach().cpu()  # [N, H, W]
 
                 # clean up masks outside of the corresponding bbox
                 out["masks"] = cleanup_masks(out["masks"], out["boxes"])
@@ -359,19 +347,17 @@ class Trainer:
                 keep_ratio,
                 inputs.device,
             )
-            result = dict(labels=lab.detach().cpu(), boxes=box.squeeze(0).detach().cpu())
+            result = {"labels": lab.detach().cpu(), "boxes": box.squeeze(0).detach().cpu()}
 
             # Original res GT polys for eval
             H0 = int(orig_sizes[idx, 0].item())
             W0 = int(orig_sizes[idx, 1].item())
-            polys = targets[idx].get("polys")
+            polys = target.get("polys")
 
             if polys:
                 gt_masks = np.stack(
                     [
-                        poly_abs_to_mask(p, H0, W0)
-                        if getattr(p, "size", 0)
-                        else np.zeros((H0, W0), dtype=np.uint8)
+                        poly_abs_to_mask(p, H0, W0) if getattr(p, "size", 0) else np.zeros((H0, W0), dtype=np.uint8)
                         for p in polys
                     ],
                     axis=0,
@@ -386,10 +372,8 @@ class Trainer:
     @torch.no_grad()
     def get_preds_and_gt(
         self, val_loader: DataLoader
-    ) -> Tuple[List[Dict[str, torch.Tensor]], List[Dict[str, torch.Tensor]]]:
-        """
-        Outputs gt and preds. Each is a List of dicts. 1 dict = 1 image.
-        """
+    ) -> tuple[list[dict[str, torch.Tensor]], list[dict[str, torch.Tensor]]]:
+        """Outputs gt and preds. Each is a List of dicts. 1 dict = 1 image."""
         all_gt, all_preds = [], []
         model = self.model
         if self.ema_model:
@@ -410,15 +394,10 @@ class Trainer:
                     raw_res = model(inputs)
 
                 targets = [
-                    {
-                        k: (v.to(self.device) if (v is not None and hasattr(v, "to")) else v)
-                        for k, v in t.items()
-                    }
+                    {k: (v.to(self.device) if (v is not None and hasattr(v, "to")) else v) for k, v in t.items()}
                     for t in targets
                 ]
-                orig_sizes = (
-                    torch.stack([t["orig_size"] for t in targets], dim=0).float().to(self.device)
-                )
+                orig_sizes = torch.stack([t["orig_size"] for t in targets], dim=0).float().to(self.device)
 
                 gt = self.gt_postprocess(inputs, targets, orig_sizes, self.keep_ratio)
                 preds = self.preds_postprocess(
@@ -450,8 +429,8 @@ class Trainer:
         iou_thresh: float,
         path_to_save: Path,
         extended: bool,
-        mode: str = None,
-    ) -> Dict[str, float]:
+        mode: str | None = None,
+    ) -> dict[str, float]:
         # All ranks perform inference on their portion of the data
         local_gt, local_preds = self.get_preds_and_gt(val_loader=val_loader)
 
@@ -502,11 +481,7 @@ class Trainer:
 
         # mean from chosen metrics
         decision_metric = np.mean(
-            [
-                metrics[metric_name]
-                for metric_name in self.decision_metrics
-                if metric_name in metrics
-            ]
+            [metrics[metric_name] for metric_name in self.decision_metrics if metric_name in metrics]
         )
 
         if decision_metric > best_metric:
@@ -534,17 +509,14 @@ class Trainer:
         nan_warn_warmup_iters = 100
 
         def optimizer_step(step_scheduler: bool) -> bool:
-            """
-            Clip grads, optimizer step, scheduler step, zero grad, EMA model update.
-            Returns True if optimizer stepped, False if skipped due to non-finite grads.
+            """Clip grads, optimizer step, scheduler step, zero grad, EMA model update. Returns True if optimizer
+            stepped, False if skipped due to non-finite grads.
             """
             nonlocal ema_iter
             if self.amp_enabled:
                 self.scaler.unscale_(self.optimizer)
             max_norm = self.clip_max_norm if self.clip_max_norm else float("inf")
-            total_norm = torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), max_norm, error_if_nonfinite=False
-            )
+            total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm, error_if_nonfinite=False)
 
             if not torch.isfinite(total_norm):
                 self.optimizer.zero_grad()
@@ -580,8 +552,7 @@ class Trainer:
                 return False
             if self.is_main:
                 logger.warning(
-                    f"{max_consecutive_skips} consecutive non-finite steps; "
-                    f"reloading weights from {ckpt_path}"
+                    f"{max_consecutive_skips} consecutive non-finite steps; reloading weights from {ckpt_path}"
                 )
             state = torch.load(ckpt_path, map_location=self.device, weights_only=True)
             target = self.model.module if isinstance(self.model, DDP) else self.model
@@ -594,10 +565,10 @@ class Trainer:
             return True
 
         def force_grad_sync() -> None:
-            """Manually average param grads across DDP ranks. Used as a fallback
-            when an accumulation window's final micro-step was skipped (non-finite
-            loss) so DDP's own all-reduce never fired and earlier no_sync'd grads
-            would otherwise stay un-synced across ranks."""
+            """Manually average param grads across DDP ranks. Used as a fallback when an accumulation window's final
+            micro-step was skipped (non-finite loss) so DDP's own all-reduce never fired and earlier
+            no_sync'd grads would otherwise stay un-synced across ranks.
+            """
             # Coalesce into one collective: flatten all grads into a single buffer,
             # one all_reduce(AVG), then copy results back.
             grads = [p.grad for p in self.model.parameters() if p.grad is not None]
@@ -633,10 +604,7 @@ class Trainer:
 
                 inputs = inputs.to(self.device)
                 targets = [
-                    {
-                        k: (v.to(self.device) if (v is not None and hasattr(v, "to")) else v)
-                        for k, v in t.items()
-                    }
+                    {k: (v.to(self.device) if (v is not None and hasattr(v, "to")) else v) for k, v in t.items()}
                     for t in targets
                 ]
 
@@ -678,8 +646,7 @@ class Trainer:
                     losses.append(loss.item())
                 elif self.is_main and cur_iter > nan_warn_warmup_iters:
                     logger.warning(
-                        f"Skipping batch at iter {cur_iter} (epoch {epoch}, "
-                        f"batch {batch_idx}): non-finite loss"
+                        f"Skipping batch at iter {cur_iter} (epoch {epoch}, batch {batch_idx}): non-finite loss"
                     )
 
                 if is_accum_boundary:
@@ -750,10 +717,7 @@ class Trainer:
             # persistent_workers pick them up; otherwise forked workers keep
             # running with stale dataset state.
             train_dataset_changed = False
-            if (
-                epoch >= self.epochs - self.no_mosaic_epochs
-                and self.train_loader.dataset.mosaic_prob
-            ):
+            if epoch >= self.epochs - self.no_mosaic_epochs and self.train_loader.dataset.mosaic_prob:
                 self.train_loader.dataset.close_mosaic()
                 train_dataset_changed = True
 
@@ -771,11 +735,7 @@ class Trainer:
             one_epoch_time = time.time() - epoch_start_time
 
             local_stop = False
-            if (
-                self.is_main
-                and self.early_stopping
-                and self.early_stopping_steps >= self.early_stopping
-            ):
+            if self.is_main and self.early_stopping and self.early_stopping_steps >= self.early_stopping:
                 local_stop = True
 
             if self.distributed:
@@ -819,9 +779,7 @@ def main(cfg: DictConfig) -> None:
                 img_size=cfg.train.img_size,
                 in_channels=cfg.train.in_channels,
             )
-            model.load_state_dict(
-                torch.load(Path(cfg.train.path_to_save) / "model.pt", weights_only=True)
-            )
+            model.load_state_dict(torch.load(Path(cfg.train.path_to_save) / "model.pt", weights_only=True))
             if trainer.ema_model:
                 trainer.ema_model.model = model
             else:
@@ -837,9 +795,7 @@ def main(cfg: DictConfig) -> None:
                     cfg=cfg,
                     debug_img_processing=cfg.train.debug_img_processing,
                 )
-                _, val_loader_eval, test_loader_eval = base_loader.build_dataloaders(
-                    distributed=False
-                )
+                _, val_loader_eval, test_loader_eval = base_loader.build_dataloaders(distributed=False)
                 trainer.val_loader = val_loader_eval
                 trainer.test_loader = test_loader_eval
                 trainer.distributed = False  # turn off DDP inside evaluate

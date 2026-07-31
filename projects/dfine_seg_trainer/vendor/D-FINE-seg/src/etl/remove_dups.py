@@ -15,7 +15,7 @@ def run(dir_path: str, remove_dups: bool):
         json.dump(search.result, f)
 
     # read dups
-    with open("dups.json", "r") as f:
+    with open("dups.json") as f:
         data = json.load(f)
 
     print(f"Found {len(data)} dups")
