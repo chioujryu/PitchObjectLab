@@ -8,7 +8,7 @@ import numpy as np
 from pitch_ball_tracker.tracking.tracklet import Tracklet
 
 
-# Deterministic colour palette by track ID
+# Deterministic color palette by track ID
 def _id_color(track_id: int) -> tuple[int, int, int]:
     np.random.seed(track_id * 137 + 42)
     return tuple(int(x) for x in np.random.randint(80, 255, 3))
@@ -26,10 +26,8 @@ class Visualizer:
         self._draw_masks = draw_masks
         self._draw_trails = draw_trails
         self._trail_length = trail_length
-        # track_id → deque of (cx, cy) centre points
-        self._trails: dict[int, deque[tuple[int, int]]] = defaultdict(
-            lambda: deque(maxlen=trail_length)
-        )
+        # track_id → deque of (cx, cy) center points
+        self._trails: dict[int, deque[tuple[int, int]]] = defaultdict(lambda: deque(maxlen=trail_length))
 
     def draw(
         self,
@@ -59,8 +57,7 @@ class Visualizer:
             label = f"ID:{t.track_id} {t.score:.2f}"
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
             cv2.rectangle(out, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
-            cv2.putText(out, label, (x1 + 2, y1 - 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(out, label, (x1 + 2, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
 
             # Motion trail
             if self._draw_trails:
@@ -72,8 +69,7 @@ class Visualizer:
                     cv2.line(out, pts[k - 1], pts[k], c, 2, cv2.LINE_AA)
 
         # Frame counter
-        cv2.putText(out, f"Frame {frame_idx}", (10, 26),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2, cv2.LINE_AA)
+        cv2.putText(out, f"Frame {frame_idx}", (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2, cv2.LINE_AA)
 
         return out
 

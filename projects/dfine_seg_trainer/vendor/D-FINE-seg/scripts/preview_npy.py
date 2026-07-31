@@ -16,6 +16,8 @@ quick action -> run shell script -> /bin/bash absolute/path/to/python /Users/use
 pass input as argument
 """
 
+from __future__ import annotations
+
 import subprocess
 import sys
 import tempfile
@@ -42,7 +44,7 @@ def render(path: Path) -> list[Path]:
 
     outs: list[Path] = []
     stem = path.stem
-    H, W, C = arr.shape
+    _H, _W, C = arr.shape
 
     if C >= 3:
         # First 3 channels = RGB; cv2 writes BGR, so swap.

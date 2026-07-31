@@ -73,11 +73,11 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+from typing import Any, Iterable, Mapping, MutableMapping, Sequence
 
+import colorama
 import numpy as np
 import yaml
-import colorama
 from colorama import Fore, Style
 from PIL import Image, ImageDraw, ImageFont, PngImagePlugin
 from tqdm import tqdm
@@ -89,7 +89,7 @@ REPO_ROOT = PROJECT_DIR.parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from projects.object_detection_common import test_modes as shared_modes  # noqa: E402
+from projects.object_detection_common import test_modes as shared_modes
 
 DEFAULT_CONFIG = PROJECT_DIR / "config" / "object_detection_dataset_evaluate.yaml"
 IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
@@ -124,10 +124,10 @@ class ImageRecord:
 class DatasetBundle:
     """In-memory COCO-compatible dataset plus resolved image paths."""
 
-    images: List[ImageRecord]
-    categories: List[Dict[str, Any]]
-    annotations: List[Dict[str, Any]]
-    coco: Dict[str, Any]
+    images: list[ImageRecord]
+    categories: list[dict[str, Any]]
+    annotations: list[dict[str, Any]]
+    coco: dict[str, Any]
     source_kind: str
 
 
@@ -137,13 +137,10 @@ class ParallelInferenceError(RuntimeError):
     def __init__(self, summary: Mapping[str, Any]) -> None:
         self.summary = dict(summary)
         failed = [
-            assignment
-            for assignment in self.summary.get("assignments", [])
-            if assignment.get("status") == "failed"
+            assignment for assignment in self.summary.get("assignments", []) if assignment.get("status") == "failed"
         ]
         details = "; ".join(
-            f"chunk_id={assignment.get('chunk_id')} device={assignment.get('device')}"
-            for assignment in failed
+            f"chunk_id={assignment.get('chunk_id')} device={assignment.get('device')}" for assignment in failed
         )
         super().__init__(f"Parallel inference failed for {details or 'unknown chunk(s)'}.")
 
@@ -202,7 +199,7 @@ def set_nested(mapping: MutableMapping[str, Any], dotted_key: str, value: Any) -
     target[parts[-1]] = value
 
 
-def load_yaml(path: Path) -> Dict[str, Any]:
+def load_yaml(path: Path) -> dict[str, Any]:
     """Load YAML into a dictionary."""
     with path.open("r", encoding="utf-8") as file:
         loaded = yaml.safe_load(file) or {}
@@ -308,10 +305,10 @@ def template_fragment(value: Any) -> str:
     return sanitize_name(text)
 
 
-def build_template_replacements(config: Mapping[str, Any], extra: Optional[Mapping[str, Any]] = None) -> Dict[str, str]:
+def build_template_replacements(config: Mapping[str, Any], extra: Mapping[str, Any] | None = None) -> dict[str, str]:
     """Build placeholder values from config dot-paths plus unambiguous leaf aliases."""
-    replacements: Dict[str, str] = {}
-    leaf_values: Dict[str, List[Any]] = {}
+    replacements: dict[str, str] = {}
+    leaf_values: dict[str, list[Any]] = {}
 
     def visit(node: Any, prefix: str = "") -> None:
         if isinstance(node, Mapping):
@@ -378,7 +375,7 @@ def normalize_device(value: Any) -> str:
     return text
 
 
-def parse_devices(model_cfg: Mapping[str, Any]) -> List[str]:
+def parse_devices(model_cfg: Mapping[str, Any]) -> list[str]:
     """Return one or more normalized devices."""
     devices = model_cfg.get("devices") or []
     if isinstance(devices, str):
@@ -409,13 +406,11 @@ def resolve_inference_chunk_count(config: Mapping[str, Any], image_count: int) -
         model_cfg = config.get("model", {})
         chunks = len(parse_devices(model_cfg if isinstance(model_cfg, Mapping) else {}))
     if chunks > int(image_count):
-        raise ValueError(
-            f"inference.chunks resolved to {chunks}, but image_count is only {int(image_count)}."
-        )
+        raise ValueError(f"inference.chunks resolved to {chunks}, but image_count is only {int(image_count)}.")
     return chunks
 
 
-def expand_chunk_devices(devices: Sequence[str], chunks: int) -> List[str]:
+def expand_chunk_devices(devices: Sequence[str], chunks: int) -> list[str]:
     """Assign every inference chunk a device in deterministic round-robin order."""
     chunk_count = _positive_inference_chunks(chunks)
     normalized_devices = [normalize_device(device) for device in devices]
@@ -424,7 +419,7 @@ def expand_chunk_devices(devices: Sequence[str], chunks: int) -> List[str]:
     return [normalized_devices[index % len(normalized_devices)] for index in range(chunk_count)]
 
 
-def cuda_index(device: str) -> Optional[int]:
+def cuda_index(device: str) -> int | None:
     """Return the CUDA ordinal from a normalized device string."""
     text = str(device).strip().lower()
     if text == "cuda":
@@ -514,13 +509,13 @@ def call_with_supported_kwargs(func: Any, *args: Any, **kwargs: Any) -> Any:
     return func(*args, **supported)
 
 
-def image_size(path: Path) -> Tuple[int, int]:
+def image_size(path: Path) -> tuple[int, int]:
     """Read image width and height with PIL."""
     with Image.open(path) as image:
         return image.size
 
 
-def normalize_names(names: Any) -> Dict[int, str]:
+def normalize_names(names: Any) -> dict[int, str]:
     """Normalize YOLO names list/dict to {category_id: name}."""
     if isinstance(names, list):
         return {index: str(name) for index, name in enumerate(names)}
@@ -529,12 +524,15 @@ def normalize_names(names: Any) -> Dict[int, str]:
     raise ValueError("Dataset names must be a list or mapping.")
 
 
-def categories_from_names(names: Mapping[int, str]) -> List[Dict[str, Any]]:
+def categories_from_names(names: Mapping[int, str]) -> list[dict[str, Any]]:
     """Create COCO categories from class names."""
-    return [{"id": int(category_id), "name": str(name), "supercategory": "object"} for category_id, name in sorted(names.items())]
+    return [
+        {"id": int(category_id), "name": str(name), "supercategory": "object"}
+        for category_id, name in sorted(names.items())
+    ]
 
 
-def resolve_yolo_root(yolo_cfg: Mapping[str, Any], yaml_path: Optional[Path]) -> Path:
+def resolve_yolo_root(yolo_cfg: Mapping[str, Any], yaml_path: Path | None) -> Path:
     """Resolve the dataset root from a YOLO data YAML."""
     bases = [PROJECT_DIR, REPO_ROOT, Path.cwd()]
     if yaml_path is not None:
@@ -559,10 +557,10 @@ def resolve_split_item(item: Any, root: Path, extra_bases: Sequence[Path]) -> Pa
     return (root / text).expanduser()
 
 
-def list_images_from_source(source: Any, root: Path, extra_bases: Sequence[Path], sort_images: bool) -> List[Path]:
+def list_images_from_source(source: Any, root: Path, extra_bases: Sequence[Path], sort_images: bool) -> list[Path]:
     """Collect images from a YOLO split source folder, text file, or list."""
     if isinstance(source, (list, tuple)):
-        images: List[Path] = []
+        images: list[Path] = []
         for item in source:
             images.extend(list_images_from_source(item, root, extra_bases, sort_images=False))
         return sorted(images) if sort_images else images
@@ -595,7 +593,7 @@ def list_images_from_source(source: Any, root: Path, extra_bases: Sequence[Path]
     raise FileNotFoundError(f"Could not collect images from split source: {source_path}")
 
 
-def replace_images_with_labels(path: Path) -> Optional[Path]:
+def replace_images_with_labels(path: Path) -> Path | None:
     """Infer a YOLO label path by replacing the last images path component with labels."""
     parts = list(path.parts)
     lowered = [part.lower() for part in parts]
@@ -606,7 +604,7 @@ def replace_images_with_labels(path: Path) -> Optional[Path]:
     return Path(*parts).with_suffix(".txt")
 
 
-def infer_label_path(image_path: Path, labels_dir: Optional[Path]) -> Path:
+def infer_label_path(image_path: Path, labels_dir: Path | None) -> Path:
     """Resolve a YOLO label path for an image."""
     if labels_dir is not None:
         direct = labels_dir / f"{image_path.stem}.txt"
@@ -630,7 +628,7 @@ def infer_label_path(image_path: Path, labels_dir: Optional[Path]) -> Path:
     return image_path.with_suffix(".txt")
 
 
-def yolo_line_to_coco_bbox(line: str, width: int, height: int) -> Optional[Tuple[int, List[float], float]]:
+def yolo_line_to_coco_bbox(line: str, width: int, height: int) -> tuple[int, list[float], float] | None:
     """Convert one YOLO label line to COCO category_id, bbox, area."""
     parts = line.strip().split()
     if len(parts) < 5:
@@ -658,8 +656,8 @@ def load_yolo_dataset(config: Mapping[str, Any], output_info: Mapping[str, Any])
     """Load YOLO-format labels and convert them to an in-memory COCO dataset."""
     dataset_cfg = config["dataset"]
     bases = [PROJECT_DIR, REPO_ROOT, Path.cwd()]
-    yolo_cfg: Dict[str, Any]
-    yaml_path: Optional[Path] = None
+    yolo_cfg: dict[str, Any]
+    yaml_path: Path | None = None
 
     data_yaml = str(dataset_cfg.get("data_yaml") or "").strip()
     if data_yaml:
@@ -684,16 +682,22 @@ def load_yolo_dataset(config: Mapping[str, Any], output_info: Mapping[str, Any])
     names = normalize_names(yolo_cfg.get("names") or dataset_cfg.get("names"))
     categories = categories_from_names(names)
     labels_dir_value = str(dataset_cfg.get("labels_dir") or "").strip()
-    labels_dir = resolve_path(labels_dir_value, [root, PROJECT_DIR, REPO_ROOT, Path.cwd()], must_exist=False) if labels_dir_value else None
+    labels_dir = (
+        resolve_path(labels_dir_value, [root, PROJECT_DIR, REPO_ROOT, Path.cwd()], must_exist=False)
+        if labels_dir_value
+        else None
+    )
 
-    image_paths = list_images_from_source(split_source, root, [yaml_path.parent] if yaml_path else [], bool(dataset_cfg.get("sort_images", True)))
+    image_paths = list_images_from_source(
+        split_source, root, [yaml_path.parent] if yaml_path else [], bool(dataset_cfg.get("sort_images", True))
+    )
     max_images = dataset_cfg.get("max_images")
     if max_images is not None:
         image_paths = image_paths[: int(max_images)]
 
     include_empty = bool(dataset_cfg.get("include_empty_images", True))
-    images: List[ImageRecord] = []
-    annotations: List[Dict[str, Any]] = []
+    images: list[ImageRecord] = []
+    annotations: list[dict[str, Any]] = []
     annotation_id = 1
     image_id = 1
 
@@ -702,7 +706,7 @@ def load_yolo_dataset(config: Mapping[str, Any], output_info: Mapping[str, Any])
             raise FileNotFoundError(f"Image does not exist: {path}")
         width, height = image_size(path)
         label_path = infer_label_path(path, labels_dir)
-        image_annotations: List[Dict[str, Any]] = []
+        image_annotations: list[dict[str, Any]] = []
         if label_path.exists():
             for line in label_path.read_text(encoding="utf-8").splitlines():
                 converted = yolo_line_to_coco_bbox(line, width, height)
@@ -727,7 +731,11 @@ def load_yolo_dataset(config: Mapping[str, Any], output_info: Mapping[str, Any])
                 file_name = path.relative_to(root).as_posix()
             except ValueError:
                 file_name = path.name
-            images.append(ImageRecord(image_id=image_id, file_name=file_name, path=str(path.resolve()), width=width, height=height))
+            images.append(
+                ImageRecord(
+                    image_id=image_id, file_name=file_name, path=str(path.resolve()), width=width, height=height
+                )
+            )
             annotations.extend(image_annotations)
             image_id += 1
 
@@ -767,7 +775,9 @@ def load_coco_dataset(config: Mapping[str, Any], output_info: Mapping[str, Any])
     dataset_cfg = config["dataset"]
     bases = [PROJECT_DIR, REPO_ROOT, Path.cwd()]
     coco_json = resolve_path(dataset_cfg.get("coco_json"), bases, must_exist=True)
-    image_dir = resolve_path(dataset_cfg.get("image_dir"), [coco_json.parent, PROJECT_DIR, REPO_ROOT, Path.cwd()], must_exist=True)
+    image_dir = resolve_path(
+        dataset_cfg.get("image_dir"), [coco_json.parent, PROJECT_DIR, REPO_ROOT, Path.cwd()], must_exist=True
+    )
     data = json.loads(coco_json.read_text(encoding="utf-8"))
     selected_images = list(data.get("images", []))
     if bool(dataset_cfg.get("sort_images", True)):
@@ -777,7 +787,7 @@ def load_coco_dataset(config: Mapping[str, Any], output_info: Mapping[str, Any])
         selected_images = selected_images[: int(max_images)]
     selected_ids = {image["id"] for image in selected_images}
 
-    images: List[ImageRecord] = []
+    images: list[ImageRecord] = []
     for image in selected_images:
         path = resolve_coco_image_path(str(image["file_name"]), image_dir, coco_json.parent)
         width = image.get("width")
@@ -794,7 +804,9 @@ def load_coco_dataset(config: Mapping[str, Any], output_info: Mapping[str, Any])
             )
         )
 
-    annotations = [annotation for annotation in data.get("annotations", []) if annotation.get("image_id") in selected_ids]
+    annotations = [
+        annotation for annotation in data.get("annotations", []) if annotation.get("image_id") in selected_ids
+    ]
     categories = list(data.get("categories", []))
     coco = {
         "info": {
@@ -825,7 +837,7 @@ def load_dataset(config: Mapping[str, Any], output_info: Mapping[str, Any]) -> D
     raise ValueError(f"Unsupported dataset.format: {dataset_format}")
 
 
-def prediction_to_clean_coco(prediction: Mapping[str, Any], image_id: int) -> Dict[str, Any]:
+def prediction_to_clean_coco(prediction: Mapping[str, Any], image_id: int) -> dict[str, Any]:
     """Normalize one SAHI COCO prediction to JSON-friendly values."""
     bbox = [float(value) for value in prediction.get("bbox", [0, 0, 0, 0])]
     return {
@@ -837,7 +849,7 @@ def prediction_to_clean_coco(prediction: Mapping[str, Any], image_id: int) -> Di
     }
 
 
-def config_list(value: Any) -> List[Any]:
+def config_list(value: Any) -> list[Any]:
     """Normalize YAML/CLI scalar or sequence values to a flat list."""
     if value is None or value == "":
         return []
@@ -853,10 +865,10 @@ def config_list(value: Any) -> List[Any]:
     return [value]
 
 
-def category_maps(categories: Sequence[Mapping[str, Any]]) -> Tuple[Dict[int, str], Dict[str, int]]:
+def category_maps(categories: Sequence[Mapping[str, Any]]) -> tuple[dict[int, str], dict[str, int]]:
     """Return category id/name lookup maps."""
-    id_to_name: Dict[int, str] = {}
-    name_to_id: Dict[str, int] = {}
+    id_to_name: dict[int, str] = {}
+    name_to_id: dict[str, int] = {}
     for category in categories:
         category_id = int(category["id"])
         name = str(category.get("name", category_id))
@@ -870,11 +882,11 @@ def resolve_category_class_ids(
     class_ids: Any,
     class_names: Any,
     context: str,
-    default_names: Optional[Sequence[str]] = None,
-) -> List[int]:
+    default_names: Sequence[str] | None = None,
+) -> list[int]:
     """Resolve category ids from explicit ids/names with optional football-friendly defaults."""
     id_to_name, name_to_id = category_maps(categories)
-    selected: List[int] = []
+    selected: list[int] = []
     seen = set()
 
     for value in config_list(class_ids):
@@ -906,7 +918,9 @@ def resolve_category_class_ids(
     return selected
 
 
-def resolve_visual_filter_class_ids(categories: Sequence[Mapping[str, Any]], output_cfg: Mapping[str, Any]) -> List[int]:
+def resolve_visual_filter_class_ids(
+    categories: Sequence[Mapping[str, Any]], output_cfg: Mapping[str, Any]
+) -> list[int]:
     """Resolve visual class filters from ids and names."""
     return resolve_category_class_ids(
         categories,
@@ -916,7 +930,9 @@ def resolve_visual_filter_class_ids(categories: Sequence[Mapping[str, Any]], out
     )
 
 
-def resolve_visual_render_class_ids(categories: Sequence[Mapping[str, Any]], output_cfg: Mapping[str, Any]) -> List[int]:
+def resolve_visual_render_class_ids(
+    categories: Sequence[Mapping[str, Any]], output_cfg: Mapping[str, Any]
+) -> list[int]:
     """Resolve classes drawn in visual sample images; empty means draw every class."""
     return resolve_category_class_ids(
         categories,
@@ -926,7 +942,9 @@ def resolve_visual_render_class_ids(categories: Sequence[Mapping[str, Any]], out
     )
 
 
-def resolve_error_case_render_class_ids(categories: Sequence[Mapping[str, Any]], error_cfg: Mapping[str, Any]) -> List[int]:
+def resolve_error_case_render_class_ids(
+    categories: Sequence[Mapping[str, Any]], error_cfg: Mapping[str, Any]
+) -> list[int]:
     """Resolve classes drawn in error-case images; empty means draw every class."""
     return resolve_category_class_ids(
         categories,
@@ -938,11 +956,11 @@ def resolve_error_case_render_class_ids(categories: Sequence[Mapping[str, Any]],
 
 def build_category_presence_index(
     rows: Sequence[Mapping[str, Any]],
-    score_threshold: Optional[float] = None,
-) -> Tuple[Dict[int, set], Dict[int, int]]:
+    score_threshold: float | None = None,
+) -> tuple[dict[int, set], dict[int, int]]:
     """Build image_id -> category set/count indexes in one pass."""
-    category_sets: Dict[int, set] = {}
-    counts: Dict[int, int] = {}
+    category_sets: dict[int, set] = {}
+    counts: dict[int, int] = {}
     for row in rows:
         if score_threshold is not None and float(row.get("score", 1.0)) < score_threshold:
             continue
@@ -957,7 +975,7 @@ def class_filter_matches(present_ids: set, required_ids: Sequence[int], mode: st
     """Return whether an image category set matches the requested class filter."""
     if not required_ids:
         return True
-    required = set(int(category_id) for category_id in required_ids)
+    required = {int(category_id) for category_id in required_ids}
     if mode == "all":
         return required.issubset(present_ids)
     return bool(required.intersection(present_ids))
@@ -976,7 +994,7 @@ def select_visual_images(
     dataset: DatasetBundle,
     predictions: Sequence[Mapping[str, Any]],
     config: Mapping[str, Any],
-) -> Tuple[List[ImageRecord], Dict[str, Any]]:
+) -> tuple[list[ImageRecord], dict[str, Any]]:
     """Select visual output images from class-filtered candidates."""
     output_cfg = config["output"]
     if not bool(output_cfg.get("save_visuals", False)):
@@ -999,14 +1017,16 @@ def select_visual_images(
     gt_sets, gt_counts = build_category_presence_index(dataset.annotations)
     pred_sets, pred_counts = build_category_presence_index(predictions, prediction_score)
 
-    candidates: List[ImageRecord] = []
-    candidate_details: Dict[int, Dict[str, Any]] = {}
+    candidates: list[ImageRecord] = []
+    candidate_details: dict[int, dict[str, Any]] = {}
     for image in dataset.images:
         image_id = int(image.image_id)
         gt_ids = gt_sets.get(image_id, set())
         pred_ids = pred_sets.get(image_id, set())
         gt_ok = gt_counts.get(image_id, 0) >= min_gt and class_filter_matches(gt_ids, required_ids, filter_match)
-        pred_ok = pred_counts.get(image_id, 0) >= min_pred and class_filter_matches(pred_ids, required_ids, filter_match)
+        pred_ok = pred_counts.get(image_id, 0) >= min_pred and class_filter_matches(
+            pred_ids, required_ids, filter_match
+        )
 
         if filter_source == "ground_truth":
             keep = gt_ok
@@ -1066,7 +1086,9 @@ def select_visual_images(
         "visual_filter_min_score": prediction_score,
         "visual_min_gt_instances": min_gt,
         "visual_min_predictions": min_pred,
-        "candidate_details": {str(image_id): candidate_details[image_id] for image_id in selected_ids if image_id in candidate_details},
+        "candidate_details": {
+            str(image_id): candidate_details[image_id] for image_id in selected_ids if image_id in candidate_details
+        },
     }
     return selected, info
 
@@ -1081,7 +1103,7 @@ def normalize_visual_format(value: Any) -> str:
     return text
 
 
-def parse_rgb_color(value: Any, default: Tuple[int, int, int]) -> Tuple[int, int, int]:
+def parse_rgb_color(value: Any, default: tuple[int, int, int]) -> tuple[int, int, int]:
     """Parse color config as name, hex, comma string, or RGB list."""
     if value is None or value == "":
         return default
@@ -1104,7 +1126,7 @@ def parse_rgb_color(value: Any, default: Tuple[int, int, int]) -> Tuple[int, int
 
 def visual_font(text_size: float) -> ImageFont.ImageFont:
     """Load a portable label font."""
-    size = max(8, int(round(14 * max(0.1, text_size))))
+    size = max(8, round(14 * max(0.1, text_size)))
     for font_name in ("arial.ttf", "DejaVuSans.ttf"):
         try:
             return ImageFont.truetype(font_name, size=size)
@@ -1120,10 +1142,10 @@ def draw_labeled_box(
     draw: ImageDraw.ImageDraw,
     box: Sequence[float],
     label: str,
-    color: Tuple[int, int, int],
+    color: tuple[int, int, int],
     line_width: int,
     font: ImageFont.ImageFont,
-    image_size_value: Tuple[int, int],
+    image_size_value: tuple[int, int],
 ) -> None:
     """Draw one clipped xywh box with an optional label."""
     width, height = image_size_value
@@ -1172,12 +1194,12 @@ def render_visual_image(
     config: Mapping[str, Any],
     output_info: Mapping[str, Any],
     output_path: Path,
-    render_class_ids: Optional[Sequence[int]] = None,
+    render_class_ids: Sequence[int] | None = None,
 ) -> None:
     """Render GT and prediction boxes for one sampled image."""
     output_cfg = config["output"]
     id_to_name, _ = category_maps(categories)
-    render_ids = set(int(category_id) for category_id in (render_class_ids or []))
+    render_ids = {int(category_id) for category_id in (render_class_ids or [])}
     gt_color = parse_rgb_color(output_cfg.get("gt_color"), VISUAL_COLOR_NAMES["green"])
     pred_color = parse_rgb_color(output_cfg.get("pred_color"), VISUAL_COLOR_NAMES["red"])
     line_width = int(output_cfg.get("rect_th", 2))
@@ -1239,8 +1261,8 @@ def render_visual_outputs(
     output_dir: Path,
     output_info: Mapping[str, Any],
     quiet: bool,
-    manifest: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
+    manifest: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     """Render random visual samples after predictions are available."""
     output_cfg = config["output"]
     if not bool(output_cfg.get("save_visuals", False)):
@@ -1254,10 +1276,10 @@ def render_visual_outputs(
     id_to_name, _ = category_maps(dataset.categories)
     render_class_names = [id_to_name.get(int(category_id), str(category_id)) for category_id in render_class_ids]
 
-    annotations_by_image: Dict[int, List[Mapping[str, Any]]] = {}
+    annotations_by_image: dict[int, list[Mapping[str, Any]]] = {}
     for annotation in dataset.annotations:
         annotations_by_image.setdefault(int(annotation["image_id"]), []).append(annotation)
-    predictions_by_image: Dict[int, List[Mapping[str, Any]]] = {}
+    predictions_by_image: dict[int, list[Mapping[str, Any]]] = {}
     for prediction in predictions:
         predictions_by_image.setdefault(int(prediction["image_id"]), []).append(prediction)
 
@@ -1267,7 +1289,7 @@ def render_visual_outputs(
         verbose=not quiet,
     )
 
-    visual_rows: List[Dict[str, Any]] = []
+    visual_rows: list[dict[str, Any]] = []
     iterator: Iterable[ImageRecord] = selected
     if bool(config["progress"].get("visuals", True)) and not quiet and selected:
         iterator = tqdm(selected, desc="Rendering visuals", unit="image")
@@ -1307,7 +1329,14 @@ def render_visual_outputs(
             "visual_random_seed": selection_info["visual_random_seed"],
         }
         visual_rows.append(row)
-        manifest.append({"path": str(visual_path), "kind": "visual", "description": "Rendered GT/prediction visual sample.", "config_hash": output_info["config_hash"]})
+        manifest.append(
+            {
+                "path": str(visual_path),
+                "kind": "visual",
+                "description": "Rendered GT/prediction visual sample.",
+                "config_hash": output_info["config_hash"],
+            }
+        )
 
     metadata_path = visuals_dir / "visuals_metadata.json"
     write_json(
@@ -1323,11 +1352,13 @@ def render_visual_outputs(
             "images": visual_rows,
         },
     )
-    manifest.append({"path": str(metadata_path), "kind": "visuals", "description": "Visual sampling metadata and full config."})
+    manifest.append(
+        {"path": str(metadata_path), "kind": "visuals", "description": "Visual sampling metadata and full config."}
+    )
     return visual_rows
 
 
-def resolve_error_case_class_ids(categories: Sequence[Mapping[str, Any]], error_cfg: Mapping[str, Any]) -> List[int]:
+def resolve_error_case_class_ids(categories: Sequence[Mapping[str, Any]], error_cfg: Mapping[str, Any]) -> list[int]:
     """Resolve classes targeted by error-case diagnostics; default to football."""
     return resolve_category_class_ids(
         categories,
@@ -1354,7 +1385,7 @@ def build_error_case_events(
     dataset: DatasetBundle,
     predictions: Sequence[Mapping[str, Any]],
     config: Mapping[str, Any],
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Find missed, misclassified, and false-positive target-class cases."""
     output_cfg = config["output"]
     error_cfg = dict(output_cfg.get("error_cases", {}) or {})
@@ -1375,16 +1406,16 @@ def build_error_case_events(
         iou_threshold = eval_cfg.get("match_iou_threshold", 0.5)
     iou_threshold = float(iou_threshold)
 
-    annotations_by_image: Dict[int, List[Mapping[str, Any]]] = {}
+    annotations_by_image: dict[int, list[Mapping[str, Any]]] = {}
     for annotation in dataset.annotations:
         annotations_by_image.setdefault(int(annotation["image_id"]), []).append(annotation)
 
-    predictions_by_image: Dict[int, List[Mapping[str, Any]]] = {}
+    predictions_by_image: dict[int, list[Mapping[str, Any]]] = {}
     for prediction in predictions:
         if float(prediction.get("score", 0.0)) >= confidence:
             predictions_by_image.setdefault(int(prediction["image_id"]), []).append(prediction)
 
-    events: List[Dict[str, Any]] = []
+    events: list[dict[str, Any]] = []
     priority = {"target_missed": 0, "target_misclassified": 1, "target_false_positive": 2}
     for image in dataset.images:
         image_id = int(image.image_id)
@@ -1408,7 +1439,9 @@ def build_error_case_events(
         matched_gt_indexes: set[int] = set()
         matched_pred_indexes: set[int] = set()
         if target_annotations and target_predictions:
-            gt_boxes = np.stack([xywh_to_xyxy(annotation["bbox"]) for _, annotation in target_annotations]).astype(np.float32)
+            gt_boxes = np.stack([xywh_to_xyxy(annotation["bbox"]) for _, annotation in target_annotations]).astype(
+                np.float32
+            )
             for pred_index, prediction in target_predictions:
                 ious = bbox_iou_one_to_many(xywh_to_xyxy(prediction["bbox"]), gt_boxes)
                 for local_index, (gt_index, _) in enumerate(target_annotations):
@@ -1423,7 +1456,7 @@ def build_error_case_events(
             if gt_index in matched_gt_indexes:
                 continue
             gt_box = xywh_to_xyxy(annotation["bbox"])
-            best_prediction: Optional[Mapping[str, Any]] = None
+            best_prediction: Mapping[str, Any] | None = None
             best_iou = 0.0
             for _, prediction in enumerate(image_predictions):
                 if int(prediction.get("category_id", -1)) in target_ids:
@@ -1432,7 +1465,9 @@ def build_error_case_events(
                 if iou > best_iou:
                     best_iou = iou
                     best_prediction = prediction
-            case_type = "target_misclassified" if best_prediction is not None and best_iou >= iou_threshold else "target_missed"
+            case_type = (
+                "target_misclassified" if best_prediction is not None and best_iou >= iou_threshold else "target_missed"
+            )
             pred_category = int(best_prediction["category_id"]) if best_prediction is not None else None
             events.append(
                 {
@@ -1440,7 +1475,9 @@ def build_error_case_events(
                     "file_name": image.file_name,
                     "case_type": case_type,
                     "target_category_id": int(annotation["category_id"]),
-                    "target_category_name": id_to_name.get(int(annotation["category_id"]), str(annotation["category_id"])),
+                    "target_category_name": id_to_name.get(
+                        int(annotation["category_id"]), str(annotation["category_id"])
+                    ),
                     "gt_category_id": int(annotation["category_id"]),
                     "gt_category_name": id_to_name.get(int(annotation["category_id"]), str(annotation["category_id"])),
                     "pred_category_id": pred_category,
@@ -1448,17 +1485,23 @@ def build_error_case_events(
                     "score": float(best_prediction.get("score", 0.0)) if best_prediction is not None else None,
                     "iou": best_iou if best_prediction is not None else 0.0,
                     "gt_bbox": json.dumps(annotation.get("bbox", []), ensure_ascii=False),
-                    "pred_bbox": json.dumps(best_prediction.get("bbox", []), ensure_ascii=False) if best_prediction is not None else "",
+                    "pred_bbox": json.dumps(best_prediction.get("bbox", []), ensure_ascii=False)
+                    if best_prediction is not None
+                    else "",
                     "priority": priority[case_type],
                 }
             )
 
         if target_predictions:
-            all_gt_boxes = np.stack([xywh_to_xyxy(annotation["bbox"]) for annotation in annotations]).astype(np.float32) if annotations else np.zeros((0, 4), dtype=np.float32)
+            all_gt_boxes = (
+                np.stack([xywh_to_xyxy(annotation["bbox"]) for annotation in annotations]).astype(np.float32)
+                if annotations
+                else np.zeros((0, 4), dtype=np.float32)
+            )
             for pred_index, prediction in target_predictions:
                 if pred_index in matched_pred_indexes:
                     continue
-                best_gt: Optional[Mapping[str, Any]] = None
+                best_gt: Mapping[str, Any] | None = None
                 best_iou = 0.0
                 if len(all_gt_boxes):
                     ious = bbox_iou_one_to_many(xywh_to_xyxy(prediction["bbox"]), all_gt_boxes)
@@ -1474,14 +1517,20 @@ def build_error_case_events(
                         "file_name": image.file_name,
                         "case_type": "target_false_positive",
                         "target_category_id": int(prediction["category_id"]),
-                        "target_category_name": id_to_name.get(int(prediction["category_id"]), str(prediction["category_id"])),
+                        "target_category_name": id_to_name.get(
+                            int(prediction["category_id"]), str(prediction["category_id"])
+                        ),
                         "gt_category_id": gt_category,
                         "gt_category_name": id_to_name.get(gt_category, "") if gt_category is not None else "",
                         "pred_category_id": int(prediction["category_id"]),
-                        "pred_category_name": id_to_name.get(int(prediction["category_id"]), str(prediction["category_id"])),
+                        "pred_category_name": id_to_name.get(
+                            int(prediction["category_id"]), str(prediction["category_id"])
+                        ),
                         "score": float(prediction.get("score", 0.0)),
                         "iou": best_iou,
-                        "gt_bbox": json.dumps(best_gt.get("bbox", []), ensure_ascii=False) if best_gt is not None else "",
+                        "gt_bbox": json.dumps(best_gt.get("bbox", []), ensure_ascii=False)
+                        if best_gt is not None
+                        else "",
                         "pred_bbox": json.dumps(prediction.get("bbox", []), ensure_ascii=False),
                         "priority": priority["target_false_positive"],
                     }
@@ -1489,7 +1538,7 @@ def build_error_case_events(
 
     events.sort(key=lambda item: (int(item["image_id"]), int(item["priority"]), -float(item["score"] or 0.0)))
     max_images = error_case_max_images(error_cfg)
-    selected_image_ids: List[int] = []
+    selected_image_ids: list[int] = []
     seen_ids = set()
     for event in events:
         image_id = int(event["image_id"])
@@ -1504,7 +1553,9 @@ def build_error_case_events(
     info = {
         "enabled": True,
         "target_class_ids": sorted(int(category_id) for category_id in target_ids),
-        "target_class_names": [id_to_name.get(int(category_id), str(category_id)) for category_id in sorted(target_ids)],
+        "target_class_names": [
+            id_to_name.get(int(category_id), str(category_id)) for category_id in sorted(target_ids)
+        ],
         "confidence_threshold": confidence,
         "match_iou_threshold": iou_threshold,
         "requested_max_images": max_images,
@@ -1523,8 +1574,8 @@ def render_error_case_outputs(
     output_dir: Path,
     output_info: Mapping[str, Any],
     quiet: bool,
-    manifest: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
+    manifest: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     """Render target-class missed, misclassified, and false-positive diagnostic images."""
     output_cfg = config["output"]
     error_cfg = dict(output_cfg.get("error_cases", {}) or {})
@@ -1532,7 +1583,7 @@ def render_error_case_outputs(
         return []
 
     events, selection_info = build_error_case_events(dataset, predictions, config)
-    selected_ids = set(int(image_id) for image_id in selection_info.get("selected_image_ids", []))
+    selected_ids = {int(image_id) for image_id in selection_info.get("selected_image_ids", [])}
     if not selected_ids:
         return []
 
@@ -1548,17 +1599,19 @@ def render_error_case_outputs(
         "render_class_names": render_class_names,
     }
 
-    annotations_by_image: Dict[int, List[Mapping[str, Any]]] = {}
+    annotations_by_image: dict[int, list[Mapping[str, Any]]] = {}
     for annotation in dataset.annotations:
         annotations_by_image.setdefault(int(annotation["image_id"]), []).append(annotation)
-    predictions_by_image: Dict[int, List[Mapping[str, Any]]] = {}
-    confidence = float(selection_info.get("confidence_threshold", config.get("model", {}).get("confidence_threshold", 0.25)))
+    predictions_by_image: dict[int, list[Mapping[str, Any]]] = {}
+    confidence = float(
+        selection_info.get("confidence_threshold", config.get("model", {}).get("confidence_threshold", 0.25))
+    )
     for prediction in predictions:
         if float(prediction.get("score", 0.0)) >= confidence:
             predictions_by_image.setdefault(int(prediction["image_id"]), []).append(prediction)
 
     images_by_id = {int(image.image_id): image for image in dataset.images}
-    events_by_image: Dict[int, List[Mapping[str, Any]]] = {}
+    events_by_image: dict[int, list[Mapping[str, Any]]] = {}
     for event in events:
         events_by_image.setdefault(int(event["image_id"]), []).append(event)
 
@@ -1568,12 +1621,14 @@ def render_error_case_outputs(
         verbose=not quiet,
     )
 
-    selected_images = [images_by_id[image_id] for image_id in selection_info["selected_image_ids"] if image_id in images_by_id]
+    selected_images = [
+        images_by_id[image_id] for image_id in selection_info["selected_image_ids"] if image_id in images_by_id
+    ]
     iterator: Iterable[ImageRecord] = selected_images
     if bool(config["progress"].get("error_cases", True)) and not quiet and selected_images:
         iterator = tqdm(selected_images, desc="Rendering error cases", unit="image")
 
-    image_rows: List[Dict[str, Any]] = []
+    image_rows: list[dict[str, Any]] = []
     for index, image in enumerate(iterator, start=1):
         image_id = int(image.image_id)
         file_stem = sanitize_name(Path(image.file_name).stem) + f"_{image_id}"
@@ -1601,12 +1656,25 @@ def render_error_case_outputs(
             "render_class_names": json.dumps(render_class_names, ensure_ascii=False),
         }
         image_rows.append(row)
-        manifest.append({"path": str(case_path), "kind": "error_case", "description": "Rendered target-class GT/prediction diagnostic image.", "config_hash": output_info["config_hash"]})
+        manifest.append(
+            {
+                "path": str(case_path),
+                "kind": "error_case",
+                "description": "Rendered target-class GT/prediction diagnostic image.",
+                "config_hash": output_info["config_hash"],
+            }
+        )
 
     metadata = {"run_id": output_info["run_id"], "config_hash": output_info["config_hash"]}
     manifest_path = case_dir / "error_cases_manifest.csv"
     write_table(manifest_path, image_rows, metadata)
-    manifest.append({"path": str(manifest_path), "kind": "error_cases", "description": "Error-case image manifest with config hash."})
+    manifest.append(
+        {
+            "path": str(manifest_path),
+            "kind": "error_cases",
+            "description": "Error-case image manifest with config hash.",
+        }
+    )
 
     events_path = case_dir / "error_case_events.csv"
     write_table(events_path, events, metadata)
@@ -1623,7 +1691,9 @@ def render_error_case_outputs(
             "events": events,
         },
     )
-    manifest.append({"path": str(metadata_path), "kind": "error_cases", "description": "Error-case metadata and full config."})
+    manifest.append(
+        {"path": str(metadata_path), "kind": "error_cases", "description": "Error-case metadata and full config."}
+    )
     return image_rows
 
 
@@ -1640,7 +1710,7 @@ def select_dataset_case_images(
     dataset: DatasetBundle,
     predictions: Sequence[Mapping[str, Any]],
     config: Mapping[str, Any],
-) -> Tuple[List[ImageRecord], Dict[str, Any]]:
+) -> tuple[list[ImageRecord], dict[str, Any]]:
     """Select input images for output/datasets case examples."""
     output_cfg = config["output"]
     if not bool(output_cfg.get("save_dataset_cases", True)):
@@ -1663,14 +1733,16 @@ def select_dataset_case_images(
     gt_sets, gt_counts = build_category_presence_index(dataset.annotations)
     pred_sets, pred_counts = build_category_presence_index(predictions, prediction_score)
 
-    candidates: List[ImageRecord] = []
-    candidate_details: Dict[int, Dict[str, Any]] = {}
+    candidates: list[ImageRecord] = []
+    candidate_details: dict[int, dict[str, Any]] = {}
     for image in dataset.images:
         image_id = int(image.image_id)
         gt_ids = gt_sets.get(image_id, set())
         pred_ids = pred_sets.get(image_id, set())
         gt_ok = gt_counts.get(image_id, 0) >= min_gt and class_filter_matches(gt_ids, required_ids, filter_match)
-        pred_ok = pred_counts.get(image_id, 0) >= min_pred and class_filter_matches(pred_ids, required_ids, filter_match)
+        pred_ok = pred_counts.get(image_id, 0) >= min_pred and class_filter_matches(
+            pred_ids, required_ids, filter_match
+        )
 
         if filter_source == "ground_truth":
             keep = gt_ok
@@ -1696,7 +1768,11 @@ def select_dataset_case_images(
     else:
         selected_count = min(len(candidates), max(0, int(max_cases)))
 
-    sampling_mode = str(output_cfg.get("dataset_case_sampling_mode", output_cfg.get("visual_sampling_mode", "random"))).strip().lower()
+    sampling_mode = (
+        str(output_cfg.get("dataset_case_sampling_mode", output_cfg.get("visual_sampling_mode", "random")))
+        .strip()
+        .lower()
+    )
     if sampling_mode not in {"random", "first", "last"}:
         raise ValueError("output.dataset_case_sampling_mode must be one of: random, first, last.")
     if sampling_mode == "first":
@@ -1704,7 +1780,9 @@ def select_dataset_case_images(
     elif sampling_mode == "last":
         selected = candidates[-selected_count:] if selected_count else []
     else:
-        selected = random.Random(get_dataset_case_seed(config)).sample(candidates, selected_count) if selected_count else []
+        selected = (
+            random.Random(get_dataset_case_seed(config)).sample(candidates, selected_count) if selected_count else []
+        )
 
     selected_ids = [int(image.image_id) for image in selected]
     info = {
@@ -1722,19 +1800,21 @@ def select_dataset_case_images(
         "visual_filter_min_score": prediction_score,
         "visual_min_gt_instances": min_gt,
         "visual_min_predictions": min_pred,
-        "candidate_details": {str(image_id): candidate_details[image_id] for image_id in selected_ids if image_id in candidate_details},
+        "candidate_details": {
+            str(image_id): candidate_details[image_id] for image_id in selected_ids if image_id in candidate_details
+        },
     }
     return selected, info
 
 
-def slice_axis_starts(length: int, window: int, overlap_ratio: float) -> List[int]:
+def slice_axis_starts(length: int, window: int, overlap_ratio: float) -> list[int]:
     """Return deterministic slice starts that cover one image axis."""
     length = max(1, int(length))
     window = max(1, min(int(window), length))
     if window >= length:
         return [0]
     overlap_ratio = max(0.0, min(0.95, float(overlap_ratio)))
-    step = max(1, int(round(window * (1.0 - overlap_ratio))))
+    step = max(1, round(window * (1.0 - overlap_ratio)))
     last_start = length - window
     starts = list(range(0, last_start + 1, step))
     if not starts or starts[-1] != last_start:
@@ -1742,7 +1822,7 @@ def slice_axis_starts(length: int, window: int, overlap_ratio: float) -> List[in
     return starts
 
 
-def generate_slice_windows(image: ImageRecord, config: Mapping[str, Any]) -> List[Tuple[int, int, int, int]]:
+def generate_slice_windows(image: ImageRecord, config: Mapping[str, Any]) -> list[tuple[int, int, int, int]]:
     """Generate SAHI-style slice windows as (x, y, width, height)."""
     sahi_cfg = config.get("sahi", {})
     slice_height = int(sahi_cfg.get("slice_height", image.height))
@@ -1754,7 +1834,7 @@ def generate_slice_windows(image: ImageRecord, config: Mapping[str, Any]) -> Lis
     return [(x, y, min(width, image.width - x), min(height, image.height - y)) for y in y_starts for x in x_starts]
 
 
-def bbox_intersects_window(bbox: Sequence[float], window: Tuple[int, int, int, int]) -> bool:
+def bbox_intersects_window(bbox: Sequence[float], window: tuple[int, int, int, int]) -> bool:
     """Return whether a COCO xywh bbox intersects a slice window."""
     x, y, width, height = [float(value) for value in bbox[:4]]
     wx, wy, ww, wh = [float(value) for value in window]
@@ -1766,7 +1846,7 @@ def select_slice_windows(
     annotations: Sequence[Mapping[str, Any]],
     predictions: Sequence[Mapping[str, Any]],
     config: Mapping[str, Any],
-) -> List[Tuple[int, int, int, int]]:
+) -> list[tuple[int, int, int, int]]:
     """Select a bounded set of useful slice windows for dataset case output."""
     windows = generate_slice_windows(image, config)
     max_slices = int(config["output"].get("max_slices_per_image", 12))
@@ -1797,8 +1877,8 @@ def render_dataset_case_outputs(
     output_dir: Path,
     output_info: Mapping[str, Any],
     quiet: bool,
-    manifest: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
+    manifest: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     """Write raw dataset case images under output/datasets."""
     output_cfg = config["output"]
     if not bool(output_cfg.get("save_dataset_cases", True)):
@@ -1812,10 +1892,10 @@ def render_dataset_case_outputs(
     case_format = normalize_visual_format(output_cfg.get("dataset_case_format", output_cfg.get("visual_format", "jpg")))
     quality = int(output_cfg.get("dataset_case_jpeg_quality", output_cfg.get("visual_jpeg_quality", 92)))
 
-    annotations_by_image: Dict[int, List[Mapping[str, Any]]] = {}
+    annotations_by_image: dict[int, list[Mapping[str, Any]]] = {}
     for annotation in dataset.annotations:
         annotations_by_image.setdefault(int(annotation["image_id"]), []).append(annotation)
-    predictions_by_image: Dict[int, List[Mapping[str, Any]]] = {}
+    predictions_by_image: dict[int, list[Mapping[str, Any]]] = {}
     for prediction in predictions:
         predictions_by_image.setdefault(int(prediction["image_id"]), []).append(prediction)
 
@@ -1825,7 +1905,7 @@ def render_dataset_case_outputs(
         verbose=not quiet,
     )
 
-    rows: List[Dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
     iterator: Iterable[ImageRecord] = selected
     if bool(config["progress"].get("dataset_cases", True)) and not quiet and selected:
         iterator = tqdm(selected, desc="Writing dataset cases", unit="image")
@@ -1854,12 +1934,27 @@ def render_dataset_case_outputs(
                         "slice_y": y,
                         "slice_width": width,
                         "slice_height": height,
-                        "gt_count": sum(1 for item in image_annotations if bbox_intersects_window(item.get("bbox", [0, 0, 0, 0]), (x, y, width, height))),
-                        "prediction_count": sum(1 for item in image_predictions if bbox_intersects_window(item.get("bbox", [0, 0, 0, 0]), (x, y, width, height))),
+                        "gt_count": sum(
+                            1
+                            for item in image_annotations
+                            if bbox_intersects_window(item.get("bbox", [0, 0, 0, 0]), (x, y, width, height))
+                        ),
+                        "prediction_count": sum(
+                            1
+                            for item in image_predictions
+                            if bbox_intersects_window(item.get("bbox", [0, 0, 0, 0]), (x, y, width, height))
+                        ),
                         "inference_engine": inference_engine_name(config),
                     }
                     rows.append(row)
-                    manifest.append({"path": str(case_path), "kind": "dataset_case", "description": "Raw SAHI slice case image.", "config_hash": output_info["config_hash"]})
+                    manifest.append(
+                        {
+                            "path": str(case_path),
+                            "kind": "dataset_case",
+                            "description": "Raw SAHI slice case image.",
+                            "config_hash": output_info["config_hash"],
+                        }
+                    )
             else:
                 case_path = case_dir / f"{image_index:04d}_{file_stem}.{case_format}"
                 save_annotated_image(source_rgb, case_path, output_info, quality)
@@ -1879,12 +1974,25 @@ def render_dataset_case_outputs(
                     "inference_engine": inference_engine_name(config),
                 }
                 rows.append(row)
-                manifest.append({"path": str(case_path), "kind": "dataset_case", "description": "Raw full-image dataset case.", "config_hash": output_info["config_hash"]})
+                manifest.append(
+                    {
+                        "path": str(case_path),
+                        "kind": "dataset_case",
+                        "description": "Raw full-image dataset case.",
+                        "config_hash": output_info["config_hash"],
+                    }
+                )
 
     metadata = {"run_id": output_info["run_id"], "config_hash": output_info["config_hash"]}
     manifest_path = case_root / "dataset_cases_manifest.csv"
     write_table(manifest_path, rows, metadata)
-    manifest.append({"path": str(manifest_path), "kind": "dataset_cases", "description": "Dataset case image manifest with config hash."})
+    manifest.append(
+        {
+            "path": str(manifest_path),
+            "kind": "dataset_cases",
+            "description": "Dataset case image manifest with config hash.",
+        }
+    )
 
     metadata_path = case_root / "dataset_cases_metadata.json"
     write_json(
@@ -1897,7 +2005,9 @@ def render_dataset_case_outputs(
             "cases": rows,
         },
     )
-    manifest.append({"path": str(metadata_path), "kind": "dataset_cases", "description": "Dataset case metadata and full config."})
+    manifest.append(
+        {"path": str(metadata_path), "kind": "dataset_cases", "description": "Dataset case metadata and full config."}
+    )
     return rows
 
 
@@ -1905,7 +2015,7 @@ def build_detection_model(model_cfg: Mapping[str, Any], device: str) -> Any:
     """Build a SAHI detection model."""
     from sahi import AutoDetectionModel
 
-    kwargs: Dict[str, Any] = {
+    kwargs: dict[str, Any] = {
         "model_type": model_cfg.get("type", "ultralytics"),
         "model_path": model_cfg.get("path"),
         "model_config_path": model_cfg.get("config_path") or None,
@@ -1931,7 +2041,7 @@ def build_ultralytics_model(model_cfg: Mapping[str, Any], device: str) -> Any:
     except Exception:
         pass
     try:
-        setattr(model, "_evaluator_device", device)
+        model._evaluator_device = device
     except Exception:
         pass
     return model
@@ -1939,8 +2049,8 @@ def build_ultralytics_model(model_cfg: Mapping[str, Any], device: str) -> Any:
 
 def build_rfdetr_model(model_cfg: Mapping[str, Any], device: str) -> Any:
     """Build an RF-DETR model for direct image-level inference."""
-    import torch
     import rfdetr
+    import torch
 
     size = str(model_cfg.get("size", "medium")).strip().lower().replace("_", "-")
     classes = {
@@ -1991,9 +2101,7 @@ def build_inference_model(config: Mapping[str, Any], device: str, prebuilt_model
     if "factory" in model_cfg and model_cfg.get("factory") is not None:
         factory_spec = model_cfg.get("factory")
         if not isinstance(factory_spec, str) or not factory_spec.strip() or "." not in factory_spec.strip():
-            raise ValueError(
-                "model.factory must be a non-empty dotted import string in 'module.attribute' form."
-            )
+            raise ValueError("model.factory must be a non-empty dotted import string in 'module.attribute' form.")
         factory_spec = factory_spec.strip()
         module_name, attribute_name = factory_spec.rsplit(".", 1)
         if (
@@ -2003,9 +2111,7 @@ def build_inference_model(config: Mapping[str, Any], device: str, prebuilt_model
             or any(not part.isidentifier() for part in module_name.split("."))
             or not attribute_name.isidentifier()
         ):
-            raise ValueError(
-                "model.factory must be a non-empty dotted import string in 'module.attribute' form."
-            )
+            raise ValueError("model.factory must be a non-empty dotted import string in 'module.attribute' form.")
         try:
             module = importlib.import_module(module_name)
         except ImportError as error:
@@ -2015,9 +2121,7 @@ def build_inference_model(config: Mapping[str, Any], device: str, prebuilt_model
         try:
             factory = getattr(module, attribute_name)
         except AttributeError as error:
-            raise ImportError(
-                f"Could not resolve model.factory {factory_spec!r} in module {module_name!r}."
-            ) from error
+            raise ImportError(f"Could not resolve model.factory {factory_spec!r} in module {module_name!r}.") from error
         if not callable(factory):
             raise TypeError(f"model.factory {factory_spec!r} must resolve to a callable.")
         return factory(model_cfg, device)
@@ -2040,7 +2144,7 @@ def remap_model_category_id(category_id: int, model_cfg: Mapping[str, Any]) -> i
     return int(category_id)
 
 
-def xyxy_to_coco_bbox(box: Sequence[float], width: int, height: int) -> Optional[Tuple[List[float], float]]:
+def xyxy_to_coco_bbox(box: Sequence[float], width: int, height: int) -> tuple[list[float], float] | None:
     """Convert clipped xyxy values to COCO xywh and area."""
     x1, y1, x2, y2 = [float(value) for value in box[:4]]
     x1 = max(0.0, min(float(width), x1))
@@ -2104,7 +2208,9 @@ def rfdetr_image_batch_size(config: Mapping[str, Any]) -> int:
 
 def rfdetr_sahi_batch_size(config: Mapping[str, Any]) -> int:
     """Return the RF-DETR SAHI slice/recheck batch size."""
-    return positive_int_setting(config.get("sahi", {}).get("batch_size"), rfdetr_image_batch_size(config), "sahi.batch_size")
+    return positive_int_setting(
+        config.get("sahi", {}).get("batch_size"), rfdetr_image_batch_size(config), "sahi.batch_size"
+    )
 
 
 def batched_sequence(values: Sequence[Any], batch_size: int) -> Iterable[Sequence[Any]]:
@@ -2148,7 +2254,7 @@ def torch_inference_context() -> Iterable[None]:
         yield
 
 
-def normalize_detection_list(result: Any, expected: int) -> List[Any]:
+def normalize_detection_list(result: Any, expected: int) -> list[Any]:
     """Normalize RF-DETR model.predict output to one detections object per input."""
     if isinstance(result, tuple):
         result = list(result)
@@ -2166,18 +2272,14 @@ def rfdetr_predict_batches(
     inputs: Sequence[Any],
     *,
     threshold: float,
-    shape: Optional[Tuple[int, int]],
+    shape: tuple[int, int] | None,
     batch_size: int,
-) -> Tuple[List[Any], List[Dict[str, Any]]]:
+) -> tuple[list[Any], list[dict[str, Any]]]:
     """Run RF-DETR model.predict on input batches with CUDA OOM downshift."""
-    detections: List[Any] = []
-    timing_rows: List[Dict[str, Any]] = []
+    detections: list[Any] = []
+    timing_rows: list[dict[str, Any]] = []
     model_state = getattr(model, "__dict__", None)
-    acceleration_handle = (
-        model_state.get("_rf_detr_acceleration_handle")
-        if isinstance(model_state, dict)
-        else None
-    )
+    acceleration_handle = model_state.get("_rf_detr_acceleration_handle") if isinstance(model_state, dict) else None
     consume_forward = getattr(acceleration_handle, "consume_forward_seconds", None)
     consume_postprocess = getattr(acceleration_handle, "consume_postprocess_seconds", None)
     stage_aware = callable(consume_forward) and callable(consume_postprocess)
@@ -2250,9 +2352,9 @@ def rfdetr_detections_to_predictions(
     model_cfg: Mapping[str, Any],
     infer_width: int,
     infer_height: int,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Convert one RF-DETR Detections object to COCO prediction rows."""
-    predictions: List[Dict[str, Any]] = []
+    predictions: list[dict[str, Any]] = []
     xyxy = to_numpy_array(getattr(detections, "xyxy", []))
     conf = to_numpy_array(getattr(detections, "confidence", []))
     cls = to_numpy_array(getattr(detections, "class_id", []))
@@ -2282,13 +2384,13 @@ def predict_rfdetr_direct_batch(
     model: Any,
     config: Mapping[str, Any],
     *,
-    sources: Optional[Sequence[Any]] = None,
-    widths: Optional[Sequence[int]] = None,
-    heights: Optional[Sequence[int]] = None,
-    confidence: Optional[float] = None,
-    batch_size: Optional[int] = None,
+    sources: Sequence[Any] | None = None,
+    widths: Sequence[int] | None = None,
+    heights: Sequence[int] | None = None,
+    confidence: float | None = None,
+    batch_size: int | None = None,
     engine: str = "rfdetr",
-) -> Tuple[List[List[Dict[str, Any]]], List[Dict[str, Any]]]:
+) -> tuple[list[list[dict[str, Any]]], list[dict[str, Any]]]:
     """Run direct RF-DETR prediction for multiple images/crops."""
     if not images:
         return [], []
@@ -2300,7 +2402,9 @@ def predict_rfdetr_direct_batch(
         shape = (image_size_value, image_size_value)
     inputs = list(sources) if sources is not None else [image.path for image in images]
     infer_widths = [int(value) for value in widths] if widths is not None else [int(image.width) for image in images]
-    infer_heights = [int(value) for value in heights] if heights is not None else [int(image.height) for image in images]
+    infer_heights = (
+        [int(value) for value in heights] if heights is not None else [int(image.height) for image in images]
+    )
     if len(inputs) != len(images) or len(infer_widths) != len(images) or len(infer_heights) != len(images):
         raise ValueError("RF-DETR batch inputs, images, widths, and heights must have the same length.")
     detections, timings = rfdetr_predict_batches(
@@ -2310,9 +2414,11 @@ def predict_rfdetr_direct_batch(
         shape=shape,
         batch_size=batch_size or rfdetr_image_batch_size(config),
     )
-    predictions_by_image: List[List[Dict[str, Any]]] = []
-    stats: List[Dict[str, Any]] = []
-    for image, detection, infer_width, infer_height, timing in zip(images, detections, infer_widths, infer_heights, timings):
+    predictions_by_image: list[list[dict[str, Any]]] = []
+    stats: list[dict[str, Any]] = []
+    for image, detection, infer_width, infer_height, timing in zip(
+        images, detections, infer_widths, infer_heights, timings
+    ):
         conversion_started = time.perf_counter()
         predictions = rfdetr_detections_to_predictions(detection, image, model_cfg, infer_width, infer_height)
         conversion_seconds = time.perf_counter() - conversion_started
@@ -2343,7 +2449,7 @@ def predict_image_sahi(
     config: Mapping[str, Any],
     output_dir: Path,
     save_visual: bool,
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Optional[Dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any] | None]:
     """Run SAHI prediction for one image."""
     model_type = str(config["model"].get("type", "ultralytics")).strip().lower()
     if model_type in {"rfdetr", "rf-detr", "rf_detr"}:
@@ -2357,7 +2463,7 @@ def predict_image_sahi(
     start = time.perf_counter()
 
     if bool(sahi_cfg.get("sliced_prediction", True)):
-        kwargs: Dict[str, Any] = {
+        kwargs: dict[str, Any] = {
             "slice_height": int(sahi_cfg.get("slice_height", 640)),
             "slice_width": int(sahi_cfg.get("slice_width", 640)),
             "overlap_height_ratio": float(sahi_cfg.get("overlap_height_ratio", 0.2)),
@@ -2381,7 +2487,9 @@ def predict_image_sahi(
         result = call_with_supported_kwargs(get_prediction, image.path, detection_model)
 
     elapsed = time.perf_counter() - start
-    predictions = [prediction_to_clean_coco(item, image.image_id) for item in result.to_coco_predictions(image_id=image.image_id)]
+    predictions = [
+        prediction_to_clean_coco(item, image.image_id) for item in result.to_coco_predictions(image_id=image.image_id)
+    ]
     durations = getattr(result, "durations_in_seconds", {}) or {}
     stat = {
         "image_id": image.image_id,
@@ -2394,7 +2502,7 @@ def predict_image_sahi(
         "sahi_durations": durations,
     }
 
-    visual_row: Optional[Dict[str, Any]] = None
+    visual_row: dict[str, Any] | None = None
     if save_visual:
         visuals_dir = output_dir / "visuals"
         visuals_dir.mkdir(parents=True, exist_ok=True)
@@ -2420,16 +2528,16 @@ def predict_image_ultralytics(
     model: Any,
     config: Mapping[str, Any],
     source: Any = None,
-    width: Optional[int] = None,
-    height: Optional[int] = None,
-    confidence: Optional[float] = None,
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any], None]:
+    width: int | None = None,
+    height: int | None = None,
+    confidence: float | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any], None]:
     """Run direct Ultralytics full-image prediction for one image."""
     model_cfg = config["model"]
     infer_width = int(width or image.width)
     infer_height = int(height or image.height)
     start = time.perf_counter()
-    predict_kwargs: Dict[str, Any] = {
+    predict_kwargs: dict[str, Any] = {
         "source": source if source is not None else image.path,
         "conf": float(model_cfg.get("confidence_threshold", 0.25) if confidence is None else confidence),
         "device": getattr(model, "_evaluator_device", model_cfg.get("device", "cpu")),
@@ -2442,8 +2550,8 @@ def predict_image_ultralytics(
     elapsed = time.perf_counter() - start
 
     result = results[0] if results else None
-    predictions: List[Dict[str, Any]] = []
-    speed: Dict[str, Any] = {}
+    predictions: list[dict[str, Any]] = []
+    speed: dict[str, Any] = {}
     if result is not None:
         speed = dict(getattr(result, "speed", {}) or {})
         boxes = getattr(result, "boxes", None)
@@ -2484,10 +2592,10 @@ def predict_image_rfdetr(
     model: Any,
     config: Mapping[str, Any],
     source: Any = None,
-    width: Optional[int] = None,
-    height: Optional[int] = None,
-    confidence: Optional[float] = None,
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any], None]:
+    width: int | None = None,
+    height: int | None = None,
+    confidence: float | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any], None]:
     """Run direct RF-DETR prediction for one image or crop."""
     predictions_by_image, stats = predict_rfdetr_direct_batch(
         [image],
@@ -2508,24 +2616,28 @@ def predict_image_direct(
     model: Any,
     config: Mapping[str, Any],
     source: Any = None,
-    width: Optional[int] = None,
-    height: Optional[int] = None,
-    confidence: Optional[float] = None,
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any], None]:
+    width: int | None = None,
+    height: int | None = None,
+    confidence: float | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any], None]:
     """Run a direct full-image/crop prediction with the configured model type."""
     model_type = str(config["model"].get("type", "ultralytics")).strip().lower()
     if model_type in {"rfdetr", "rf-detr", "rf_detr"}:
-        return predict_image_rfdetr(image, model, config, source=source, width=width, height=height, confidence=confidence)
-    return predict_image_ultralytics(image, model, config, source=source, width=width, height=height, confidence=confidence)
+        return predict_image_rfdetr(
+            image, model, config, source=source, width=width, height=height, confidence=confidence
+        )
+    return predict_image_ultralytics(
+        image, model, config, source=source, width=width, height=height, confidence=confidence
+    )
 
 
-def coco_bbox_center(bbox: Sequence[float]) -> Tuple[float, float]:
+def coco_bbox_center(bbox: Sequence[float]) -> tuple[float, float]:
     """Return the center point of a COCO xywh box."""
     x, y, width, height = [float(value) for value in bbox[:4]]
     return x + width / 2.0, y + height / 2.0
 
 
-def center_in_coco_bbox(center: Tuple[float, float], bbox: Sequence[float], padding_ratio: float = 0.0) -> bool:
+def center_in_coco_bbox(center: tuple[float, float], bbox: Sequence[float], padding_ratio: float = 0.0) -> bool:
     """Return True when a center point falls inside a COCO xywh box plus optional relative padding."""
     x, y, width, height = [float(value) for value in bbox[:4]]
     pad_x = max(0.0, float(width) * float(padding_ratio))
@@ -2535,23 +2647,23 @@ def center_in_coco_bbox(center: Tuple[float, float], bbox: Sequence[float], padd
 
 
 def centered_square_window(
-    center: Tuple[float, float],
+    center: tuple[float, float],
     crop_size: int,
     image_width: int,
     image_height: int,
-) -> Tuple[int, int, int, int]:
+) -> tuple[int, int, int, int]:
     """Build a clamped square crop window centered on an object."""
     size = max(1, int(crop_size))
     size = min(size, max(1, int(image_width)), max(1, int(image_height)))
     cx, cy = center
-    x = int(round(float(cx) - size / 2.0))
-    y = int(round(float(cy) - size / 2.0))
+    x = round(float(cx) - size / 2.0)
+    y = round(float(cy) - size / 2.0)
     x = max(0, min(max(0, int(image_width) - size), x))
     y = max(0, min(max(0, int(image_height) - size), y))
     return x, y, size, size
 
 
-def resolve_recheck_target_class_ids(config: Mapping[str, Any], recheck_cfg: Mapping[str, Any]) -> List[int]:
+def resolve_recheck_target_class_ids(config: Mapping[str, Any], recheck_cfg: Mapping[str, Any]) -> list[int]:
     """Resolve SAHI recheck target class IDs, defaulting to football aliases."""
     return resolve_category_class_ids(
         config.get("dataset_categories", []),
@@ -2568,7 +2680,7 @@ def apply_sahi_recheck_batch(
     config: Mapping[str, Any],
     source_rgbs: Sequence[Image.Image],
     predictions_by_image: Sequence[Sequence[Mapping[str, Any]]],
-) -> Tuple[List[List[Dict[str, Any]]], List[Dict[str, Any]]]:
+) -> tuple[list[list[dict[str, Any]]], list[dict[str, Any]]]:
     """Verify target-class SAHI boxes in batches with centered second-pass crops."""
     sahi_cfg = config["sahi"]
     recheck_cfg = dict(sahi_cfg.get("recheck", {}) or {})
@@ -2603,11 +2715,17 @@ def apply_sahi_recheck_batch(
         ]
 
     recheck_start = time.perf_counter()
-    crop_size = int(recheck_cfg.get("crop_size", max(int(sahi_cfg.get("slice_width", 640)), int(sahi_cfg.get("slice_height", 640)))))
-    second_conf = float(recheck_cfg.get("second_confidence_threshold", config["model"].get("confidence_threshold", 0.25)))
+    crop_size = int(
+        recheck_cfg.get("crop_size", max(int(sahi_cfg.get("slice_width", 640)), int(sahi_cfg.get("slice_height", 640))))
+    )
+    second_conf = float(
+        recheck_cfg.get("second_confidence_threshold", config["model"].get("confidence_threshold", 0.25))
+    )
     first_weight = float(recheck_cfg.get("first_weight", 0.5))
     second_weight = float(recheck_cfg.get("second_weight", 0.5))
-    fused_threshold = float(recheck_cfg.get("fused_confidence_threshold", config["model"].get("confidence_threshold", 0.25)))
+    fused_threshold = float(
+        recheck_cfg.get("fused_confidence_threshold", config["model"].get("confidence_threshold", 0.25))
+    )
     center_padding_ratio = float(recheck_cfg.get("center_padding_ratio", 0.0))
     max_rechecks = int(recheck_cfg.get("max_rechecks_per_image", 50) or 0)
 
@@ -2628,14 +2746,14 @@ def apply_sahi_recheck_batch(
         }
         for _ in predictions_by_image
     ]
-    task_records: List[ImageRecord] = []
-    task_sources: List[Image.Image] = []
-    task_widths: List[int] = []
-    task_heights: List[int] = []
-    task_meta: List[Dict[str, Any]] = []
+    task_records: list[ImageRecord] = []
+    task_sources: list[Image.Image] = []
+    task_widths: list[int] = []
+    task_heights: list[int] = []
+    task_meta: list[dict[str, Any]] = []
     rechecked_keys: set = set()
-    batch_indices_by_image: List[set] = [set() for _ in predictions_by_image]
-    batch_sizes_by_image: List[set] = [set() for _ in predictions_by_image]
+    batch_indices_by_image: list[set] = [set() for _ in predictions_by_image]
+    batch_sizes_by_image: list[set] = [set() for _ in predictions_by_image]
 
     for image_index, (image, source_rgb, predictions) in enumerate(zip(images, source_rgbs, predictions_by_image)):
         indexed_targets = [
@@ -2643,10 +2761,16 @@ def apply_sahi_recheck_batch(
             for prediction_index, prediction in enumerate(predictions)
             if int(prediction.get("category_id", -1)) in target_ids
         ]
-        selected_indices = {
-            prediction_index
-            for prediction_index, _ in sorted(indexed_targets, key=lambda item: float(item[1].get("score", 0.0)), reverse=True)[:max_rechecks]
-        } if max_rechecks > 0 else set()
+        selected_indices = (
+            {
+                prediction_index
+                for prediction_index, _ in sorted(
+                    indexed_targets, key=lambda item: float(item[1].get("score", 0.0)), reverse=True
+                )[:max_rechecks]
+            }
+            if max_rechecks > 0
+            else set()
+        )
         stats[image_index]["requested"] = len(indexed_targets)
         stats[image_index]["rechecked"] = len(selected_indices)
 
@@ -2671,7 +2795,7 @@ def apply_sahi_recheck_batch(
             )
             rechecked_keys.add((image_index, prediction_index))
 
-    passed_rows: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    passed_rows: dict[tuple[int, int], dict[str, Any]] = {}
     if task_records:
         second_predictions_by_task, second_stats_by_task = predict_rfdetr_direct_batch(
             task_records,
@@ -2701,7 +2825,9 @@ def apply_sahi_recheck_batch(
             batch_size = second_stat.get("batch_size")
             if isinstance(batch_size, int) and not isinstance(batch_size, bool) and batch_size > 0:
                 batch_sizes_by_image[image_index].add(batch_size)
-            projected = shared_modes.project_predictions_to_original(second_predictions, x, y, image.width, image.height)
+            projected = shared_modes.project_predictions_to_original(
+                second_predictions, x, y, image.width, image.height
+            )
             matching = [
                 item
                 for item in projected
@@ -2716,7 +2842,9 @@ def apply_sahi_recheck_batch(
                 stats[image_index]["filtered"] += 1
                 continue
             best_second = max(matching, key=lambda item: float(item.get("score", 0.0)))
-            fused_score = first_weight * float(first_prediction.get("score", 0.0)) + second_weight * float(best_second.get("score", 0.0))
+            fused_score = first_weight * float(first_prediction.get("score", 0.0)) + second_weight * float(
+                best_second.get("score", 0.0)
+            )
             if fused_score < fused_threshold:
                 stats[image_index]["filtered"] += 1
                 continue
@@ -2729,9 +2857,9 @@ def apply_sahi_recheck_batch(
             passed_rows[(image_index, prediction_index)] = row
             stats[image_index]["passed"] += 1
 
-    output_by_image: List[List[Dict[str, Any]]] = []
+    output_by_image: list[list[dict[str, Any]]] = []
     for image_index, predictions in enumerate(predictions_by_image):
-        output_predictions: List[Dict[str, Any]] = []
+        output_predictions: list[dict[str, Any]] = []
         for prediction_index, prediction in enumerate(predictions):
             key = (image_index, prediction_index)
             if key in rechecked_keys:
@@ -2743,9 +2871,7 @@ def apply_sahi_recheck_batch(
 
     recheck_elapsed = time.perf_counter() - recheck_start
     known_stage_seconds = sum(
-        float(row["model_forward_seconds"])
-        + float(row["preprocess_seconds"])
-        + float(row["postprocess_seconds"])
+        float(row["model_forward_seconds"]) + float(row["preprocess_seconds"]) + float(row["postprocess_seconds"])
         for row in stats
     )
     non_model_seconds = max(0.0, recheck_elapsed - known_stage_seconds)
@@ -2758,9 +2884,7 @@ def apply_sahi_recheck_batch(
         extra_postprocess = non_model_seconds * allocation_weights[image_index] / max(1, total_weight)
         row["postprocess_seconds"] = float(row["postprocess_seconds"]) + extra_postprocess
         row["elapsed_seconds"] = (
-            float(row["preprocess_seconds"])
-            + float(row["model_forward_seconds"])
-            + float(row["postprocess_seconds"])
+            float(row["preprocess_seconds"]) + float(row["model_forward_seconds"]) + float(row["postprocess_seconds"])
         )
         row["batch_count"] = len(batch_indices_by_image[image_index])
         row["effective_batch_sizes"] = sorted(batch_sizes_by_image[image_index])
@@ -2773,7 +2897,7 @@ def apply_sahi_recheck(
     config: Mapping[str, Any],
     source_rgb: Image.Image,
     predictions: Sequence[Mapping[str, Any]],
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Verify target-class SAHI boxes with a centered second pass and fused confidence."""
     output, stats = apply_sahi_recheck_batch([image], model, config, [source_rgb], [predictions])
     return output[0], stats[0]
@@ -2784,8 +2908,8 @@ def predict_images_rfdetr_full(
     model: Any,
     config: Mapping[str, Any],
     *,
-    batch_size: Optional[int] = None,
-) -> Tuple[List[List[Dict[str, Any]]], List[Dict[str, Any]]]:
+    batch_size: int | None = None,
+) -> tuple[list[list[dict[str, Any]]], list[dict[str, Any]]]:
     """Run batched RF-DETR full-image inference."""
     predictions_by_image, stats = predict_rfdetr_direct_batch(
         images,
@@ -2819,20 +2943,20 @@ def predict_images_rfdetr_sahi(
     images: Sequence[ImageRecord],
     model: Any,
     config: Mapping[str, Any],
-) -> Tuple[List[List[Dict[str, Any]]], List[Dict[str, Any]]]:
+) -> tuple[list[list[dict[str, Any]]], list[dict[str, Any]]]:
     """Run batched direct RF-DETR SAHI-style sliced prediction."""
     if not images:
         return [], []
     sahi_started = time.perf_counter()
     sahi_cfg = config["sahi"]
     slice_batch_size = rfdetr_sahi_batch_size(config)
-    windows_by_image: List[List[Tuple[int, int, int, int]]] = []
-    source_rgbs: List[Image.Image] = []
-    task_records: List[ImageRecord] = []
-    task_sources: List[Image.Image] = []
-    task_widths: List[int] = []
-    task_heights: List[int] = []
-    task_meta: List[Tuple[int, int, int, int, int]] = []
+    windows_by_image: list[list[tuple[int, int, int, int]]] = []
+    source_rgbs: list[Image.Image] = []
+    task_records: list[ImageRecord] = []
+    task_sources: list[Image.Image] = []
+    task_widths: list[int] = []
+    task_heights: list[int] = []
+    task_meta: list[tuple[int, int, int, int, int]] = []
 
     for image_index, image in enumerate(images):
         windows = shared_modes.generate_slice_windows_for_size(
@@ -2857,7 +2981,7 @@ def predict_images_rfdetr_sahi(
     sahi_model_forward_by_image = [0.0 for _ in images]
     base_model_forward_by_image = [0.0 for _ in images]
     model_postprocess_by_image = [0.0 for _ in images]
-    all_predictions: List[List[Dict[str, Any]]] = [[] for _ in images]
+    all_predictions: list[list[dict[str, Any]]] = [[] for _ in images]
     if task_records:
         slice_predictions_by_task, slice_stats = predict_rfdetr_direct_batch(
             task_records,
@@ -2896,7 +3020,7 @@ def predict_images_rfdetr_sahi(
             model_postprocess_by_image[image_index] += float(stat.get("postprocess_seconds", 0.0))
 
     postprocess_start = time.perf_counter()
-    postprocessed: List[List[Dict[str, Any]]] = []
+    postprocessed: list[list[dict[str, Any]]] = []
     for predictions in all_predictions:
         postprocessed.append(
             shared_modes.postprocess_sahi_coco_predictions(
@@ -2908,7 +3032,7 @@ def predict_images_rfdetr_sahi(
             )
         )
     postprocess_elapsed = time.perf_counter() - postprocess_start
-    recheck_stats: List[Dict[str, Any]] = [{"enabled": False} for _ in images]
+    recheck_stats: list[dict[str, Any]] = [{"enabled": False} for _ in images]
     if bool(dict(sahi_cfg.get("recheck", {}) or {}).get("enabled", False)):
         postprocessed, recheck_stats = apply_sahi_recheck_batch(images, model, config, source_rgbs, postprocessed)
 
@@ -2922,17 +3046,13 @@ def predict_images_rfdetr_sahi(
         + sum(float(row.get("postprocess_seconds", 0.0)) for row in recheck_stats)
     )
     preprocess_per_image = max(0.0, total_sahi_elapsed - known_stage_total) / max(1, len(images))
-    stats: List[Dict[str, Any]] = []
+    stats: list[dict[str, Any]] = []
     for image_index, image in enumerate(images):
         recheck_model_forward_seconds = float(recheck_stats[image_index].get("model_forward_seconds", 0.0))
         recheck_postprocess_seconds = float(recheck_stats[image_index].get("postprocess_seconds", 0.0))
         base_model_forward_seconds = base_model_forward_by_image[image_index]
         sahi_model_forward_seconds = sahi_model_forward_by_image[image_index]
-        model_forward_seconds = (
-            base_model_forward_seconds
-            + sahi_model_forward_seconds
-            + recheck_model_forward_seconds
-        )
+        model_forward_seconds = base_model_forward_seconds + sahi_model_forward_seconds + recheck_model_forward_seconds
         total_postprocess_seconds = (
             model_postprocess_by_image[image_index]
             + postprocess_elapsed / max(1, len(images))
@@ -2959,8 +3079,12 @@ def predict_images_rfdetr_sahi(
                 "preprocess_seconds": preprocess_seconds,
                 "postprocess_seconds": total_postprocess_seconds,
                 "model_forward_ratio": model_forward_seconds / elapsed_seconds if elapsed_seconds > 0.0 else 0.0,
-                "sahi_model_forward_ratio": sahi_model_forward_seconds / elapsed_seconds if elapsed_seconds > 0.0 else 0.0,
-                "recheck_model_forward_ratio": recheck_model_forward_seconds / elapsed_seconds if elapsed_seconds > 0.0 else 0.0,
+                "sahi_model_forward_ratio": sahi_model_forward_seconds / elapsed_seconds
+                if elapsed_seconds > 0.0
+                else 0.0,
+                "recheck_model_forward_ratio": recheck_model_forward_seconds / elapsed_seconds
+                if elapsed_seconds > 0.0
+                else 0.0,
             }
         )
     return postprocessed, stats
@@ -2970,7 +3094,7 @@ def predict_images_rfdetr_class_crop(
     images: Sequence[ImageRecord],
     model: Any,
     config: Mapping[str, Any],
-) -> Tuple[List[List[Dict[str, Any]]], List[Dict[str, Any]]]:
+) -> tuple[list[list[dict[str, Any]]], list[dict[str, Any]]]:
     """Run batched RF-DETR class-crop inference."""
     if not images:
         return [], []
@@ -2984,14 +3108,14 @@ def predict_images_rfdetr_class_crop(
         batch_size=rfdetr_image_batch_size(config),
         engine="rfdetr_class_crop_source",
     )
-    output_predictions: List[Optional[List[Dict[str, Any]]]] = [None for _ in images]
-    output_stats: List[Optional[Dict[str, Any]]] = [None for _ in images]
-    fallback_indices: List[int] = []
-    crop_records: List[ImageRecord] = []
-    crop_sources: List[Image.Image] = []
-    crop_widths: List[int] = []
-    crop_heights: List[int] = []
-    crop_meta: List[Dict[str, Any]] = []
+    output_predictions: list[list[dict[str, Any]] | None] = [None for _ in images]
+    output_stats: list[dict[str, Any] | None] = [None for _ in images]
+    fallback_indices: list[int] = []
+    crop_records: list[ImageRecord] = []
+    crop_sources: list[Image.Image] = []
+    crop_widths: list[int] = []
+    crop_heights: list[int] = []
+    crop_meta: list[dict[str, Any]] = []
 
     def include_source_stages(stat: MutableMapping[str, Any], source_stat: Mapping[str, Any]) -> None:
         for key in ("preprocess_seconds", "model_forward_seconds", "postprocess_seconds"):
@@ -2999,8 +3123,7 @@ def predict_images_rfdetr_class_crop(
             stat_fallback = stat.get("elapsed_seconds", 0.0) if key == "model_forward_seconds" else 0.0
             stat[key] = float(source_stat.get(key, source_fallback)) + float(stat.get(key, stat_fallback))
         stat["elapsed_seconds"] = sum(
-            float(stat.get(key, 0.0))
-            for key in ("preprocess_seconds", "model_forward_seconds", "postprocess_seconds")
+            float(stat.get(key, 0.0)) for key in ("preprocess_seconds", "model_forward_seconds", "postprocess_seconds")
         )
 
     for image_index, (image, source_predictions) in enumerate(zip(images, source_predictions_by_image)):
@@ -3075,7 +3198,9 @@ def predict_images_rfdetr_class_crop(
             image = images[image_index]
             crop_x = int(meta["crop_x"])
             crop_y = int(meta["crop_y"])
-            projected = shared_modes.project_predictions_to_original(crop_predictions, crop_x, crop_y, image.width, image.height)
+            projected = shared_modes.project_predictions_to_original(
+                crop_predictions, crop_x, crop_y, image.width, image.height
+            )
             include_source_stages(stat, source_stats[image_index])
             stat.update(
                 {
@@ -3096,7 +3221,8 @@ def predict_images_rfdetr_class_crop(
             output_stats[image_index] = stat
 
     resolved_stats = [
-        stat or {
+        stat
+        or {
             "image_id": image.image_id,
             "file_name": image.file_name,
             "width": image.width,
@@ -3150,8 +3276,8 @@ def predict_images_rfdetr(
     inference_model: Any,
     config: Mapping[str, Any],
     output_dir: Path,
-    visual_image_ids: Optional[Sequence[int]] = None,
-) -> Tuple[List[List[Dict[str, Any]]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    visual_image_ids: Sequence[int] | None = None,
+) -> tuple[list[list[dict[str, Any]]], list[dict[str, Any]], list[dict[str, Any]]]:
     """Run batched RF-DETR inference for the configured test mode."""
     _ = output_dir
     _ = visual_image_ids
@@ -3169,7 +3295,7 @@ def predict_image_sliced_direct(
     image: ImageRecord,
     model: Any,
     config: Mapping[str, Any],
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any], None]:
+) -> tuple[list[dict[str, Any]], dict[str, Any], None]:
     """Run SAHI-style sliced prediction using the direct model adapter."""
     predictions_by_image, stats = predict_images_rfdetr_sahi([image], model, config)
     return predictions_by_image[0], stats[0], None
@@ -3179,7 +3305,7 @@ def predict_image_class_crop(
     image: ImageRecord,
     model: Any,
     config: Mapping[str, Any],
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any], None]:
+) -> tuple[list[dict[str, Any]], dict[str, Any], None]:
     """Run prediction-crop-prediction and project crop detections to original coordinates."""
     crop_cfg = shared_modes.default_crop_config(config)
     start = time.perf_counter()
@@ -3228,7 +3354,9 @@ def predict_image_class_crop(
         width=crop_w,
         height=crop_h,
     )
-    predictions = shared_modes.project_predictions_to_original(crop_predictions, crop_x, crop_y, image.width, image.height)
+    predictions = shared_modes.project_predictions_to_original(
+        crop_predictions, crop_x, crop_y, image.width, image.height
+    )
     elapsed = time.perf_counter() - start
     crop_stat.update(
         {
@@ -3255,7 +3383,7 @@ def predict_image(
     config: Mapping[str, Any],
     output_dir: Path,
     save_visual: bool,
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Optional[Dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any] | None]:
     """Run configured prediction for one image."""
     mode = shared_modes.canonical_test_mode(config)
     if mode == shared_modes.SAHI_MODE:
@@ -3267,12 +3395,12 @@ def predict_image(
 
 def inference_worker(
     chunk_id: int,
-    records: List[Dict[str, Any]],
+    records: list[dict[str, Any]],
     config: Mapping[str, Any],
     output_dir_text: str,
     device: str,
     visual_image_ids: Sequence[int],
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Multiprocessing-safe worker for image-level inference."""
     output_dir = Path(output_dir_text)
     worker_config = dict(config)
@@ -3285,20 +3413,16 @@ def inference_worker(
     inference_model = build_inference_model(config, device)
     model_load_seconds = time.perf_counter() - model_load_start
     model_state = getattr(inference_model, "__dict__", None)
-    acceleration_handle = (
-        model_state.get("_rf_detr_acceleration_handle")
-        if isinstance(model_state, dict)
-        else None
-    )
+    acceleration_handle = model_state.get("_rf_detr_acceleration_handle") if isinstance(model_state, dict) else None
     acceleration_metadata = getattr(acceleration_handle, "metadata", None)
     if isinstance(acceleration_metadata, Mapping):
         acceleration_metadata = dict(acceleration_metadata)
     else:
         acceleration_metadata = None
-    visual_ids = set(int(image_id) for image_id in visual_image_ids)
-    all_predictions: List[Dict[str, Any]] = []
-    all_stats: List[Dict[str, Any]] = []
-    visual_rows: List[Dict[str, Any]] = []
+    visual_ids = {int(image_id) for image_id in visual_image_ids}
+    all_predictions: list[dict[str, Any]] = []
+    all_stats: list[dict[str, Any]] = []
+    visual_rows: list[dict[str, Any]] = []
     image_records = [ImageRecord(**record) for record in records]
 
     inference_start = time.perf_counter()
@@ -3353,11 +3477,11 @@ def inference_worker(
     }
 
 
-def chunk_records(records: Sequence[ImageRecord], chunks: int) -> List[List[Dict[str, Any]]]:
+def chunk_records(records: Sequence[ImageRecord], chunks: int) -> list[list[dict[str, Any]]]:
     """Split image records into balanced chunks."""
     if chunks <= 1:
         return [[record.__dict__ for record in records]]
-    buckets: List[List[Dict[str, Any]]] = [[] for _ in range(chunks)]
+    buckets: list[list[dict[str, Any]]] = [[] for _ in range(chunks)]
     for index, record in enumerate(records):
         buckets[index % chunks].append(record.__dict__)
     return [bucket for bucket in buckets if bucket]
@@ -3369,12 +3493,12 @@ def run_batched_rfdetr_records(
     config: Mapping[str, Any],
     output_dir: Path,
     visual_image_ids: Sequence[int],
-    progress_bar: Optional[Any] = None,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    progress_bar: Any | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     """Run RF-DETR records in image batches and flatten evaluator outputs."""
-    all_predictions: List[Dict[str, Any]] = []
-    all_stats: List[Dict[str, Any]] = []
-    visual_rows: List[Dict[str, Any]] = []
+    all_predictions: list[dict[str, Any]] = []
+    all_stats: list[dict[str, Any]] = []
+    visual_rows: list[dict[str, Any]] = []
     for batch in batched_sequence(list(records), rfdetr_image_batch_size(config)):
         predictions_by_image, stats, batch_visual_rows = predict_images_rfdetr(
             images=batch,
@@ -3392,7 +3516,7 @@ def run_batched_rfdetr_records(
     return all_predictions, all_stats, visual_rows
 
 
-def _failed_parallel_assignment(plan: Mapping[str, Any], error: Exception) -> Dict[str, Any]:
+def _failed_parallel_assignment(plan: Mapping[str, Any], error: Exception) -> dict[str, Any]:
     """Build a deterministic failed assignment from the parent's submitted plan."""
     return {
         "chunk_id": int(plan["chunk_id"]),
@@ -3411,7 +3535,7 @@ def _failed_parallel_assignment(plan: Mapping[str, Any], error: Exception) -> Di
 def _validate_parallel_worker_result(
     result: Any,
     plan: Mapping[str, Any],
-) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     """Validate an untrusted worker result against its parent-owned assignment plan."""
     if not isinstance(result, Mapping):
         raise ValueError("worker result must be a mapping.")
@@ -3428,9 +3552,7 @@ def _validate_parallel_worker_result(
     for field, expected in expected_values.items():
         actual = result.get(field)
         if isinstance(actual, bool) or actual != expected:
-            raise ValueError(
-                f"worker result {field}={actual!r} does not match submitted {field}={expected!r}."
-            )
+            raise ValueError(f"worker result {field}={actual!r} does not match submitted {field}={expected!r}.")
 
     predictions = result.get("predictions")
     stats = result.get("stats")
@@ -3464,8 +3586,7 @@ def _validate_parallel_worker_result(
                 converter(prediction[field])
             except (KeyError, TypeError, ValueError, OverflowError) as error:
                 raise ValueError(
-                    f"worker result predictions[{index}].{field} must be convertible "
-                    f"to {converter.__name__}."
+                    f"worker result predictions[{index}].{field} must be convertible to {converter.__name__}."
                 ) from error
 
     for index, stat in enumerate(stats):
@@ -3474,15 +3595,13 @@ def _validate_parallel_worker_result(
         try:
             int(stat["image_id"])
         except (KeyError, TypeError, ValueError, OverflowError) as error:
-            raise ValueError(
-                f"worker result stats[{index}].image_id must be convertible to int."
-            ) from error
+            raise ValueError(f"worker result stats[{index}].image_id must be convertible to int.") from error
 
     for index, visual in enumerate(visuals):
         if not isinstance(visual, Mapping):
             raise ValueError(f"worker result visuals[{index}] must be a mapping.")
 
-    times: Dict[str, float] = {}
+    times: dict[str, float] = {}
     for field in ("model_load_seconds", "inference_seconds"):
         value = result.get(field)
         if isinstance(value, bool):
@@ -3490,9 +3609,7 @@ def _validate_parallel_worker_result(
         try:
             numeric_value = float(value)
         except (TypeError, ValueError) as error:
-            raise ValueError(
-                f"worker result {field} must be a finite non-negative number."
-            ) from error
+            raise ValueError(f"worker result {field} must be a finite non-negative number.") from error
         if not math.isfinite(numeric_value) or numeric_value < 0:
             raise ValueError(f"worker result {field} must be a finite non-negative number.")
         times[field] = numeric_value
@@ -3502,9 +3619,7 @@ def _validate_parallel_worker_result(
         raise ValueError("worker result effective_batch_sizes must be a list.")
     for batch_size in effective_batch_sizes:
         if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
-            raise ValueError(
-                "worker result effective_batch_sizes members must be positive integers."
-            )
+            raise ValueError("worker result effective_batch_sizes members must be positive integers.")
     normalized_batch_sizes = sorted(set(effective_batch_sizes))
 
     acceleration = result.get("acceleration")
@@ -3546,11 +3661,11 @@ def run_inference(
     output_dir: Path,
     quiet: bool,
     prebuilt_model: Any = None,
-) -> Tuple[
-    List[Dict[str, Any]],
-    List[Dict[str, Any]],
-    List[Dict[str, Any]],
-    Optional[Dict[str, Any]],
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    dict[str, Any] | None,
 ]:
     """Run inference across all images."""
     devices = parse_devices(config["model"])
@@ -3566,7 +3681,9 @@ def run_inference(
     if chunk_count == 1:
         inference_model = build_inference_model(config, chunk_devices[0], prebuilt_model=prebuilt_model)
         if is_rfdetr_model_type(config.get("model", {})):
-            progress_bar = tqdm(total=len(dataset.images), desc=f"{engine} inference", unit="image") if progress_enabled else None
+            progress_bar = (
+                tqdm(total=len(dataset.images), desc=f"{engine} inference", unit="image") if progress_enabled else None
+            )
             try:
                 predictions, stats, visuals = run_batched_rfdetr_records(
                     dataset.images,
@@ -3580,9 +3697,9 @@ def run_inference(
             finally:
                 if progress_bar is not None:
                     progress_bar.close()
-        all_predictions: List[Dict[str, Any]] = []
-        all_stats: List[Dict[str, Any]] = []
-        visual_rows: List[Dict[str, Any]] = []
+        all_predictions: list[dict[str, Any]] = []
+        all_stats: list[dict[str, Any]] = []
+        visual_rows: list[dict[str, Any]] = []
         iterator: Iterable[ImageRecord] = dataset.images
         if progress_enabled:
             iterator = tqdm(dataset.images, desc=f"{engine} inference", unit="image")
@@ -3610,9 +3727,7 @@ def run_inference(
                 "device": chunk_devices[index],
                 "image_count": len(records),
                 "visual_image_ids": [
-                    record["image_id"]
-                    for record in records
-                    if record["image_id"] in visual_image_ids
+                    record["image_id"] for record in records if record["image_id"] in visual_image_ids
                 ],
             }
         )
@@ -3620,13 +3735,13 @@ def run_inference(
         f"Using {chunk_count} image-level multiprocessing chunks on devices: {', '.join(devices)}",
         verbose=not quiet,
     )
-    assignments_by_chunk: Dict[int, Dict[str, Any]] = {}
-    payloads_by_chunk: Dict[
+    assignments_by_chunk: dict[int, dict[str, Any]] = {}
+    payloads_by_chunk: dict[
         int,
-        Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]],
+        tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]],
     ] = {}
-    futures: Dict[Any, Mapping[str, Any]] = {}
-    controller_error: Optional[Exception] = None
+    futures: dict[Any, Mapping[str, Any]] = {}
+    controller_error: Exception | None = None
     wall_start = time.perf_counter()
 
     def record_terminal_future(future: Any, plan: Mapping[str, Any]) -> None:
@@ -3682,9 +3797,7 @@ def run_inference(
         if controller_error is None:
             controller_error = error
 
-    missing_plans = [
-        plan for plan in plans if int(plan["chunk_id"]) not in assignments_by_chunk
-    ]
+    missing_plans = [plan for plan in plans if int(plan["chunk_id"]) not in assignments_by_chunk]
     if missing_plans:
         missing_error = controller_error or RuntimeError("Parallel chunk did not produce a terminal result.")
         for plan in missing_plans:
@@ -3712,9 +3825,9 @@ def run_inference(
     if parallel_summary["status"] == "failed":
         raise ParallelInferenceError(parallel_summary)
 
-    all_predictions: List[Dict[str, Any]] = []
-    all_stats: List[Dict[str, Any]] = []
-    visual_rows: List[Dict[str, Any]] = []
+    all_predictions: list[dict[str, Any]] = []
+    all_stats: list[dict[str, Any]] = []
+    visual_rows: list[dict[str, Any]] = []
     for chunk_id in range(chunk_count):
         predictions, stats, visuals = payloads_by_chunk[chunk_id]
         all_predictions.extend(predictions)
@@ -3765,12 +3878,14 @@ def bbox_iou_one_to_many(box: np.ndarray, boxes: np.ndarray) -> np.ndarray:
     return np.divide(inter, union, out=np.zeros_like(inter, dtype=np.float32), where=union > 0)
 
 
-def build_gt_indexes(annotations: Sequence[Mapping[str, Any]]) -> Tuple[Dict[Tuple[int, int], np.ndarray], Dict[Tuple[int, int], List[int]], Dict[int, int], Dict[int, int]]:
+def build_gt_indexes(
+    annotations: Sequence[Mapping[str, Any]],
+) -> tuple[dict[tuple[int, int], np.ndarray], dict[tuple[int, int], list[int]], dict[int, int], dict[int, int]]:
     """Build fast ground-truth indexes by image/class."""
-    grouped_boxes: Dict[Tuple[int, int], List[np.ndarray]] = {}
-    grouped_ann_ids: Dict[Tuple[int, int], List[int]] = {}
-    gt_by_class: Dict[int, int] = {}
-    gt_by_image: Dict[int, int] = {}
+    grouped_boxes: dict[tuple[int, int], list[np.ndarray]] = {}
+    grouped_ann_ids: dict[tuple[int, int], list[int]] = {}
+    gt_by_class: dict[int, int] = {}
+    gt_by_image: dict[int, int] = {}
     for annotation in annotations:
         image_id = int(annotation["image_id"])
         category_id = int(annotation["category_id"])
@@ -3790,7 +3905,7 @@ def match_predictions_at_threshold(
     category_ids: Sequence[int],
     iou_threshold: float,
     confidence_threshold: float,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Compute operating-point TP/FP/FN metrics with greedy score-ordered matching."""
     gt_boxes, _, gt_by_class, gt_by_image = build_gt_indexes(annotations)
     matched = {key: np.zeros(len(boxes), dtype=bool) for key, boxes in gt_boxes.items()}
@@ -3839,13 +3954,23 @@ def match_predictions_at_threshold(
             fp_by_class[category_id] = fp_by_class.get(category_id, 0) + 1
             per_image[image_id]["fp"] += 1
 
-    fn_by_class = {category_id: max(0, gt_by_class.get(category_id, 0) - tp_by_class.get(category_id, 0)) for category_id in category_ids}
+    fn_by_class = {
+        category_id: max(0, gt_by_class.get(category_id, 0) - tp_by_class.get(category_id, 0))
+        for category_id in category_ids
+    }
     for key, boxes in gt_boxes.items():
         image_id, _ = key
         unmatched = int((~matched[key]).sum())
         per_image.setdefault(
             image_id,
-            {"image_id": image_id, "tp": 0, "fp": 0, "fn": 0, "ground_truth": gt_by_image.get(image_id, 0), "predictions": 0},
+            {
+                "image_id": image_id,
+                "tp": 0,
+                "fp": 0,
+                "fn": 0,
+                "ground_truth": gt_by_image.get(image_id, 0),
+                "predictions": 0,
+            },
         )
         per_image[image_id]["fn"] += unmatched
 
@@ -3863,7 +3988,9 @@ def match_predictions_at_threshold(
         cls_fn = int(fn_by_class.get(category_id, 0))
         cls_precision = cls_tp / (cls_tp + cls_fp) if (cls_tp + cls_fp) else 0.0
         cls_recall = cls_tp / (cls_tp + cls_fn) if (cls_tp + cls_fn) else 0.0
-        cls_f1 = (2.0 * cls_precision * cls_recall / (cls_precision + cls_recall)) if (cls_precision + cls_recall) else 0.0
+        cls_f1 = (
+            (2.0 * cls_precision * cls_recall / (cls_precision + cls_recall)) if (cls_precision + cls_recall) else 0.0
+        )
         per_class.append(
             {
                 "category_id": category_id,
@@ -3880,7 +4007,11 @@ def match_predictions_at_threshold(
     for row in per_image.values():
         row["precision"] = row["tp"] / (row["tp"] + row["fp"]) if (row["tp"] + row["fp"]) else 0.0
         row["recall"] = row["tp"] / (row["tp"] + row["fn"]) if (row["tp"] + row["fn"]) else 0.0
-        row["f1"] = (2.0 * row["precision"] * row["recall"] / (row["precision"] + row["recall"])) if (row["precision"] + row["recall"]) else 0.0
+        row["f1"] = (
+            (2.0 * row["precision"] * row["recall"] / (row["precision"] + row["recall"]))
+            if (row["precision"] + row["recall"])
+            else 0.0
+        )
 
     return {
         "tp": tp,
@@ -3901,12 +4032,12 @@ def match_predictions_by_area_at_threshold(
     area_ranges: Sequence[float],
     iou_threshold: float,
     confidence_threshold: float,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Compute operating-point metrics by category and small/medium/large area bucket."""
     gt_boxes, _, _, _ = build_gt_indexes(annotations)
     matched = {key: np.zeros(len(boxes), dtype=bool) for key, boxes in gt_boxes.items()}
-    gt_meta: Dict[Tuple[int, int], List[Mapping[str, Any]]] = {}
-    counts: Dict[Tuple[int, str], Dict[str, int]] = {
+    gt_meta: dict[tuple[int, int], list[Mapping[str, Any]]] = {}
+    counts: dict[tuple[int, str], dict[str, int]] = {
         (int(category_id), bucket): {"tp": 0, "fp": 0, "fn": 0, "instances": 0}
         for category_id in category_ids
         for bucket in ("small", "medium", "large")
@@ -3964,7 +4095,7 @@ def match_predictions_by_area_at_threshold(
             counts.setdefault((category_id, bucket), {"tp": 0, "fp": 0, "fn": 0, "instances": 0})
             counts[(category_id, bucket)]["fn"] += 1
 
-    output_rows: List[Dict[str, Any]] = []
+    output_rows: list[dict[str, Any]] = []
     for category_id in category_ids:
         for bucket in ("small", "medium", "large"):
             row = counts.get((int(category_id), bucket), {"tp": 0, "fp": 0, "fn": 0, "instances": 0})
@@ -3996,7 +4127,7 @@ def threshold_sweep(
     category_ids: Sequence[int],
     thresholds: Sequence[float],
     iou_threshold: float,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Compute P/R/F1 as confidence threshold decreases using incremental matching."""
     gt_boxes, _, gt_by_class, _ = build_gt_indexes(annotations)
     total_gt = int(sum(gt_by_class.values()))
@@ -4006,7 +4137,7 @@ def threshold_sweep(
     pointer = 0
     tp = 0
     fp = 0
-    rows: List[Dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
 
     for threshold in thresholds_desc:
         while pointer < len(sorted_predictions) and float(sorted_predictions[pointer].get("score", 0.0)) >= threshold:
@@ -4054,13 +4185,13 @@ def build_confusion_matrix(
     category_ids: Sequence[int],
     iou_threshold: float,
     confidence_threshold: float,
-) -> Tuple[np.ndarray, List[int]]:
+) -> tuple[np.ndarray, list[int]]:
     """Build an object-detection confusion matrix with a background row/column."""
     cat_to_index = {category_id: index for index, category_id in enumerate(category_ids)}
     bg_index = len(category_ids)
     matrix = np.zeros((len(category_ids) + 1, len(category_ids) + 1), dtype=np.int64)
 
-    gt_by_image: Dict[int, List[Dict[str, Any]]] = {}
+    gt_by_image: dict[int, list[dict[str, Any]]] = {}
     for annotation in annotations:
         gt_by_image.setdefault(int(annotation["image_id"]), []).append(
             {
@@ -4070,7 +4201,7 @@ def build_confusion_matrix(
             }
         )
 
-    preds_by_image: Dict[int, List[Mapping[str, Any]]] = {}
+    preds_by_image: dict[int, list[Mapping[str, Any]]] = {}
     for prediction in predictions:
         if float(prediction.get("score", 0.0)) >= confidence_threshold:
             preds_by_image.setdefault(int(prediction["image_id"]), []).append(prediction)
@@ -4107,7 +4238,14 @@ def build_confusion_matrix(
     return matrix, list(category_ids)
 
 
-def capture_coco_eval(gt_path: Path, predictions: List[Dict[str, Any]], config: Mapping[str, Any], image_ids: Sequence[int], category_ids: Sequence[int], quiet: bool) -> Tuple[Any, str]:
+def capture_coco_eval(
+    gt_path: Path,
+    predictions: list[dict[str, Any]],
+    config: Mapping[str, Any],
+    image_ids: Sequence[int],
+    category_ids: Sequence[int],
+    quiet: bool,
+) -> tuple[Any, str]:
     """Run pycocotools COCOeval and capture its text summary."""
     from pycocotools.coco import COCO
     from pycocotools.cocoeval import COCOeval
@@ -4120,7 +4258,11 @@ def capture_coco_eval(gt_path: Path, predictions: List[Dict[str, Any]], config: 
             coco_dt = coco_gt.loadRes(predictions)
         else:
             coco_dt = COCO()
-            coco_dt.dataset = {"images": coco_gt.dataset.get("images", []), "categories": coco_gt.dataset.get("categories", []), "annotations": []}
+            coco_dt.dataset = {
+                "images": coco_gt.dataset.get("images", []),
+                "categories": coco_gt.dataset.get("categories", []),
+                "annotations": [],
+            }
             coco_dt.createIndex()
         coco_eval = COCOeval(coco_gt, coco_dt, iouType=str(eval_cfg.get("type", "bbox")))
         coco_eval.params.imgIds = [int(image_id) for image_id in image_ids]
@@ -4144,7 +4286,9 @@ def capture_coco_eval(gt_path: Path, predictions: List[Dict[str, Any]], config: 
     return coco_eval, text
 
 
-def format_coco_summary_line(title: str, metric_type: str, iou_label: str, area_label: str, max_det: int, value: float) -> str:
+def format_coco_summary_line(
+    title: str, metric_type: str, iou_label: str, area_label: str, max_det: int, value: float
+) -> str:
     """Format one COCO-style summary row."""
     return f" {title:<18} {metric_type} @[ IoU={iou_label:<9} | area={area_label:>6s} | maxDets={max_det:>3d} ] = {value:0.3f}"
 
@@ -4167,18 +4311,106 @@ def summarize_coco_eval(coco_eval: Any) -> str:
     iou_range_label = f"{float(p.iouThrs[0]):0.2f}:{float(p.iouThrs[-1]):0.2f}"
     stats = np.zeros((12,), dtype=np.float64)
     rows = [
-        ("Average Precision", "(AP)", iou_range_label, "all", max_det, mean_coco_precision(coco_eval, max_det=max_det), 0),
-        ("Average Precision", "(AP)", "0.50", "all", max_det, mean_coco_precision(coco_eval, iou_threshold=0.5, max_det=max_det), 1),
-        ("Average Precision", "(AP)", "0.75", "all", max_det, mean_coco_precision(coco_eval, iou_threshold=0.75, max_det=max_det), 2),
-        ("Average Precision", "(AP)", iou_range_label, "small", max_det, mean_coco_precision(coco_eval, area_label="small", max_det=max_det), 3),
-        ("Average Precision", "(AP)", iou_range_label, "medium", max_det, mean_coco_precision(coco_eval, area_label="medium", max_det=max_det), 4),
-        ("Average Precision", "(AP)", iou_range_label, "large", max_det, mean_coco_precision(coco_eval, area_label="large", max_det=max_det), 5),
-        ("Average Recall", "(AR)", iou_range_label, "all", max_det_1, mean_coco_recall(coco_eval, max_det=max_det_1), 6),
-        ("Average Recall", "(AR)", iou_range_label, "all", max_det_10, mean_coco_recall(coco_eval, max_det=max_det_10), 7),
+        (
+            "Average Precision",
+            "(AP)",
+            iou_range_label,
+            "all",
+            max_det,
+            mean_coco_precision(coco_eval, max_det=max_det),
+            0,
+        ),
+        (
+            "Average Precision",
+            "(AP)",
+            "0.50",
+            "all",
+            max_det,
+            mean_coco_precision(coco_eval, iou_threshold=0.5, max_det=max_det),
+            1,
+        ),
+        (
+            "Average Precision",
+            "(AP)",
+            "0.75",
+            "all",
+            max_det,
+            mean_coco_precision(coco_eval, iou_threshold=0.75, max_det=max_det),
+            2,
+        ),
+        (
+            "Average Precision",
+            "(AP)",
+            iou_range_label,
+            "small",
+            max_det,
+            mean_coco_precision(coco_eval, area_label="small", max_det=max_det),
+            3,
+        ),
+        (
+            "Average Precision",
+            "(AP)",
+            iou_range_label,
+            "medium",
+            max_det,
+            mean_coco_precision(coco_eval, area_label="medium", max_det=max_det),
+            4,
+        ),
+        (
+            "Average Precision",
+            "(AP)",
+            iou_range_label,
+            "large",
+            max_det,
+            mean_coco_precision(coco_eval, area_label="large", max_det=max_det),
+            5,
+        ),
+        (
+            "Average Recall",
+            "(AR)",
+            iou_range_label,
+            "all",
+            max_det_1,
+            mean_coco_recall(coco_eval, max_det=max_det_1),
+            6,
+        ),
+        (
+            "Average Recall",
+            "(AR)",
+            iou_range_label,
+            "all",
+            max_det_10,
+            mean_coco_recall(coco_eval, max_det=max_det_10),
+            7,
+        ),
         ("Average Recall", "(AR)", iou_range_label, "all", max_det, mean_coco_recall(coco_eval, max_det=max_det), 8),
-        ("Average Recall", "(AR)", iou_range_label, "small", max_det, mean_coco_recall(coco_eval, area_label="small", max_det=max_det), 9),
-        ("Average Recall", "(AR)", iou_range_label, "medium", max_det, mean_coco_recall(coco_eval, area_label="medium", max_det=max_det), 10),
-        ("Average Recall", "(AR)", iou_range_label, "large", max_det, mean_coco_recall(coco_eval, area_label="large", max_det=max_det), 11),
+        (
+            "Average Recall",
+            "(AR)",
+            iou_range_label,
+            "small",
+            max_det,
+            mean_coco_recall(coco_eval, area_label="small", max_det=max_det),
+            9,
+        ),
+        (
+            "Average Recall",
+            "(AR)",
+            iou_range_label,
+            "medium",
+            max_det,
+            mean_coco_recall(coco_eval, area_label="medium", max_det=max_det),
+            10,
+        ),
+        (
+            "Average Recall",
+            "(AR)",
+            iou_range_label,
+            "large",
+            max_det,
+            mean_coco_recall(coco_eval, area_label="large", max_det=max_det),
+            11,
+        ),
     ]
     lines = []
     for title, metric_type, iou_label, area_label, row_max_det, value, index in rows:
@@ -4188,7 +4420,13 @@ def summarize_coco_eval(coco_eval: Any) -> str:
     return "\n".join(lines) + "\n"
 
 
-def mean_coco_precision(coco_eval: Any, category_index: Optional[int] = None, iou_threshold: Optional[float] = None, area_label: str = "all", max_det: Optional[int] = None) -> float:
+def mean_coco_precision(
+    coco_eval: Any,
+    category_index: int | None = None,
+    iou_threshold: float | None = None,
+    area_label: str = "all",
+    max_det: int | None = None,
+) -> float:
     """Mean precision from COCOeval precision tensor."""
     precision = coco_eval.eval.get("precision")
     if precision is None:
@@ -4204,14 +4442,22 @@ def mean_coco_precision(coco_eval: Any, category_index: Optional[int] = None, io
             return -1.0
         values = values[iou_indices]
     if category_index is not None:
-        values = values[:, :, category_index : category_index + 1, area_index : area_index + 1, max_index : max_index + 1]
+        values = values[
+            :, :, category_index : category_index + 1, area_index : area_index + 1, max_index : max_index + 1
+        ]
     else:
         values = values[:, :, :, area_index : area_index + 1, max_index : max_index + 1]
     valid = values[values > -1]
     return float(np.mean(valid)) if valid.size else -1.0
 
 
-def mean_coco_recall(coco_eval: Any, category_index: Optional[int] = None, iou_threshold: Optional[float] = None, area_label: str = "all", max_det: Optional[int] = None) -> float:
+def mean_coco_recall(
+    coco_eval: Any,
+    category_index: int | None = None,
+    iou_threshold: float | None = None,
+    area_label: str = "all",
+    max_det: int | None = None,
+) -> float:
     """Mean recall from COCOeval recall tensor."""
     recall = coco_eval.eval.get("recall")
     if recall is None:
@@ -4234,7 +4480,7 @@ def mean_coco_recall(coco_eval: Any, category_index: Optional[int] = None, iou_t
     return float(np.mean(valid)) if valid.size else -1.0
 
 
-def coco_metrics_dict(coco_eval: Any) -> Dict[str, float]:
+def coco_metrics_dict(coco_eval: Any) -> dict[str, float]:
     """Collect standard and extended COCO metrics."""
     max_det = int(coco_eval.params.maxDets[-1])
     stats = getattr(coco_eval, "stats", np.full(12, -1.0))
@@ -4258,7 +4504,7 @@ def coco_metrics_dict(coco_eval: Any) -> Dict[str, float]:
     return metrics
 
 
-def coco_per_class_metrics(coco_eval: Any, categories: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+def coco_per_class_metrics(coco_eval: Any, categories: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Collect per-class COCO AP/AR metrics."""
     cat_ids = list(coco_eval.params.catIds)
     cat_id_to_name = {int(category["id"]): str(category.get("name", category["id"])) for category in categories}
@@ -4275,26 +4521,44 @@ def coco_per_class_metrics(coco_eval: Any, categories: Sequence[Mapping[str, Any
                 f"AR@{max_det}": mean_coco_recall(coco_eval, category_index=index, max_det=max_det),
                 "mAP50-95": mean_coco_precision(coco_eval, category_index=index, max_det=max_det),
                 "mAP50": mean_coco_precision(coco_eval, category_index=index, iou_threshold=0.5, max_det=max_det),
-                "mAP50-95_small": mean_coco_precision(coco_eval, category_index=index, area_label="small", max_det=max_det),
-                "mAP50-95_medium": mean_coco_precision(coco_eval, category_index=index, area_label="medium", max_det=max_det),
-                "mAP50-95_large": mean_coco_precision(coco_eval, category_index=index, area_label="large", max_det=max_det),
-                "mAP50_small": mean_coco_precision(coco_eval, category_index=index, iou_threshold=0.5, area_label="small", max_det=max_det),
-                "mAP50_medium": mean_coco_precision(coco_eval, category_index=index, iou_threshold=0.5, area_label="medium", max_det=max_det),
-                "mAP50_large": mean_coco_precision(coco_eval, category_index=index, iou_threshold=0.5, area_label="large", max_det=max_det),
-                f"AR@{max_det}_small": mean_coco_recall(coco_eval, category_index=index, area_label="small", max_det=max_det),
-                f"AR@{max_det}_medium": mean_coco_recall(coco_eval, category_index=index, area_label="medium", max_det=max_det),
-                f"AR@{max_det}_large": mean_coco_recall(coco_eval, category_index=index, area_label="large", max_det=max_det),
+                "mAP50-95_small": mean_coco_precision(
+                    coco_eval, category_index=index, area_label="small", max_det=max_det
+                ),
+                "mAP50-95_medium": mean_coco_precision(
+                    coco_eval, category_index=index, area_label="medium", max_det=max_det
+                ),
+                "mAP50-95_large": mean_coco_precision(
+                    coco_eval, category_index=index, area_label="large", max_det=max_det
+                ),
+                "mAP50_small": mean_coco_precision(
+                    coco_eval, category_index=index, iou_threshold=0.5, area_label="small", max_det=max_det
+                ),
+                "mAP50_medium": mean_coco_precision(
+                    coco_eval, category_index=index, iou_threshold=0.5, area_label="medium", max_det=max_det
+                ),
+                "mAP50_large": mean_coco_precision(
+                    coco_eval, category_index=index, iou_threshold=0.5, area_label="large", max_det=max_det
+                ),
+                f"AR@{max_det}_small": mean_coco_recall(
+                    coco_eval, category_index=index, area_label="small", max_det=max_det
+                ),
+                f"AR@{max_det}_medium": mean_coco_recall(
+                    coco_eval, category_index=index, area_label="medium", max_det=max_det
+                ),
+                f"AR@{max_det}_large": mean_coco_recall(
+                    coco_eval, category_index=index, area_label="large", max_det=max_det
+                ),
             }
         )
     return rows
 
 
-def coco_per_class_size_metrics(coco_eval: Any, categories: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+def coco_per_class_size_metrics(coco_eval: Any, categories: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Collect per-class COCO metrics as one row per small/medium/large bucket."""
     cat_ids = list(coco_eval.params.catIds)
     cat_id_to_name = {int(category["id"]): str(category.get("name", category["id"])) for category in categories}
     max_det = int(coco_eval.params.maxDets[-1])
-    rows: List[Dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
     for index, category_id in enumerate(cat_ids):
         for area_label in ("small", "medium", "large"):
             rows.append(
@@ -4302,9 +4566,15 @@ def coco_per_class_size_metrics(coco_eval: Any, categories: Sequence[Mapping[str
                     "category_id": int(category_id),
                     "class": cat_id_to_name.get(int(category_id), str(category_id)),
                     "area": area_label,
-                    "mAP50-95": mean_coco_precision(coco_eval, category_index=index, area_label=area_label, max_det=max_det),
-                    "mAP50": mean_coco_precision(coco_eval, category_index=index, iou_threshold=0.5, area_label=area_label, max_det=max_det),
-                    f"AR@{max_det}": mean_coco_recall(coco_eval, category_index=index, area_label=area_label, max_det=max_det),
+                    "mAP50-95": mean_coco_precision(
+                        coco_eval, category_index=index, area_label=area_label, max_det=max_det
+                    ),
+                    "mAP50": mean_coco_precision(
+                        coco_eval, category_index=index, iou_threshold=0.5, area_label=area_label, max_det=max_det
+                    ),
+                    f"AR@{max_det}": mean_coco_recall(
+                        coco_eval, category_index=index, area_label=area_label, max_det=max_det
+                    ),
                 }
             )
     return rows
@@ -4314,9 +4584,9 @@ def write_table(path: Path, rows: Sequence[Mapping[str, Any]], metadata: Mapping
     """Write rows to CSV, adding run metadata columns to every row."""
     path.parent.mkdir(parents=True, exist_ok=True)
     metadata = dict(metadata)
-    fieldnames: List[str] = list(metadata.keys())
+    fieldnames: list[str] = list(metadata.keys())
     for row in rows:
-        for key in row.keys():
+        for key in row:
             if key not in fieldnames:
                 fieldnames.append(key)
     with path.open("w", encoding="utf-8", newline="") as file:
@@ -4326,7 +4596,7 @@ def write_table(path: Path, rows: Sequence[Mapping[str, Any]], metadata: Mapping
             writer.writerow({**metadata, **dict(row)})
 
 
-def summarize_inference_timing(stats_rows: Sequence[Mapping[str, Any]]) -> Dict[str, float]:
+def summarize_inference_timing(stats_rows: Sequence[Mapping[str, Any]]) -> dict[str, float]:
     """Summarize additive RF-DETR stage timings without changing legacy timing keys."""
     if not stats_rows:
         return {"avg_inference_seconds_per_image": 0.0}
@@ -4346,10 +4616,7 @@ def summarize_inference_timing(stats_rows: Sequence[Mapping[str, Any]]) -> Dict[
         "model_forward_seconds",
         "postprocess_seconds",
     )
-    stage_totals = {
-        field: sum(float(row.get(field, 0.0)) for row in stats_rows)
-        for field in stage_fields
-    }
+    stage_totals = {field: sum(float(row.get(field, 0.0)) for row in stats_rows) for field in stage_fields}
     image_count = len(stats_rows)
     summary.update(
         {
@@ -4390,7 +4657,7 @@ def write_metrics_tables(
     stats_rows: Sequence[Mapping[str, Any]],
     visual_rows: Sequence[Mapping[str, Any]],
     output_info: Mapping[str, Any],
-    manifest: List[Dict[str, Any]],
+    manifest: list[dict[str, Any]],
 ) -> None:
     """Write metric JSON and CSV outputs."""
     metadata = {"run_id": output_info["run_id"], "config_hash": output_info["config_hash"]}
@@ -4413,15 +4680,21 @@ def write_metrics_tables(
     if sweep_rows:
         path = output_dir / "threshold_sweep.csv"
         write_table(path, sweep_rows, metadata)
-        manifest.append({"path": str(path), "kind": "metrics", "description": "Confidence-threshold precision/recall/F1 sweep."})
+        manifest.append(
+            {"path": str(path), "kind": "metrics", "description": "Confidence-threshold precision/recall/F1 sweep."}
+        )
     if stats_rows:
         path = output_dir / "inference_stats.csv"
         write_table(path, stats_rows, metadata)
-        manifest.append({"path": str(path), "kind": "runtime", "description": "Per-image inference runtime statistics."})
+        manifest.append(
+            {"path": str(path), "kind": "runtime", "description": "Per-image inference runtime statistics."}
+        )
     if visual_rows:
         path = output_dir / "visuals_manifest.csv"
         write_table(path, visual_rows, metadata)
-        manifest.append({"path": str(path), "kind": "visuals", "description": "Visual output sidecar manifest with config hash."})
+        manifest.append(
+            {"path": str(path), "kind": "visuals", "description": "Visual output sidecar manifest with config hash."}
+        )
 
 
 def setup_matplotlib() -> Any:
@@ -4434,14 +4707,20 @@ def setup_matplotlib() -> Any:
     return plt
 
 
-def save_plot(fig: Any, path: Path, config_hash_value: str, manifest: List[Dict[str, Any]], description: str) -> None:
+def save_plot(fig: Any, path: Path, config_hash_value: str, manifest: list[dict[str, Any]], description: str) -> None:
     """Save a matplotlib figure with config metadata."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=180, bbox_inches="tight", metadata={"Description": f"config_hash={config_hash_value}"})
     manifest.append({"path": str(path), "kind": "plot", "description": description, "config_hash": config_hash_value})
 
 
-def plot_pr_curve(coco_eval: Any, categories: Sequence[Mapping[str, Any]], output_dir: Path, output_info: Mapping[str, Any], manifest: List[Dict[str, Any]]) -> None:
+def plot_pr_curve(
+    coco_eval: Any,
+    categories: Sequence[Mapping[str, Any]],
+    output_dir: Path,
+    output_info: Mapping[str, Any],
+    manifest: list[dict[str, Any]],
+) -> None:
     """Plot COCO PR curve at IoU 0.50."""
     plt = setup_matplotlib()
     p = coco_eval.params
@@ -4464,7 +4743,13 @@ def plot_pr_curve(coco_eval: Any, categories: Sequence[Mapping[str, Any]], outpu
     for index, category_id in enumerate(p.catIds[:10]):
         values = precision[:, index]
         if np.any(values > -1):
-            ax.plot(recall, np.maximum(values, 0), linewidth=1.0, alpha=0.75, label=cat_id_to_name.get(int(category_id), str(category_id)))
+            ax.plot(
+                recall,
+                np.maximum(values, 0),
+                linewidth=1.0,
+                alpha=0.75,
+                label=cat_id_to_name.get(int(category_id), str(category_id)),
+            )
     ax.set_title(f"PR Curve @ IoU 0.50\nconfig {output_info['config_hash']}")
     ax.set_xlabel("Recall")
     ax.set_ylabel("Precision")
@@ -4472,11 +4757,22 @@ def plot_pr_curve(coco_eval: Any, categories: Sequence[Mapping[str, Any]], outpu
     ax.set_ylim(0, 1)
     ax.grid(True, alpha=0.25)
     ax.legend(loc="lower left", fontsize=8)
-    save_plot(fig, output_dir / "PR_curve.png", output_info["config_hash"], manifest, "COCO precision-recall curve at IoU 0.50.")
+    save_plot(
+        fig,
+        output_dir / "PR_curve.png",
+        output_info["config_hash"],
+        manifest,
+        "COCO precision-recall curve at IoU 0.50.",
+    )
     plt.close(fig)
 
 
-def plot_threshold_curves(sweep_rows: Sequence[Mapping[str, Any]], output_dir: Path, output_info: Mapping[str, Any], manifest: List[Dict[str, Any]]) -> None:
+def plot_threshold_curves(
+    sweep_rows: Sequence[Mapping[str, Any]],
+    output_dir: Path,
+    output_info: Mapping[str, Any],
+    manifest: list[dict[str, Any]],
+) -> None:
     """Plot Precision, Recall, and F1 vs confidence."""
     if not sweep_rows:
         return
@@ -4495,11 +4791,20 @@ def plot_threshold_curves(sweep_rows: Sequence[Mapping[str, Any]], output_dir: P
         ax.set_xlim(0, 1)
         ax.set_ylim(0, 1)
         ax.grid(True, alpha=0.25)
-        save_plot(fig, output_dir / file_name, output_info["config_hash"], manifest, f"{title} vs confidence threshold.")
+        save_plot(
+            fig, output_dir / file_name, output_info["config_hash"], manifest, f"{title} vs confidence threshold."
+        )
         plt.close(fig)
 
 
-def plot_confusion(matrix: np.ndarray, labels: Sequence[str], output_dir: Path, output_info: Mapping[str, Any], manifest: List[Dict[str, Any]], normalized: bool) -> None:
+def plot_confusion(
+    matrix: np.ndarray,
+    labels: Sequence[str],
+    output_dir: Path,
+    output_info: Mapping[str, Any],
+    manifest: list[dict[str, Any]],
+    normalized: bool,
+) -> None:
     """Plot raw or normalized confusion matrix."""
     plt = setup_matplotlib()
     values = matrix.astype(np.float64)
@@ -4527,7 +4832,15 @@ def plot_confusion(matrix: np.ndarray, labels: Sequence[str], output_dir: Path, 
         for row in range(values.shape[0]):
             for col in range(values.shape[1]):
                 text = f"{values[row, col]:.2f}" if normalized else str(int(values[row, col]))
-                ax.text(col, row, text, ha="center", va="center", color="white" if values[row, col] > threshold else "black", fontsize=7)
+                ax.text(
+                    col,
+                    row,
+                    text,
+                    ha="center",
+                    va="center",
+                    color="white" if values[row, col] > threshold else "black",
+                    fontsize=7,
+                )
     save_plot(fig, output_dir / file_name, output_info["config_hash"], manifest, title)
     plt.close(fig)
 
@@ -4536,11 +4849,11 @@ def write_plots(
     coco_eval: Any,
     categories: Sequence[Mapping[str, Any]],
     sweep_rows: Sequence[Mapping[str, Any]],
-    confusion_matrix: Optional[np.ndarray],
-    confusion_labels: Optional[List[str]],
+    confusion_matrix: np.ndarray | None,
+    confusion_labels: list[str] | None,
     output_dir: Path,
     output_info: Mapping[str, Any],
-    manifest: List[Dict[str, Any]],
+    manifest: list[dict[str, Any]],
 ) -> None:
     """Write all plot outputs."""
     plot_pr_curve(coco_eval, categories, output_dir, output_info, manifest)
@@ -4550,7 +4863,7 @@ def write_plots(
         plot_confusion(confusion_matrix, confusion_labels, output_dir, output_info, manifest, normalized=True)
 
 
-def estimate_resources(dataset: DatasetBundle, config: Mapping[str, Any]) -> Dict[str, Any]:
+def estimate_resources(dataset: DatasetBundle, config: Mapping[str, Any]) -> dict[str, Any]:
     """Estimate output file count and disk usage before writing outputs."""
     output_cfg = config["output"]
     eval_cfg = config["evaluation"]
@@ -4570,7 +4883,7 @@ def estimate_resources(dataset: DatasetBundle, config: Mapping[str, Any]) -> Dic
     avg_image_area = int(sum(sampled_areas) / len(sampled_areas)) if sampled_areas else 640 * 640
 
     visual_count = 0
-    visual_candidate_count: Optional[int] = 0
+    visual_candidate_count: int | None = 0
     visual_estimate_note = "disabled"
     if bool(output_cfg.get("save_visuals", False)):
         if str(output_cfg.get("visual_filter_source", "ground_truth")).strip().lower() == "ground_truth":
@@ -4585,7 +4898,7 @@ def estimate_resources(dataset: DatasetBundle, config: Mapping[str, Any]) -> Dic
             visual_estimate_note = "upper bound; prediction-based filters are known after inference"
 
     dataset_case_count = 0
-    dataset_case_candidate_count: Optional[int] = 0
+    dataset_case_candidate_count: int | None = 0
     dataset_case_estimate_note = "disabled"
     if bool(output_cfg.get("save_dataset_cases", True)):
         case_filter_source = str(output_cfg.get("visual_filter_source", "ground_truth")).strip().lower()
@@ -4652,14 +4965,30 @@ def estimate_resources(dataset: DatasetBundle, config: Mapping[str, Any]) -> Dic
     plot_bytes = plot_count * 350_000
     visual_bytes = visual_count * avg_image_size
     if use_sahi_inference(config):
-        slice_area = int(output_cfg.get("max_slices_per_image", 12)) * int(config.get("sahi", {}).get("slice_height", 640)) * int(config.get("sahi", {}).get("slice_width", 640))
-        slice_ratio = max(0.05, min(1.0, slice_area / max(1, avg_image_area * max(1, int(output_cfg.get("max_slices_per_image", 12))))))
+        slice_area = (
+            int(output_cfg.get("max_slices_per_image", 12))
+            * int(config.get("sahi", {}).get("slice_height", 640))
+            * int(config.get("sahi", {}).get("slice_width", 640))
+        )
+        slice_ratio = max(
+            0.05,
+            min(1.0, slice_area / max(1, avg_image_area * max(1, int(output_cfg.get("max_slices_per_image", 12))))),
+        )
         dataset_case_bytes = int(dataset_case_count * avg_image_size * slice_ratio)
     else:
         dataset_case_bytes = dataset_case_count * avg_image_size
     error_case_bytes = error_case_count * avg_image_size
     config_bytes = 60_000
-    total_bytes = prediction_json_bytes + gt_json_bytes + csv_bytes + plot_bytes + visual_bytes + dataset_case_bytes + error_case_bytes + config_bytes
+    total_bytes = (
+        prediction_json_bytes
+        + gt_json_bytes
+        + csv_bytes
+        + plot_bytes
+        + visual_bytes
+        + dataset_case_bytes
+        + error_case_bytes
+        + config_bytes
+    )
 
     return {
         "inference_engine": engine,
@@ -4692,9 +5021,13 @@ def print_resource_estimate(estimate: Mapping[str, Any], output_dir: Path, verbo
     print(f"Estimated output files: {estimate['estimated_file_count']}")
     print(f"Estimated disk usage: {estimate['estimated_mb']} MB")
     print(f"Visual images to save: {estimate['visual_count']}")
-    print(f"Visual candidate estimate: {estimate['visual_candidate_count'] if estimate['visual_candidate_count'] is not None else 'unknown'} ({estimate['visual_estimate_note']})")
+    print(
+        f"Visual candidate estimate: {estimate['visual_candidate_count'] if estimate['visual_candidate_count'] is not None else 'unknown'} ({estimate['visual_estimate_note']})"
+    )
     print(f"Dataset case images to save: {estimate['dataset_case_count']}")
-    print(f"Dataset case candidate estimate: {estimate['dataset_case_candidate_count'] if estimate['dataset_case_candidate_count'] is not None else 'unknown'} ({estimate['dataset_case_estimate_note']})")
+    print(
+        f"Dataset case candidate estimate: {estimate['dataset_case_candidate_count'] if estimate['dataset_case_candidate_count'] is not None else 'unknown'} ({estimate['dataset_case_estimate_note']})"
+    )
     print(f"Error-case images to save: {estimate['error_case_count']} ({estimate['error_case_estimate_note']})")
     print(f"Plot files to save: {estimate['plot_count']}")
 
@@ -4713,7 +5046,9 @@ def confirm_or_exit(config: Mapping[str, Any], estimate: Mapping[str, Any], outp
         raise SystemExit("Cancelled by developer before inference.")
 
 
-def add_config_metadata_to_coco(coco: Mapping[str, Any], output_info: Mapping[str, Any], config: Mapping[str, Any]) -> Dict[str, Any]:
+def add_config_metadata_to_coco(
+    coco: Mapping[str, Any], output_info: Mapping[str, Any], config: Mapping[str, Any]
+) -> dict[str, Any]:
     """Attach reproducibility info to a COCO dictionary."""
     data = dict(coco)
     info = dict(data.get("info") or {})
@@ -4722,12 +5057,20 @@ def add_config_metadata_to_coco(coco: Mapping[str, Any], output_info: Mapping[st
     return data
 
 
-def write_config_outputs(output_dir: Path, config: Mapping[str, Any], source_config: Path, output_info: Mapping[str, Any], manifest: List[Dict[str, Any]]) -> None:
+def write_config_outputs(
+    output_dir: Path,
+    config: Mapping[str, Any],
+    source_config: Path,
+    output_info: Mapping[str, Any],
+    manifest: list[dict[str, Any]],
+) -> None:
     """Write resolved config and metadata outputs."""
     config_dir = output_dir / "config"
     resolved = config_dir / "resolved_config.yaml"
     save_yaml(resolved, config)
-    manifest.append({"path": str(resolved), "kind": "config", "description": "Resolved config used to create this run."})
+    manifest.append(
+        {"path": str(resolved), "kind": "config", "description": "Resolved config used to create this run."}
+    )
     if source_config.exists():
         copied = config_dir / "source_config.yaml"
         shutil.copy2(source_config, copied)
@@ -4751,7 +5094,9 @@ def build_arg_parser(usage_text: str) -> argparse.ArgumentParser:
     parser.add_argument("--quiet", action="store_true", help="Suppress most status text.")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose wrapper text.")
     parser.add_argument("--use-sahi", action="store_true", help="Use SAHI inference. This writes sliced dataset cases.")
-    parser.add_argument("--no-sahi", action="store_true", help="Disable SAHI and use direct Ultralytics full-image inference.")
+    parser.add_argument(
+        "--no-sahi", action="store_true", help="Disable SAHI and use direct Ultralytics full-image inference."
+    )
     parser.add_argument("--test-mode", choices=["full_image", "sahi", "class_crop"], help="Inference/test mode.")
     parser.add_argument("--dataset-format", choices=["yolo", "coco"], help="Dataset format override.")
     parser.add_argument("--data-yaml", type=str, help="YOLO data.yaml override.")
@@ -4761,20 +5106,30 @@ def build_arg_parser(usage_text: str) -> argparse.ArgumentParser:
     parser.add_argument("--model-path", type=str, help="Model weights/path override.")
     parser.add_argument("--model-type", type=str, help="SAHI model type override, e.g. ultralytics.")
     parser.add_argument("--device", type=str, help="Device override: cpu, cuda:0, 0, etc.")
-    parser.add_argument("--devices", type=str, help="Comma-separated devices for multi-process inference, e.g. cuda:0,cuda:1.")
+    parser.add_argument(
+        "--devices", type=str, help="Comma-separated devices for multi-process inference, e.g. cuda:0,cuda:1."
+    )
     parser.add_argument("--conf", type=float, help="Model confidence threshold override.")
     parser.add_argument("--slice-height", type=int, help="SAHI slice/window height.")
     parser.add_argument("--slice-width", type=int, help="SAHI slice/window width.")
     parser.add_argument("--overlap-height-ratio", type=float, help="SAHI height overlap ratio.")
     parser.add_argument("--overlap-width-ratio", type=float, help="SAHI width overlap ratio.")
     parser.add_argument("--batch-size", type=int, help="RF-DETR image and SAHI slice batch size.")
-    parser.add_argument("--crop-class-names", type=str, help="Comma-separated class names used to find class_crop windows.")
+    parser.add_argument(
+        "--crop-class-names", type=str, help="Comma-separated class names used to find class_crop windows."
+    )
     parser.add_argument("--crop-class-ids", type=str, help="Comma-separated class IDs used to find class_crop windows.")
-    parser.add_argument("--crop-source-conf", type=float, help="Confidence threshold for crop-window source predictions.")
+    parser.add_argument(
+        "--crop-source-conf", type=float, help="Confidence threshold for crop-window source predictions."
+    )
     parser.add_argument("--crop-padding-pixels", type=int, help="Fixed padding around class_crop union box.")
     parser.add_argument("--crop-padding-ratio", type=float, help="Ratio padding around class_crop union box.")
-    parser.add_argument("--postprocess-type", type=str, choices=["GREEDYNMM", "NMM", "NMS", "LSNMS"], help="SAHI postprocess type.")
-    parser.add_argument("--postprocess-match-metric", type=str, choices=["IOS", "IOU"], help="SAHI postprocess match metric.")
+    parser.add_argument(
+        "--postprocess-type", type=str, choices=["GREEDYNMM", "NMM", "NMS", "LSNMS"], help="SAHI postprocess type."
+    )
+    parser.add_argument(
+        "--postprocess-match-metric", type=str, choices=["IOS", "IOU"], help="SAHI postprocess match metric."
+    )
     parser.add_argument("--postprocess-match-threshold", type=float, help="SAHI postprocess match threshold.")
     parser.add_argument("--output-dir", type=str, help="Output root directory override.")
     parser.add_argument("--name", type=str, help="Output run name override.")
@@ -4784,31 +5139,65 @@ def build_arg_parser(usage_text: str) -> argparse.ArgumentParser:
     parser.add_argument("--save-visuals", action="store_true", help="Save prediction visualization images.")
     parser.add_argument("--no-save-visuals", action="store_true", help="Disable prediction visualization images.")
     parser.add_argument("--max-visuals", type=int, help="Maximum visualization images to save.")
-    parser.add_argument("--save-dataset-cases", action="store_true", help="Save raw evaluated image cases under output/datasets.")
+    parser.add_argument(
+        "--save-dataset-cases", action="store_true", help="Save raw evaluated image cases under output/datasets."
+    )
     parser.add_argument("--no-save-dataset-cases", action="store_true", help="Disable output/datasets case images.")
-    parser.add_argument("--max-dataset-case-images", type=int, help="Maximum source images used for output/datasets cases.")
-    parser.add_argument("--max-slices-per-image", type=int, help="Maximum slice case crops saved per source image when SAHI is enabled.")
-    parser.add_argument("--visual-sampling-mode", choices=["random", "first", "last"], help="How to sample visual images from candidates.")
+    parser.add_argument(
+        "--max-dataset-case-images", type=int, help="Maximum source images used for output/datasets cases."
+    )
+    parser.add_argument(
+        "--max-slices-per-image", type=int, help="Maximum slice case crops saved per source image when SAHI is enabled."
+    )
+    parser.add_argument(
+        "--visual-sampling-mode",
+        choices=["random", "first", "last"],
+        help="How to sample visual images from candidates.",
+    )
     parser.add_argument("--visual-seed", type=int, help="Random seed for visual sampling.")
-    parser.add_argument("--visual-filter-class-names", type=str, help="Comma-separated class names that visual samples must contain.")
-    parser.add_argument("--visual-filter-class-ids", type=str, help="Comma-separated class IDs that visual samples must contain.")
-    parser.add_argument("--visual-filter-source", choices=["ground_truth", "prediction", "either", "both"], help="Use GT, predictions, either, or both for visual class filtering.")
-    parser.add_argument("--visual-filter-match", choices=["any", "all"], help="Whether any or all requested classes must be present.")
-    parser.add_argument("--visual-min-gt-instances", type=int, help="Minimum GT annotations required for a visual candidate.")
-    parser.add_argument("--visual-min-predictions", type=int, help="Minimum predictions required for a visual candidate.")
-    parser.add_argument("--visual-filter-min-score", type=float, help="Minimum prediction score used only for visual candidate filtering.")
+    parser.add_argument(
+        "--visual-filter-class-names", type=str, help="Comma-separated class names that visual samples must contain."
+    )
+    parser.add_argument(
+        "--visual-filter-class-ids", type=str, help="Comma-separated class IDs that visual samples must contain."
+    )
+    parser.add_argument(
+        "--visual-filter-source",
+        choices=["ground_truth", "prediction", "either", "both"],
+        help="Use GT, predictions, either, or both for visual class filtering.",
+    )
+    parser.add_argument(
+        "--visual-filter-match", choices=["any", "all"], help="Whether any or all requested classes must be present."
+    )
+    parser.add_argument(
+        "--visual-min-gt-instances", type=int, help="Minimum GT annotations required for a visual candidate."
+    )
+    parser.add_argument(
+        "--visual-min-predictions", type=int, help="Minimum predictions required for a visual candidate."
+    )
+    parser.add_argument(
+        "--visual-filter-min-score",
+        type=float,
+        help="Minimum prediction score used only for visual candidate filtering.",
+    )
     parser.add_argument("--visual-draw-min-score", type=float, help="Minimum prediction score drawn in visual images.")
     parser.add_argument("--draw-ground-truth", action="store_true", help="Draw ground-truth boxes in visual images.")
-    parser.add_argument("--no-draw-ground-truth", action="store_true", help="Do not draw ground-truth boxes in visual images.")
+    parser.add_argument(
+        "--no-draw-ground-truth", action="store_true", help="Do not draw ground-truth boxes in visual images."
+    )
     parser.add_argument("--draw-predictions", action="store_true", help="Draw prediction boxes in visual images.")
-    parser.add_argument("--no-draw-predictions", action="store_true", help="Do not draw prediction boxes in visual images.")
-    parser.add_argument("--extra", action="append", default=[], help="Dot override like section.key=value. Can be repeated.")
+    parser.add_argument(
+        "--no-draw-predictions", action="store_true", help="Do not draw prediction boxes in visual images."
+    )
+    parser.add_argument(
+        "--extra", action="append", default=[], help="Dot override like section.key=value. Can be repeated."
+    )
     return parser
 
 
-def cli_overrides(args: argparse.Namespace) -> Dict[str, Any]:
+def cli_overrides(args: argparse.Namespace) -> dict[str, Any]:
     """Translate CLI arguments into config overrides."""
-    overrides: Dict[str, Any] = {}
+    overrides: dict[str, Any] = {}
     if args.yes:
         set_nested(overrides, "runtime.yes", True)
     if args.demo:
@@ -4915,7 +5304,9 @@ def cli_overrides(args: argparse.Namespace) -> Dict[str, Any]:
     return overrides
 
 
-def normalize_config(config: MutableMapping[str, Any], source_config: Path) -> Tuple[Dict[str, Any], Path, Dict[str, Any]]:
+def normalize_config(
+    config: MutableMapping[str, Any], source_config: Path
+) -> tuple[dict[str, Any], Path, dict[str, Any]]:
     """Resolve paths, demo settings, output name, run_id, and config hash."""
     timestamp = datetime.now().strftime(TIMESTAMP_FORMAT)
     config = dict(config)
@@ -4953,7 +5344,9 @@ def normalize_config(config: MutableMapping[str, Any], source_config: Path) -> T
     inference_cfg["batch_size"] = positive_int_setting(inference_cfg.get("batch_size"), 1, "inference.batch_size")
     if "chunks" in inference_cfg:
         inference_cfg["chunks"] = _positive_inference_chunks(inference_cfg.get("chunks"))
-    sahi_cfg["batch_size"] = positive_int_setting(sahi_cfg.get("batch_size"), inference_cfg["batch_size"], "sahi.batch_size")
+    sahi_cfg["batch_size"] = positive_int_setting(
+        sahi_cfg.get("batch_size"), inference_cfg["batch_size"], "sahi.batch_size"
+    )
     model_type = str(model_cfg.get("type", "ultralytics")).strip().lower()
     if mode != shared_modes.SAHI_MODE and model_type not in {"ultralytics", "rfdetr", "rf-detr", "rf_detr"}:
         raise ValueError("Direct full_image/class_crop inference supports model.type: ultralytics or rfdetr.")
@@ -4961,7 +5354,9 @@ def normalize_config(config: MutableMapping[str, Any], source_config: Path) -> T
     bases = [source_config.parent, PROJECT_DIR, REPO_ROOT, Path.cwd()]
     for key in ["data_yaml", "coco_json", "image_dir", "labels_dir"]:
         if dataset_cfg.get(key):
-            dataset_cfg[key] = str(resolve_path(dataset_cfg[key], bases, must_exist=key in {"data_yaml", "coco_json", "image_dir"}))
+            dataset_cfg[key] = str(
+                resolve_path(dataset_cfg[key], bases, must_exist=key in {"data_yaml", "coco_json", "image_dir"})
+            )
     model_cfg["path"] = resolve_existing_or_raw(model_cfg.get("path"), bases)
     if model_cfg.get("config_path"):
         model_cfg["config_path"] = str(resolve_path(model_cfg["config_path"], bases, must_exist=True))
@@ -5020,8 +5415,12 @@ def normalize_config(config: MutableMapping[str, Any], source_config: Path) -> T
     output_cfg["error_cases"].setdefault("max_images", None)
     output_cfg["error_cases"].setdefault("format", output_cfg.get("visual_format", "jpg"))
     output_cfg["visual_format"] = normalize_visual_format(output_cfg.get("visual_format", "jpg"))
-    output_cfg["dataset_case_format"] = normalize_visual_format(output_cfg.get("dataset_case_format", output_cfg["visual_format"]))
-    output_cfg["error_cases"]["format"] = normalize_visual_format(output_cfg["error_cases"].get("format", output_cfg["visual_format"]))
+    output_cfg["dataset_case_format"] = normalize_visual_format(
+        output_cfg.get("dataset_case_format", output_cfg["visual_format"])
+    )
+    output_cfg["error_cases"]["format"] = normalize_visual_format(
+        output_cfg["error_cases"].get("format", output_cfg["visual_format"])
+    )
     if output_cfg.get("visual_random_seed") is None:
         output_cfg["visual_random_seed"] = int(runtime.get("seed", 0))
     if output_cfg.get("dataset_case_random_seed") is None:
@@ -5032,7 +5431,9 @@ def normalize_config(config: MutableMapping[str, Any], source_config: Path) -> T
     sahi_cfg["recheck"].setdefault("enabled", False)
     sahi_cfg["recheck"].setdefault("target_class_ids", [])
     sahi_cfg["recheck"].setdefault("target_class_names", [])
-    sahi_cfg["recheck"].setdefault("crop_size", max(int(sahi_cfg.get("slice_width", 640)), int(sahi_cfg.get("slice_height", 640))))
+    sahi_cfg["recheck"].setdefault(
+        "crop_size", max(int(sahi_cfg.get("slice_width", 640)), int(sahi_cfg.get("slice_height", 640)))
+    )
     sahi_cfg["recheck"].setdefault("second_confidence_threshold", float(model_cfg.get("confidence_threshold", 0.25)))
     sahi_cfg["recheck"].setdefault("first_weight", 0.5)
     sahi_cfg["recheck"].setdefault("second_weight", 0.5)
@@ -5059,7 +5460,9 @@ def normalize_config(config: MutableMapping[str, Any], source_config: Path) -> T
             output_cfg["max_dataset_case_images"] = demo_max_cases
         else:
             output_cfg["max_dataset_case_images"] = min(int(output_cfg["max_dataset_case_images"]), demo_max_cases)
-        output_cfg["max_slices_per_image"] = min(int(output_cfg.get("max_slices_per_image", 12)), int(demo_cfg.get("max_slices_per_image", 4)))
+        output_cfg["max_slices_per_image"] = min(
+            int(output_cfg.get("max_slices_per_image", 12)), int(demo_cfg.get("max_slices_per_image", 4))
+        )
 
     split = dataset_cfg.get("split", "coco")
     model_name = sanitize_name(Path(str(model_cfg.get("path", "model"))).stem)
@@ -5072,14 +5475,20 @@ def normalize_config(config: MutableMapping[str, Any], source_config: Path) -> T
         output_dir = resolve_output_root(render_template(exact_output, replacements), source_config)
         rendered_name = output_dir.name
     else:
-        output_root = resolve_output_root(render_template(output_cfg.get("dir", "outputs"), replacements), source_config)
+        output_root = resolve_output_root(
+            render_template(output_cfg.get("dir", "outputs"), replacements), source_config
+        )
         run_name = str(output_cfg.get("name", "det_eval_{engine}_{model}_{split}_{timestamp}"))
         rendered_name = sanitize_name(str(render_template(run_name, replacements)))
         output_dir = output_root / rendered_name
         if not bool(output_cfg.get("exist_ok", False)):
             output_dir = increment_path(output_dir)
-    output_cfg["dataset_cases_subdir"] = sanitize_name(str(render_template(output_cfg["dataset_cases_subdir"], replacements)))
-    output_cfg["visual_output_subdir"] = sanitize_name(str(render_template(output_cfg["visual_output_subdir"], replacements)))
+    output_cfg["dataset_cases_subdir"] = sanitize_name(
+        str(render_template(output_cfg["dataset_cases_subdir"], replacements))
+    )
+    output_cfg["visual_output_subdir"] = sanitize_name(
+        str(render_template(output_cfg["visual_output_subdir"], replacements))
+    )
     output_cfg["resolved_name"] = rendered_name
     output_cfg["resolved_dir"] = str(output_dir)
     runtime["timestamp"] = timestamp
@@ -5099,9 +5508,9 @@ def normalize_config(config: MutableMapping[str, Any], source_config: Path) -> T
     return resolved, output_dir, output_info
 
 
-def default_curve_thresholds() -> List[float]:
+def default_curve_thresholds() -> list[float]:
     """Return 0.00:0.01:1.00 thresholds."""
-    return [round(index / 100.0, 2) for index in range(0, 101)]
+    return [round(index / 100.0, 2) for index in range(101)]
 
 
 def run_evaluation(
@@ -5110,7 +5519,7 @@ def run_evaluation(
     prebuilt_model: Any = None,
     already_normalized: bool = False,
     print_summary: bool = True,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Run a full evaluator pass from an in-memory config."""
     if already_normalized:
         output_dir = Path(config["output"]["resolved_dir"])
@@ -5137,7 +5546,7 @@ def run_evaluation(
     confirm_or_exit(config, estimate, output_dir, verbose)
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    manifest: List[Dict[str, Any]] = []
+    manifest: list[dict[str, Any]] = []
     if bool(config["output"].get("save_config", True)):
         write_config_outputs(output_dir, config, source_config, output_info, manifest)
 
@@ -5145,7 +5554,9 @@ def run_evaluation(
     gt_path = output_dir / ("ground_truth_coco.json" if save_ground_truth else "_tmp_ground_truth_coco.json")
     if save_ground_truth:
         write_json(gt_path, add_config_metadata_to_coco(dataset.coco, output_info, config))
-        manifest.append({"path": str(gt_path), "kind": "dataset", "description": "COCO ground truth used for evaluation."})
+        manifest.append(
+            {"path": str(gt_path), "kind": "dataset", "description": "COCO ground truth used for evaluation."}
+        )
     else:
         write_json(gt_path, add_config_metadata_to_coco(dataset.coco, output_info, config))
 
@@ -5188,15 +5599,21 @@ def run_evaluation(
                 "description": "Parallel inference chunk timing and status summary.",
             }
         )
-    predictions = sorted(predictions, key=lambda item: (int(item["image_id"]), int(item["category_id"]), -float(item["score"])))
+    predictions = sorted(
+        predictions, key=lambda item: (int(item["image_id"]), int(item["category_id"]), -float(item["score"]))
+    )
 
     predictions_path = output_dir / "predictions_coco.json"
     if bool(config["output"].get("save_predictions_json", True)):
         write_json(predictions_path, predictions)
-        manifest.append({"path": str(predictions_path), "kind": "predictions", "description": "COCO result predictions JSON."})
+        manifest.append(
+            {"path": str(predictions_path), "kind": "predictions", "description": "COCO result predictions JSON."}
+        )
         metadata_path = output_dir / "predictions_coco.metadata.json"
         write_json(metadata_path, {"metadata": output_info, "config": config, "prediction_count": len(predictions)})
-        manifest.append({"path": str(metadata_path), "kind": "predictions", "description": "Prediction JSON sidecar metadata."})
+        manifest.append(
+            {"path": str(metadata_path), "kind": "predictions", "description": "Prediction JSON sidecar metadata."}
+        )
 
     if bool(config["output"].get("save_model_input_batches", True)):
         manifest.extend(
@@ -5212,7 +5629,9 @@ def run_evaluation(
             )
         )
 
-    dataset_case_rows = render_dataset_case_outputs(dataset, predictions, config, output_dir, output_info, quiet, manifest)
+    dataset_case_rows = render_dataset_case_outputs(
+        dataset, predictions, config, output_dir, output_info, quiet, manifest
+    )
     visual_rows = render_visual_outputs(dataset, predictions, config, output_dir, output_info, quiet, manifest)
     error_case_rows = render_error_case_outputs(dataset, predictions, config, output_dir, output_info, quiet, manifest)
 
@@ -5243,11 +5662,15 @@ def run_evaluation(
         confidence_threshold=operating_conf,
     )
     curve_thresholds = eval_cfg.get("curve_confidence_thresholds") or default_curve_thresholds()
-    sweep_rows = threshold_sweep(predictions, dataset.annotations, category_ids, curve_thresholds, match_iou) if bool(eval_cfg.get("curves", True)) else []
+    sweep_rows = (
+        threshold_sweep(predictions, dataset.annotations, category_ids, curve_thresholds, match_iou)
+        if bool(eval_cfg.get("curves", True))
+        else []
+    )
     best_f1 = max(sweep_rows, key=lambda row: row["f1"], default={"confidence": operating_conf, "f1": operating["f1"]})
 
     coco_summary = coco_metrics_dict(coco_eval)
-    summary: Dict[str, Any] = {
+    summary: dict[str, Any] = {
         **coco_summary,
         "Precision": operating["precision"],
         "Recall": operating["recall"],
@@ -5271,8 +5694,8 @@ def run_evaluation(
     }
 
     cat_name = {int(category["id"]): str(category.get("name", category["id"])) for category in dataset.categories}
-    per_class_rows: List[Dict[str, Any]] = []
-    per_class_size_rows: List[Dict[str, Any]] = []
+    per_class_rows: list[dict[str, Any]] = []
+    per_class_size_rows: list[dict[str, Any]] = []
     if bool(eval_cfg.get("classwise", True)):
         coco_per_class = {row["category_id"]: row for row in coco_per_class_metrics(coco_eval, dataset.categories)}
         area_ranges = [float(value) for value in eval_cfg.get("area_ranges", [1024, 9216, 10000000000])]
@@ -5288,7 +5711,9 @@ def run_evaluation(
             iou_threshold=match_iou,
             confidence_threshold=operating_conf,
         )
-        class_names = {int(category["id"]): str(category.get("name", category["id"])) for category in dataset.categories}
+        class_names = {
+            int(category["id"]): str(category.get("name", category["id"])) for category in dataset.categories
+        }
         for row in operating_size:
             category_id = int(row["category_id"])
             area_label = str(row["area"])
@@ -5296,7 +5721,11 @@ def run_evaluation(
                 {
                     "category_id": category_id,
                     "class": class_names.get(category_id, str(category_id)),
-                    **{key: value for key, value in coco_size.get((category_id, area_label), {}).items() if key not in {"category_id", "class", "area"}},
+                    **{
+                        key: value
+                        for key, value in coco_size.get((category_id, area_label), {}).items()
+                        if key not in {"category_id", "class", "area"}
+                    },
                     **row,
                 }
             )
@@ -5306,7 +5735,11 @@ def run_evaluation(
                 {
                     "category_id": category_id,
                     "class": cat_name.get(category_id, str(category_id)),
-                    **{key: value for key, value in coco_per_class.get(category_id, {}).items() if key not in {"category_id", "class"}},
+                    **{
+                        key: value
+                        for key, value in coco_per_class.get(category_id, {}).items()
+                        if key not in {"category_id", "class"}
+                    },
                     **{key: value for key, value in row.items() if key != "category_id"},
                 }
             )
@@ -5318,31 +5751,62 @@ def run_evaluation(
             row["file_name"] = file_name_by_id.get(int(row["image_id"]), "")
 
     if bool(config["output"].get("save_metrics", True)):
-        write_metrics_tables(output_dir, summary, per_class_rows, per_image_rows, sweep_rows, stats_rows, visual_rows, output_info, manifest)
+        write_metrics_tables(
+            output_dir,
+            summary,
+            per_class_rows,
+            per_image_rows,
+            sweep_rows,
+            stats_rows,
+            visual_rows,
+            output_info,
+            manifest,
+        )
         if per_class_size_rows:
             metadata = {"run_id": output_info["run_id"], "config_hash": output_info["config_hash"]}
             per_class_size_path = output_dir / "per_class_size_metrics.csv"
             write_table(per_class_size_path, per_class_size_rows, metadata)
-            manifest.append({"path": str(per_class_size_path), "kind": "metrics", "description": "Per-class small/medium/large AP/P/R/F1 metrics."})
+            manifest.append(
+                {
+                    "path": str(per_class_size_path),
+                    "kind": "metrics",
+                    "description": "Per-class small/medium/large AP/P/R/F1 metrics.",
+                }
+            )
             per_class_size_json_path = output_dir / "per_class_size_metrics.json"
             write_json(per_class_size_json_path, {"metadata": output_info, "metrics": per_class_size_rows})
-            manifest.append({"path": str(per_class_size_json_path), "kind": "metrics", "description": "Per-class small/medium/large metrics JSON."})
+            manifest.append(
+                {
+                    "path": str(per_class_size_json_path),
+                    "kind": "metrics",
+                    "description": "Per-class small/medium/large metrics JSON.",
+                }
+            )
     elif visual_rows:
         path = output_dir / "visuals_manifest.csv"
         write_table(path, visual_rows, {"run_id": output_info["run_id"], "config_hash": output_info["config_hash"]})
-        manifest.append({"path": str(path), "kind": "visuals", "description": "Visual output sidecar manifest with config hash."})
+        manifest.append(
+            {"path": str(path), "kind": "visuals", "description": "Visual output sidecar manifest with config hash."}
+        )
 
     confusion = None
     confusion_labels = None
     if bool(eval_cfg.get("confusion_matrix", True)):
-        matrix, ordered_ids = build_confusion_matrix(predictions, dataset.annotations, category_ids, match_iou, operating_conf)
+        matrix, ordered_ids = build_confusion_matrix(
+            predictions, dataset.annotations, category_ids, match_iou, operating_conf
+        )
         confusion = matrix
-        confusion_labels = [cat_name.get(category_id, str(category_id)) for category_id in ordered_ids] + [BACKGROUND_LABEL]
+        confusion_labels = [cat_name.get(category_id, str(category_id)) for category_id in ordered_ids] + [
+            BACKGROUND_LABEL
+        ]
         path = output_dir / "confusion_matrix.csv"
         write_table(
             path,
             [
-                {"actual": confusion_labels[row], **{f"pred_{confusion_labels[col]}": int(matrix[row, col]) for col in range(matrix.shape[1])}}
+                {
+                    "actual": confusion_labels[row],
+                    **{f"pred_{confusion_labels[col]}": int(matrix[row, col]) for col in range(matrix.shape[1])},
+                }
                 for row in range(matrix.shape[0])
             ],
             {"run_id": output_info["run_id"], "config_hash": output_info["config_hash"]},
@@ -5350,7 +5814,9 @@ def run_evaluation(
         manifest.append({"path": str(path), "kind": "metrics", "description": "Raw confusion matrix CSV."})
 
     if bool(config["output"].get("save_plots", True)):
-        write_plots(coco_eval, dataset.categories, sweep_rows, confusion, confusion_labels, output_dir, output_info, manifest)
+        write_plots(
+            coco_eval, dataset.categories, sweep_rows, confusion, confusion_labels, output_dir, output_info, manifest
+        )
 
     if bool(config["output"].get("save_output_manifest", True)):
         manifest_path = output_dir / "output_manifest.json"
@@ -5478,7 +5944,7 @@ Example usage:
     confirm_or_exit(config, estimate, output_dir, verbose)
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    manifest: List[Dict[str, Any]] = []
+    manifest: list[dict[str, Any]] = []
     if bool(config["output"].get("save_config", True)):
         write_config_outputs(output_dir, config, source_config, output_info, manifest)
 
@@ -5486,23 +5952,33 @@ Example usage:
     gt_path = output_dir / ("ground_truth_coco.json" if save_ground_truth else "_tmp_ground_truth_coco.json")
     if bool(config["output"].get("save_ground_truth_json", True)):
         write_json(gt_path, add_config_metadata_to_coco(dataset.coco, output_info, config))
-        manifest.append({"path": str(gt_path), "kind": "dataset", "description": "COCO ground truth used for evaluation."})
+        manifest.append(
+            {"path": str(gt_path), "kind": "dataset", "description": "COCO ground truth used for evaluation."}
+        )
     else:
         write_json(gt_path, add_config_metadata_to_coco(dataset.coco, output_info, config))
 
     blue(f"Running {engine} inference...", verbose=verbose)
     predictions, stats_rows, _, _ = run_inference(dataset, config, output_dir, quiet=quiet)
-    predictions = sorted(predictions, key=lambda item: (int(item["image_id"]), int(item["category_id"]), -float(item["score"])))
+    predictions = sorted(
+        predictions, key=lambda item: (int(item["image_id"]), int(item["category_id"]), -float(item["score"]))
+    )
 
     predictions_path = output_dir / "predictions_coco.json"
     if bool(config["output"].get("save_predictions_json", True)):
         write_json(predictions_path, predictions)
-        manifest.append({"path": str(predictions_path), "kind": "predictions", "description": "COCO result predictions JSON."})
+        manifest.append(
+            {"path": str(predictions_path), "kind": "predictions", "description": "COCO result predictions JSON."}
+        )
         metadata_path = output_dir / "predictions_coco.metadata.json"
         write_json(metadata_path, {"metadata": output_info, "config": config, "prediction_count": len(predictions)})
-        manifest.append({"path": str(metadata_path), "kind": "predictions", "description": "Prediction JSON sidecar metadata."})
+        manifest.append(
+            {"path": str(metadata_path), "kind": "predictions", "description": "Prediction JSON sidecar metadata."}
+        )
 
-    dataset_case_rows = render_dataset_case_outputs(dataset, predictions, config, output_dir, output_info, quiet, manifest)
+    dataset_case_rows = render_dataset_case_outputs(
+        dataset, predictions, config, output_dir, output_info, quiet, manifest
+    )
     visual_rows = render_visual_outputs(dataset, predictions, config, output_dir, output_info, quiet, manifest)
 
     blue("Computing COCO and operating-point metrics...", verbose=verbose)
@@ -5532,11 +6008,15 @@ Example usage:
         confidence_threshold=operating_conf,
     )
     curve_thresholds = eval_cfg.get("curve_confidence_thresholds") or default_curve_thresholds()
-    sweep_rows = threshold_sweep(predictions, dataset.annotations, category_ids, curve_thresholds, match_iou) if bool(eval_cfg.get("curves", True)) else []
+    sweep_rows = (
+        threshold_sweep(predictions, dataset.annotations, category_ids, curve_thresholds, match_iou)
+        if bool(eval_cfg.get("curves", True))
+        else []
+    )
     best_f1 = max(sweep_rows, key=lambda row: row["f1"], default={"confidence": operating_conf, "f1": operating["f1"]})
 
     coco_summary = coco_metrics_dict(coco_eval)
-    summary: Dict[str, Any] = {
+    summary: dict[str, Any] = {
         **coco_summary,
         "Precision": operating["precision"],
         "Recall": operating["recall"],
@@ -5558,7 +6038,7 @@ Example usage:
     }
 
     cat_name = {int(category["id"]): str(category.get("name", category["id"])) for category in dataset.categories}
-    per_class_rows: List[Dict[str, Any]] = []
+    per_class_rows: list[dict[str, Any]] = []
     if bool(eval_cfg.get("classwise", True)):
         coco_per_class = {row["category_id"]: row for row in coco_per_class_metrics(coco_eval, dataset.categories)}
         for row in operating["per_class"]:
@@ -5567,7 +6047,11 @@ Example usage:
                 {
                     "category_id": category_id,
                     "class": cat_name.get(category_id, str(category_id)),
-                    **{key: value for key, value in coco_per_class.get(category_id, {}).items() if key not in {"category_id", "class"}},
+                    **{
+                        key: value
+                        for key, value in coco_per_class.get(category_id, {}).items()
+                        if key not in {"category_id", "class"}
+                    },
                     **{key: value for key, value in row.items() if key != "category_id"},
                 }
             )
@@ -5579,30 +6063,57 @@ Example usage:
             row["file_name"] = file_name_by_id.get(int(row["image_id"]), "")
 
     if bool(config["output"].get("save_metrics", True)):
-        write_metrics_tables(output_dir, summary, per_class_rows, per_image_rows, sweep_rows, stats_rows, visual_rows, output_info, manifest)
+        write_metrics_tables(
+            output_dir,
+            summary,
+            per_class_rows,
+            per_image_rows,
+            sweep_rows,
+            stats_rows,
+            visual_rows,
+            output_info,
+            manifest,
+        )
     elif visual_rows:
         path = output_dir / "visuals_manifest.csv"
         write_table(path, visual_rows, {"run_id": output_info["run_id"], "config_hash": output_info["config_hash"]})
-        manifest.append({"path": str(path), "kind": "visuals", "description": "Visual output sidecar manifest with config hash."})
+        manifest.append(
+            {"path": str(path), "kind": "visuals", "description": "Visual output sidecar manifest with config hash."}
+        )
 
     confusion = None
     confusion_labels = None
     if bool(eval_cfg.get("confusion_matrix", True)):
-        matrix, ordered_ids = build_confusion_matrix(predictions, dataset.annotations, category_ids, match_iou, operating_conf)
+        matrix, ordered_ids = build_confusion_matrix(
+            predictions, dataset.annotations, category_ids, match_iou, operating_conf
+        )
         confusion = matrix
-        confusion_labels = [cat_name.get(category_id, str(category_id)) for category_id in ordered_ids] + [BACKGROUND_LABEL]
+        confusion_labels = [cat_name.get(category_id, str(category_id)) for category_id in ordered_ids] + [
+            BACKGROUND_LABEL
+        ]
         write_table(
             output_dir / "confusion_matrix.csv",
             [
-                {"actual": confusion_labels[row], **{f"pred_{confusion_labels[col]}": int(matrix[row, col]) for col in range(matrix.shape[1])}}
+                {
+                    "actual": confusion_labels[row],
+                    **{f"pred_{confusion_labels[col]}": int(matrix[row, col]) for col in range(matrix.shape[1])},
+                }
                 for row in range(matrix.shape[0])
             ],
             {"run_id": output_info["run_id"], "config_hash": output_info["config_hash"]},
         )
-        manifest.append({"path": str(output_dir / "confusion_matrix.csv"), "kind": "metrics", "description": "Raw confusion matrix CSV."})
+        manifest.append(
+            {
+                "path": str(output_dir / "confusion_matrix.csv"),
+                "kind": "metrics",
+                "description": "Raw confusion matrix CSV.",
+            }
+        )
 
     if bool(config["output"].get("save_plots", True)):
-        write_plots(coco_eval, dataset.categories, sweep_rows, confusion, confusion_labels, output_dir, output_info, manifest)
+        write_plots(
+            coco_eval, dataset.categories, sweep_rows, confusion, confusion_labels, output_dir, output_info, manifest
+        )
 
     if bool(config["output"].get("save_output_manifest", True)):
         manifest_path = output_dir / "output_manifest.json"

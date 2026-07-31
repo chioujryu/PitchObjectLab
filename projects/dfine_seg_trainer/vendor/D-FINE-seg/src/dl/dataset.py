@@ -1,8 +1,9 @@
+from __future__ import annotations
+
 import json
 import random
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
 import albumentations as A
 import cv2
@@ -12,9 +13,6 @@ import torch
 from albumentations.pytorch import ToTensorV2
 from loguru import logger
 from omegaconf import DictConfig
-from torch.utils.data import DataLoader, Dataset
-from torch.utils.data.distributed import DistributedSampler
-
 from src.d_fine.dist_utils import is_main_process
 from src.dl.utils import (
     LetterboxRect,
@@ -28,20 +26,20 @@ from src.dl.utils import (
     seed_worker,
     vis_one_box,
 )
+from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 
 
-def read_image_hwc(path) -> Optional[np.ndarray]:
+def read_image_hwc(path) -> np.ndarray | None:
     """Load an image as an HWC uint8 array.
 
     - ``.npy``: ``np.load`` (multi-channel data; project convention is RGB+extras).
     - everything else: default ``cv2.imread`` (BGR uint8, 3 channels — grayscale
-      replicated, alpha dropped, uint16 quantized). Matches ``_read_image``'s
-      3-channel branch so inference call sites and the training reader share
-      the same source-of-truth.
+    replicated, alpha dropped, uint16 quantized). Matches ``_read_image``'s 3-channel branch so inference call sites and
+    the training reader share the same source-of-truth.
 
-    Returns ``None`` if the file can't be decoded. Grayscale results from
-    ``.npy`` are promoted to HWC with a trailing axis so callers can rely on
-    ``shape[2]``.
+    Returns ``None`` if the file can't be decoded. Grayscale results from ``.npy`` are promoted to HWC with a trailing
+    axis so callers can rely on ``shape[2]``.
     """
     path = Path(path)
     if path.suffix.lower() == ".npy":
@@ -56,16 +54,16 @@ def read_image_hwc(path) -> Optional[np.ndarray]:
 
 
 def parse_yolo_label_file(path: Path):
-    """
-    Supports both pure detection lines (5 cols) and YOLO-Seg lines (>=7 cols).
+    """Supports both pure detection lines (5 cols) and YOLO-Seg lines (>=7 cols).
+
     Returns:
-      boxes_norm: np.ndarray (N,5) -> [cls, xc, yc, w, h] in norm (float32)
-      polys_norm: list[np.ndarray] -> each (K,2) normalized polygon (float32) or [] if none
+        boxes_norm: np.ndarray (N,5) -> [cls, xc, yc, w, h] in norm (float32)
+        polys_norm: list[np.ndarray] -> each (K,2) normalized polygon (float32) or [] if none.
     """
     boxes_norm = []
     polys_norm = []  # keep normalized here
 
-    with open(path, "r") as f:
+    with open(path) as f:
         for ln, raw in enumerate(f, 1):
             s = raw.strip()
             if not s or s.startswith("#"):
@@ -88,9 +86,7 @@ def parse_yolo_label_file(path: Path):
                 polys_norm.append(poly)
                 x_min, y_min = poly.min(axis=0)
                 x_max, y_max = poly.max(axis=0)
-                boxes_norm.append(
-                    [cl, (x_min + x_max) / 2, (y_min + y_max) / 2, x_max - x_min, y_max - y_min]
-                )
+                boxes_norm.append([cl, (x_min + x_max) / 2, (y_min + y_max) / 2, x_max - x_min, y_max - y_min])
             else:
                 raise ValueError(f"Invalid label line (wrong number of values) {path}:{ln}: {s}")
 
@@ -101,17 +97,16 @@ def parse_yolo_label_file(path: Path):
 
 
 def load_coco_split(json_path: Path, use_one_class: bool = False):
-    """
-    Load a COCO-format JSON annotation file and pre-parse all annotations.
+    """Load a COCO-format JSON annotation file and pre-parse all annotations.
 
     Returns:
-      entries: list of dicts, each with:
-          'file_name': str
-          'targets': np.ndarray (N, 5) [class_id, x1, y1, x2, y2] absolute
-          'polys_abs': list of np.ndarray (K, 2) absolute polygon coordinates
-      cat_id_to_class_id: dict mapping COCO category_id -> 0-based contiguous class_id
+        entries: list of dicts, each with:
+        'file_name': str
+        'targets': np.ndarray (N, 5) [class_id, x1, y1, x2, y2] absolute
+        'polys_abs': list of np.ndarray (K, 2) absolute polygon coordinates
+        cat_id_to_class_id: dict mapping COCO category_id -> 0-based contiguous class_id
     """
-    with open(json_path, "r") as f:
+    with open(json_path) as f:
         coco = json.load(f)
 
     categories = sorted(coco.get("categories", []), key=lambda c: c["id"])
@@ -174,13 +169,13 @@ def load_coco_split(json_path: Path, use_one_class: bool = False):
 class CustomDataset(Dataset):
     def __init__(
         self,
-        img_size: Tuple[int, int],  # h, w
+        img_size: tuple[int, int],  # h, w
         root_path: Path,
         split: pd.DataFrame,
         debug_img_processing: bool,
         mode: str,
         cfg: DictConfig,
-        coco_annotations: Optional[List[Dict]] = None,
+        coco_annotations: list[dict] | None = None,
     ) -> None:
         self.project_path = Path(cfg.train.root)
         self.root_path = root_path
@@ -191,8 +186,7 @@ class CustomDataset(Dataset):
         self.in_channels = int(cfg.train.in_channels)
         if self.in_channels not in (3, 4):
             raise ValueError(
-                f"train.in_channels must be 3 (RGB) or 4 (RGB+one extra modality); "
-                f"got {self.in_channels}."
+                f"train.in_channels must be 3 (RGB) or 4 (RGB+one extra modality); got {self.in_channels}."
             )
         self.norm = ([0.0] * self.in_channels, [1.0] * self.in_channels)
         self.debug_img_processing = debug_img_processing
@@ -293,24 +287,18 @@ class CustomDataset(Dataset):
 
             self.transform = A.Compose(
                 augs + resize + norm,
-                bbox_params=A.BboxParams(
-                    format="pascal_voc", label_fields=["class_labels", "box_indices"]
-                ),
+                bbox_params=A.BboxParams(format="pascal_voc", label_fields=["class_labels", "box_indices"]),
                 mask_interpolation=cv2.INTER_LINEAR,
             )
         elif self.mode in ["val", "test", "bench"]:
             self.mosaic_prob = 0
             self.transform = A.Compose(
                 resize + norm,
-                bbox_params=A.BboxParams(
-                    format="pascal_voc", label_fields=["class_labels", "box_indices"]
-                ),
+                bbox_params=A.BboxParams(format="pascal_voc", label_fields=["class_labels", "box_indices"]),
                 mask_interpolation=cv2.INTER_LINEAR,
             )
         else:
-            raise ValueError(
-                f"Unknown mode: {self.mode}, choose from ['train', 'val', 'test', 'bench']"
-            )
+            raise ValueError(f"Unknown mode: {self.mode}, choose from ['train', 'val', 'test', 'bench']")
 
         self.mosaic_transform = A.Compose(norm, mask_interpolation=cv2.INTER_LINEAR)
 
@@ -344,9 +332,7 @@ class CustomDataset(Dataset):
         if masks is not None and masks.numel() > 0:
             mnp = masks.cpu().numpy()
             for k in range(mnp.shape[0]):
-                cnts, _ = cv2.findContours(
-                    mnp[k].astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-                )
+                cnts, _ = cv2.findContours(mnp[k].astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 cv2.drawContours(image_np, cnts, -1, (0, 255, 0), 1)
 
         # Draw bounding boxes and class IDs
@@ -361,7 +347,7 @@ class CustomDataset(Dataset):
         save_path = save_dir / f"{idx}_idx_{img_path.stem}_debug.jpg"
         cv2.imwrite(str(save_path), cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR))
 
-    def _read_image(self, path) -> Optional[np.ndarray]:
+    def _read_image(self, path) -> np.ndarray | None:
         """Load an image as HWC with channels in RGB(+extras) order.
 
         Delegates to ``read_image_hwc`` (cv2 default for non-.npy, np.load for
@@ -372,22 +358,20 @@ class CustomDataset(Dataset):
         producers (alpha pre-multiplication + photometric-tag swap).
 
         Returns ``None`` if the file cannot be decoded.
-        Raises ``ValueError`` when the channel count doesn't match in_channels."""
+        Raises ``ValueError`` when the channel count doesn't match in_channels.
+        """
         image = read_image_hwc(path)
         if image is None:
             return None
         if Path(path).suffix.lower() != ".npy":
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         if image.shape[2] != self.in_channels:
-            raise ValueError(
-                f"Expected {self.in_channels} channels at {path}, got {image.shape[2]}"
-            )
+            raise ValueError(f"Expected {self.in_channels} channels at {path}, got {image.shape[2]}")
         return image
 
-    def _get_data(self, idx) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        returns np.ndarray image (RGB for 3ch, multi-channel TIFF as-is for >3ch);
-        targets as np.ndarray [[class_id, x1, y1, x2, y2]]
+    def _get_data(self, idx) -> tuple[np.ndarray, np.ndarray]:
+        """Returns np.ndarray image (RGB for 3ch, multi-channel TIFF as-is for >3ch); targets as np.ndarray [[class_id,
+        x1, y1, x2, y2]].
         """
         if self.coco_mode:
             return self._get_data_coco(idx)
@@ -425,7 +409,7 @@ class CustomDataset(Dataset):
             polys_abs = [norm_poly_to_abs(p, height, width) for p in polys_norm]
         return image, targets, orig_size, polys_abs
 
-    def _get_data_coco(self, idx) -> Tuple[np.ndarray, np.ndarray, torch.Tensor, list]:
+    def _get_data_coco(self, idx) -> tuple[np.ndarray, np.ndarray, torch.Tensor, list]:
         """Load image and annotations from pre-parsed COCO entries."""
         entry = self._coco_entries[idx]
         image_path = Path(entry["file_name"])
@@ -475,9 +459,7 @@ class CustomDataset(Dataset):
             else:
                 scale_h, scale_w = (1.0 * self.target_h / h, 1.0 * self.target_w / w)
 
-            img = cv2.resize(
-                img, (int(w * scale_w), int(h * scale_h)), interpolation=cv2.INTER_LINEAR
-            )
+            img = cv2.resize(img, (int(w * scale_w), int(h * scale_h)), interpolation=cv2.INTER_LINEAR)
             (h, w, c) = img.shape[:3]
 
             if mosaic_img is None:
@@ -569,10 +551,7 @@ class CustomDataset(Dataset):
         # rasterize masks from transformed polygons
         if self.return_masks and len(mosaic_segs):
             H, W = self.target_h, self.target_w
-            masks = [
-                poly_abs_to_mask(p, H, W) if p.size else np.zeros((H, W), np.uint8)
-                for p in mosaic_segs
-            ]
+            masks = [poly_abs_to_mask(p, H, W) if p.size else np.zeros((H, W), np.uint8) for p in mosaic_segs]
             masks_t = torch.from_numpy(np.stack(masks, 0)).to(torch.uint8)
         else:
             masks_t = torch.zeros((0, self.target_h, self.target_w), dtype=torch.uint8)
@@ -583,17 +562,17 @@ class CustomDataset(Dataset):
         if is_main_process():
             logger.info("Closing mosaic")
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        returns
+        Returns:
             image: CHW tensor
             labels: (N,) long
             boxes: (N,4) normalized xywh
             masks_t: (N,H,W) uint8 (possibly N=0)
             image_path: Path
             orig_size: torch.tensor([H, W])
-            polys_out: list[(K,2)] absolute polygons at ORIGINAL resolution, aligned with
-                labels/boxes — only populated for val/test segmentation eval, else None.
+            polys_out: list[(K,2)] absolute polygons at ORIGINAL resolution, aligned with labels/boxes — only populated
+                for val/test segmentation eval, else None.
         """
         image_path = Path(self.split.iloc[idx].values[0])
         # Original-resolution GT polygons, for val/test eval.
@@ -667,18 +646,14 @@ class CustomDataset(Dataset):
                 )
 
             image = transformed["image"]  # RGB, CHW
-            boxes = torch.as_tensor(
-                np.array(transformed["bboxes"]), dtype=torch.float32
-            )  # abs xyxy
+            boxes = torch.as_tensor(np.array(transformed["bboxes"]), dtype=torch.float32)  # abs xyxy
             labels = torch.as_tensor(np.array(transformed["class_labels"]), dtype=torch.int64)
 
         if self.debug_img_processing and idx <= self.cases_to_debug:
             self._debug_image(idx, image, boxes, labels, image_path, masks=masks_t)
 
         # return back to normalized format for model
-        boxes = torch.tensor(
-            abs_xyxy_to_norm_xywh(boxes, image.shape[1], image.shape[2]), dtype=torch.float32
-        )
+        boxes = torch.tensor(abs_xyxy_to_norm_xywh(boxes, image.shape[1], image.shape[2]), dtype=torch.float32)
         return image, labels, boxes, masks_t, image_path, orig_size, polys_out
 
     def __len__(self):
@@ -689,7 +664,7 @@ class Loader:
     def __init__(
         self,
         root_path: Path,
-        img_size: Tuple[int, int],
+        img_size: tuple[int, int],
         batch_size: int,
         num_workers: int,
         cfg: DictConfig,
@@ -715,16 +690,12 @@ class Loader:
             self._get_splits_coco()
         else:
             self._get_splits_yolo()
-        assert len(self.splits["train"]) and len(self.splits["val"]), (
-            "Train and Val splits must be present"
-        )
+        assert len(self.splits["train"]) and len(self.splits["val"]), "Train and Val splits must be present"
 
     def _get_splits_yolo(self) -> None:
         for split_name in self.splits:
             if (self.root_path / f"{split_name}.csv").exists():
-                self.splits[split_name] = pd.read_csv(
-                    self.root_path / f"{split_name}.csv", header=None
-                )
+                self.splits[split_name] = pd.read_csv(self.root_path / f"{split_name}.csv", header=None)
             else:
                 self.splits[split_name] = []
 
@@ -740,7 +711,7 @@ class Loader:
             else:
                 self.splits[split_name] = []
 
-    def _get_label_stats(self) -> Dict:
+    def _get_label_stats(self) -> dict:
         if self.use_one_class:
             classes = {"target": 0}
         else:
@@ -805,15 +776,11 @@ class Loader:
         for split_image in raw_split_images:
             split_images.append(Path(split_image).stem)
 
-        images = {
-            f.stem for f in (self.root_path / "images").iterdir() if not f.stem.startswith(".")
-        }
+        images = {f.stem for f in (self.root_path / "images").iterdir() if not f.stem.startswith(".")}
         images = images.intersection(split_images)
         return len(images - labels)
 
-    def _build_dataloader_impl(
-        self, dataset: Dataset, shuffle: bool = False, distributed: bool = False
-    ) -> DataLoader:
+    def _build_dataloader_impl(self, dataset: Dataset, shuffle: bool = False, distributed: bool = False) -> DataLoader:
         collate_fn = self.val_collate_fn
         if dataset.mode == "train":
             collate_fn = self.train_collate_fn
@@ -824,20 +791,18 @@ class Loader:
         if distributed:
             # Use DistributedSampler for both train and val/test in DDP mode
             # For val/test: shuffle=False, drop_last=False to ensure all samples are evaluated
-            sampler = DistributedSampler(
-                dataset, shuffle=(shuffle and dataset.mode == "train"), drop_last=False
-            )
+            sampler = DistributedSampler(dataset, shuffle=(shuffle and dataset.mode == "train"), drop_last=False)
             shuffle_flag = False  # cannot use shuffle=True when sampler is set
 
-        dl_kwargs = dict(
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
-            shuffle=shuffle_flag,
-            sampler=sampler,
-            collate_fn=collate_fn,
-            worker_init_fn=seed_worker,
-            pin_memory=True,
-        )
+        dl_kwargs = {
+            "batch_size": self.batch_size,
+            "num_workers": self.num_workers,
+            "shuffle": shuffle_flag,
+            "sampler": sampler,
+            "collate_fn": collate_fn,
+            "worker_init_fn": seed_worker,
+            "pin_memory": True,
+        }
         if self.num_workers > 0:
             dl_kwargs["prefetch_factor"] = 2
             # Only train benefits from persistent workers (avoids re-forking from a
@@ -861,9 +826,7 @@ class Loader:
         """
         return self._build_dataloader_impl(train_dataset, shuffle=True, distributed=distributed)
 
-    def build_dataloaders(
-        self, distributed: bool = False
-    ) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    def build_dataloaders(self, distributed: bool = False) -> tuple[DataLoader, DataLoader, DataLoader]:
         train_ds = CustomDataset(
             self.img_size,
             self.root_path,
@@ -898,28 +861,19 @@ class Loader:
                 cfg=self.cfg,
                 coco_annotations=self.coco_annotations["test"],
             )
-            test_loader = self._build_dataloader_impl(
-                test_ds, shuffle=False, distributed=distributed
-            )
+            test_loader = self._build_dataloader_impl(test_ds, shuffle=False, distributed=distributed)
 
         if is_main_process():
-            logger.info(
-                f"Images in train: {len(train_ds)}, val: {len(val_ds)}, test: {len(test_ds)}"
-            )
+            logger.info(f"Images in train: {len(train_ds)}, val: {len(val_ds)}, test: {len(test_ds)}")
             obj_stats = self._get_label_stats()
-            sorted_obj_stats = dict(
-                sorted(obj_stats.items(), key=lambda item: item[1], reverse=True)
-            )
-            logger.info(
-                f"Objects count: {', '.join(f'{key}: {value}' for key, value in sorted_obj_stats.items())}"
-            )
+            sorted_obj_stats = dict(sorted(obj_stats.items(), key=lambda item: item[1], reverse=True))
+            logger.info(f"Objects count: {', '.join(f'{key}: {value}' for key, value in sorted_obj_stats.items())}")
             logger.info(f"Background images: {self._get_amount_of_background()}")
         return train_loader, val_loader, test_loader
 
-    def _collate_fn(self, batch) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
-        """
-        Input: List[Tuple[Tensor[channel, height, width], Tensor[labels], Tensor[boxes]], ...]
-        where each tuple is a an item in a batch...]
+    def _collate_fn(self, batch) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor]]:
+        """Input: List[Tuple[Tensor[channel, height, width], Tensor[labels], Tensor[boxes]], ...] where each tuple is a
+        an item in a batch...].
         """
         batch = [item for item in batch if item is not None]
         if len(batch) == 0:
@@ -943,15 +897,11 @@ class Loader:
         images = torch.stack(images, dim=0)
         return images, targets, img_paths
 
-    def val_collate_fn(self, batch) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
+    def val_collate_fn(self, batch) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor]]:
         return self._collate_fn(batch)
 
-    def train_collate_fn(
-        self, batch
-    ) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
-        """
-        During traing add multiscale augmentation to the batch
-        """
+    def train_collate_fn(self, batch) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor]]:
+        """During traing add multiscale augmentation to the batch."""
         images, targets, img_paths = self._collate_fn(batch)
 
         if random.random() < self.multiscale_prob:
@@ -960,17 +910,13 @@ class Loader:
             new_w = images.shape[3] + offset
 
             # boxes are normalized, so only image should be resized
-            images = torch.nn.functional.interpolate(
-                images, size=(new_h, new_w), mode="bilinear", align_corners=False
-            )
+            images = torch.nn.functional.interpolate(images, size=(new_h, new_w), mode="bilinear", align_corners=False)
 
             for t in targets:
                 m = t["masks"]
                 if m.numel() == 0:
                     continue
                 m = m.unsqueeze(1).float()  # (N,1,H,W)
-                m = torch.nn.functional.interpolate(
-                    m, size=(new_h, new_w), mode="bilinear", align_corners=False
-                )
+                m = torch.nn.functional.interpolate(m, size=(new_h, new_w), mode="bilinear", align_corners=False)
                 t["masks"] = (m.squeeze(1) > 0.5).to(torch.uint8)  # back to (N,H,W)
         return images, targets, img_paths
