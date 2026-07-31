@@ -1,0 +1,458 @@
+# Full-video RF-DETR Medium P2 inference preset for inference_rf_detr_model.py.
+# Uses FP16 TensorRT, 160x160 SAHI slices, centered 320x320 football recheck,
+# and OC-SORT tracking for the six explicitly listed videos.
+#
+# The source training run name contains "motion_v5", but its saved merged/model
+# configs show the checkpoint architecture is P2 [P2, P3, P4] with motion disabled.
+# This preset follows the saved architecture so checkpoint loading and TensorRT
+# export use the correct graph.
+
+# Runtime controls for dry-run, prompts, verbosity, seeds, and estimates. Options: mapping.
+runtime:
+  # Print wrapper status text. Options: true, false.
+  verbose: true
+  # Estimate outputs and exit before model loading/inference. Options: true, false.
+  dry_run: false
+  # Ask before writing rendered videos, predictions, configs, caches, or engines. Options: true, false.
+  confirm_before_run: true
+  # Skip confirmation after reviewing the estimate. Options: true, false.
+  "yes": false
+  # Seed reserved for deterministic future sampling. Options: integer.
+  seed: 0
+  # Runtime-estimate settings. Options: mapping.
+  time_estimate:
+    # Print a rough HH:MM:SS runtime estimate before execution. Options: true, false.
+    enabled: true
+    # Prefer latest sibling run_timing.json throughput when available. Options: true, false.
+    use_history: true
+    # Fallback train speed retained for the shared schema. Options: positive seconds per batch.
+    default_train_seconds_per_batch: 0.7
+    # Fallback test speed retained for the shared schema. Options: positive seconds per image.
+    default_test_seconds_per_image: 0.25
+    # Fallback inference speed for each selected video detection frame. Options: positive seconds per frame.
+    default_inference_seconds_per_image: 0.25
+    # Fallback cost for drawing/writing each output video frame. Options: positive seconds per frame.
+    default_video_render_seconds_per_frame: 0.005
+
+# Model construction and inference acceleration settings. Options: mapping.
+model:
+  # RF-DETR model size. Options: base, nano, small, medium, large.
+  size: medium
+  # Checkpoint trained with Medium, one class, 576 resolution, and P2 [P2, P3, P4].
+  pretrain_weights: <path-to-medium-p2-checkpoint>/checkpoint_best_total.pth
+  # Explicit checkpoint input resolution. Options: positive integer.
+  resolution: 576
+  # Explicit checkpoint class count. Options: positive integer.
+  num_classes: 1
+  # Compute device selector. Options: auto, cpu, cuda, cuda:N, N, mps, -1.
+  device: auto
+  # RF-DETR AMP construction setting; TensorRT precision is configured separately. Options: true, false.
+  amp: true
+  # First-stage prediction confidence threshold. Options: 0.0-1.0.
+  confidence_threshold: 0.25
+  # Optional model-label to output-category mapping. Options: {}, false, or {model_label: category_id}.
+  category_remapping: {}
+  # Extra RF-DETR ModelConfig keys. Options: any supported ModelConfig key.
+  extra_model_args: {}
+  # Standalone inference acceleration settings. Options: mapping.
+  inference_optimization:
+    # Inference runtime. Options: pytorch, tensorrt.
+    backend: tensorrt
+    # PyTorch-only settings; retained for the complete schema. Options: mapping.
+    pytorch:
+      # PyTorch compute precision. Options: fp32, bf16.
+      precision: fp32
+    # TensorRT-only settings. TensorRT is CUDA-only and does not silently fall back. Options: mapping.
+    tensorrt:
+      # TensorRT engine precision. Options: fp16, bf16.
+      precision: fp16
+      # Existing serialized engine. Empty builds/reuses the compatible cache entry. Options: empty or .engine/.plan path.
+      engine_path: ""
+      # Manifest paired with engine_path. Empty derives/reuses the project-managed manifest. Options: empty or JSON path.
+      manifest_path: ""
+      # Project-relative engine/ONNX cache directory. Options: path; empty uses the same project default.
+      cache_dir: runs/rf_detr/tensorrt_cache
+      # TensorRT builder workspace limit in GiB. Options: positive number.
+      workspace_gib: 4
+      # Ignore a valid cache entry and rebuild. Options: true, false.
+      force_rebuild: false
+      # Dynamic-batch profile; spatial dimensions remain fixed at 576x576. Options: mapping.
+      profile:
+        # Smallest accepted batch; 1 keeps tail batches valid. Options: 1.
+        min_batch_size: 1
+        # Batch optimized by TensorRT autotuning. Options: positive integer.
+        opt_batch_size: 4
+        # Largest accepted engine batch. Options: positive integer >= opt_batch_size.
+        max_batch_size: 4
+
+  # P2 stride-4 feature-level settings; must match the checkpoint architecture. Options: mapping.
+  p2:
+    # Enable the project P2 model patch. Options: true, false.
+    enabled: true
+    # Projector/decoder feature levels in ascending stride order. Options: supported P-level list containing P2.
+    projector_scale: [P2, P3, P4]
+    # P2 projector internals; null values retain the training defaults. Options: mapping.
+    projector:
+      # C2f/CSPRepLayer depth per stage. Options: null or positive integer.
+      num_blocks: null
+      # Extra-level stochastic-depth survival probability. Options: null or 0.0-1.0.
+      survival_prob: null
+      # Force-zero the last N ViT feature maps. Options: null or non-negative integer.
+      force_drop_last_n_features: null
+      # LayerNorm inside projector convolutions. Options: null, true, false.
+      layer_norm: null
+      # RMSNorm inside projector convolutions. Options: null, true, false.
+      rms_norm: null
+    # Pretrained-weight compatibility settings. Options: mapping.
+    weights:
+      # Suppress the expected projector-scale compatibility warning. Options: true, false.
+      suppress_compat_warning: true
+    # Validated ModelConfig overrides; null inherits the explicit model/training value. Options: mapping.
+    overrides:
+      # Input resolution override. Options: null or compatible positive integer.
+      resolution: null
+      # Decoder query count. Options: null or positive integer.
+      num_queries: null
+      # Number of selected postprocess predictions. Options: null or positive integer.
+      num_select: null
+      # Deformable-attention sampling points per level/head. Options: null or positive integer.
+      dec_n_points: null
+      # Gradient checkpointing; saved checkpoint used false. Options: null, true, false.
+      gradient_checkpointing: false
+
+  # TrackNetV5 architecture settings; disabled to match this checkpoint. Options: mapping.
+  motion:
+    # Master switch. Options: true, false.
+    enabled: false
+    # Motion module type when enabled. Options: tracknet_v5, none.
+    type: tracknet_v5
+    # Temporal frame-context settings. Options: mapping.
+    temporal:
+      # Frames per temporal window. Options: positive integer.
+      num_frames: 3
+      # Stride between temporal frames. Options: positive integer.
+      frame_stride: 1
+      # Single-frame fallback. Options: identity, noise, zero.
+      fallback_mode: identity
+      # Gaussian noise standard deviation for fallback_mode=noise. Options: non-negative float.
+      noise_std: 0.02
+    # TrackNetV5 submodule settings retained for the complete schema. Options: mapping.
+    tracknet_v5:
+      # Motion Direction Decoupling settings. Options: mapping.
+      mdd:
+        # Enable MDD when motion is enabled. Options: true, false.
+        enabled: true
+        # Channels per polarity field; must be even. Options: positive even integer.
+        polarity_channels: 4
+        # Learnable sigmoid attention settings. Options: mapping.
+        attention:
+          # Learn sigmoid steepness and midpoint. Options: true, false.
+          learnable: true
+          # Initial sigmoid steepness. Options: positive float.
+          init_k: 1.0
+          # Initial sigmoid midpoint. Options: float.
+          init_m: 0.5
+      # Residual Spatio-Temporal Refinement settings. Options: mapping.
+      rstr:
+        # Enable R-STR when motion is enabled. Options: true, false.
+        enabled: true
+        # Spatial attention blocks per scale. Options: positive integer.
+        num_blocks: 2
+        # Attention projection dimension. Options: positive integer.
+        hidden_dim: 256
+        # Attention heads; must divide hidden_dim. Options: positive integer.
+        num_heads: 8
+        # Attention mode. Options: divided, joint.
+        attention_mode: divided
+        # Attention/FFN dropout. Options: 0.0-0.5.
+        dropout: 0.1
+        # Use PixelShuffle refinement upsampling. Options: true, false.
+        use_pixel_shuffle: true
+        # Training-time context masking probability. Options: 0.0-0.3.
+        context_mask_prob: 0.1
+    # Motion auxiliary loss settings. Options: mapping.
+    loss:
+      # Motion-attention auxiliary loss weight. Options: non-negative float.
+      motion_attention_weight: 0.0
+    # Motion-only ModelConfig overrides. Options: mapping.
+    overrides:
+      # Input resolution. Options: null or positive integer.
+      resolution: null
+      # Decoder query count. Options: null or positive integer.
+      num_queries: null
+      # Number of selected predictions. Options: null or positive integer.
+      num_select: null
+      # Gradient checkpointing. Options: null, true, false.
+      gradient_checkpointing: true
+
+# Dataset label metadata. Options: mapping.
+dataset:
+  # One checkpoint output class; ID 0 is football. Options: list or ID-to-name mapping.
+  class_names: [football]
+  # Optional dataset YAML used only when class_names is empty. Options: empty or YAML path.
+  data_yaml: ""
+
+# Output directory settings and naming templates. Options: mapping.
+output:
+  # Exact output directory. Empty composes root/name. Options: empty, absolute path, or project-relative path.
+  output_dir: ""
+  # Project-relative output root. Options: path string.
+  root: runs/rf_detr/inference
+  # Timestamped run folder name. Options: string supporting {timestamp}.
+  name: rfdetr_medium_p2_trt_fp16_sahi160_recheck320_ocsort_6videos_{timestamp}
+  # Allow writing into an existing directory. Options: true, false.
+  exist_ok: false
+
+# Inference sources, batching, rendering, video, and tracking settings. Options: mapping.
+inference:
+  # Explicit image/video/folder/HTTP(S) inputs. Options: list of supported sources.
+  sources:
+    - <path-to-video-directory>/video_01.mp4
+    - <path-to-video-directory>/video_02.mp4
+    - <path-to-video-directory>/video_03.mp4
+    - <path-to-video-directory>/video_04.mp4
+    - <path-to-video-directory>/video_05.mp4
+    - <path-to-video-directory>/video_06.mp4
+  # Recurse into folder sources. Options: true, false.
+  recursive: true
+  # Maximum discovered sources after type caps. Options: all, null, or positive integer.
+  max_sources: all
+  # Maximum image sources. Options: all, null, or positive integer.
+  max_images: all
+  # Maximum video sources. Options: all, null, or positive integer.
+  max_videos: all
+  # Inference mode. Options: full_image, sahi, class_crop.
+  mode: sahi
+  # Outer source/frame batch size; active RF-DETR SAHI calls use sahi.batch_size. Options: positive integer.
+  batch_size: 8
+  # Image extensions discovered in folders. Options: extension list.
+  image_extensions: [.bmp, .jpeg, .jpg, .png, .tif, .tiff, .webp]
+  # Video extensions discovered in folders. Options: extension list.
+  video_extensions: [.avi, .m4v, .mkv, .mov, .mp4, .mpeg, .mpg, .webm]
+  # Category IDs to render; empty defers to names. Options: ID list.
+  render_class_ids: []
+  # Render only football boxes. Options: name list.
+  render_class_names: [football]
+  # Save full line-delimited prediction records. Options: true, false.
+  save_predictions_jsonl: true
+  # Concise football center-coordinate JSONL output. Options: mapping.
+  football_output:
+    # Write football_predictions.jsonl. Options: true, false.
+    enabled: true
+    # Category IDs to export; non-empty takes precedence over names. Options: ID list.
+    target_class_ids: []
+    # Category names to export when IDs are empty. Options: name list.
+    target_class_names: [football]
+  # Video segment, sampling, batching, and rendering settings. Options: mapping.
+  video:
+    # Detect every source frame. Options: null or positive FPS.
+    detection_fps: null
+    # Detection-frame batch size; null inherits inference.batch_size, while SAHI model calls remain batch 4.
+    batch_size: null
+    # Begin each video at its first frame. Options: seconds, MM:SS, HH:MM:SS.
+    start_time: 0
+    # Continue through each video end. Options: all, null, seconds, MM:SS, HH:MM:SS.
+    end_time: all
+    # Process the entire selected range. Options: all, null, or positive duration.
+    max_seconds: all
+    # Preserve each input video's FPS. Options: null or positive FPS.
+    output_fps: null
+    # Draw latest detections on skipped frames; retained although every frame is selected. Options: true, false.
+    render_skipped_frames: true
+  # Pluggable video tracking settings. Options: mapping.
+  tracking:
+    # Enable video tracking. Options: true, false.
+    enabled: true
+    # Tracking implementation. Options: circle, ocsort, deepocsort, botsort, bytetrack.
+    algorithm: ocsort
+    # Category IDs to track; empty defers to names. Options: ID list.
+    target_class_ids: []
+    # Track only football. Options: name list; empty defaults to football.
+    target_class_names: [football]
+    # Circle-only base search radius; ignored by OC-SORT. Options: positive number.
+    radius_pixels: 80
+    # Circle-only size-relative radius scale. Options: null or positive number.
+    radius_scale: 10
+    # Circle-only radius growth per missing frame. Options: non-negative number.
+    radius_growth_per_missing_frame: 10.0
+    # Circle-only grown radius cap. Options: null or positive number.
+    max_radius_pixels: null
+    # Overlay expiry aligned with OC-SORT max_age. Options: all, null, or non-negative integer.
+    max_missing_frames: 60
+    # Render/summary confirmation gate; OC-SORT also applies its own min_hits. Options: positive integer.
+    min_hits: 1
+    # Circle-only velocity-predicted matching. Options: true, false.
+    use_velocity_prediction: false
+    # Circle-only velocity EMA weight. Options: 0.0-1.0.
+    velocity_smoothing: 0.5
+    # Draw trajectory polylines. Options: true, false.
+    draw_trajectory: true
+    # Maximum retained/rendered trajectory points. Options: null or positive integer.
+    trajectory_max_points: 30
+    # Expire trail points after this many source frames. Options: null or positive integer.
+    trajectory_max_age_frames: 60
+    # Trajectory line width in pixels. Options: positive integer.
+    trajectory_width: 2
+    # Assign distinct trajectory colors per track. Options: true, false.
+    trajectory_per_track_color: true
+    # Taper old-to-new trajectory segments. Options: true, false.
+    trajectory_taper: true
+    # Draw the current tracked center. Options: true, false.
+    draw_current_center: true
+    # Circle-only search-radius overlay. Options: true, false.
+    draw_search_circle: false
+    # Include track ID in labels. Options: true, false.
+    label_track_id: true
+    # Local ReID weights for appearance trackers; ignored by OC-SORT. Options: null or local path.
+    reid_weights: null
+    # Appearance-model device; ignored by OC-SORT. Options: null or supported device.
+    reid_device: null
+    # FP16 appearance inference; ignored by OC-SORT. Options: true, false.
+    reid_half: false
+    # Camera-motion compensation for applicable appearance trackers. Options: ecc, orb, sof, null.
+    cmc_method: ecc
+    # Separate tracking ID spaces per class. Options: true, false.
+    per_class: false
+    # OC-SORT parameters tuned for a tiny, fast football with non-overlapping adjacent boxes.
+    ocsort:
+      # Primary detection confidence gate. Options: 0.0-1.0.
+      det_thresh: 0.2
+      # Frames a track survives without a match. Options: positive integer.
+      max_age: 60
+      # Matches required before OC-SORT outputs a track. Options: positive integer.
+      min_hits: 2
+      # Centroid similarity gate; 0.97 permits about 3% of frame diagonal center displacement.
+      asso_threshold: 0.97
+      # Observation history window used for motion direction. Options: positive integer.
+      delta_t: 3
+      # Association function; centroid does not require box overlap. Options: iou, giou, ciou, diou, centroid.
+      asso_func: centroid
+      # Direction-consistency momentum weight. Options: 0.0-1.0.
+      inertia: 0.3
+      # Enable BYTE-style low-confidence second association. Options: true, false.
+      use_byte: false
+      # Position-velocity process-noise scale. Options: positive float.
+      Q_xy_scaling: 0.01
+      # Box-scale velocity process-noise scale. Options: positive float.
+      Q_s_scaling: 0.0001
+    # Deep OC-SORT parameters; inactive but retained for supported algorithm switching.
+    deepocsort:
+      # Detection confidence gate. Options: 0.0-1.0.
+      det_thresh: 0.3
+      # Frames a track survives without matching. Options: positive integer.
+      max_age: 60
+      # Matches required before a track is output. Options: positive integer.
+      min_hits: 3
+      # IoU association gate. Options: 0.0-1.0.
+      iou_threshold: 0.3
+      # Observation history window used for motion direction. Options: positive integer.
+      delta_t: 3
+      # Association function. Options: iou, giou, ciou, diou, centroid.
+      asso_func: iou
+      # Direction-consistency momentum weight. Options: 0.0-1.0.
+      inertia: 0.2
+      # Appearance-embedding association weight. Options: 0.0-1.0.
+      w_association_emb: 0.5
+      # Fixed-alpha appearance-memory EMA weight. Options: 0.0-1.0.
+      alpha_fixed_emb: 0.95
+      # Disable appearance embeddings and their ReID model. Options: true, false.
+      embedding_off: false
+      # Disable Deep OC-SORT camera-motion compensation. Options: true, false.
+      cmc_off: false
+    # BoT-SORT parameters; inactive but retained for supported algorithm switching.
+    botsort:
+      # High-confidence first-association threshold. Options: 0.0-1.0.
+      track_high_thresh: 0.5
+      # Low-confidence second-association threshold. Options: 0.0-1.0.
+      track_low_thresh: 0.1
+      # Threshold required to start a new track. Options: 0.0-1.0.
+      new_track_thresh: 0.6
+      # Frames a lost track remains buffered. Options: positive integer.
+      track_buffer: 30
+      # Association match threshold. Options: 0.0-1.0.
+      match_thresh: 0.8
+      # IoU proximity gate for appearance association. Options: 0.0-1.0.
+      proximity_thresh: 0.5
+      # Appearance-similarity gate. Options: 0.0-1.0.
+      appearance_thresh: 0.25
+      # Use appearance ReID. Options: true, false.
+      with_reid: true
+      # Fuse detection confidence during first association. Options: true, false.
+      fuse_first_associate: false
+    # ByteTrack parameters; inactive but retained for supported algorithm switching.
+    bytetrack:
+      # Primary detection confidence gate. Options: 0.0-1.0.
+      track_thresh: 0.45
+      # Association match threshold. Options: 0.0-1.0.
+      match_thresh: 0.8
+      # Frames a lost track remains buffered. Options: positive integer.
+      track_buffer: 25
+      # Nominal video FPS used for buffer timing. Options: positive integer.
+      frame_rate: 30
+
+# Class-crop settings retained for mode switching. Options: mapping.
+crop:
+  # Prediction class IDs used to find crop windows. Options: ID list.
+  class_ids: []
+  # Prediction class names used to find crop windows. Options: name list.
+  class_names: []
+  # Crop-window source. Options: prediction.
+  source: prediction
+  # First-pass confidence threshold. Options: 0.0-1.0.
+  source_conf: 0.25
+  # Fixed crop padding in pixels. Options: non-negative integer.
+  padding_pixels: 0
+  # Relative crop padding. Options: non-negative float.
+  padding_ratio: 0.05
+  # Behavior when no crop class is predicted. Options: full_image.
+  fallback: full_image
+
+# SAHI sliced-inference and centered recheck settings. Options: mapping.
+sahi:
+  # First-stage slice height in pixels. Options: positive integer.
+  slice_height: 160
+  # First-stage slice width in pixels. Options: positive integer.
+  slice_width: 160
+  # Vertical overlap between adjacent slices. Options: 0.0-0.9.
+  overlap_height_ratio: 0.2
+  # Horizontal overlap between adjacent slices. Options: 0.0-0.9.
+  overlap_width_ratio: 0.2
+  # Do not add a full-image prediction pass. Options: true, false.
+  standard_prediction: false
+  # Slice postprocessor. Options: GREEDYNMM, NMM, NMS, LSNMS.
+  postprocess_type: GREEDYNMM
+  # Intersection-over-smaller metric for partial small-slice boxes. Options: IOS, IOU.
+  postprocess_match_metric: IOS
+  # Slice merge threshold. Options: 0.0-1.0.
+  postprocess_match_threshold: 0.5
+  # Keep slice merging class-aware. Options: true, false.
+  postprocess_class_agnostic: false
+  # Real RF-DETR batch used by first-stage slices and recheck crops. Options: positive integer.
+  batch_size: 4
+  # Target-class centered second-pass verification. Options: mapping.
+  recheck:
+    # Enable centered football verification. Options: true, false.
+    enabled: true
+    # Target category IDs; empty defers to names. Options: ID list.
+    target_class_ids: []
+    # Target category names. Options: name list; empty defaults to football.
+    target_class_names: [football]
+    # Centered BxB crop side length in pixels. Options: positive integer.
+    crop_size: 320
+    # Second-pass confidence threshold. Options: 0.0-1.0.
+    second_confidence_threshold: 0.25
+    # First-stage score weight. Options: non-negative float.
+    first_weight: 0.5
+    # Second-stage score weight. Options: non-negative float.
+    second_weight: 0.5
+    # Keep the first-stage box only when its fused score reaches this threshold. Options: 0.0-1.0.
+    fused_confidence_threshold: 0.5
+    # Extra relative padding for second-pass center-hit matching. Options: non-negative float.
+    center_padding_ratio: 0.0
+    # Maximum target boxes rechecked per source frame, ranked by score. Options: non-negative integer.
+    max_rechecks_per_image: 50
+
+# Evaluation schema placeholder retained for train/test/inference consistency. Options: mapping.
+evaluation:
+  # Prediction geometry type. Options: bbox.
+  type: bbox
