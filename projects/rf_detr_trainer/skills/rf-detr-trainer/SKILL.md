@@ -26,7 +26,7 @@ Use this skill when editing `projects/rf_detr_trainer` or related object-detecti
 7. Python entrypoints should import `colorama`, call `colorama.init(autoreset=True)`, include a triple-quoted `"""..."""` usage docstring, and show progress bars for long loops.
 8. CUDA must be configurable as `auto`, `cpu`, `cuda`, `cuda:N`, or specific IDs. Keep Windows and Linux path handling.
 9. For package/model/dataset downloads, check the observed public IP region first. Use China/HK/MO/TW mirrors when detected, otherwise official sources, and allow mirror/source overrides so the workflow works with or without VPN.
-10. Keep DataLoader/worker-style parallelism uniformly set to `2` in configs and defaults unless the developer explicitly asks for a different value.
+10. Keep DataLoader/worker-style parallelism defaulted to `2`, but preserve an explicit `num_workers: 0`. Keep `runtime.cpu.enabled: true` and `budget_percent: 50` in complete execution presets; use the shared early bootstrap and CLI flags in all entrypoints so active model processes share the thread budget without changing thread settings on ordinary module import.
 11. Maintain a project-local `uv` environment. If `.venv` is missing, create it through `uv`; if it exists, add new dependencies with `uv add` and keep `pyproject.toml`/`uv.lock` in sync so future setup only needs `uv sync`.
 12. GPU PyTorch setup must auto-detect hardware and choose the appropriate PyTorch build/index. Reuse `scripts/setup_pytorch_uv.py` when possible and follow the region-aware download rule.
 13. Update `README.md` whenever entrypoint usage, config options, setup steps, or output behavior changes.

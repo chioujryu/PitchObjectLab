@@ -9,6 +9,12 @@
 
 # Runtime controls for dry-run, prompts, verbosity, seeds, and estimates. Options: mapping.
 runtime:
+  # Bound numerical-library thread pools so RF-DETR does not monopolize the host. Options: mapping.
+  cpu:
+    # Enable the cross-platform CPU thread budget. Options: true, false.
+    enabled: true
+    # Percentage of logical CPUs shared by active model processes. Options: 1-100.
+    budget_percent: 50
   # Print wrapper status text. Options: true, false.
   verbose: true
   # Estimate outputs and exit before model loading/inference. Options: true, false.

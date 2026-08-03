@@ -2,6 +2,12 @@
 # Supply the trained checkpoint and image/video source with --checkpoint and --source.
 # This architecture is intentionally fixed to the inspected one-class 704px Large P2 checkpoint.
 runtime:
+  # Bound numerical-library thread pools so RF-DETR does not monopolize the host. Options: mapping.
+  cpu:
+    # Enable the cross-platform CPU thread budget. Options: true, false.
+    enabled: true
+    # Percentage of logical CPUs shared by active model processes. Options: 1-100.
+    budget_percent: 50
   # Print preparation, acceleration, and output summaries. Options: true, false.
   verbose: true
   # Validate and estimate without creating the engine or inference outputs. Options: true, false.

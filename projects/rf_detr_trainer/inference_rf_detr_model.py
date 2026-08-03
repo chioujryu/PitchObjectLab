@@ -31,16 +31,29 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
-import colorama
-from colorama import Fore, Style
-from PIL import Image, ImageDraw, ImageFont
-from tqdm import tqdm
+import rf_detr_cpu_runtime as cpu_runtime
 
-import rf_detr_runtime as trainer
-import rf_detr_video_tracking as video_tracking
-from projects.object_detection_dataset_evaluator import object_detection_dataset_evaluator as evaluator
+_CPU_BOOTSTRAP_POLICY = (
+    cpu_runtime.bootstrap_from_argv(
+        Path(__file__).resolve().parent / "config" / "rf_detr_inference.yaml",
+        "inference",
+    )
+    if __name__ in {"__main__", "__mp_main__"}
+    else None
+)
+
+import colorama  # noqa: E402 - CPU bootstrap must run before numerical imports.
+from colorama import Fore, Style  # noqa: E402
+from PIL import Image, ImageDraw, ImageFont  # noqa: E402
+from tqdm import tqdm  # noqa: E402
+
+import rf_detr_runtime as trainer  # noqa: E402
+import rf_detr_video_tracking as video_tracking  # noqa: E402
+from projects.object_detection_dataset_evaluator import object_detection_dataset_evaluator as evaluator  # noqa: E402
 
 colorama.init(autoreset=True)
+if _CPU_BOOTSTRAP_POLICY is not None:
+    cpu_runtime.apply_loaded_runtime(_CPU_BOOTSTRAP_POLICY)
 
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = PROJECT_DIR / "config" / "rf_detr_inference.yaml"
@@ -95,6 +108,7 @@ def load_yaml(path: Path) -> Dict[str, Any]:
 
 def apply_cli_overrides(config: MutableMapping[str, Any], args: argparse.Namespace) -> None:
     runtime = config.setdefault("runtime", {})
+    cpu_runtime.apply_cpu_cli_overrides(config, args)
     output = config.setdefault("output", {})
     inference = config.setdefault("inference", {})
     model = config.setdefault("model", {})
@@ -1574,6 +1588,7 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
     parser.add_argument("--reid-weights", dest="reid_weights", help="Override inference.tracking.reid_weights (local ReID .pt path for deepocsort/botsort).")
     parser.add_argument("--dry-run", action="store_true", help="Validate and estimate outputs without inference.")
     parser.add_argument("--yes", action="store_true", help="Skip confirmation.")
+    cpu_runtime.add_cpu_cli_arguments(parser)
     args = parser.parse_args()
 
     source_config = Path(args.config).expanduser()
@@ -1581,13 +1596,16 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
         source_config = (Path.cwd() / source_config).resolve()
     config = load_yaml(source_config)
     apply_cli_overrides(config, args)
+    cpu_summary = cpu_runtime.validate_active_config(config, "inference", source_config)
     trainer._require_custom_architecture_checkpoint(config, "Inference")
     trainer.validate_inference_acceleration_config(config)
     categories = build_categories(config)
     football_output_config = parse_football_output_config(config, categories)
     verbose = bool(config.get("runtime", {}).get("verbose", True))
+    print(cpu_runtime.format_summary(cpu_summary))
     if timing_context is not None:
         timing_context["verbose"] = verbose
+        timing_context["cpu_runtime"] = cpu_summary
         timing_context["execution_profile"] = trainer.inference_execution_profile(config)
     timestamp = datetime.now().strftime(TIMESTAMP_FORMAT)
     output_dir = build_output_dir(config, timestamp)
@@ -1791,6 +1809,7 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
 def main() -> int:
     """Run inference with elapsed-time reporting."""
     timing_context = trainer.start_run_timing("inference")
+    timing_context["cpu_runtime"] = cpu_runtime.current_summary()
     try:
         result = _main_impl(timing_context)
         timing_context["success"] = True

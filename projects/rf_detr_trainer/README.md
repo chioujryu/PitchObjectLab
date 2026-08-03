@@ -69,6 +69,21 @@ Then run commands with:
 uv run python train_rf_detr_model.py --help
 ```
 
+## Tests and Continuous Integration
+
+Run the complete RF-DETR unit-test suite from this subproject:
+
+```bash
+uv run --frozen python -u -m unittest discover -s tests -p "test_*.py" -v
+```
+
+The PitchObjectLab CI workflow runs this suite with Python 3.12 on both Linux
+and Windows for every pull request and every push to `main`. CI installs
+CPU-only PyTorch wheels from the dependencies declared in `pyproject.toml`; it
+does not change the CUDA 12.8 development lockfile, build a TensorRT engine, or
+claim real GPU/TensorRT execution coverage. TensorRT presets are still parsed
+and checked as configuration contracts by the unit tests.
+
 ## Quick Start
 
 Edit:
@@ -112,8 +127,48 @@ completed epoch stored in the checkpoint; work from a partially completed
 epoch is repeated. The normal output estimate and confirmation still apply,
 or pass `--yes` after reviewing them.
 
-Training and evaluation DataLoader workers are standardized at `2` in configs
-and defaults for stable Windows/Linux behavior.
+Training and evaluation DataLoader workers default to `2` in configs for stable
+Windows/Linux behavior. An explicit `num_workers: 0` is preserved, which is
+useful when debugging or when process creation is undesirable.
+
+### CPU thread budget
+
+All train, test, and inference presets enable a balanced numerical-library
+thread budget by default:
+
+```yaml
+runtime:
+  cpu:
+    enabled: true
+    budget_percent: 50
+```
+
+The total budget is `floor(logical CPUs * budget_percent / 100)`. Training
+shares it across `WORLD_SIZE` or explicit GPU devices, standalone testing
+shares it across `test.parallel.chunks`, and inference uses one model process.
+For example, 32 logical CPUs at 50% produce 16 total threads; six test chunks
+receive two threads each. A run fails before model work starts when the model
+process count is larger than the total thread budget.
+
+CLI values override YAML, and YAML overrides the defaults:
+
+```bash
+# Use 25% of logical CPUs as the total thread budget.
+uv run python train_rf_detr_model.py --cpu-budget-percent 25 --dry-run --yes
+
+# Explicitly disable project-managed limits and retain library/environment defaults.
+uv run python test_rf_detr_model.py --no-cpu-limit --dry-run --yes
+
+# Re-enable a limit disabled by YAML.
+uv run python inference_rf_detr_model.py --cpu-limit --cpu-budget-percent 50 --yes
+```
+
+The supported flags on all three entrypoints are `--cpu-budget-percent 1..100`,
+`--cpu-limit`, and `--no-cpu-limit`. The percentage is a cross-platform thread
+budget for PyTorch, OpenMP, BLAS, NumExpr, and OpenCV; it is not a precise CPU
+utilization cap. The startup log, config snapshot metadata, and
+`run_timing.json` record the resolved process split and observed library thread
+pool values.
 
 ## RF-DETR + TrackNetV5-inspired temporal training
 
@@ -455,6 +510,13 @@ For P2-only test and inference, start from
 `config/rf_detr_test_sahi_medium.yaml` and
 `config/rf_detr_inference_medium_p2_video_1984090152231178242_003.yaml`:
 update their dataset/source and device fields for the target machine.
+
+For a complete Medium P2 inference example combining TensorRT FP16, 160 x 160
+SAHI slices, centered 320 x 320 football rechecks, OC-SORT tracking, and six
+explicit video placeholders, use
+`config/rf_detr_inference_medium_p2_tensorrt_sahi160_recheck320_ocsort_6videos.yaml`.
+Replace its checkpoint and six source paths before running it; keep the P2
+architecture identical to the checkpoint.
 
 ```yaml
 model:

@@ -70,13 +70,28 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from string import Formatter
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
-import colorama
-import yaml
-from colorama import Fore, Style
-from pytorch_lightning.callbacks import Callback
-from tqdm import tqdm
+import rf_detr_cpu_runtime as cpu_runtime
+from rf_detr_config import deep_update as _deep_update_config
+from rf_detr_config import load_yaml as _load_yaml_config
+
+_CPU_BOOTSTRAP_POLICY = (
+    cpu_runtime.bootstrap_from_argv(
+        Path(__file__).resolve().parent / "config" / "rf_detr_train.yaml",
+        "train",
+    )
+    if __name__ in {"__main__", "__mp_main__"}
+    else None
+)
+
+import colorama  # noqa: E402 - CPU bootstrap must run before numerical imports.
+import yaml  # noqa: E402
+from colorama import Fore, Style  # noqa: E402
+from pytorch_lightning.callbacks import Callback  # noqa: E402
+from tqdm import tqdm  # noqa: E402
 
 colorama.init(autoreset=True)
+if _CPU_BOOTSTRAP_POLICY is not None:
+    cpu_runtime.apply_loaded_runtime(_CPU_BOOTSTRAP_POLICY)
 os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -96,15 +111,7 @@ IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 PITCHOBJECTLAB_ARCHITECTURE_KEY = 'pitchobjectlab_architecture'
 PITCHOBJECTLAB_ARCHITECTURE_SCHEMA_VERSION = 3
 PITCHOBJECTLAB_TENSORRT_EXPORT_ABI = 3
-LEGACY_TRACKNET_CONFIG_ALIASES = {
-    "rf_detr_train_motion_v5_medium.yaml": "rf_detr_train_medium_p2_tracknet_v5.yaml",
-    "rf_detr_train_motion_v5_medium_no-p2.yaml": "rf_detr_train_medium_tracknet_v5.yaml",
-    "rf_detr_train_motion_v5_large.yaml": "rf_detr_train_large_p2_tracknet_v5.yaml",
-    "rf_detr_train_motion_v5_large_no-p2.yaml": "rf_detr_train_large_tracknet_v5.yaml",
-    "rf_detr_train_motion_v5_large_v2.yaml": "rf_detr_train_large_p2_tracknet_v5.yaml",
-    "rf_detr_train_smoke_motion_v5_medium.yaml": "rf_detr_train_smoke_temporal_tracknet_v5.yaml",
-    "rf_detr_train_smoke_motion_v5_p2_medium.yaml": "rf_detr_train_smoke_temporal_tracknet_v5.yaml",
-}
+
 DATASET_SOURCE_FORMATS = {
     "auto",
     "rfdetr",
@@ -371,42 +378,13 @@ def parse_extra_args(values: Optional[Sequence[str]]) -> Dict[str, Any]:
 
 
 def deep_update(base: MutableMapping[str, Any], updates: Mapping[str, Any]) -> MutableMapping[str, Any]:
-    """Recursively merge dictionaries in-place."""
-    for key, value in updates.items():
-        if isinstance(value, Mapping) and isinstance(base.get(key), MutableMapping):
-            deep_update(base[key], value)
-        else:
-            base[key] = value
-    return base
+    """Recursively merge dictionaries in-place via the lightweight config module."""
+    return _deep_update_config(base, updates)
 
 
 def load_yaml(path: Path, _seen: Optional[set[Path]] = None) -> Dict[str, Any]:
     """Load a YAML mapping, resolving an optional relative ``extends`` chain."""
-    path = path.expanduser().resolve()
-    if _seen is None and path.name in LEGACY_TRACKNET_CONFIG_ALIASES:
-        warnings.warn(
-            f"{path.name} is deprecated; use "
-            f"{LEGACY_TRACKNET_CONFIG_ALIASES[path.name]} instead.",
-            FutureWarning,
-            stacklevel=2,
-        )
-    seen = set() if _seen is None else set(_seen)
-    if path in seen:
-        chain = " -> ".join(str(item) for item in (*seen, path))
-        raise ValueError(f"Config extends cycle detected: {chain}")
-    seen.add(path)
-    with path.open("r", encoding="utf-8") as file:
-        data = yaml.safe_load(file) or {}
-    if not isinstance(data, dict):
-        raise ValueError(f"Config must be a YAML mapping: {path}")
-    parent = data.pop("extends", None)
-    if parent not in (None, ""):
-        parent_path = Path(str(parent)).expanduser()
-        if not parent_path.is_absolute():
-            parent_path = (path.parent / parent_path).resolve()
-        base = load_yaml(parent_path, seen)
-        return dict(deep_update(base, data))
-    return data
+    return _load_yaml_config(path, _seen)
 
 
 def save_yaml(path: Path, data: Mapping[str, Any]) -> None:
@@ -883,7 +861,11 @@ def dump_config_snapshot(
     config_dir = output_dir / "config"
     config_dir.mkdir(parents=True, exist_ok=True)
     save_yaml(config_dir / "merged_config.yaml", merged_config)
-    write_json(config_dir / "run_metadata.json", metadata)
+    metadata_payload = dict(metadata)
+    active_cpu_runtime = cpu_runtime.current_summary()
+    if active_cpu_runtime:
+        metadata_payload.setdefault("cpu_runtime", active_cpu_runtime)
+    write_json(config_dir / "run_metadata.json", metadata_payload)
     copy_if_exists(source_config, config_dir / "source_config.yaml")
     if train_config is not None:
         train_dump = train_config.model_dump() if hasattr(train_config, "model_dump") else train_config
@@ -1240,6 +1222,8 @@ def finish_run_timing(context: MutableMapping[str, Any]) -> None:
             payload["acceleration"] = json_safe_value(context["acceleration"])
         if context.get("stage_timing") is not None:
             payload["stage_timing"] = json_safe_value(context["stage_timing"])
+        if context.get("cpu_runtime") is not None:
+            payload["cpu_runtime"] = json_safe_value(context["cpu_runtime"])
         if context.get("error"):
             payload["error"] = context["error"]
         if context.get("log_path"):
@@ -4458,7 +4442,8 @@ def build_eval_dataloader(datamodule: Any, model_config: Any, train_config: Any,
     from rfdetr.utilities.tensors import collate_fn
 
     dataset = build_dataset(split, build_namespace(model_config, train_config), model_config.resolution)
-    num_workers = int(getattr(train_config, "num_workers", 2) or 2)
+    raw_num_workers = getattr(train_config, "num_workers", 2)
+    num_workers = int(2 if raw_num_workers is None else raw_num_workers)
     pin_memory = getattr(datamodule, "_pin_memory", False)
     persistent_workers = bool(num_workers > 0 and getattr(datamodule, "_persistent_workers", False))
     prefetch_factor = getattr(datamodule, "_prefetch_factor", None) if num_workers > 0 else None
@@ -5286,6 +5271,7 @@ def apply_cli_overrides(config: MutableMapping[str, Any], args: argparse.Namespa
     output = config.setdefault("output", {})
     periodic = config.setdefault("periodic_test", {})
     demo = config.setdefault("demo", {})
+    cpu_runtime.apply_cpu_cli_overrides(config, args)
 
     for key in ("dry_run", "verbose", "confirm_before_run"):
         value = getattr(args, key, None)
@@ -5419,6 +5405,7 @@ Example usage:
     parser.add_argument("--verbose", dest="verbose", action="store_true", default=None, help="Enable blue wrapper logs.")
     parser.add_argument("--quiet", dest="verbose", action="store_false", help="Disable blue wrapper logs.")
     parser.add_argument("--confirm-before-run", type=parse_bool, default=None, help="Ask before heavy output is created.")
+    cpu_runtime.add_cpu_cli_arguments(parser)
     parser.add_argument("--demo", action="store_true", default=None, help="Enable demo mode.")
     parser.add_argument("--no-demo", dest="demo", action="store_false", help="Disable demo mode.")
 
@@ -5553,8 +5540,12 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
         config = load_yaml(source_config)
         apply_cli_overrides(config, args)
         verbose = bool(config.get("runtime", {}).get("verbose", True))
+        cpu_summary = cpu_runtime.validate_active_config(config, "train", source_config)
+        if not distributed_child:
+            blue(cpu_runtime.format_summary(cpu_summary), verbose=verbose, force=True)
         if timing_context is not None:
             timing_context["verbose"] = verbose and not distributed_child
+            timing_context["cpu_runtime"] = cpu_summary
         apply_demo_mode(config, timestamp, verbose)
         resolve_train_resume_checkpoint(config, source_config)
         child_metadata: Dict[str, Any] = {}
@@ -5840,6 +5831,7 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
 def main() -> int:
     """Run training with elapsed-time reporting."""
     timing_context = start_run_timing("train", verbose=not is_nonzero_distributed_process())
+    timing_context["cpu_runtime"] = cpu_runtime.current_summary()
     try:
         result = _main_impl(timing_context)
         timing_context["success"] = True

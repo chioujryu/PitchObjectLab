@@ -452,7 +452,9 @@ class RfDetrInferenceTest(unittest.TestCase):
     def test_all_inference_configs_declare_optional_architecture_blocks(self):
         config_dir = PROJECT_DIR / "config"
         p2_video_preset = "rf_detr_inference_medium_p2_video_1984090152231178242_003.yaml"
+        combined_preset = "rf_detr_inference_medium_p2_tensorrt_sahi160_recheck320_ocsort_6videos.yaml"
         tensorrt_presets = {
+            combined_preset,
             "rf_detr_inference_tracknet_tensorrt_fp16_example.yaml",
             "rf_detr_inference_large_p2_tensorrt_fp16_smoke.yaml",
             "rf_detr_inference_small_p2.yaml",
@@ -485,6 +487,20 @@ class RfDetrInferenceTest(unittest.TestCase):
                 self.assertEqual(model["inference_optimization"]["backend"], expected_backend)
                 self.assertEqual(model["inference_optimization"]["pytorch"]["precision"], "fp32")
                 self.assertIn(model["inference_optimization"]["tensorrt"]["precision"], {"fp16", "bf16"})
+                if path.name == combined_preset:
+                    self.assertEqual(model["inference_optimization"]["tensorrt"]["precision"], "fp16")
+                    self.assertTrue(model["p2"]["enabled"])
+                    self.assertFalse(model["motion"]["enabled"])
+                    self.assertEqual(len(config["inference"]["sources"]), 6)
+                    self.assertEqual(config["inference"]["mode"], "sahi")
+                    self.assertTrue(config["inference"]["tracking"]["enabled"])
+                    self.assertEqual(config["inference"]["tracking"]["algorithm"], "ocsort")
+                    self.assertEqual(
+                        (config["sahi"]["slice_height"], config["sahi"]["slice_width"]),
+                        (160, 160),
+                    )
+                    self.assertTrue(config["sahi"]["recheck"]["enabled"])
+                    self.assertEqual(config["sahi"]["recheck"]["crop_size"], 320)
                 if path.name == p2_video_preset:
                     self.assertTrue(model["p2"]["enabled"])
                 if path.name == "rf_detr_inference_tracknet_tensorrt_fp16_example.yaml":

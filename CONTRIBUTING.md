@@ -113,7 +113,16 @@ def example_small_function(arg1: int, arg2: int = 4) -> bool:
 
 ### ✅ GitHub Actions CI Tests
 
-All pull requests must pass the [GitHub Actions](https://github.com/features/actions) [Continuous Integration](https://docs.ultralytics.com/help/CI/) (CI) tests before they can be merged. These tests include linting, unit tests, and other checks to ensure that your changes meet the project's quality standards. Review the CI output and address any issues that arise.
+All pull requests must pass the [PitchObjectLab CI workflow](https://github.com/chioujryu/PitchObjectLab/actions/workflows/ci.yml) before they can be merged. The workflow runs the complete RF-DETR unit-test suite with Python 3.12 on Linux and Windows. It uses CPU-only PyTorch wheels and validates TensorRT configuration contracts without building or executing a TensorRT engine.
+
+Run the same test suite locally before opening a pull request:
+
+```bash
+cd projects/rf_detr_trainer
+uv run --frozen python -u -m unittest discover -s tests -p "test_*.py" -v
+```
+
+Review both operating-system jobs in the CI output and address any failure.
 
 ## ✨ Best Practices for Code Contributions
 
@@ -133,7 +142,7 @@ Reviewing pull requests is another valuable way to contribute. When reviewing PR
 - **Check for unit tests:** Verify that the PR includes tests for new features or changes.
 - **Review documentation updates:** Ensure [documentation](https://docs.ultralytics.com/) is updated to reflect changes.
 - **Evaluate performance impact:** Consider how changes might affect [performance](https://docs.ultralytics.com/guides/yolo-performance-metrics/).
-- **Verify CI tests:** Confirm all [Continuous Integration tests](https://docs.ultralytics.com/help/CI/) are passing.
+- **Verify CI tests:** Confirm both Linux and Windows jobs in the [PitchObjectLab CI workflow](https://github.com/chioujryu/PitchObjectLab/actions/workflows/ci.yml) are passing.
 - **Provide constructive feedback:** Offer specific, clear feedback about any issues or concerns.
 - **Recognize effort:** Acknowledge the author's work to maintain a positive collaborative atmosphere.
 
@@ -256,7 +265,7 @@ Google-style docstrings provide clear, concise documentation for functions and c
 
 ### How can I ensure my changes pass the GitHub Actions CI tests?
 
-Before your pull request can be merged, it must pass all GitHub Actions Continuous Integration (CI) tests. These tests include linting, unit tests, and other checks to ensure the code meets the project's quality standards. Review the CI output and fix any issues. For detailed information on the CI process and troubleshooting tips, see the [GitHub Actions CI Tests](#-github-actions-ci-tests) section.
+Before your pull request can be merged, run the RF-DETR unit-test command documented in the [GitHub Actions CI Tests](#-github-actions-ci-tests) section. The pull request must then pass the same suite on both Linux and Windows. Review the failing test name and traceback in the [PitchObjectLab CI workflow](https://github.com/chioujryu/PitchObjectLab/actions/workflows/ci.yml); this workflow does not run the vendored Ultralytics benchmark, slow-test, or lint matrices.
 
 ### How do I report a bug in Ultralytics YOLO repositories?
 

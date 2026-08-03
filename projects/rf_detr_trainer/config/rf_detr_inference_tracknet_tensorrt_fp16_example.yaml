@@ -1,6 +1,12 @@
 # TrackNetV5-only FP16 TensorRT example for inference_rf_detr_model.py.
 # Pass the trained checkpoint and media source with --checkpoint and --source.
 runtime:
+  # Bound numerical-library thread pools so RF-DETR does not monopolize the host. Options: mapping.
+  cpu:
+    # Enable the cross-platform CPU thread budget. Options: true, false.
+    enabled: true
+    # Percentage of logical CPUs shared by active model processes. Options: 1-100.
+    budget_percent: 50
   verbose: true
   dry_run: false
   confirm_before_run: true

@@ -35,18 +35,31 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, MutableMapping, Optional
 
-import colorama
-from colorama import Fore, Style
-from tqdm import tqdm
+import rf_detr_cpu_runtime as cpu_runtime
 
-import rf_detr_runtime as trainer
-from projects.object_detection_dataset_evaluator.object_detection_dataset_evaluator import (
+_CPU_BOOTSTRAP_POLICY = (
+    cpu_runtime.bootstrap_from_argv(
+        Path(__file__).resolve().parent / "config" / "rf_detr_test.yaml",
+        "test",
+    )
+    if __name__ in {"__main__", "__mp_main__"}
+    else None
+)
+
+import colorama  # noqa: E402 - CPU bootstrap must run before numerical imports.
+from colorama import Fore, Style  # noqa: E402
+from tqdm import tqdm  # noqa: E402
+
+import rf_detr_runtime as trainer  # noqa: E402
+from projects.object_detection_dataset_evaluator.object_detection_dataset_evaluator import (  # noqa: E402
     expand_chunk_devices,
     parse_devices,
     run_evaluation,
 )
 
 colorama.init(autoreset=True)
+if _CPU_BOOTSTRAP_POLICY is not None:
+    cpu_runtime.apply_loaded_runtime(_CPU_BOOTSTRAP_POLICY)
 
 DEFAULT_CONFIG = Path(__file__).resolve().parent / "config" / "rf_detr_test.yaml"
 TIMESTAMP_FORMAT = "%Y%m%d%H%M%S"
@@ -58,6 +71,7 @@ def load_yaml(path: Path) -> Dict[str, Any]:
 
 def apply_cli_overrides(config: MutableMapping[str, Any], args: argparse.Namespace) -> None:
     runtime = config.setdefault("runtime", {})
+    cpu_runtime.apply_cpu_cli_overrides(config, args)
     model = config.setdefault("model", {})
     output = config.setdefault("output", {})
     test = config.setdefault("test", {})
@@ -704,7 +718,7 @@ def build_internal_test_config(config: Mapping[str, Any]) -> Dict[str, Any]:
         "dataset_file": "roboflow",
         "batch_size": int(test_settings.get("batch_size", 4) or 4),
         "grad_accum_steps": 1,
-        "num_workers": int(test.get("num_workers", 2) or 2),
+        "num_workers": int(2 if test.get("num_workers", 2) is None else test.get("num_workers", 2)),
         "device": device,
         "eval_max_dets": _last_max_det(evaluation),
         "run_test": False,
@@ -750,6 +764,7 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
     parser.add_argument("--chunks", type=int, help="Concurrent standalone test chunks/model replicas.")
     parser.add_argument("--dry-run", action="store_true", help="Validate and print planned output without inference.")
     parser.add_argument("--yes", action="store_true", help="Skip confirmation.")
+    cpu_runtime.add_cpu_cli_arguments(parser)
     args = parser.parse_args()
 
     with tqdm(total=6, desc="Preparing RF-DETR test", unit="step") as bar:
@@ -758,6 +773,8 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
             source_config = (Path.cwd() / source_config).resolve()
         config = load_yaml(source_config)
         apply_cli_overrides(config, args)
+        cpu_summary = cpu_runtime.validate_active_config(config, "test", source_config)
+        print(cpu_runtime.format_summary(cpu_summary))
         internal_config = build_internal_test_config(config)
         trainer._require_custom_architecture_checkpoint(internal_config, "Standalone test")
         validate_parallel_test_compatibility(internal_config)
@@ -765,6 +782,7 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
         parallel_chunks = standalone_parallel_chunks(internal_config)
         if timing_context is not None:
             timing_context["verbose"] = bool(internal_config.get("runtime", {}).get("verbose", True))
+            timing_context["cpu_runtime"] = cpu_summary
             timing_context["execution_profile"] = trainer.inference_execution_profile(internal_config)
         bar.update(1)
 
@@ -981,6 +999,7 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
 def main() -> int:
     """Run standalone test with elapsed-time reporting."""
     timing_context = trainer.start_run_timing("test")
+    timing_context["cpu_runtime"] = cpu_runtime.current_summary()
     try:
         result = _main_impl(timing_context)
         timing_context["success"] = True
