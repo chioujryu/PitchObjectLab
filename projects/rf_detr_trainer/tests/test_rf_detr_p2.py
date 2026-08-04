@@ -16,11 +16,11 @@ faithful Backbone.__init__ copy that reproduces upstream for P3/P4/P5), so it do
 not affect other test modules in the same session.
 """
 
-from contextlib import ExitStack
-from pathlib import Path
 import sys
 import tempfile
 import unittest
+from contextlib import ExitStack
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -31,8 +31,8 @@ PROJECT_DIR = Path(__file__).resolve().parents[1]
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
-import rf_detr_p2  # noqa: E402
-import train_rf_detr_model as trainer  # noqa: E402
+import rf_detr_p2
+import train_rf_detr_model as trainer
 
 
 class P2ConfigHelperTest(unittest.TestCase):
@@ -146,9 +146,7 @@ class P2PatchTest(unittest.TestCase):
         first = torch.arange(2 * 4 * 3 * 3, dtype=torch.float32).reshape(2, 4, 3, 3)
         second = first + 100.0
 
-        stabilized = rf_detr_p2._stabilize_raw_features_for_export(
-            [first, second], channels=[4, 4], height=3, width=3
-        )
+        stabilized = rf_detr_p2._stabilize_raw_features_for_export([first, second], channels=[4, 4], height=3, width=3)
 
         self.assertEqual([tuple(value.shape) for value in stabilized], [(2, 4, 3, 3)] * 2)
         self.assertTrue(torch.equal(stabilized[0], first))
@@ -206,10 +204,9 @@ class P2PatchTest(unittest.TestCase):
 class P2WeightLoaderFilterTest(unittest.TestCase):
     """The patched loader drops only known P2 mismatches on non-strict loads.
 
-    Stock RF-DETR detection/seg checkpoints are single-scale (projector_scale ["P4"]);
-    enabling P2 resizes the deformable-attention Linear layers + projector first stage,
-    which torch's strict=False would otherwise reject. Non-P2 architecture mismatches
-    continue to raise instead of being silently discarded.
+    Stock RF-DETR detection/seg checkpoints are single-scale (projector_scale ["P4"]); enabling P2 resizes the
+    deformable-attention Linear layers + projector first stage, which torch's strict=False would otherwise reject.
+    Non-P2 architecture mismatches continue to raise instead of being silently discarded.
     """
 
     @staticmethod
@@ -318,8 +315,7 @@ class P2CheckpointCompatibilityTest(unittest.TestCase):
         model._pitchobjectlab_p2_load_report = {
             "schema_version": 1,
             "projector_scale": ["P2", "P3", "P4"],
-            "dropped_p2_mismatches": dropped
-            or ["transformer.cross_attn.sampling_offsets.weight"],
+            "dropped_p2_mismatches": dropped or ["transformer.cross_attn.sampling_offsets.weight"],
             "loaded": True,
             "missing_keys": [],
             "unexpected_keys": [],
@@ -368,9 +364,7 @@ class P2CheckpointCompatibilityTest(unittest.TestCase):
             )
 
             with self.assertRaisesRegex(RuntimeError, "P2 architecture metadata"):
-                rf_detr_p2.assert_p2_checkpoint_compatible(
-                    model, checkpoint, expected_architecture=expected
-                )
+                rf_detr_p2.assert_p2_checkpoint_compatible(model, checkpoint, expected_architecture=expected)
 
     def test_training_guard_allows_single_level_stock_initialization(self):
         model = self._LWDETR()
@@ -391,11 +385,7 @@ class P2CheckpointCompatibilityTest(unittest.TestCase):
         model = self._LWDETR()
         self._record_successful_stock_load(model)
         model.register_buffer("_kp_active_mask", torch.zeros((0, 0), dtype=torch.bool))
-        state = {
-            key: value.clone()
-            for key, value in model.state_dict().items()
-            if key != "_kp_active_mask"
-        }
+        state = {key: value.clone() for key, value in model.state_dict().items() if key != "_kp_active_mask"}
         state["transformer.cross_attn.sampling_offsets.weight"] = torch.zeros(4, 4)
         with tempfile.TemporaryDirectory() as directory:
             checkpoint = Path(directory) / "stock_without_empty_keypoint_mask.pth"
@@ -412,18 +402,12 @@ class P2CheckpointCompatibilityTest(unittest.TestCase):
         model._pitchobjectlab_p2_load_report = {
             "schema_version": 1,
             "projector_scale": ["P2", "P3", "P4"],
-            "dropped_p2_mismatches": [
-                "transformer.cross_attn.sampling_offsets.weight"
-            ],
+            "dropped_p2_mismatches": ["transformer.cross_attn.sampling_offsets.weight"],
             "loaded": False,
             "error": "RuntimeError: simulated non-P2 shape mismatch",
         }
         model.register_buffer("_kp_active_mask", torch.ones((1, 1), dtype=torch.bool))
-        state = {
-            key: value.clone()
-            for key, value in model.state_dict().items()
-            if key != "_kp_active_mask"
-        }
+        state = {key: value.clone() for key, value in model.state_dict().items() if key != "_kp_active_mask"}
         state["transformer.cross_attn.sampling_offsets.weight"] = torch.zeros(4, 4)
         with tempfile.TemporaryDirectory() as directory:
             checkpoint = Path(directory) / "stock_without_nonempty_keypoint_mask.pth"
@@ -539,9 +523,7 @@ class TrainingMainFlowOrderTest(unittest.TestCase):
                 raise StopAfterMotionAttach
 
             p2_module = ModuleType("rf_detr_p2")
-            p2_module.assert_p2_training_checkpoint_compatible = MagicMock(
-                side_effect=guard_side_effect
-            )
+            p2_module.assert_p2_training_checkpoint_compatible = MagicMock(side_effect=guard_side_effect)
             motion_module = ModuleType("rf_detr_motion")
             motion_module.attach_motion_module = MagicMock(side_effect=attach_side_effect)
             training_module = ModuleType("rfdetr.training")
@@ -570,9 +552,7 @@ class TrainingMainFlowOrderTest(unittest.TestCase):
                         },
                     )
                 )
-                stack.enter_context(
-                    patch.object(trainer, "is_nonzero_distributed_process", return_value=True)
-                )
+                stack.enter_context(patch.object(trainer, "is_nonzero_distributed_process", return_value=True))
                 stack.enter_context(patch.object(trainer, "load_yaml", return_value=config))
                 stack.enter_context(
                     patch.object(
@@ -581,18 +561,10 @@ class TrainingMainFlowOrderTest(unittest.TestCase):
                         return_value={},
                     )
                 )
-                stack.enter_context(
-                    patch.object(trainer, "build_output_dir", return_value=directory_path / "out")
-                )
-                stack.enter_context(
-                    patch.object(trainer, "ensure_rfdetr_detection_hflip_support")
-                )
-                stack.enter_context(
-                    patch.object(trainer, "get_model_class", return_value=model_cls)
-                )
-                stack.enter_context(
-                    patch.object(trainer, "build_model_kwargs", return_value={})
-                )
+                stack.enter_context(patch.object(trainer, "build_output_dir", return_value=directory_path / "out"))
+                stack.enter_context(patch.object(trainer, "ensure_rfdetr_detection_hflip_support"))
+                stack.enter_context(patch.object(trainer, "get_model_class", return_value=model_cls))
+                stack.enter_context(patch.object(trainer, "build_model_kwargs", return_value={}))
                 stack.enter_context(
                     patch.object(
                         trainer,
@@ -607,13 +579,9 @@ class TrainingMainFlowOrderTest(unittest.TestCase):
                         return_value={},
                     )
                 )
-                stack.enter_context(
-                    patch.object(trainer, "apply_validation_interval_to_trainer_kwargs")
-                )
+                stack.enter_context(patch.object(trainer, "apply_validation_interval_to_trainer_kwargs"))
                 stack.enter_context(patch.object(trainer, "apply_multigpu_ddp_strategy"))
-                stack.enter_context(
-                    patch.object(trainer, "apply_multigpu_validation_safety")
-                )
+                stack.enter_context(patch.object(trainer, "apply_multigpu_validation_safety"))
                 stack.enter_context(
                     patch.object(
                         trainer,

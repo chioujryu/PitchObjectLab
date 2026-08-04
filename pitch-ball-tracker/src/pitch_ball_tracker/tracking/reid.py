@@ -8,15 +8,12 @@ from torchvision.models import MobileNet_V3_Small_Weights, mobilenet_v3_small
 
 
 class BallReIDExtractor:
-    """
-    Lightweight appearance feature extractor for ball re-identification.
+    """Lightweight appearance feature extractor for ball re-identification.
 
-    Uses MobileNetV3-Small as the backbone (pretrained on ImageNet).
-    The final classification head is replaced with a projection layer that
-    produces a normalised embedding of configurable dimension.
+    Uses MobileNetV3-Small as the backbone (pretrained on ImageNet). The final classification head is replaced with a
+    projection layer that produces a normalized embedding of configurable dimension.
 
-    Input: BGR frame (numpy uint8) + list of xyxy boxes.
-    Output: (N, embedding_dim) float32 numpy array.
+    Input: BGR frame (numpy uint8) + list of xyxy boxes. Output: (N, embedding_dim) float32 numpy array.
     """
 
     def __init__(
@@ -29,11 +26,13 @@ class BallReIDExtractor:
         self.embedding_dim = embedding_dim
         self.half = half and device.type == "cuda"
         self._model = self._build_model()
-        self._transform = T.Compose([
-            T.Resize((64, 64), antialias=True),
-            T.ToTensor(),
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
+        self._transform = T.Compose(
+            [
+                T.Resize((64, 64), antialias=True),
+                T.ToTensor(),
+                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ]
+        )
 
     # ------------------------------------------------------------------
     # Build
@@ -41,6 +40,7 @@ class BallReIDExtractor:
 
     def _build_model(self) -> nn.Module:
         import torch.nn.functional as F
+
         backbone = mobilenet_v3_small(weights=MobileNet_V3_Small_Weights.DEFAULT)
         # MobileNetV3-Small: backbone.features output channels = 576
         feature_extractor = backbone.features
@@ -76,9 +76,8 @@ class BallReIDExtractor:
 
     @torch.no_grad()
     def extract(self, frame_bgr: np.ndarray, boxes: np.ndarray) -> np.ndarray:
-        """
-        Extract L2-normalised embeddings for `boxes` (N×4 xyxy) in `frame_bgr`.
-        Returns (N, embedding_dim) float32 array.
+        """Extract L2-normalised embeddings for `boxes` (N×4 xyxy) in `frame_bgr`. Returns (N, embedding_dim) float32
+        array.
         """
         import cv2
         from PIL import Image
@@ -91,8 +90,10 @@ class BallReIDExtractor:
         tensors: list[torch.Tensor] = []
         for box in boxes:
             x1, y1, x2, y2 = (
-                int(max(box[0], 0)), int(max(box[1], 0)),
-                int(min(box[2], W)), int(min(box[3], H)),
+                int(max(box[0], 0)),
+                int(max(box[1], 0)),
+                int(min(box[2], W)),
+                int(min(box[3], H)),
             )
             if x2 <= x1 or y2 <= y1:
                 crop = np.zeros((64, 64, 3), dtype=np.uint8)
@@ -114,9 +115,7 @@ class BallReIDExtractor:
 
     @staticmethod
     def cosine_similarity(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-        """
-        Compute pairwise cosine similarity matrix.
-        a: (M, D), b: (N, D)  →  returns (M, N)
-        Assumes embeddings are already L2-normalised.
+        """Compute pairwise cosine similarity matrix. a: (M, D), b: (N, D) → returns (M, N) Assumes embeddings are
+        already L2-normalised.
         """
         return a @ b.T

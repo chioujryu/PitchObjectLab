@@ -418,7 +418,7 @@ uv run python -m unittest tests.test_rf_detr_video_tracking
 uv run python -m py_compile inference_rf_detr_model.py rf_detr_video_tracking.py rf_detr_boxmot_tracker.py
 # 端到端（OC-SORT，無下載）：先 --dry-run 看估算，再去掉 --dry-run、加 --yes 實跑
 uv run python inference_rf_detr_model.py --config config/rf_detr_inference.yaml \
-  --source <sample_video.mp4> --tracker ocsort --output-dir runs/rf_detr/inference_ocsort_demo --dry-run
+  --source ocsort --output-dir runs/rf_detr/inference_ocsort_demo --dry-run < sample_video.mp4 > --tracker
 ```
 
 ## Module 3.2 — 主球選擇（player proximity + 群聚 + 遲滯）— `now`
@@ -530,9 +530,9 @@ git diff --check
 # 3) 端到端：對樣本影片開啟追蹤（先看估算，再實跑）
 uv run python inference_rf_detr_model.py \
   --config config/rf_detr_inference.yaml \
-  --source <sample_video.mp4> \
-  --output-dir runs/rf_detr/inference_tracking_demo \
-  --dry-run
+  --source \
+  runs/rf_detr/inference_tracking_demo \
+  --dry-run < sample_video.mp4 > --output-dir
 # 編輯 config：inference.tracking.enabled: true，再去掉 --dry-run、加 --yes 實跑
 
 # 人工檢視重點：
