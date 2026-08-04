@@ -51,6 +51,13 @@ class FootballTrackerTest(unittest.TestCase):
         self.assertEqual(first[0]["track_id"], 1)
         self.assertEqual(second[0]["track_id"], 1)
 
+    def test_new_track_is_not_aged_on_its_creation_frame(self):
+        tracker = vt.FootballTracker(make_config())
+
+        tracker.update(0, [ball(100, 100)])
+
+        self.assertEqual(tracker.tracks[0].missing_frames, 0)
+
     def test_recenter_follows_moving_ball(self):
         tracker = vt.FootballTracker(make_config())
         ids = [tracker.update(i, [ball(100 + 40 * i, 100)])[0]["track_id"] for i in range(4)]
@@ -194,6 +201,25 @@ class BoxmotConfigTest(unittest.TestCase):
         cfg = vt.parse_tracking_config({"inference": {"tracking": {"algorithm": "circle"}}}, CATEGORIES)
         self.assertEqual(cfg.algorithm, "circle")
 
+    def test_hybrid_algorithm_allowed(self):
+        cfg = vt.parse_tracking_config({"inference": {"tracking": {"algorithm": "hybrid"}}}, CATEGORIES)
+        self.assertEqual(cfg.algorithm, "hybrid")
+
+    def test_hybrid_nested_config_is_validated_and_preserved(self):
+        raw = {"inference": {"tracking": {"algorithm": "hybrid", "hybrid": {
+            "candidate": {"low_confidence": 0.2, "high_confidence": 0.6},
+            "hypothesis": {"beam_width": 4},
+        }}}}
+
+        cfg = vt.parse_tracking_config(raw, CATEGORIES)
+
+        self.assertEqual(cfg.hybrid_options["candidate"]["low_confidence"], 0.2)
+        self.assertEqual(cfg.hybrid_options["hypothesis"]["beam_width"], 4)
+
+    def test_hybrid_unknown_config_key_raises(self):
+        with self.assertRaisesRegex(ValueError, "unknown.*hybrid"):
+            vt.parse_tracking_config({"inference": {"tracking": {"algorithm": "hybrid", "hybrid": {"typo": 1}}}}, CATEGORIES)
+
     def test_nested_boxmot_blocks_map_to_flat_fields(self):
         raw = {
             "inference": {
@@ -273,6 +299,7 @@ class TrackingSummaryTest(unittest.TestCase):
             {"source": "v.mp4", "frame_index": 0, "track_id": 2, "track_hits": 1, "track_confirmed": False},
             {"source": "v.mp4", "frame_index": 2, "track_id": None},
         ]
+
         summary = vt.build_tracking_summary(rows)
         self.assertEqual(summary["track_count"], 2)
         self.assertEqual(summary["confirmed_count"], 1)
@@ -282,6 +309,33 @@ class TrackingSummaryTest(unittest.TestCase):
         self.assertEqual(track1["num_points"], 2)
         self.assertEqual(track1["lifespan_frames"], 2)
         self.assertTrue(track1["confirmed"])
+
+    def test_hybrid_summary_includes_state_and_cmc_diagnostics(self):
+        predictions = [{"source": "v.mp4", "frame_index": 0, "track_id": 1, "track_hits": 1}]
+        states = [
+            {
+                "source": "v.mp4",
+                "frame_index": 0,
+                "track_id": 1,
+                "status": "confirmed",
+                "observation": "observed",
+                "cmc": {"method": "sparse_optical_flow", "success": True, "reason": None},
+            },
+            {
+                "source": "v.mp4",
+                "frame_index": 1,
+                "track_id": 1,
+                "status": "lost",
+                "observation": "predicted",
+                "cmc": {"method": "identity", "success": False, "reason": "estimation_failed"},
+            },
+        ]
+
+        summary = vt.build_hybrid_tracking_summary(predictions, states)
+
+        self.assertEqual(summary["state_rows"], 2)
+        self.assertEqual(summary["observation_counts"], {"observed": 1, "predicted": 1})
+        self.assertEqual(summary["cmc"]["fallback_reasons"], {"estimation_failed": 1})
 
 
 class TrackVisibilityTest(unittest.TestCase):
@@ -325,6 +379,21 @@ class TrackVisibilityTest(unittest.TestCase):
 # --- O4: synthetic end-to-end video test (no RF-DETR model) -----------------
 
 import inference_rf_detr_model as inference_runner  # noqa: E402
+
+
+class TrackerFactoryTest(unittest.TestCase):
+    def test_hybrid_factory_is_lazy_and_uses_nested_options(self):
+        from rf_detr_hybrid_tracker import HybridFootballTracker
+
+        cfg = vt.parse_tracking_config({"inference": {"tracking": {
+            "enabled": True,
+            "algorithm": "hybrid",
+            "hybrid": {"hypothesis": {"lookahead_seconds": 0.25}},
+        }}}, CATEGORIES)
+
+        tracker = inference_runner.create_tracker(cfg)
+        self.assertIsInstance(tracker, HybridFootballTracker)
+        self.assertAlmostEqual(tracker.cfg.lookahead_seconds, 0.25)
 
 # frame_index -> list of ball centers detected on that frame.
 SCRIPT = {0: [(20, 20)], 1: [(24, 20)], 2: [(28, 20)], 3: [(32, 20)], 4: [(36, 20)], 5: [(40, 20)]}
@@ -400,6 +469,56 @@ class SyntheticVideoTrackingTest(unittest.TestCase):
                 item, 1, None, {}, CATEGORIES, output_dir, [], video_cfg, tracking_config
             )
         return rows, target
+
+    def _run_hybrid(self, tmp, batch_size):
+        video_path = Path(tmp) / "clip.mp4"
+        _write_synthetic_video(video_path)
+        output_dir = Path(tmp) / f"hybrid_{batch_size}"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        item = inference_runner.SourceItem(source=str(video_path), kind="video", is_url=False, local_path=video_path)
+        video_cfg = {
+            "batch_size": batch_size,
+            "detection_fps": None,
+            "start_time": 0,
+            "end_time": "all",
+            "max_seconds": "all",
+            "output_fps": None,
+            "render_skipped_frames": True,
+        }
+        tracking_config = inference_runner.video_tracking.parse_tracking_config(
+            {"inference": {"tracking": {
+                "enabled": True,
+                "algorithm": "hybrid",
+                "hybrid": {
+                    "hypothesis": {"lookahead_seconds": 0.1},
+                    "cmc": {"cmc_enabled": False},
+                    "association": {"high_gate_pixels": 80.0},
+                },
+            }}},
+            CATEGORIES,
+        )
+        states = []
+        with mock.patch.object(inference_runner.evaluator, "predict_image", _fake_predict_image), mock.patch.object(
+            inference_runner.evaluator, "predict_images_rfdetr", _fake_predict_images_rfdetr
+        ):
+            rows, target, _ = inference_runner.predict_video_file(
+                item, 1, None, {}, CATEGORIES, output_dir, [], video_cfg, tracking_config, "cpu", states
+            )
+        return rows, states, target
+
+    def test_hybrid_one_pass_and_batched_commit_all_frames_with_stable_ids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            one_rows, one_states, one_video = self._run_hybrid(tmp, 1)
+            batch_rows, batch_states, batch_video = self._run_hybrid(tmp, 4)
+            self.assertTrue(one_video.exists() and batch_video.exists())
+
+        one_ids = _track_ids_by_frame(one_rows)
+        batch_ids = _track_ids_by_frame(batch_rows)
+        self.assertEqual(set(one_ids), set(SCRIPT))
+        self.assertEqual(one_ids, batch_ids)
+        self.assertEqual(set(one_ids.values()), {1})
+        self.assertTrue(one_states and batch_states)
+        self.assertEqual({row["frame_index"] for row in one_states}, set(SCRIPT))
 
     def test_one_pass_and_batched_match_and_track_is_stable(self):
         with tempfile.TemporaryDirectory() as tmp:

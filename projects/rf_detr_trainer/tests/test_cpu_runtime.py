@@ -249,8 +249,8 @@ class CpuPresetTests(unittest.TestCase):
                 path.name,
             )
 
-        self.assertEqual(len(paths), 56)
-        self.assertEqual(len(standalone), 42)
+        self.assertEqual(len(paths), 57)
+        self.assertEqual(len(standalone), 43)
         self.assertEqual(len(extended), 14)
         for path in standalone:
             raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}

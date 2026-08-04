@@ -136,9 +136,9 @@ class SahiPostprocessTest(unittest.TestCase):
         class FakeModel:
             def predict(self, *_args, **_kwargs):
                 return SimpleNamespace(
-                    xyxy=np.array([[4, 4, 8, 8]], dtype=np.float32),
-                    confidence=np.array([0.8], dtype=np.float32),
-                    class_id=np.array([1], dtype=np.int64),
+                    xyxy=np.array([[4, 4, 8, 8], [8, 8, 12, 12]], dtype=np.float32),
+                    confidence=np.array([0.9, 0.6], dtype=np.float32),
+                    class_id=np.array([1, 1], dtype=np.int64),
                 )
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -160,6 +160,9 @@ class SahiPostprocessTest(unittest.TestCase):
                         "second_weight": 0.5,
                         "fused_confidence_threshold": 0.6,
                         "center_padding_ratio": 0.0,
+                        "match_center_tolerance_pixels": 8.0,
+                        "match_min_size_ratio": 0.25,
+                        "match_max_size_ratio": 4.0,
                         "max_rechecks_per_image": 5,
                     },
                 },
@@ -171,7 +174,10 @@ class SahiPostprocessTest(unittest.TestCase):
 
             self.assertEqual(len(output), 1)
             self.assertEqual(output[0]["bbox"], [40, 40, 10, 10])
-            self.assertAlmostEqual(output[0]["score"], 0.7)
+            self.assertAlmostEqual(output[0]["score"], 0.6)
+            self.assertAlmostEqual(output[0]["second_stage_score"], 0.6)
+            self.assertAlmostEqual(output[0]["recheck_match_distance_pixels"], 0.0)
+            self.assertEqual(output[0]["second_stage_bbox"], [43.0, 43.0, 4.0, 4.0])
             self.assertEqual(stats["passed"], 1)
 
     def test_sahi_recheck_filters_target_without_center_hit(self):

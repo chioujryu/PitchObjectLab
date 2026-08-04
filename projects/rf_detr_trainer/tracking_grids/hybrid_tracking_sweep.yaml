@@ -1,0 +1,21 @@
+# Hybrid-only grid consumed by evaluate_rf_detr_tracking.py sweep.
+# Keys are dotted paths relative to inference.tracking.hybrid; values are candidate lists.
+
+# Confidence boundary for first-stage association. Options: list of 0.0-1.0 values.
+candidate.high_confidence: [0.45, 0.50]
+# New-ID gate; low-tier detections never spawn even when varied. Options: list >= high confidence candidates.
+candidate.new_track_confidence: [0.60]
+# High-tier compensated center gate. Options: list of positive pixels.
+association.high_gate_pixels: [36.0, 72.0, 96.0]
+# Observation-direction cost weight. Options: list of non-negative floats.
+association.weight_direction: [0.0, 0.05]
+# Ambiguity gap at which purity is preferred to continuity. Options: list of non-negative floats.
+hypothesis.ambiguity_margin: [0.0, 0.02]
+# Short-window commit delay. Options: list of non-negative seconds.
+hypothesis.lookahead_seconds: [0.30, 0.50]
+# Confirmed-track survival time. Options: list of non-negative seconds.
+lifecycle.lost_seconds: [1.00]
+# Process-noise scale for rapid acceleration. Options: list of positive floats.
+motion.process_noise: [12.0]
+# Minimum CMC inlier count. Options: list of positive integers.
+cmc.cmc_min_inliers: [12]

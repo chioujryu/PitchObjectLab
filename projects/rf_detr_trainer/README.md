@@ -756,6 +756,11 @@ When `inference.mode: sahi` and `sahi.recheck.enabled: true`,
 prediction class. The runner applies it before tracking, JSONL/summary output,
 and image/video rendering so every inference artifact uses the same filtered
 predictions. Scores equal to the threshold are retained.
+The recheck keeps first-stage geometry, selects a same-class second-stage box by
+center residual and configurable size-ratio gates, and records `first_stage_score`,
+`second_stage_score`, `second_stage_bbox`, `recheck_match_distance_pixels`, and
+`recheck_passed`. Configure `match_center_tolerance_pixels`,
+`match_min_size_ratio`, and `match_max_size_ratio` under `sahi.recheck`.
 
 ### Video tracking
 
@@ -767,7 +772,7 @@ trajectory trails, and writes a `tracking_summary.json`. The tracker is selected
 inference:
   tracking:
     enabled: true
-    algorithm: circle     # default; or ocsort / deepocsort / botsort / bytetrack (via boxmot)
+    algorithm: circle     # default; or hybrid / ocsort / deepocsort / botsort / bytetrack
     target_class_names: [football]   # which class(es) to track (default football)
 ```
 
@@ -777,6 +782,10 @@ inference:
 - `ocsort`, `deepocsort`, `botsort`, `bytetrack` — provided by
   [`boxmot`](https://github.com/mikel-brostrom/boxmot). OC-SORT and ByteTrack are
   motion-only and need no extra weights; Deep OC-SORT and BoT-SORT add appearance ReID.
+- `hybrid` combines ByteTrack-style confidence tiers, OC-SORT observation correction,
+  BoT-SORT-style camera-motion compensation, adaptive CV/CA motion, and delayed
+  ambiguity handling. It tracks every visible football; it does not assume a regulation
+  pitch, choose a single "main" ball, or use player/field/ReID semantics.
 
 Each boxmot tracker's parameters live in its **own nested block** under `inference.tracking`
 (`ocsort:`, `deepocsort:`, `botsort:`, `bytetrack:`); the shared ReID/camera-motion keys
@@ -799,6 +808,9 @@ The tracked class is configurable for every algorithm via
 `inference.tracking.target_class_ids` / `target_class_names`; with both empty it defaults
 to `football`. The `predictions.jsonl` track fields and `tracking_summary.json` are the
 same regardless of algorithm, so downstream tooling does not change when you switch.
+Hybrid additionally writes `track_states.jsonl`. `predictions.jsonl` contains only
+committed observed detections; predicted-only lifecycle rows, CMC diagnostics, covariance,
+and ambiguity metadata live in `track_states.jsonl`.
 
 The boxmot trackers require the dependency (already pinned in `pyproject.toml`):
 
@@ -822,9 +834,42 @@ inference:
 
 The ReID device follows `model.device` (override with `inference.tracking.reid_device`);
 FP16 ReID (`reid_half`) is GPU-only and is forced off on CPU/MPS. CLI overrides:
-`--tracker {circle,ocsort,deepocsort,botsort,bytetrack}` and `--reid-weights PATH`, plus
+`--tracker {circle,hybrid,ocsort,deepocsort,botsort,bytetrack}` and `--reid-weights PATH`, plus
 the existing `--track` / `--no-track`. Every `inference.tracking.*` key is documented inline
 in `config/rf_detr_inference.yaml`.
+
+
+The ready-to-run football profile is
+`config/rf_detr_inference_medium_p2_sahi320_recheck640_hybrid.yaml`: RF-DETR Medium at
+resolution 576 with P2/P3/P4, SAHI 320 (20% overlap, GREEDYNMM+IOS), 640 recheck, 0.5/0.5
+score fusion, final confidence 0.25, inference batch 8, and SAHI batch 4. Supply the
+checkpoint explicitly so an accidental weight substitution cannot go unnoticed:
+
+```bash
+uv run --frozen python inference_rf_detr_model.py \
+  --config config/rf_detr_inference_medium_p2_sahi320_recheck640_hybrid.yaml \
+  --checkpoint C:/weights/checkpoint_best_ema.pth --source C:/data/video15 --yes
+```
+
+Prepare Label Studio review data, cache detections once, compare trackers, and sweep only
+tracking parameters with `evaluate_rf_detr_tracking.py`. Pseudo identities are explicitly
+non-official until a human completes identity review:
+
+```bash
+uv run --frozen python evaluate_rf_detr_tracking.py prepare_gt \
+  --source-root LABEL_STUDIO_RUN --output-dir EVAL_DIR --yes
+uv run --frozen python evaluate_rf_detr_tracking.py cache \
+  --source-root LABEL_STUDIO_RUN --output-dir EVAL_DIR --config CONFIG --checkpoint MODEL --yes
+uv run --frozen python evaluate_rf_detr_tracking.py evaluate \
+  --source-root LABEL_STUDIO_RUN --output-dir EVAL_DIR --config CONFIG --checkpoint MODEL --yes
+uv run --frozen python evaluate_rf_detr_tracking.py sweep \
+  --source-root LABEL_STUDIO_RUN --output-dir EVAL_DIR --config CONFIG --checkpoint MODEL \
+  --grid tracking_grids/hybrid_tracking_sweep.yaml --yes
+```
+
+The default comparison is offline-safe (`circle,ocsort,bytetrack,hybrid`). To add
+`deepocsort,botsort`, pass them in `--algorithms` together with an existing local
+`--reid-weights` file; evaluation never auto-downloads ReID weights.
 
 ## Dataset Layout
 

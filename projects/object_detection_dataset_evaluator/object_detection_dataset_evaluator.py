@@ -2534,6 +2534,38 @@ def center_in_coco_bbox(center: Tuple[float, float], bbox: Sequence[float], padd
     return (x - pad_x) <= cx <= (x + width + pad_x) and (y - pad_y) <= cy <= (y + height + pad_y)
 
 
+
+def recheck_match_diagnostics(
+    first_bbox: Sequence[float],
+    second_bbox: Sequence[float],
+    minimum_center_tolerance_pixels: float,
+    center_padding_ratio: float,
+    minimum_size_ratio: float,
+    maximum_size_ratio: float,
+) -> Optional[Tuple[float, float]]:
+    """Return (center residual, size penalty) when a second-stage box is geometrically plausible."""
+    first = [float(value) for value in list(first_bbox)[:4]]
+    second = [float(value) for value in list(second_bbox)[:4]]
+    if len(first) < 4 or len(second) < 4 or first[2] <= 0.0 or first[3] <= 0.0:
+        return None
+    first_center = coco_bbox_center(first)
+    second_center = coco_bbox_center(second)
+    center_distance = math.hypot(second_center[0] - first_center[0], second_center[1] - first_center[1])
+    half_diagonal = 0.5 * math.hypot(first[2], first[3])
+    allowed_distance = max(float(minimum_center_tolerance_pixels), half_diagonal * (1.0 + 2.0 * center_padding_ratio))
+    if center_distance > allowed_distance:
+        return None
+    if second[2] <= 0.0 or second[3] <= 0.0:
+        return None
+    width_ratio = second[2] / first[2]
+    height_ratio = second[3] / first[3]
+    if not minimum_size_ratio <= width_ratio <= maximum_size_ratio:
+        return None
+    if not minimum_size_ratio <= height_ratio <= maximum_size_ratio:
+        return None
+    size_penalty = abs(math.log(width_ratio)) + abs(math.log(height_ratio))
+    return center_distance, size_penalty
+
 def centered_square_window(
     center: Tuple[float, float],
     crop_size: int,
@@ -2609,6 +2641,9 @@ def apply_sahi_recheck_batch(
     second_weight = float(recheck_cfg.get("second_weight", 0.5))
     fused_threshold = float(recheck_cfg.get("fused_confidence_threshold", config["model"].get("confidence_threshold", 0.25)))
     center_padding_ratio = float(recheck_cfg.get("center_padding_ratio", 0.0))
+    match_center_tolerance = float(recheck_cfg.get("match_center_tolerance_pixels", 8.0))
+    match_min_size_ratio = float(recheck_cfg.get("match_min_size_ratio", 0.25))
+    match_max_size_ratio = float(recheck_cfg.get("match_max_size_ratio", 4.0))
     max_rechecks = int(recheck_cfg.get("max_rechecks_per_image", 50) or 0)
 
     stats = [
@@ -2702,20 +2737,26 @@ def apply_sahi_recheck_batch(
             if isinstance(batch_size, int) and not isinstance(batch_size, bool) and batch_size > 0:
                 batch_sizes_by_image[image_index].add(batch_size)
             projected = shared_modes.project_predictions_to_original(second_predictions, x, y, image.width, image.height)
-            matching = [
-                item
-                for item in projected
-                if int(item.get("category_id", -1)) == int(meta["category_id"])
-                and center_in_coco_bbox(
-                    coco_bbox_center(item.get("bbox", [0, 0, 0, 0])),
+            matching = []
+            for item in projected:
+                if int(item.get("category_id", -1)) != int(meta["category_id"]):
+                    continue
+                diagnostics = recheck_match_diagnostics(
                     first_prediction.get("bbox", [0, 0, 0, 0]),
+                    item.get("bbox", [0, 0, 0, 0]),
+                    match_center_tolerance,
                     center_padding_ratio,
+                    match_min_size_ratio,
+                    match_max_size_ratio,
                 )
-            ]
+                if diagnostics is not None:
+                    matching.append((item, diagnostics[0], diagnostics[1]))
             if not matching:
                 stats[image_index]["filtered"] += 1
                 continue
-            best_second = max(matching, key=lambda item: float(item.get("score", 0.0)))
+            best_second, match_distance, _size_penalty = min(
+                matching, key=lambda match: (match[1], match[2], -float(match[0].get("score", 0.0)))
+            )
             fused_score = first_weight * float(first_prediction.get("score", 0.0)) + second_weight * float(best_second.get("score", 0.0))
             if fused_score < fused_threshold:
                 stats[image_index]["filtered"] += 1
@@ -2727,6 +2768,8 @@ def apply_sahi_recheck_batch(
             row["recheck_crop"] = [int(x), int(y), int(width), int(height)]
             row["recheck_passed"] = True
             passed_rows[(image_index, prediction_index)] = row
+            row["recheck_match_distance_pixels"] = float(match_distance)
+            row["second_stage_bbox"] = [float(value) for value in best_second.get("bbox", [0, 0, 0, 0])[:4]]
             stats[image_index]["passed"] += 1
 
     output_by_image: List[List[Dict[str, Any]]] = []
@@ -5039,6 +5082,9 @@ def normalize_config(config: MutableMapping[str, Any], source_config: Path) -> T
     sahi_cfg["recheck"].setdefault("fused_confidence_threshold", float(model_cfg.get("confidence_threshold", 0.25)))
     sahi_cfg["recheck"].setdefault("center_padding_ratio", 0.0)
     sahi_cfg["recheck"].setdefault("max_rechecks_per_image", 50)
+    sahi_cfg["recheck"].setdefault("match_center_tolerance_pixels", 8.0)
+    sahi_cfg["recheck"].setdefault("match_min_size_ratio", 0.25)
+    sahi_cfg["recheck"].setdefault("match_max_size_ratio", 4.0)
 
     if bool(demo_cfg.get("enabled", False)):
         demo_max_images = int(demo_cfg.get("max_images", 8))

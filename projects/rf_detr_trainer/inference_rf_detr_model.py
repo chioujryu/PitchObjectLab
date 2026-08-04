@@ -839,8 +839,9 @@ def draw_predictions(
         font = ImageFont.truetype("arial.ttf", 14)
     except Exception:
         font = ImageFont.load_default()
-    tracking_active = bool(tracks) and tracking_cfg is not None and getattr(tracking_cfg, "enabled", False)
-    if tracking_active:
+    has_tracked_rows = any(prediction.get("track_id") is not None for prediction in predictions)
+    tracking_active = tracking_cfg is not None and getattr(tracking_cfg, "enabled", False) and (bool(tracks) or has_tracked_rows)
+    if tracking_active and tracks:
         draw_track_overlays(draw, tracks, tracking_cfg, sorted(tracking_cfg.target_class_ids), current_frame_index)
     for prediction in predictions:
         category_id = int(prediction.get("category_id", 0))
@@ -1058,15 +1059,25 @@ def create_tracker(
 ) -> Optional[Any]:
     """Build the configured tracker, or None when tracking is disabled.
 
-    algorithm 'circle' -> built-in FootballTracker; 'ocsort'/'deepocsort'/'botsort'/'bytetrack'
-    -> the boxmot adapter. boxmot is imported lazily so it is only required when a boxmot
-    algorithm is actually selected.
+    algorithm 'circle' -> built-in FootballTracker; 'hybrid' -> delayed hybrid tracker;
+    'ocsort'/'deepocsort'/'botsort'/'bytetrack' -> the boxmot adapter. Optional tracker
+    modules are imported lazily only when their algorithm is selected.
     """
     if tracking_config is None or not tracking_config.enabled:
         return None
     if getattr(tracking_config, "algorithm", "circle") == "circle":
         return video_tracking.FootballTracker(tracking_config)
+    if getattr(tracking_config, "algorithm", "circle") == "hybrid":
+        from rf_detr_hybrid_tracker import HybridFootballTracker, HybridTrackingConfig
+
+        hybrid_cfg = HybridTrackingConfig.from_mapping(getattr(tracking_config, "hybrid_options", {}))
+        return HybridFootballTracker(
+            hybrid_cfg,
+            target_class_ids=tracking_config.target_class_ids,
+            history_maxlen=tracking_config.trajectory_max_points or 300,
+        )
     import rf_detr_boxmot_tracker as boxmot_tracking
+
 
     if getattr(tracking_config, "reid_half", False) and not boxmot_tracking.effective_reid_half(tracking_config, tracker_device):
         print(
@@ -1194,6 +1205,50 @@ def build_video_row(
     row["video_effective_end_seconds"] = frame_window.effective_end_seconds
     return row
 
+def is_hybrid_tracker(tracker: Any) -> bool:
+    """Whether a tracker uses delayed step/flush commits."""
+    return tracker is not None and tracker.__class__.__name__ == "HybridFootballTracker"
+
+
+def collect_hybrid_committed(
+    packets: Sequence[Mapping[str, Any]],
+    all_predictions: List[Dict[str, Any]],
+    tracking_state_rows: Optional[List[Dict[str, Any]]],
+    source: str,
+    input_fps: float,
+    frame_window: VideoFrameWindow,
+) -> None:
+    """Attach video metadata only after hybrid frames are committed."""
+    for packet in packets:
+        absolute_frame_index = int(packet["frame_index"])
+        segment_frame_index = absolute_frame_index - frame_window.start_frame
+        for prediction in packet.get("detections", []):
+            all_predictions.append(
+                build_video_row(
+                    prediction,
+                    source,
+                    absolute_frame_index,
+                    segment_frame_index,
+                    input_fps,
+                    frame_window,
+                )
+            )
+        if tracking_state_rows is None:
+            continue
+        for state in packet.get("track_states", []):
+            row = dict(state)
+            row.update(
+                source=source,
+                frame_index=absolute_frame_index,
+                segment_frame_index=segment_frame_index,
+                timestamp_seconds=absolute_frame_index / input_fps,
+                segment_timestamp_seconds=segment_frame_index / input_fps,
+                cmc=dict(packet.get("cmc", {})),
+                hypothesis=dict(packet.get("hypothesis", {})),
+            )
+            tracking_state_rows.append(row)
+
+
 
 def predict_video_file_one_pass(
     item: SourceItem,
@@ -1206,6 +1261,7 @@ def predict_video_file_one_pass(
     video_cfg: Mapping[str, Any],
     tracking_config: Optional[Any] = None,
     tracker_device: str = "cpu",
+    tracking_state_rows: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[List[Dict[str, Any]], Path, int]:
     import cv2
 
@@ -1239,6 +1295,7 @@ def predict_video_file_one_pass(
     frame_cache_dir.mkdir(parents=True, exist_ok=True)
     render_skipped = bool(video_cfg.get("render_skipped_frames", True))
     tracker = create_tracker(tracking_config, tracker_device, (width, height))
+    hybrid_tracking = is_hybrid_tracker(tracker)
     iterator = tqdm(total=frame_limit, desc=f"Inference video {item.local_path.name}", unit="frame")
     segment_frame_index = 0
     absolute_frame_index = frame_window.start_frame
@@ -1268,12 +1325,25 @@ def predict_video_file_one_pass(
                 )
                 record_inference_timing_rows(model, [timing])
                 frame_predictions = filter_final_inference_predictions(frame_predictions, prediction_config)
-                if tracker is not None:
-                    frame_predictions = tracker.update(absolute_frame_index, frame_predictions, frame=frame)
-                for prediction in frame_predictions:
-                    all_predictions.append(
-                        build_video_row(prediction, item.source, absolute_frame_index, segment_frame_index, input_fps, frame_window)
+                if hybrid_tracking:
+                    committed = tracker.step(
+                        absolute_frame_index, absolute_frame_index / input_fps, frame, frame_predictions
                     )
+                    collect_hybrid_committed(
+                        committed, all_predictions, tracking_state_rows, item.source, input_fps, frame_window
+                    )
+                    latest = tracker.latest_frame()
+                    frame_predictions = list(latest["detections"]) if latest is not None else []
+                elif tracker is not None:
+                    frame_predictions = tracker.update(absolute_frame_index, frame_predictions, frame=frame)
+                if not hybrid_tracking:
+                    for prediction in frame_predictions:
+                        all_predictions.append(
+                            build_video_row(
+                                prediction, item.source, absolute_frame_index, segment_frame_index,
+                                input_fps, frame_window,
+                            )
+                        )
                 last_predictions = frame_predictions
                 image_id += 1
             if should_detect or render_skipped:
@@ -1296,6 +1366,11 @@ def predict_video_file_one_pass(
             segment_frame_index += 1
             absolute_frame_index += 1
             iterator.update(1)
+        if hybrid_tracking:
+            collect_hybrid_committed(
+                tracker.flush(), all_predictions, tracking_state_rows, item.source, input_fps, frame_window
+            )
+
     finally:
         iterator.close()
         capture.release()
@@ -1316,6 +1391,7 @@ def predict_video_file_batched(
     batch_size: int,
     tracking_config: Optional[Any] = None,
     tracker_device: str = "cpu",
+    tracking_state_rows: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[List[Dict[str, Any]], Path, int]:
     """Batch RF-DETR detection frames, then render the selected video range."""
     import cv2
@@ -1419,6 +1495,7 @@ def predict_video_file_batched(
 
     render_skipped = bool(video_cfg.get("render_skipped_frames", True))
     tracker = create_tracker(tracking_config, tracker_device, (width, height))
+    hybrid_tracking = is_hybrid_tracker(tracker)
     last_predictions: List[Dict[str, Any]] = []
     segment_frame_index = 0
     render_iterator = tqdm(total=frame_limit, desc=f"Render video {item.local_path.name}", unit="frame")
@@ -1434,12 +1511,25 @@ def predict_video_file_batched(
             frame_predictions = last_predictions
             if should_detect:
                 frame_predictions = predictions_by_segment.get(segment_frame_index, [])
-                if tracker is not None:
-                    frame_predictions = tracker.update(absolute_frame_index, frame_predictions, frame=frame)
-                for prediction in frame_predictions:
-                    all_predictions.append(
-                        build_video_row(prediction, item.source, absolute_frame_index, segment_frame_index, input_fps, frame_window)
+                if hybrid_tracking:
+                    committed = tracker.step(
+                        absolute_frame_index, absolute_frame_index / input_fps, frame, frame_predictions
                     )
+                    collect_hybrid_committed(
+                        committed, all_predictions, tracking_state_rows, item.source, input_fps, frame_window
+                    )
+                    latest = tracker.latest_frame()
+                    frame_predictions = list(latest["detections"]) if latest is not None else []
+                elif tracker is not None:
+                    frame_predictions = tracker.update(absolute_frame_index, frame_predictions, frame=frame)
+                if not hybrid_tracking:
+                    for prediction in frame_predictions:
+                        all_predictions.append(
+                            build_video_row(
+                                prediction, item.source, absolute_frame_index, segment_frame_index,
+                                input_fps, frame_window,
+                            )
+                        )
                 last_predictions = frame_predictions
             if should_detect or render_skipped:
                 pil_frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
@@ -1463,6 +1553,11 @@ def predict_video_file_batched(
     finally:
         render_iterator.close()
         render_capture.release()
+        if hybrid_tracking:
+            collect_hybrid_committed(
+                tracker.flush(), all_predictions, tracking_state_rows, item.source, input_fps, frame_window
+            )
+
         writer.release()
         shutil.rmtree(frame_cache_dir, ignore_errors=True)
     return all_predictions, target, image_id
@@ -1479,13 +1574,14 @@ def predict_video_file(
     video_cfg: Mapping[str, Any],
     tracking_config: Optional[Any] = None,
     tracker_device: str = "cpu",
+    tracking_state_rows: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[List[Dict[str, Any]], Path, int]:
     """Predict one video with batched detection frames when configured."""
     configured_batch = positive_batch_size(video_cfg.get("batch_size"), "inference.video.batch_size", 1)
     if configured_batch <= 1:
         return predict_video_file_one_pass(
             item, start_image_id, model, prediction_config, categories, output_dir, render_ids, video_cfg,
-            tracking_config, tracker_device,
+            tracking_config, tracker_device, tracking_state_rows,
         )
     try:
         return predict_video_file_batched(
@@ -1499,14 +1595,14 @@ def predict_video_file(
             video_cfg,
             configured_batch,
             tracking_config,
-            tracker_device,
+            tracker_device, tracking_state_rows,
         )
     except RuntimeError as exc:
         if "batched" in str(exc).lower() or "reopen video" in str(exc).lower() or "seek video" in str(exc).lower():
             print(Fore.BLUE + Style.BRIGHT + f"Warning: batched video inference fell back to one-pass mode. {exc}")
             return predict_video_file_one_pass(
                 item, start_image_id, model, prediction_config, categories, output_dir, render_ids, video_cfg,
-                tracking_config, tracker_device,
+                tracking_config, tracker_device, tracking_state_rows,
             )
         raise
 
@@ -1584,7 +1680,7 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
     parser.add_argument("--no-track", dest="no_track", action="store_true", help="Disable football tracking (overrides config and --track).")
     parser.add_argument("--track-radius", dest="track_radius", type=float, help="Override inference.tracking.radius_pixels (search radius in pixels).")
     parser.add_argument("--track-velocity", dest="track_velocity", action="store_true", help="Enable the velocity-predicted gate for the circle tracker.")
-    parser.add_argument("--tracker", dest="tracker", choices=["circle", "ocsort", "deepocsort", "botsort", "bytetrack"], help="Override inference.tracking.algorithm.")
+    parser.add_argument("--tracker", dest="tracker", choices=["circle", "ocsort", "deepocsort", "botsort", "bytetrack", "hybrid"], help="Override inference.tracking.algorithm.")
     parser.add_argument("--reid-weights", dest="reid_weights", help="Override inference.tracking.reid_weights (local ReID .pt path for deepocsort/botsort).")
     parser.add_argument("--dry-run", action="store_true", help="Validate and estimate outputs without inference.")
     parser.add_argument("--yes", action="store_true", help="Skip confirmation.")
@@ -1716,6 +1812,7 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
         warn_reid_in_restricted_region(tracking_config)
     all_predictions: List[Dict[str, Any]] = []
     outputs: List[Dict[str, Any]] = []
+    track_state_rows: List[Dict[str, Any]] = []
     image_id = 1
     video_cfg = dict(config.get("inference", {}).get("video", {}) or {})
     video_cfg["batch_size"] = video_batch_size(config)
@@ -1748,7 +1845,19 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
                 flush_pending_images()
         elif item.kind == "video":
             flush_pending_images()
-            predictions, path, image_id = predict_video_file(item, image_id, model, prediction_config, categories, output_dir, render_ids, video_cfg, tracking_config, tracker_device)
+            predictions, path, image_id = predict_video_file(
+                item,
+                image_id,
+                model,
+                prediction_config,
+                categories,
+                output_dir,
+                render_ids,
+                video_cfg,
+                tracking_config,
+                tracker_device,
+                track_state_rows,
+            )
             all_predictions.extend(predictions)
             outputs.append({"source": item.source, "kind": "video", "output": str(path), "predictions": len(predictions)})
     flush_pending_images()
@@ -1760,6 +1869,8 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
     trainer.write_json(output_dir / "class_colors.json", {"categories": categories, "colors": colors})
     if bool(config.get("inference", {}).get("save_predictions_jsonl", True)):
         write_predictions_jsonl(output_dir / "predictions.jsonl", all_predictions)
+    if tracking_config.enabled and tracking_config.algorithm == "hybrid":
+        write_predictions_jsonl(output_dir / "track_states.jsonl", track_state_rows)
     football_rows = build_standard_football_rows(all_predictions, football_output_config, categories)
     football_summary = write_football_predictions_output(
         output_dir,
@@ -1788,7 +1899,12 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
             + f"recheck={stage_timing['recheck_model_forward_ratio'] * 100.0:.2f}%."
         )
     if tracking_config.enabled:
-        trainer.write_json(output_dir / "tracking_summary.json", video_tracking.build_tracking_summary(all_predictions))
+        tracking_summary = (
+            video_tracking.build_hybrid_tracking_summary(all_predictions, track_state_rows)
+            if tracking_config.algorithm == "hybrid"
+            else video_tracking.build_tracking_summary(all_predictions)
+        )
+        trainer.write_json(output_dir / "tracking_summary.json", tracking_summary)
     trainer.dump_config_snapshot(
         output_dir=output_dir,
         merged_config=config,

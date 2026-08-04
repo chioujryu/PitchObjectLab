@@ -137,7 +137,43 @@ def _as_positive_float(value: Any, default: float, field_name: str) -> float:
 
 # Tracking algorithms: "circle" is the built-in stdlib tracker in this module; the rest are
 # provided by the boxmot adapter (rf_detr_boxmot_tracker.BoxmotTracker).
-ALLOWED_ALGORITHMS: Tuple[str, ...] = ("circle", "ocsort", "deepocsort", "botsort", "bytetrack")
+_HYBRID_OPTION_GROUPS = {
+    "candidate": {"low_confidence", "high_confidence", "new_track_confidence", "low_require_recheck"},
+    "hypothesis": {"lookahead_seconds", "beam_width", "ambiguity_margin"},
+    "lifecycle": {"confirmed_hits", "confirmation_window", "lost_seconds", "predicted_output_seconds"},
+    "association": {
+        "high_gate_pixels", "low_gate_pixels", "mahalanobis_gate", "weight_mahalanobis", "weight_center",
+        "weight_direction", "weight_size", "weight_confidence", "low_gate_scale",
+    },
+    "motion": {
+        "process_noise", "measurement_noise", "acceleration_smoothing", "size_smoothing",
+        "model_probability_smoothing",
+    },
+    "cmc": {
+        "cmc_enabled", "cmc_max_corners", "cmc_quality_level", "cmc_min_distance", "cmc_ransac_threshold",
+        "cmc_min_inliers", "cmc_max_translation", "cmc_min_scale", "cmc_max_scale",
+    },
+}
+
+
+def _validate_hybrid_options(raw: Any) -> Dict[str, Any]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, Mapping):
+        raise ValueError("inference.tracking.hybrid must be a mapping")
+    copied: Dict[str, Any] = {}
+    for group, values in raw.items():
+        if group not in _HYBRID_OPTION_GROUPS:
+            raise ValueError(f"unknown inference.tracking.hybrid.{group}")
+        if not isinstance(values, Mapping):
+            raise ValueError(f"inference.tracking.hybrid.{group} must be a mapping")
+        unknown = set(values) - _HYBRID_OPTION_GROUPS[group]
+        if unknown:
+            raise ValueError(f"unknown inference.tracking.hybrid.{group}.{sorted(unknown)[0]}")
+        copied[group] = dict(values)
+    return copied
+
+ALLOWED_ALGORITHMS: Tuple[str, ...] = ("circle", "ocsort", "deepocsort", "botsort", "bytetrack", "hybrid")
 # boxmot trackers that consume an appearance ReID model (need reid_weights / device).
 APPEARANCE_ALGORITHMS: Tuple[str, ...] = ("deepocsort", "botsort")
 _ALLOWED_CMC_METHODS = {"ecc", "orb", "sof", "sparseoptflow", "file", "files"}
@@ -206,6 +242,8 @@ class TrackingConfig:
     botsort_proximity_thresh: float = 0.5
     botsort_appearance_thresh: float = 0.25
     botsort_with_reid: bool = True
+    # Hybrid settings remain grouped so config snapshots preserve their public structure.
+    hybrid_options: Dict[str, Any] = field(default_factory=dict)
     botsort_fuse_first_associate: bool = False
     # ByteTrack parameters.
     bytetrack_track_thresh: float = 0.45
@@ -344,6 +382,7 @@ def parse_tracking_config(
         raise ValueError(
             f"inference.tracking.algorithm must be one of {list(ALLOWED_ALGORITHMS)}, got {algorithm!r}"
         )
+    hybrid_options = _validate_hybrid_options(raw.get("hybrid"))
     cmc_method = _as_optional_str(raw.get("cmc_method", "ecc"))
     if cmc_method is not None and cmc_method.casefold() not in _ALLOWED_CMC_METHODS:
         raise ValueError(
@@ -413,6 +452,7 @@ def parse_tracking_config(
         botsort_match_thresh=_as_unit_float(botsort.get("match_thresh"), 0.8, "botsort.match_thresh"),
         botsort_proximity_thresh=_as_unit_float(botsort.get("proximity_thresh"), 0.5, "botsort.proximity_thresh"),
         botsort_appearance_thresh=_as_unit_float(botsort.get("appearance_thresh"), 0.25, "botsort.appearance_thresh"),
+        hybrid_options=hybrid_options,
         botsort_with_reid=_as_bool(botsort.get("with_reid"), True),
         botsort_fuse_first_associate=_as_bool(botsort.get("fuse_first_associate"), False),
         bytetrack_track_thresh=_as_unit_float(bytetrack.get("track_thresh"), 0.45, "bytetrack.track_thresh"),
@@ -530,6 +570,7 @@ class FootballTracker:
             )
             self.next_id += 1
             self.tracks.append(track)
+            used_tracks.add(track.track_id)
             used_dets.add(index)
             assigned[index] = track
 
@@ -608,3 +649,44 @@ def build_tracking_summary(all_predictions: Sequence[Mapping[str, Any]]) -> Dict
         "track_count": len(tracks),
         "confirmed_count": sum(1 for group in tracks if group["confirmed"]),
     }
+
+def build_hybrid_tracking_summary(
+    all_predictions: Sequence[Mapping[str, Any]],
+    track_states: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Extend the legacy track summary with hybrid state and explicit CMC diagnostics."""
+    summary = build_tracking_summary(all_predictions)
+    observations: Dict[str, int] = {}
+    statuses: Dict[str, int] = {}
+    methods: Dict[str, int] = {}
+    successes = 0
+    fallbacks = 0
+    fallback_reasons: Dict[str, int] = {}
+    for row in track_states:
+        observation = str(row.get("observation", "unknown"))
+        status = str(row.get("status", "unknown"))
+        observations[observation] = observations.get(observation, 0) + 1
+        statuses[status] = statuses.get(status, 0) + 1
+        cmc = row.get("cmc", {})
+        if not isinstance(cmc, Mapping):
+            cmc = {}
+        method = str(cmc.get("method", "unknown"))
+        methods[method] = methods.get(method, 0) + 1
+        if bool(cmc.get("success")):
+            successes += 1
+        else:
+            fallbacks += 1
+            reason = str(cmc.get("reason") or "unspecified")
+            fallback_reasons[reason] = fallback_reasons.get(reason, 0) + 1
+    summary.update(
+        state_rows=len(track_states),
+        observation_counts=observations,
+        status_counts=statuses,
+        cmc={
+            "method_counts": methods,
+            "success_rows": successes,
+            "fallback_rows": fallbacks,
+            "fallback_reasons": fallback_reasons,
+        },
+    )
+    return summary
