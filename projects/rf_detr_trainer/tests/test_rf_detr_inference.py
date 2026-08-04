@@ -1,17 +1,16 @@
-from pathlib import Path
 import sys
 import tempfile
-from types import ModuleType, SimpleNamespace
 import unittest
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
-
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 REPO_ROOT = PROJECT_DIR.parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-import inference_rf_detr_model as inference_runner  # noqa: E402
+import inference_rf_detr_model as inference_runner
 
 
 class RfDetrInferenceTest(unittest.TestCase):
@@ -99,7 +98,9 @@ class RfDetrInferenceTest(unittest.TestCase):
 
         self.assertEqual(inference_runner.inference_batch_size(config), 8)
         self.assertEqual(inference_runner.video_batch_size(config), 8)
-        self.assertEqual(inference_runner.video_batch_size({"inference": {"batch_size": 8, "video": {"batch_size": 3}}}), 3)
+        self.assertEqual(
+            inference_runner.video_batch_size({"inference": {"batch_size": 8, "video": {"batch_size": 3}}}), 3
+        )
 
     def test_prediction_config_includes_batch_size(self):
         config = {"model": {"confidence_threshold": 0.3}, "inference": {"mode": "full_image", "batch_size": 7}}
@@ -149,7 +150,10 @@ class RfDetrInferenceTest(unittest.TestCase):
     def test_final_prediction_filter_is_inactive_without_sahi_and_recheck(self):
         predictions = [{"category_id": 1, "score": 0.1}]
         configs = [
-            {"inference": {"mode": "full_image"}, "sahi": {"recheck": {"enabled": True, "fused_confidence_threshold": 0.5}}},
+            {
+                "inference": {"mode": "full_image"},
+                "sahi": {"recheck": {"enabled": True, "fused_confidence_threshold": 0.5}},
+            },
             {"inference": {"mode": "sahi"}, "sahi": {"recheck": {"enabled": False, "fused_confidence_threshold": 0.5}}},
         ]
 
@@ -219,7 +223,13 @@ class RfDetrInferenceTest(unittest.TestCase):
         self.assertEqual(row["source"], "v.mp4")
         self.assertEqual(row["frame_index"], 3)
         self.assertAlmostEqual(row["timestamp_seconds"], 0.1)
-        for key in ("segment_frame_index", "segment_timestamp_seconds", "video_start_seconds", "video_end_seconds", "video_effective_end_seconds"):
+        for key in (
+            "segment_frame_index",
+            "segment_timestamp_seconds",
+            "video_start_seconds",
+            "video_end_seconds",
+            "video_effective_end_seconds",
+        ):
             self.assertIn(key, row)
 
     def test_load_model_attaches_motion_only_when_enabled(self):
@@ -298,20 +308,40 @@ class RfDetrInferenceTest(unittest.TestCase):
 
     @staticmethod
     def _cli_args(**overrides):
-        base = dict(
-            yes=False, dry_run=False, source=None, output_dir=None, checkpoint=None, device=None,
-            confidence_threshold=None, max_sources=None, max_images=None, max_videos=None,
-            batch_size=None, video_batch_size=None, max_seconds=None, video_start_time=None, video_end_time=None,
-            track=False, no_track=False, track_radius=None, track_velocity=False,
-            inference_backend=None, inference_precision=None, tensorrt_engine=None,
-            tensorrt_cache_dir=None, tensorrt_force_rebuild=False,
-        )
+        base = {
+            "yes": False,
+            "dry_run": False,
+            "source": None,
+            "output_dir": None,
+            "checkpoint": None,
+            "device": None,
+            "confidence_threshold": None,
+            "max_sources": None,
+            "max_images": None,
+            "max_videos": None,
+            "batch_size": None,
+            "video_batch_size": None,
+            "max_seconds": None,
+            "video_start_time": None,
+            "video_end_time": None,
+            "track": False,
+            "no_track": False,
+            "track_radius": None,
+            "track_velocity": False,
+            "inference_backend": None,
+            "inference_precision": None,
+            "tensorrt_engine": None,
+            "tensorrt_cache_dir": None,
+            "tensorrt_force_rebuild": False,
+        }
         base.update(overrides)
         return SimpleNamespace(**base)
 
     def test_cli_track_overrides_enable_and_tune(self):
         config = {}
-        inference_runner.apply_cli_overrides(config, self._cli_args(track=True, track_radius=120.0, track_velocity=True))
+        inference_runner.apply_cli_overrides(
+            config, self._cli_args(track=True, track_radius=120.0, track_velocity=True)
+        )
         tracking = config["inference"]["tracking"]
         self.assertTrue(tracking["enabled"])
         self.assertEqual(tracking["radius_pixels"], 120.0)
@@ -328,13 +358,7 @@ class RfDetrInferenceTest(unittest.TestCase):
         self.assertNotIn("tracking", config.get("inference", {}))
 
     def test_cli_selects_tensorrt_bf16_and_artifact_options(self):
-        config = {
-            "model": {
-                "inference_optimization": {
-                    "tensorrt": {"manifest_path": "stale.engine.manifest.json"}
-                }
-            }
-        }
+        config = {"model": {"inference_optimization": {"tensorrt": {"manifest_path": "stale.engine.manifest.json"}}}}
         inference_runner.apply_cli_overrides(
             config,
             self._cli_args(

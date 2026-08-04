@@ -72,7 +72,7 @@ dataset:
   max_images: all
   temporal:
     # One complete window per split is enough for the bounded overfit smoke.
-    max_windows_per_split: {train: 1, val: 1, test: 1}
+    max_windows_per_split: { train: 1, val: 1, test: 1 }
 
 train:
   dataset_dir: "C:/Users/XBOT/Documents/Datasets/soccer_ball_merged_v1/datasets/spatiotemporal/frame_label_process_result_smoke"
@@ -102,4 +102,3 @@ periodic_test:
 
 demo:
   enabled: false
-

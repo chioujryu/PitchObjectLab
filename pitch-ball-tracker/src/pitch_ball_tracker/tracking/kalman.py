@@ -4,14 +4,10 @@ import numpy as np
 
 
 class KalmanBoxTracker:
-    """
-    Kalman filter for a single bounding box.
+    """Kalman filter for a single bounding box.
 
-    State vector  x = [cx, cy, a, h, vx, vy, va, vh]
-      cx, cy : centre coordinates
-      a      : aspect ratio (w / h)
-      h      : height
-      vx…vh  : corresponding velocities
+    State vector x = [cx, cy, a, h, vx, vy, va, vh] cx, cy : center coordinates a : aspect ratio (w / h) h : height
+    vx…vh : corresponding velocities
 
     Observation z = [cx, cy, a, h]
 
