@@ -63,6 +63,7 @@ import sys
 import tempfile
 import time
 import warnings
+from collections import Counter
 from copy import deepcopy
 from datetime import datetime
 from functools import wraps
@@ -86,7 +87,7 @@ _CPU_BOOTSTRAP_POLICY = (
 import colorama  # noqa: E402 - CPU bootstrap must run before numerical imports.
 import yaml  # noqa: E402
 from colorama import Fore, Style  # noqa: E402
-from pytorch_lightning.callbacks import Callback  # noqa: E402
+from pytorch_lightning.callbacks import Callback, ModelCheckpoint  # noqa: E402
 from tqdm import tqdm  # noqa: E402
 
 colorama.init(autoreset=True)
@@ -231,6 +232,7 @@ class TeeTextStream:
     def __init__(self, stream: Any, log_file: Any) -> None:
         self.stream = stream
         self.log_file = log_file
+        self._pending_log_line = ""
 
     @staticmethod
     def _is_closed(stream: Any) -> bool:
@@ -259,8 +261,29 @@ class TeeTextStream:
 
     def write(self, data: str) -> int:
         written = self._write_if_open(self.stream, data)
-        self._write_if_open(self.log_file, data)
+        self._write_collapsed_log(data)
         return len(data) if written is None else written
+
+    def _write_collapsed_log(self, data: str) -> None:
+        """Write complete log lines while replacing carriage-return progress updates."""
+        normalized = str(data).replace("\r\n", "\n")
+        for character in normalized:
+            if character == "\r":
+                self._pending_log_line = ""
+            elif character == "\n":
+                self._write_if_open(self.log_file, self._pending_log_line + "\n")
+                self._pending_log_line = ""
+            else:
+                self._pending_log_line += character
+                if len(self._pending_log_line) > 65_536:
+                    self._pending_log_line = self._pending_log_line[-65_536:]
+
+    def finalize_log_line(self) -> None:
+        """Persist the latest unterminated console line once at capture shutdown."""
+        if not self._pending_log_line:
+            return
+        self._write_if_open(self.log_file, self._pending_log_line + "\n")
+        self._pending_log_line = ""
 
     def flush(self) -> None:
         self._flush_if_open(self.stream)
@@ -311,6 +334,9 @@ def stop_run_log_capture(context: Optional[MutableMapping[str, Any]]) -> None:
     if not capture:
         return
     try:
+        for stream in (sys.stdout, sys.stderr):
+            if isinstance(stream, TeeTextStream):
+                stream.finalize_log_line()
         print(f"Run log ended at {datetime.now().isoformat(timespec='seconds')}")
         sys.stdout.flush()
         sys.stderr.flush()
@@ -849,6 +875,71 @@ def copy_if_exists(src: Optional[Path], dst: Path) -> None:
         shutil.copy2(src, dst)
 
 
+CONFIG_SNAPSHOT_COLLECTION_LIMIT = 256
+_CONFIG_SNAPSHOT_PATH_TOKENS = ("file", "image", "path", "record", "manifest", "source")
+
+
+def _snapshot_collection_digest(value: Any) -> str:
+    """Return a stable digest for a collection omitted from a config snapshot."""
+    safe = json_safe_value(value)
+    encoded = json.dumps(safe, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _looks_like_per_file_mapping(value: Mapping[Any, Any]) -> bool:
+    """Detect legacy maps keyed by hundreds of image/file names."""
+    if len(value) <= CONFIG_SNAPSHOT_COLLECTION_LIMIT:
+        return False
+    sampled_keys = [str(key).lower() for key in list(value.keys())[:64]]
+    if not sampled_keys:
+        return False
+    file_like = sum(
+        Path(key).suffix.lower() in IMAGE_EXTENSIONS or "/" in key or "\\" in key
+        for key in sampled_keys
+    )
+    return file_like / len(sampled_keys) >= 0.8
+
+
+def compact_config_snapshot_value(value: Any, key_path: Tuple[str, ...] = ()) -> Any:
+    """Compact generated per-file collections while retaining a reproducibility digest.
+
+    This only affects ``config/merged_config.yaml``.  The in-memory configuration and
+    user-supplied source config remain untouched.
+    """
+    if isinstance(value, Mapping):
+        if _looks_like_per_file_mapping(value):
+            counts = Counter(str(item) for item in value.values() if isinstance(item, (str, int, float, bool)))
+            return {
+                "snapshot_compacted": True,
+                "item_count": len(value),
+                "sha256": _snapshot_collection_digest(value),
+                "value_counts": dict(sorted(counts.items())) if len(counts) <= 32 else {},
+            }
+        return {
+            str(key): compact_config_snapshot_value(item, (*key_path, str(key)))
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        leaf = key_path[-1].lower() if key_path else ""
+        generated_path_list = any(token in leaf for token in _CONFIG_SNAPSHOT_PATH_TOKENS)
+        if len(value) > CONFIG_SNAPSHOT_COLLECTION_LIMIT and generated_path_list:
+            return {
+                "snapshot_compacted": True,
+                "item_count": len(value),
+                "sha256": _snapshot_collection_digest(value),
+            }
+        return [compact_config_snapshot_value(item, key_path) for item in value]
+    return json_safe_value(value)
+
+
+def compact_merged_config_snapshot(config: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return a bounded merged-config representation suitable for run artifacts."""
+    compacted = compact_config_snapshot_value(config)
+    if not isinstance(compacted, dict):
+        raise TypeError("Merged config snapshot must remain a mapping.")
+    return compacted
+
+
 def dump_config_snapshot(
     output_dir: Path,
     merged_config: Mapping[str, Any],
@@ -860,7 +951,7 @@ def dump_config_snapshot(
     """Save reproducibility config files inside an output folder."""
     config_dir = output_dir / "config"
     config_dir.mkdir(parents=True, exist_ok=True)
-    save_yaml(config_dir / "merged_config.yaml", merged_config)
+    save_yaml(config_dir / "merged_config.yaml", compact_merged_config_snapshot(merged_config))
     metadata_payload = dict(metadata)
     active_cpu_runtime = cpu_runtime.current_summary()
     if active_cpu_runtime:
@@ -1178,11 +1269,26 @@ def finish_run_timing(context: MutableMapping[str, Any]) -> None:
         if isinstance(stage_timing, Mapping):
             with contextlib.suppress(TypeError, ValueError):
                 stage_total = float(stage_timing.get("total_seconds", 0.0) or 0.0)
-                stage_units = float(stage_timing.get("images_or_frames", 0.0) or 0.0)
-                if stage_total >= 0.0 and stage_units > 0.0:
-                    steady_state_seconds = stage_total
+                critical_path_wall = float(
+                    stage_timing.get("critical_path_wall_seconds", stage_total) or 0.0
+                )
+                stage_units = float(
+                    stage_timing.get(
+                        "runtime_units",
+                        stage_timing.get("images_or_frames", 0.0),
+                    )
+                    or 0.0
+                )
+                if critical_path_wall >= 0.0 and stage_units > 0.0:
+                    steady_state_seconds = critical_path_wall
                     throughput_units = stage_units
-                    throughput_source = "stage_timing"
+                    throughput_source = (
+                        "stage_timing-critical-path-wall"
+                        if "critical_path_wall_seconds" in stage_timing
+                        else "stage_timing"
+                    )
+                    if "runtime_units" in stage_timing:
+                        throughput_source += "-runtime-units"
 
         throughput: Dict[str, Any] = {
             "runtime_units": throughput_units,
@@ -1233,16 +1339,20 @@ def finish_run_timing(context: MutableMapping[str, Any]) -> None:
         stop_run_log_capture(context)
 
 
-def maybe_count_images(path: Optional[Path]) -> Optional[int]:
+def maybe_count_images(path: Optional[Path], max_count: Optional[int] = None) -> Optional[int]:
     """Count image files under a local directory, returning None when unavailable."""
     if path is None or not path.exists():
         return None
+    if max_count is not None and int(max_count) <= 0:
+        return 0
     if path.is_file():
         return 1 if path.suffix.lower() in IMAGE_EXTENSIONS else 0
     total = 0
     for file_path in path.rglob("*"):
         if file_path.suffix.lower() in IMAGE_EXTENSIONS:
             total += 1
+            if max_count is not None and total >= max(0, int(max_count)):
+                return total
     return total
 
 
@@ -2677,8 +2787,17 @@ def build_dataset_plan(
     config: Mapping[str, Any],
     output_dir: Path,
     source_config: Optional[Path],
+    *,
+    required_splits: Optional[Sequence[str]] = None,
+    required_split_limits: Optional[Mapping[str, Optional[int]]] = None,
 ) -> Dict[str, Any]:
-    """Build a dataset preparation plan without writing output."""
+    """Build a dataset preparation plan without writing output.
+
+    ``required_splits`` is a read-planning optimization for an already RF-DETR-readable
+    dataset. Conversion and training plans still inspect every source split because their
+    cache/fingerprint semantics require it; standalone tests can avoid walking unrelated
+    train/validation image trees merely to estimate one limited test split.
+    """
     dataset_dir_value = get_dataset_dir_value(config)
     dataset_dir = None
     bases = config_path_bases(source_config)
@@ -2756,9 +2875,21 @@ def build_dataset_plan(
         return build_rfdetr_limited_dataset_plan(config, dataset_dir, source_config)
     split_counts: Dict[str, Optional[int]] = {}
     if dataset_dir is not None:
+        count_splits = (
+            list(dict.fromkeys(str(split) for split in required_splits))
+            if required_splits is not None
+            else ["train", "valid", "val", "test"]
+        )
         split_counts = {
-            split: maybe_count_images(dataset_split_dir(dataset_dir, split))
-            for split in ("train", "valid", "val", "test")
+            split: maybe_count_images(
+                dataset_split_dir(dataset_dir, split),
+                (
+                    required_split_limits.get(split)
+                    if required_split_limits is not None
+                    else None
+                ),
+            )
+            for split in count_splits
         }
     return {
         "source_format": source_format,
@@ -2990,7 +3121,7 @@ def materialize_cache_dataset_plan(
     cache_root = Path(plan["cache_root"])
     link_mode = str(plan.get("link_mode", "auto"))
     cache_reused = cache_is_ready(plan) and not bool(plan.get("refresh_cache", False))
-    image_modes: Dict[str, Dict[str, str]] = {}
+    image_mode_counts: Dict[str, Dict[str, int]] = {}
     if cache_reused:
         blue(f"Reusing RF-DETR dataset cache at {cache_dir}.", verbose)
     else:
@@ -3001,14 +3132,14 @@ def materialize_cache_dataset_plan(
             for split, records in plan.get("records_by_split", {}).items():
                 split_dir = cache_dir / split
                 split_dir.mkdir(parents=True, exist_ok=True)
-                split_modes: Dict[str, str] = {}
+                split_modes: Counter[str] = Counter()
                 for record in records:
                     source_image = Path(record["source_image"])
                     target_image = split_dir / str(record["file_name"])
-                    split_modes[str(record["file_name"])] = create_file_link(source_image, target_image, link_mode)
+                    split_modes[create_file_link(source_image, target_image, link_mode)] += 1
                     progress.update(1)
                 write_cache_split_coco(split_dir, records, plan["categories"])
-                image_modes[split] = split_modes
+                image_mode_counts[split] = dict(sorted(split_modes.items()))
         write_json(cache_dir / "source_fingerprint.json", plan["fingerprint"])
 
     metadata = {
@@ -3018,7 +3149,7 @@ def materialize_cache_dataset_plan(
         "cache_root": str(cache_root),
         "fingerprint_hash": plan.get("fingerprint", {}).get("hash"),
         "link_mode_requested": link_mode,
-        "link_mode_used": image_modes,
+        "link_mode_used": image_mode_counts,
         "split_counts": dict(plan.get("split_counts", {})),
         "dataset_limits": plan.get("fingerprint", {}).get("dataset_limits", {}),
         "class_names": list(plan.get("class_names", [])),
@@ -3028,6 +3159,23 @@ def materialize_cache_dataset_plan(
         with contextlib.suppress(Exception):
             metadata = json.loads((cache_dir / "adapter_metadata.json").read_text(encoding="utf-8"))
             metadata["cache_reused"] = True
+            stored_modes = metadata.get("link_mode_used", {})
+            if isinstance(stored_modes, Mapping):
+                compact_modes: Dict[str, Dict[str, int]] = {}
+                for split, per_image_or_counts in stored_modes.items():
+                    if not isinstance(per_image_or_counts, Mapping):
+                        continue
+                    if all(isinstance(value, str) for value in per_image_or_counts.values()):
+                        compact_modes[str(split)] = dict(
+                            sorted(Counter(str(value) for value in per_image_or_counts.values()).items())
+                        )
+                    else:
+                        compact_modes[str(split)] = {
+                            str(mode): int(count)
+                            for mode, count in per_image_or_counts.items()
+                            if isinstance(count, int) and not isinstance(count, bool) and count >= 0
+                        }
+                metadata["link_mode_used"] = compact_modes
     write_json(cache_dir / "adapter_metadata.json", metadata)
 
     dataset_cfg = config.setdefault("dataset", {})
@@ -3762,6 +3910,7 @@ def build_train_kwargs(config: Mapping[str, Any], output_dir: Path) -> Dict[str,
     train = deepcopy(config.get("train", {}))
     extra = train.pop("extra_train_args", {}) or {}
     device = train.pop("device", None)
+    save_last_interval = train.pop("save_last_interval", 1)
     train.pop("max_time_minutes", None)
     train_kwargs: Dict[str, Any] = {}
     train_kwargs.update(train)
@@ -3771,8 +3920,682 @@ def build_train_kwargs(config: Mapping[str, Any], output_dir: Path) -> Dict[str,
     train_kwargs["output_dir"] = str(output_dir)
     if device not in (None, "", "auto"):
         train_kwargs["_device"] = str(device)
+    train_kwargs["_save_last_interval"] = normalize_positive_interval(
+        save_last_interval,
+        "train.save_last_interval",
+    )
     train_kwargs["run_test"] = bool(train_kwargs.get("run_test", False))
     return train_kwargs
+
+
+def normalize_positive_interval(value: Any, field: str) -> int:
+    """Validate a positive epoch interval without accepting booleans."""
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be a positive integer.")
+    try:
+        interval = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must be a positive integer.") from exc
+    if interval <= 0:
+        raise ValueError(f"{field} must be a positive integer.")
+    return interval
+
+
+def normalize_performance_profile(value: Any) -> Optional[str]:
+    """Normalize an optional safe/fast performance profile."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    profile = str(value).strip().lower()
+    if profile not in {"safe", "fast"}:
+        raise ValueError("runtime.performance_profile must be one of: safe, fast.")
+    return profile
+
+
+TRAIN_AUTOTUNE_DEFAULTS: Dict[str, Any] = {
+    "candidates": [4, 8, 16],
+    "warmup_steps": 50,
+    "measure_steps": 200,
+    "target_effective_batch": 32,
+    "max_vram_fraction": 0.9,
+    "loader_wait_threshold": 0.05,
+    "loader_candidates": [2, 4, 8],
+    "loader_warmup_batches": 2,
+    "loader_measure_batches": 20,
+}
+
+
+def training_autotune_settings(config: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return validated single-GPU profile autotune settings."""
+    runtime = config.get("runtime", {})
+    train = config.get("train", {})
+    profile = normalize_performance_profile(
+        runtime.get("performance_profile") if isinstance(runtime, Mapping) else None
+    )
+    configured = train.get("autotune", {}) if isinstance(train, Mapping) else {}
+    if configured is None:
+        configured = {}
+    if not isinstance(configured, Mapping):
+        raise ValueError("train.autotune must be a mapping.")
+    settings = deepcopy(TRAIN_AUTOTUNE_DEFAULTS)
+    settings.update(configured)
+    configured_batch = train.get("batch_size") if isinstance(train, Mapping) else None
+    settings["enabled"] = bool(
+        settings.get("enabled", profile in {"safe", "fast"})
+        and isinstance(train, Mapping)
+        and isinstance(configured_batch, str)
+        and configured_batch.strip().lower() == "auto"
+    )
+
+    def positive_int(key: str) -> int:
+        return normalize_positive_interval(settings.get(key), f"train.autotune.{key}")
+
+    candidates = settings.get("candidates")
+    if not isinstance(candidates, (list, tuple)) or not candidates:
+        raise ValueError("train.autotune.candidates must be a non-empty list of positive integers.")
+    settings["candidates"] = sorted(
+        {
+            normalize_positive_interval(value, "train.autotune.candidates[]")
+            for value in candidates
+        }
+    )
+    loader_candidates = settings.get("loader_candidates")
+    if not isinstance(loader_candidates, (list, tuple)) or not loader_candidates:
+        raise ValueError("train.autotune.loader_candidates must be a non-empty list of non-negative integers.")
+    normalized_loader_candidates: set[int] = set()
+    for value in loader_candidates:
+        if isinstance(value, bool):
+            raise ValueError("train.autotune.loader_candidates[] must be a non-negative integer.")
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("train.autotune.loader_candidates[] must be a non-negative integer.") from exc
+        if parsed < 0:
+            raise ValueError("train.autotune.loader_candidates[] must be a non-negative integer.")
+        normalized_loader_candidates.add(parsed)
+    settings["loader_candidates"] = sorted(normalized_loader_candidates)
+    for key in (
+        "warmup_steps",
+        "measure_steps",
+        "target_effective_batch",
+        "loader_warmup_batches",
+        "loader_measure_batches",
+    ):
+        settings[key] = positive_int(key)
+    for key in ("max_vram_fraction", "loader_wait_threshold"):
+        try:
+            value = float(settings.get(key))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"train.autotune.{key} must be between 0 and 1.") from exc
+        if not 0.0 < value < 1.0:
+            raise ValueError(f"train.autotune.{key} must be between 0 and 1.")
+        settings[key] = value
+    return settings
+
+
+def select_training_microbatch(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    target_effective_batch: int,
+    max_vram_fraction: float,
+) -> Optional[Dict[str, Any]]:
+    """Select the fastest exact-effective-batch candidate below the VRAM gate."""
+    eligible: List[Dict[str, Any]] = []
+    for raw_row in rows:
+        row = dict(raw_row)
+        candidate = int(row.get("micro_batch", 0) or 0)
+        if candidate <= 0 or target_effective_batch % candidate != 0:
+            continue
+        if not bool(row.get("success", False)):
+            continue
+        if float(row.get("projected_vram_fraction", 1.0) or 1.0) >= max_vram_fraction:
+            continue
+        row["grad_accum_steps"] = target_effective_batch // candidate
+        row["effective_batch"] = candidate * row["grad_accum_steps"]
+        eligible.append(row)
+    if not eligible:
+        return None
+    return max(
+        eligible,
+        key=lambda row: (
+            float(row.get("images_per_second", 0.0) or 0.0),
+            int(row["micro_batch"]),
+        ),
+    )
+
+
+def benchmark_training_microbatches(
+    model_context: Any,
+    model_config: Any,
+    train_config: Any,
+    settings: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Benchmark synthetic full train steps for the configured 4/8/16 candidates."""
+    import torch
+
+    from rfdetr.datasets.coco import compute_multi_scale_scales
+    from rfdetr.models import build_criterion_from_config
+    from rfdetr.training.auto_batch import _probe_step
+
+    device = torch.device(model_context.device)
+    if not torch.cuda.is_available() or getattr(device, "type", None) != "cuda":
+        raise RuntimeError("Train throughput autotune requires one CUDA device.")
+    resolution = int(model_config.resolution)
+    if bool(getattr(train_config, "multi_scale", False)) and not bool(
+        getattr(train_config, "do_random_resize_via_padding", False)
+    ):
+        scales = compute_multi_scale_scales(
+            resolution,
+            bool(getattr(train_config, "expanded_scales", True)),
+            int(model_config.patch_size),
+            int(model_config.num_windows),
+        )
+        if scales:
+            resolution = max(scales)
+
+    criterion, _ = build_criterion_from_config(model_config, train_config)
+    criterion = criterion.to(device)
+    model = model_context.model
+    model_was_training = bool(model.training)
+    criterion_was_training = bool(criterion.training)
+    cpu_rng_state = torch.get_rng_state()
+    cuda_rng_states = torch.cuda.get_rng_state_all()
+    original_buffers = {
+        name: buffer.detach().cpu().clone()
+        for name, buffer in model.named_buffers()
+    }
+    model.train()
+    criterion.train()
+    amp_enabled = bool(getattr(model_config, "amp", True))
+    requested_dtype = str(getattr(train_config, "amp_dtype", "auto") or "auto").lower()
+    autocast_dtype = None
+    if amp_enabled:
+        autocast_dtype = (
+            torch.float16
+            if requested_dtype == "fp16"
+            else (torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16)
+        )
+    ema_bytes = 0
+    if bool(getattr(train_config, "use_ema", False)):
+        ema_bytes = sum(
+            int(tensor.numel()) * int(tensor.element_size())
+            for tensor in list(model.parameters()) + list(model.buffers())
+        )
+    device_properties = torch.cuda.get_device_properties(device)
+    total_memory = int(device_properties.total_memory)
+    rows: List[Dict[str, Any]] = []
+    try:
+        for micro_batch in settings["candidates"]:
+            row: Dict[str, Any] = {
+                "micro_batch": int(micro_batch),
+                "warmup_steps": int(settings["warmup_steps"]),
+                "measure_steps": int(settings["measure_steps"]),
+                "success": False,
+            }
+            if int(settings["target_effective_batch"]) % int(micro_batch) != 0:
+                row["reason"] = "does_not_divide_target_effective_batch"
+                rows.append(row)
+                continue
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats(device)
+            probe_ok = True
+            for _ in range(int(settings["warmup_steps"])):
+                if not _probe_step(
+                    model=model,
+                    criterion=criterion,
+                    micro_batch_size=int(micro_batch),
+                    resolution=resolution,
+                    device=device,
+                    num_classes=int(model_config.num_classes),
+                    amp=amp_enabled,
+                    segmentation_head=bool(model_config.segmentation_head),
+                    max_targets_per_image=int(
+                        getattr(train_config, "auto_batch_max_targets_per_image", 100)
+                    ),
+                    num_channels=int(getattr(model_config, "num_channels", 3)),
+                    autocast_dtype=autocast_dtype,
+                ):
+                    probe_ok = False
+                    break
+            if probe_ok:
+                torch.cuda.synchronize(device)
+                started = time.perf_counter()
+                completed_steps = 0
+                for _ in range(int(settings["measure_steps"])):
+                    if not _probe_step(
+                        model=model,
+                        criterion=criterion,
+                        micro_batch_size=int(micro_batch),
+                        resolution=resolution,
+                        device=device,
+                        num_classes=int(model_config.num_classes),
+                        amp=amp_enabled,
+                        segmentation_head=bool(model_config.segmentation_head),
+                        max_targets_per_image=int(
+                            getattr(train_config, "auto_batch_max_targets_per_image", 100)
+                        ),
+                        num_channels=int(getattr(model_config, "num_channels", 3)),
+                        autocast_dtype=autocast_dtype,
+                    ):
+                        probe_ok = False
+                        break
+                    completed_steps += 1
+                torch.cuda.synchronize(device)
+                elapsed = time.perf_counter() - started
+                if probe_ok and completed_steps == int(settings["measure_steps"]):
+                    peak_reserved = int(torch.cuda.max_memory_reserved(device))
+                    projected_peak = peak_reserved + ema_bytes
+                    row.update(
+                        {
+                            "success": True,
+                            "elapsed_seconds": elapsed,
+                            "seconds_per_step": elapsed / completed_steps,
+                            "images_per_second": int(micro_batch) * completed_steps / elapsed,
+                            "peak_reserved_bytes": peak_reserved,
+                            "ema_projected_bytes": ema_bytes,
+                            "projected_peak_bytes": projected_peak,
+                            "projected_vram_fraction": projected_peak / total_memory,
+                        }
+                    )
+            if not probe_ok:
+                row["reason"] = "cuda_oom"
+            rows.append(row)
+    finally:
+        with torch.no_grad():
+            for name, buffer in model.named_buffers():
+                original = original_buffers.get(name)
+                if original is not None:
+                    buffer.copy_(original.to(device=buffer.device, dtype=buffer.dtype))
+        torch.set_rng_state(cpu_rng_state)
+        torch.cuda.set_rng_state_all(cuda_rng_states)
+        model.train(model_was_training)
+        criterion.train(criterion_was_training)
+        model.zero_grad(set_to_none=True)
+        criterion.zero_grad(set_to_none=True)
+        del criterion
+        torch.cuda.empty_cache()
+
+    selected = select_training_microbatch(
+        rows,
+        target_effective_batch=int(settings["target_effective_batch"]),
+        max_vram_fraction=float(settings["max_vram_fraction"]),
+    )
+    return {
+        "enabled": True,
+        "hardware": {
+            "device_index": int(device.index or 0),
+            "device_name": torch.cuda.get_device_name(device),
+            "gpu_uuid": json_safe_value(getattr(device_properties, "uuid", None)),
+            "compute_capability": [
+                int(device_properties.major),
+                int(device_properties.minor),
+            ],
+            "total_vram_bytes": total_memory,
+            "torch_version": str(torch.__version__),
+            "cuda_version": str(torch.version.cuda),
+        },
+        "resolution": resolution,
+        "target_effective_batch": int(settings["target_effective_batch"]),
+        "max_vram_fraction": float(settings["max_vram_fraction"]),
+        "rows": rows,
+        "selected": selected,
+    }
+
+
+def loader_wait_fraction(loader_seconds: float, model_step_seconds: float) -> float:
+    """Return the fraction of a sequential step spent waiting for a batch."""
+    wait = max(0.0, float(loader_seconds))
+    model = max(0.0, float(model_step_seconds))
+    total = wait + model
+    return wait / total if total > 0.0 else 0.0
+
+
+def select_loader_worker_count(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    model_step_seconds: float,
+    wait_threshold: float,
+    baseline_workers: int = 2,
+) -> Optional[Dict[str, Any]]:
+    """Keep workers=2 unless measured loader wait exceeds the 5% gate."""
+    successful = [dict(row) for row in rows if bool(row.get("success", False))]
+    baseline = next(
+        (row for row in successful if int(row.get("num_workers", -1)) == baseline_workers),
+        None,
+    )
+    if baseline is None:
+        return None
+    baseline_fraction = loader_wait_fraction(
+        float(baseline.get("seconds_per_batch", 0.0) or 0.0),
+        model_step_seconds,
+    )
+    if baseline_fraction <= wait_threshold:
+        baseline["loader_wait_fraction"] = baseline_fraction
+        baseline["selection_reason"] = "baseline_wait_within_threshold"
+        return baseline
+    selected = min(
+        successful,
+        key=lambda row: (
+            float(row.get("seconds_per_batch", math.inf) or math.inf),
+            int(row.get("num_workers", baseline_workers)),
+        ),
+    )
+    selected["loader_wait_fraction"] = loader_wait_fraction(
+        float(selected.get("seconds_per_batch", 0.0) or 0.0),
+        model_step_seconds,
+    )
+    selected["baseline_loader_wait_fraction"] = baseline_fraction
+    selected["selection_reason"] = "baseline_wait_exceeded_threshold"
+    return selected
+
+
+def benchmark_dataloader_wait(
+    datamodule: Any,
+    *,
+    num_workers: int,
+    warmup_batches: int,
+    measure_batches: int,
+) -> Dict[str, Any]:
+    """Measure only time blocked on ``next(loader)`` without changing RNG state."""
+    import random
+
+    import numpy as np
+    import torch
+
+    python_rng = random.getstate()
+    numpy_rng = np.random.get_state()
+    torch_rng = torch.get_rng_state()
+    cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []
+    original_workers = int(getattr(datamodule, "_num_workers", num_workers))
+    original_persistent = bool(getattr(datamodule, "_persistent_workers", original_workers > 0))
+    original_prefetch = getattr(datamodule, "_prefetch_factor", 2 if original_workers > 0 else None)
+    iterator: Any = None
+    try:
+        datamodule._num_workers = int(num_workers)
+        datamodule._persistent_workers = bool(int(num_workers) > 0 and original_persistent)
+        datamodule._prefetch_factor = (
+            (original_prefetch if original_prefetch is not None else 2)
+            if int(num_workers) > 0
+            else None
+        )
+        datamodule.setup("fit")
+        iterator = iter(datamodule.train_dataloader())
+        for _ in range(int(warmup_batches)):
+            next(iterator)
+        started = time.perf_counter()
+        completed = 0
+        for _ in range(int(measure_batches)):
+            next(iterator)
+            completed += 1
+        elapsed = time.perf_counter() - started
+        if completed <= 0:
+            raise RuntimeError("DataLoader benchmark did not produce any measured batches.")
+        return {
+            "num_workers": int(num_workers),
+            "success": True,
+            "warmup_batches": int(warmup_batches),
+            "measure_batches": completed,
+            "elapsed_seconds": elapsed,
+            "seconds_per_batch": elapsed / completed,
+        }
+    finally:
+        shutdown = getattr(iterator, "_shutdown_workers", None)
+        if callable(shutdown):
+            shutdown()
+        datamodule._num_workers = original_workers
+        datamodule._persistent_workers = original_persistent
+        datamodule._prefetch_factor = original_prefetch
+        random.setstate(python_rng)
+        np.random.set_state(numpy_rng)
+        torch.set_rng_state(torch_rng)
+        if cuda_rng:
+            torch.cuda.set_rng_state_all(cuda_rng)
+
+
+def tune_training_dataloader_workers(
+    datamodule: Any,
+    train_config: Any,
+    settings: Mapping[str, Any],
+    *,
+    model_step_seconds: float,
+) -> Dict[str, Any]:
+    """Benchmark workers 4/8 only when the workers=2 loader wait exceeds 5%."""
+    current_workers = int(getattr(train_config, "num_workers", 2) or 0)
+    report: Dict[str, Any] = {
+        "enabled": current_workers == 2,
+        "baseline_workers": 2,
+        "wait_threshold": float(settings["loader_wait_threshold"]),
+        "model_step_seconds": float(model_step_seconds),
+        "rows": [],
+        "selected": None,
+    }
+    if current_workers != 2:
+        report["reason"] = "explicit_num_workers_preserved"
+        return report
+
+    def measure(workers: int) -> Dict[str, Any]:
+        try:
+            return benchmark_dataloader_wait(
+                datamodule,
+                num_workers=workers,
+                warmup_batches=int(settings["loader_warmup_batches"]),
+                measure_batches=int(settings["loader_measure_batches"]),
+            )
+        except Exception as exc:
+            return {
+                "num_workers": workers,
+                "success": False,
+                "error": f"{exc.__class__.__name__}: {exc}",
+            }
+
+    baseline = measure(2)
+    report["rows"].append(baseline)
+    baseline_selection = select_loader_worker_count(
+        report["rows"],
+        model_step_seconds=model_step_seconds,
+        wait_threshold=float(settings["loader_wait_threshold"]),
+    )
+    if baseline_selection is None:
+        report["reason"] = "baseline_benchmark_failed"
+        return report
+    if baseline_selection["selection_reason"] != "baseline_wait_within_threshold":
+        for workers in settings["loader_candidates"]:
+            workers = int(workers)
+            if workers not in {2, 4, 8} or workers == 2:
+                continue
+            report["rows"].append(measure(workers))
+    selected = select_loader_worker_count(
+        report["rows"],
+        model_step_seconds=model_step_seconds,
+        wait_threshold=float(settings["loader_wait_threshold"]),
+    )
+    report["selected"] = selected
+    if selected is None:
+        report["reason"] = "no_successful_candidate"
+        return report
+
+    selected_workers = int(selected["num_workers"])
+    train_config.num_workers = selected_workers
+    datamodule._num_workers = selected_workers
+    configured_persistent = getattr(train_config, "persistent_workers", None)
+    datamodule._persistent_workers = bool(
+        selected_workers > 0
+        and (True if configured_persistent is None else configured_persistent)
+    )
+    configured_prefetch = getattr(train_config, "prefetch_factor", None)
+    datamodule._prefetch_factor = (
+        (2 if configured_prefetch is None else int(configured_prefetch))
+        if selected_workers > 0
+        else None
+    )
+    return report
+
+
+def configure_training_phase_profiler(
+    config: Mapping[str, Any],
+    trainer_kwargs: MutableMapping[str, Any],
+    output_dir: Path,
+) -> Dict[str, Any]:
+    """Install Lightning's phase profiler for safe/fast runs unless explicitly overridden."""
+    runtime = config.get("runtime", {})
+    train = config.get("train", {})
+    profile = normalize_performance_profile(
+        runtime.get("performance_profile") if isinstance(runtime, Mapping) else None
+    )
+    requested = (
+        train.get("phase_profiler", profile in {"safe", "fast"})
+        if isinstance(train, Mapping)
+        else profile in {"safe", "fast"}
+    )
+    if not isinstance(requested, bool):
+        raise ValueError("train.phase_profiler must be a boolean.")
+    if not requested:
+        return {"enabled": False, "reason": "disabled"}
+    if "profiler" in trainer_kwargs:
+        return {"enabled": True, "source": "trainer.extra_trainer_args"}
+
+    from pytorch_lightning.profilers import SimpleProfiler
+
+    profile_path = output_dir / "phase_profile.txt"
+    trainer_kwargs["profiler"] = SimpleProfiler(
+        dirpath=str(output_dir),
+        filename="phase_profile",
+        extended=True,
+    )
+    return {
+        "enabled": True,
+        "source": "performance_profile",
+        "path": str(profile_path),
+        "coverage": [
+            "train_step",
+            "backward",
+            "optimizer",
+            "validation",
+            "metrics",
+            "callbacks_and_checkpoints",
+        ],
+    }
+
+
+def run_fast_postfit_validation(
+    *,
+    performance_profile: Optional[str],
+    run_final_test: bool,
+    trainer: Any,
+    module: Any,
+    datamodule: Any,
+    output_dir: Path,
+    verbose: bool,
+) -> Tuple[bool, Optional[Path]]:
+    """Load the best checkpoint and run one complete, DDP-safe fast-profile validation."""
+    if performance_profile != "fast" or not run_final_test:
+        return False, None
+    world_size = max(1, int(getattr(trainer, "world_size", 1) or 1))
+    is_global_zero = bool(getattr(trainer, "is_global_zero", True))
+    if world_size == 1 and not is_global_zero:
+        return False, None
+    best_checkpoint = load_best_checkpoint_if_available(module, output_dir, verbose)
+    trainer.validate(
+        model=module,
+        datamodule=datamodule,
+        ckpt_path=None,
+        verbose=bool(verbose and is_global_zero),
+    )
+    return True, best_checkpoint
+
+
+def apply_train_performance_profile(config: MutableMapping[str, Any]) -> Optional[str]:
+    """Apply the selected train preset before field-specific CLI overrides."""
+    runtime = config.setdefault("runtime", {})
+    if not isinstance(runtime, MutableMapping):
+        raise ValueError("runtime must be a mapping.")
+    legacy_performance = config.get("performance", {})
+    legacy_profile = (
+        legacy_performance.get("profile")
+        if isinstance(legacy_performance, Mapping)
+        else None
+    )
+    profile = normalize_performance_profile(
+        runtime.get("performance_profile", legacy_profile)
+    )
+    if profile is None:
+        return None
+    runtime["performance_profile"] = profile
+    train = config.setdefault("train", {})
+    model = config.setdefault("model", {})
+    extra_model_args = model.setdefault("extra_model_args", {})
+    train.update(
+        {
+            "amp_dtype": "bf16",
+            "batch_size": "auto",
+            "auto_batch_target_effective": 32,
+            "grad_accum_steps": 8,
+            "num_workers": 2,
+        }
+    )
+    if profile == "safe":
+        train.update(
+            {
+                "multi_scale": True,
+                "expanded_scales": True,
+                "ema_update_interval": 1,
+                "eval_interval": 1,
+                "compute_val_loss": True,
+                "checkpoint_interval": 5,
+                "save_last_interval": 1,
+            }
+        )
+        extra_model_args["compile"] = False
+    else:
+        train.update(
+            {
+                "multi_scale": False,
+                "expanded_scales": False,
+                "ema_update_interval": 2,
+                "eval_interval": 5,
+                "compute_val_loss": False,
+                "checkpoint_interval": 5,
+                "save_last_interval": 2,
+            }
+        )
+        extra_model_args["compile"] = True
+    return profile
+
+
+class RollingLastCheckpoint(ModelCheckpoint):
+    """Distinct callback state key for the independently scheduled rolling checkpoint."""
+
+
+def configure_save_last_interval(
+    trainer: Any,
+    *,
+    save_last_interval: int,
+    archive_interval: int,
+) -> None:
+    """Configure the rolling ``last.ckpt`` cadence independently from archives."""
+    interval = normalize_positive_interval(save_last_interval, "train.save_last_interval")
+    normalize_positive_interval(archive_interval, "train.checkpoint_interval")
+    rolling = RollingLastCheckpoint(
+        dirpath=str(getattr(trainer, "default_root_dir")),
+        filename="last",
+        every_n_epochs=interval,
+        save_top_k=1,
+        enable_version_counter=False,
+        auto_insert_metric_name=False,
+        verbose=False,
+    )
+    callbacks = getattr(trainer, "callbacks", [])
+    existing_index = next(
+        (
+            index
+            for index, callback in enumerate(callbacks)
+            if isinstance(callback, ModelCheckpoint) and getattr(callback, "filename", None) == "last"
+        ),
+        None,
+    )
+    if existing_index is None:
+        callbacks.append(rolling)
+    else:
+        callbacks[existing_index] = rolling
 
 
 def resolve_train_resume_checkpoint(
@@ -4473,9 +5296,10 @@ class SimpleDetections:
 class RFDETRLightningPredictor:
     """Image-level predictor backed by a live RF-DETR Lightning module."""
 
-    def __init__(self, pl_module: Any, model_config: Any) -> None:
+    def __init__(self, pl_module: Any, model_config: Any, *, manage_model_state: bool = True) -> None:
         self.pl_module = pl_module
         self.model_config = model_config
+        self.manage_model_state = bool(manage_model_state)
 
     def predict(
         self,
@@ -4514,15 +5338,18 @@ class RFDETRLightningPredictor:
             tensors.append(tensor)
 
         was_training = bool(self.pl_module.training)
-        self.pl_module.eval()
+        if self.manage_model_state:
+            self.pl_module.eval()
         device = self.pl_module.device
         batch = torch.stack(tensors).to(device)
         target_sizes = torch.tensor(orig_sizes, device=device)
-        with torch.no_grad():
-            outputs = self.pl_module.model(batch)
-            results = self.pl_module.postprocess(outputs, target_sizes)
-        if was_training:
-            self.pl_module.train()
+        try:
+            with torch.inference_mode():
+                outputs = self.pl_module.model(batch)
+                results = self.pl_module.postprocess(outputs, target_sizes)
+        finally:
+            if self.manage_model_state and was_training:
+                self.pl_module.train()
 
         detections = []
         for result in results:
@@ -4532,6 +5359,38 @@ class RFDETRLightningPredictor:
             keep = scores > float(threshold)
             detections.append(SimpleDetections(xyxy=boxes[keep], confidence=scores[keep], class_id=labels[keep]))
         return detections[0] if single else detections
+
+
+@contextlib.contextmanager
+def lightning_evaluation_session(
+    pl_module: Any,
+    model_config: Any,
+    train_config: Any,
+) -> Iterable[None]:
+    """Keep a live training module in one inference/autocast session for a full evaluator run."""
+    import torch
+
+    was_training = bool(pl_module.training)
+    pl_module.eval()
+    raw_device = getattr(pl_module, "device", "cpu")
+    device_type = str(getattr(raw_device, "type", raw_device)).split(":", 1)[0].lower()
+    amp_enabled = bool(getattr(model_config, "amp", True)) and device_type == "cuda"
+    requested_dtype = str(getattr(train_config, "amp_dtype", "auto") or "auto").strip().lower()
+    if not amp_enabled or requested_dtype == "fp16":
+        autocast_dtype = torch.float16
+    else:
+        autocast_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    autocast_context = (
+        torch.autocast(device_type="cuda", dtype=autocast_dtype)
+        if amp_enabled
+        else contextlib.nullcontext()
+    )
+    try:
+        with torch.inference_mode(), autocast_context:
+            yield
+    finally:
+        if was_training:
+            pl_module.train()
 
 
 def periodic_test_mode(periodic: Mapping[str, Any]) -> str:
@@ -4571,6 +5430,7 @@ def normalize_rfdetr_test_settings(merged_config: Mapping[str, Any], section: st
         "model_input_batch_size": int(source.get("model_input_batch_size", 9) or 9),
         "batch_size": int(source.get("batch_size", 4) or 4),
         "error_cases": dict(source.get("error_cases", {}) or {}),
+        "artifacts": dict(source.get("artifacts", {}) or {}),
         "conf": source.get("conf", model.get("confidence_threshold", 0.25)),
         "match_iou_threshold": source.get("match_iou_threshold", evaluation.get("match_iou_threshold", 0.5)),
         "max_dets": int(max_dets) if max_dets is not None else None,
@@ -4659,6 +5519,7 @@ def build_rfdetr_evaluator_config(
     dataset_cfg.update({"include_empty_images": True, "sort_images": True, "max_images": test_settings.get("max_images")})
     category_remapping = infer_rfdetr_category_remapping(merged_config, dataset_cfg)
     visual_cfg = dict(test_settings.get("visual_samples", {}) or {})
+    artifacts_cfg = dict(test_settings.get("artifacts", {}) or {})
     visual_max_images = visual_cfg.get("max_images")
     error_cases_cfg = dict(test_settings.get("error_cases", {}) or {})
     if visual_max_images is not None and error_cases_cfg.get("max_images") is None:
@@ -4730,6 +5591,9 @@ def build_rfdetr_evaluator_config(
             "save_model_input_batches": True,
             "max_model_input_batches": 3,
             "model_input_batch_size": int(test_settings.get("model_input_batch_size", 9) or 9),
+            "full_model_input_manifest": bool(
+                artifacts_cfg.get("full_model_input_manifest", False)
+            ),
         },
         "progress": {
             "images": bool(test_settings.get("progress_bar", True)),
@@ -4770,8 +5634,14 @@ def run_rfdetr_shared_evaluation(
     from projects.object_detection_dataset_evaluator.object_detection_dataset_evaluator import run_evaluation
 
     evaluator_config = build_rfdetr_evaluator_config(merged_config, model_config, train_config, output_dir, split)
-    predictor = RFDETRLightningPredictor(pl_module, model_config)
-    result = run_evaluation(evaluator_config, source_config or DEFAULT_CONFIG, prebuilt_model=predictor, print_summary=False)
+    predictor = RFDETRLightningPredictor(pl_module, model_config, manage_model_state=False)
+    with lightning_evaluation_session(pl_module, model_config, train_config):
+        result = run_evaluation(
+            evaluator_config,
+            source_config or DEFAULT_CONFIG,
+            prebuilt_model=predictor,
+            print_summary=False,
+        )
     write_rfdetr_evaluator_aliases(output_dir, result)
     dump_config_snapshot(
         output_dir=output_dir,
@@ -4888,16 +5758,15 @@ def manual_test_evaluation(
     f1_local = init_matching_accumulator()
     using_inference_runtime = inference_runtime is not None
     if using_inference_runtime:
-        was_training = False
         device = getattr(inference_runtime, "device", None)
         if device is None:
             raise RuntimeError("Standalone inference runtime did not expose its execution device.")
+        evaluation_session: Any = torch.inference_mode()
     else:
         if pl_module is None:
             raise ValueError("pl_module is required when inference_runtime is not provided.")
-        was_training = bool(pl_module.training)
-        pl_module.eval()
         device = getattr(pl_module, "device", None)
+        evaluation_session = lightning_evaluation_session(pl_module, model_config, train_config)
     if device is not None:
         map_metric = map_metric.to(device)
 
@@ -4908,7 +5777,7 @@ def manual_test_evaluation(
     standalone_preprocess_seconds = 0.0
     standalone_postprocess_seconds = 0.0
     standalone_image_count = 0
-    with torch.no_grad():
+    with evaluation_session:
         for batch_idx, batch in enumerate(iterable):
             runtime_batch_started = time.perf_counter() if using_inference_runtime else 0.0
             runtime_preprocess_seconds = 0.0
@@ -4979,9 +5848,6 @@ def manual_test_evaluation(
                 iou_type="segm" if segmentation else "bbox",
             )
             merge_matching_data(f1_local, matching)
-    if not using_inference_runtime and was_training:
-        pl_module.train()
-
     raw_metrics = map_metric.compute()
     pfx = "bbox_" if segmentation else ""
     mar_key = f"{pfx}mar_{max_dets}"
@@ -5273,6 +6139,9 @@ def apply_cli_overrides(config: MutableMapping[str, Any], args: argparse.Namespa
     demo = config.setdefault("demo", {})
     cpu_runtime.apply_cpu_cli_overrides(config, args)
 
+    if getattr(args, "performance_profile", None) is not None:
+        runtime["performance_profile"] = normalize_performance_profile(args.performance_profile)
+
     for key in ("dry_run", "verbose", "confirm_before_run"):
         value = getattr(args, key, None)
         if value is not None:
@@ -5337,6 +6206,7 @@ def apply_cli_overrides(config: MutableMapping[str, Any], args: argparse.Namespa
         "weight_decay": args.weight_decay,
         "num_workers": args.workers,
         "checkpoint_interval": args.checkpoint_interval,
+        "save_last_interval": getattr(args, "save_last_interval", None),
         "resume": getattr(args, "resume", None),
         "eval_interval": args.eval_interval,
         "early_stopping": args.early_stopping,
@@ -5463,6 +6333,12 @@ Example usage:
     parser.add_argument("--workers", type=int, default=None, help="Dataloader workers.")
     parser.add_argument("--checkpoint-interval", type=int, default=None, help="Save checkpoint every N epochs.")
     parser.add_argument(
+        "--save-last-interval",
+        type=int,
+        default=None,
+        help="Overwrite the rolling last.ckpt every N epochs, independently of archive checkpoints.",
+    )
+    parser.add_argument(
         "--resume",
         default=None,
         help="Resume from a PyTorch Lightning .ckpt checkpoint, restoring optimizer, scheduler, and callback state.",
@@ -5471,6 +6347,12 @@ Example usage:
     parser.add_argument("--early-stopping", type=parse_bool, default=None, help="Enable early stopping.")
     parser.add_argument("--early-stopping-patience", type=int, default=None, help="Early stopping patience.")
     parser.add_argument("--progress-bar", choices=["tqdm", "rich", "none"], default=None, help="RF-DETR progress bar style.")
+    parser.add_argument(
+        "--performance-profile",
+        choices=["safe", "fast"],
+        default=None,
+        help="Apply the safe or fast training preset before field-specific CLI overrides.",
+    )
 
     parser.add_argument("--periodic-test", type=parse_bool, default=None, help="Enable scheduled in-training test.")
     parser.add_argument("--test-interval-epochs", type=int, default=None, help="Run test every N epochs.")
@@ -5538,6 +6420,9 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
 
     with tqdm(total=8, desc="Preparing", disable=distributed_child) as bar:
         config = load_yaml(source_config)
+        if args.performance_profile is not None:
+            config.setdefault("runtime", {})["performance_profile"] = args.performance_profile
+        selected_performance_profile = apply_train_performance_profile(config)
         apply_cli_overrides(config, args)
         verbose = bool(config.get("runtime", {}).get("verbose", True))
         cpu_summary = cpu_runtime.validate_active_config(config, "train", source_config)
@@ -5633,11 +6518,20 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
         model_kwargs = build_model_kwargs(config)
         train_kwargs = build_train_kwargs(config, output_dir)
         device_value = train_kwargs.pop("_device", None)
+        # Keep compatibility with project integrations/tests that provide a
+        # minimal TrainConfig kwargs mapping instead of calling
+        # build_train_kwargs().  The public default remains one epoch.
+        save_last_interval = int(train_kwargs.pop("_save_last_interval", 1))
         trainer_kwargs = parse_device_to_trainer_kwargs(device_value)
         trainer_kwargs.update(config.get("trainer", {}).get("extra_trainer_args", {}) or {})
         apply_validation_interval_to_trainer_kwargs(config, trainer_kwargs, verbose)
         apply_multigpu_ddp_strategy(config, trainer_kwargs, verbose)
         apply_multigpu_validation_safety(trainer_kwargs, verbose)
+        phase_profiler_report = configure_training_phase_profiler(
+            config,
+            trainer_kwargs,
+            output_dir,
+        )
 
         blue(f"Creating RF-DETR model: {model_cls.__name__}.", verbose)
         rf_model = model_cls(**model_kwargs)
@@ -5665,23 +6559,111 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
             attach_motion_module(rf_model.model, _motion_cfg)
             blue("TrackNetV5 motion module (MDD + R-STR) attached to LWDETR.", verbose)
         train_config = rf_model.get_train_config(**train_kwargs)
+        _temporal_enabled = temporal_motion_enabled(config)
+        autotune_settings = training_autotune_settings(config)
+        train_autotune_report: Dict[str, Any] = {
+            "enabled": bool(autotune_settings["enabled"]),
+            "settings": dict(autotune_settings),
+            "selected": None,
+        }
         if train_config.batch_size == "auto":
             from rfdetr.detr import _ensure_model_on_device
 
             _ensure_model_on_device(rf_model.model)
-            auto_batch = resolve_auto_batch_config(
-                model_context=rf_model.model,
-                model_config=rf_model.model_config,
-                train_config=train_config,
+            custom_autotune_allowed = bool(
+                autotune_settings["enabled"]
+                and not _motion_enabled
+                and not _temporal_enabled
+                and not distributed_child
+                and not uses_multiple_gpu_devices(trainer_kwargs)
             )
-            train_config.batch_size = auto_batch.safe_micro_batch
-            train_config.grad_accum_steps = auto_batch.recommended_grad_accum_steps
+            selected_batch: Optional[Mapping[str, Any]] = None
+            if custom_autotune_allowed:
+                blue(
+                    "Benchmarking train microbatches 4/8/16 "
+                    f"({autotune_settings['warmup_steps']} warmup + "
+                    f"{autotune_settings['measure_steps']} measured steps each).",
+                    verbose,
+                )
+                try:
+                    measured = benchmark_training_microbatches(
+                        model_context=rf_model.model,
+                        model_config=rf_model.model_config,
+                        train_config=train_config,
+                        settings=autotune_settings,
+                    )
+                    train_autotune_report.update(measured)
+                    selected_batch = measured.get("selected")
+                except Exception as exc:
+                    train_autotune_report.update(
+                        {
+                            "custom_benchmark_failed": True,
+                            "error": f"{exc.__class__.__name__}: {exc}",
+                        }
+                    )
+                    blue(
+                        f"Train throughput benchmark failed; falling back to RF-DETR auto-batch: {exc}",
+                        verbose,
+                        force=True,
+                    )
+            else:
+                reasons = []
+                if _motion_enabled or _temporal_enabled:
+                    reasons.append("TrackNet/temporal training requires a dedicated real-window benchmark")
+                if distributed_child:
+                    reasons.append("non-zero distributed child")
+                if uses_multiple_gpu_devices(trainer_kwargs):
+                    reasons.append("multi-GPU run")
+                if not autotune_settings["enabled"]:
+                    reasons.append("profile autotune disabled")
+                train_autotune_report["custom_benchmark_skip_reason"] = "; ".join(reasons)
+
+            if selected_batch is not None:
+                train_config.batch_size = int(selected_batch["micro_batch"])
+                train_config.grad_accum_steps = int(selected_batch["grad_accum_steps"])
+                train_autotune_report["selection_source"] = "measured_throughput_vram_gate"
+            else:
+                auto_batch = resolve_auto_batch_config(
+                    model_context=rf_model.model,
+                    model_config=rf_model.model_config,
+                    train_config=train_config,
+                )
+                train_config.batch_size = auto_batch.safe_micro_batch
+                train_config.grad_accum_steps = auto_batch.recommended_grad_accum_steps
+                train_autotune_report.update(
+                    {
+                        "selection_source": "rfdetr_auto_batch_fallback",
+                        "fallback": {
+                            "safe_micro_batch": int(auto_batch.safe_micro_batch),
+                            "recommended_grad_accum_steps": int(
+                                auto_batch.recommended_grad_accum_steps
+                            ),
+                            "effective_batch_size": int(auto_batch.effective_batch_size),
+                            "device_name": str(auto_batch.device_name),
+                        },
+                    }
+                )
+            train_autotune_report["selected"] = {
+                "micro_batch": int(train_config.batch_size),
+                "grad_accum_steps": int(train_config.grad_accum_steps),
+                "effective_batch": int(train_config.batch_size) * int(train_config.grad_accum_steps),
+            }
+            config.setdefault("train", {}).update(
+                {
+                    "batch_size": int(train_config.batch_size),
+                    "grad_accum_steps": int(train_config.grad_accum_steps),
+                    "auto_batch_target_effective": int(
+                        autotune_settings["target_effective_batch"]
+                    ),
+                }
+            )
             blue(
                 f"Auto batch resolved: batch_size={train_config.batch_size}, grad_accum_steps={train_config.grad_accum_steps}.",
                 verbose,
             )
+            if not distributed_child:
+                write_json(output_dir / "train_autotune.json", train_autotune_report)
 
-        _temporal_enabled = temporal_motion_enabled(config)
         if not _temporal_enabled:
             rf_model._align_num_classes_from_dataset(train_config.dataset_dir)
 
@@ -5698,6 +6680,39 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
         else:
             module = RFDETRModelModule(rf_model.model_config, train_config)
             datamodule = RFDETRDataModule(rf_model.model_config, train_config)
+
+        measured_selection = train_autotune_report.get("selected")
+        measured_rows = train_autotune_report.get("rows")
+        selected_measured_row = None
+        if isinstance(measured_rows, list) and isinstance(measured_selection, Mapping):
+            selected_measured_row = next(
+                (
+                    row
+                    for row in measured_rows
+                    if isinstance(row, Mapping)
+                    and bool(row.get("success", False))
+                    and int(row.get("micro_batch", -1))
+                    == int(measured_selection.get("micro_batch", -2))
+                ),
+                None,
+            )
+        if (
+            not _temporal_enabled
+            and not _motion_enabled
+            and train_autotune_report.get("selection_source")
+            == "measured_throughput_vram_gate"
+            and isinstance(selected_measured_row, Mapping)
+        ):
+            loader_report = tune_training_dataloader_workers(
+                datamodule,
+                train_config,
+                autotune_settings,
+                model_step_seconds=float(selected_measured_row.get("seconds_per_step", 0.0) or 0.0),
+            )
+            train_autotune_report["dataloader"] = loader_report
+            config.setdefault("train", {})["num_workers"] = int(train_config.num_workers)
+            if not distributed_child:
+                write_json(output_dir / "train_autotune.json", train_autotune_report)
 
         if _motion_enabled and train_config.resume:
             from rf_detr_motion import assert_motion_checkpoint_compatible
@@ -5716,6 +6731,17 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
             )
 
         trainer = build_trainer(train_config, rf_model.model_config, **trainer_kwargs)
+        configure_save_last_interval(
+            trainer,
+            save_last_interval=save_last_interval,
+            archive_interval=int(train_config.checkpoint_interval),
+        )
+        if selected_performance_profile is not None:
+            blue(
+                f"Training performance profile: {selected_performance_profile}; "
+                f"rolling last.ckpt interval={save_last_interval} epoch(s).",
+                verbose,
+            )
         install_best_checkpoint_metadata(
             trainer,
             build_pitchobjectlab_architecture(config, rf_model.model_config),
@@ -5745,6 +6771,8 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
                     "cwd": str(Path.cwd()),
                     "output_dir": str(output_dir),
                     "device": device_value or "auto",
+                    "train_autotune": train_autotune_report,
+                    "phase_profiler": phase_profiler_report,
                     "train_batch_grid_files": [
                         str(output_dir / f"train_batch{index}.jpg")
                         for index in range(TRAIN_BATCH_GRID_MAX_BATCHES)
@@ -5770,16 +6798,28 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
         trainer.fit(module, datamodule, ckpt_path=train_config.resume or None)
         if bool(getattr(trainer, 'is_global_zero', True)):
             enrich_best_checkpoint_metadata(output_dir)
+        periodic = config.get("periodic_test", {})
+        run_final_test = bool(periodic.get("run_final_test", True))
+        fast_validation_ran, fast_best_checkpoint = run_fast_postfit_validation(
+            performance_profile=selected_performance_profile,
+            run_final_test=run_final_test,
+            trainer=trainer,
+            module=module,
+            datamodule=datamodule,
+            output_dir=output_dir,
+            verbose=verbose,
+        )
         rf_model.model.model = module.model
         if getattr(datamodule, "class_names", None) is not None:
             rf_model.model.class_names = datamodule.class_names
         bar.set_description("Final test")
         bar.update(1)
 
-        periodic = config.get("periodic_test", {})
         is_global_zero = bool(getattr(trainer, "is_global_zero", not distributed_child))
-        if bool(periodic.get("run_final_test", True)) and is_global_zero:
-            best_checkpoint = load_best_checkpoint_if_available(module, output_dir, verbose)
+        if run_final_test and is_global_zero:
+            best_checkpoint = fast_best_checkpoint
+            if not fast_validation_ran:
+                best_checkpoint = load_best_checkpoint_if_available(module, output_dir, verbose)
             final_output_name = render_output_template(
                 str(periodic.get("final_output_dir_name", "final_test")),
                 config,

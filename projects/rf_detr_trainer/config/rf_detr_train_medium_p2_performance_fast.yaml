@@ -1,0 +1,21 @@
+# Accuracy-gated single-GPU Medium-P2 fixed-shape training profile.
+extends: rf_detr_train_medium_p2_performance_safe.yaml
+
+runtime:
+  performance_profile: fast
+
+model:
+  extra_model_args:
+    compile: true
+
+train:
+  multi_scale: false
+  expanded_scales: false
+  ema_update_interval: 2
+  eval_interval: 5
+  compute_val_loss: false
+  checkpoint_interval: 5
+  save_last_interval: 2
+
+output:
+  name: rfdetr_medium_p2_train_fast_{timestamp}

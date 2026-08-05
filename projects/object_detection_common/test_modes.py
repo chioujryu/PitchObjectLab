@@ -438,12 +438,17 @@ def build_model_input_cases(
     images: Sequence[Any],
     config: Mapping[str, Any],
     stats_rows: Sequence[Mapping[str, Any]],
+    *,
+    max_cases: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """Build manifest rows for images actually sent to the model."""
     mode = canonical_test_mode(config)
     sahi_cfg = config.get("sahi", {})
     stats_by_image = {int(row.get("image_id", 0)): row for row in stats_rows}
     cases: List[Dict[str, Any]] = []
+    case_limit = None if max_cases is None else max(0, int(max_cases))
+    if case_limit == 0:
+        return cases
     case_index = 1
     for image in images:
         image_id = int(get_value(image, "image_id"))
@@ -476,6 +481,8 @@ def build_model_input_cases(
                     }
                 )
                 case_index += 1
+                if case_limit is not None and len(cases) >= case_limit:
+                    return cases
         elif mode == CLASS_CROP_MODE and stat.get("crop_x") is not None:
             cases.append(
                 {
@@ -494,6 +501,8 @@ def build_model_input_cases(
                 }
             )
             case_index += 1
+            if case_limit is not None and len(cases) >= case_limit:
+                return cases
         else:
             cases.append(
                 {
@@ -511,6 +520,8 @@ def build_model_input_cases(
                 }
             )
             case_index += 1
+            if case_limit is not None and len(cases) >= case_limit:
+                return cases
     return cases
 
 
@@ -623,7 +634,12 @@ def write_model_input_artifacts(
     prefix: str = "test",
 ) -> List[Dict[str, Any]]:
     """Write model-input manifest and Ultralytics-style batch grids."""
-    cases = build_model_input_cases(images, config, stats_rows)
+    output_cfg = config.get("output", {})
+    max_batches = max(0, int(output_cfg.get("max_model_input_batches", 3)))
+    batch_size = max(1, int(output_cfg.get("model_input_batch_size", 9)))
+    full_manifest = bool(output_cfg.get("full_model_input_manifest", False))
+    case_limit = None if full_manifest else max_batches * batch_size
+    cases = build_model_input_cases(images, config, stats_rows, max_cases=case_limit)
     output_dir.mkdir(parents=True, exist_ok=True)
     fieldnames = [
         "case_index",
@@ -646,7 +662,18 @@ def write_model_input_artifacts(
         for row in cases:
             writer.writerow(row)
     json_path = output_dir / "model_inputs_manifest.json"
-    json_path.write_text(json.dumps({"cases": cases}, indent=2, ensure_ascii=False), encoding="utf-8")
+    json_path.write_text(
+        json.dumps(
+            {
+                "full_manifest": full_manifest,
+                "case_limit": case_limit,
+                "cases": cases,
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
 
     annotations_by_image: Dict[int, List[Mapping[str, Any]]] = {}
     for annotation in annotations:
@@ -656,12 +683,10 @@ def write_model_input_artifacts(
         predictions_by_image.setdefault(int(prediction["image_id"]), []).append(prediction)
     names, _ = category_maps(categories)
 
-    max_batches = int(config.get("output", {}).get("max_model_input_batches", 3))
-    batch_size = int(config.get("output", {}).get("model_input_batch_size", 9))
-    batch_size = max(1, batch_size)
+    manifest_description = "Full model input manifest" if full_manifest else "Sampled model input manifest"
     manifest_rows = [
-        {"path": str(csv_path), "kind": "model_inputs", "description": "Model input manifest CSV."},
-        {"path": str(json_path), "kind": "model_inputs", "description": "Model input manifest JSON."},
+        {"path": str(csv_path), "kind": "model_inputs", "description": f"{manifest_description} CSV."},
+        {"path": str(json_path), "kind": "model_inputs", "description": f"{manifest_description} JSON."},
     ]
     for batch_index in range(max_batches):
         start = batch_index * batch_size

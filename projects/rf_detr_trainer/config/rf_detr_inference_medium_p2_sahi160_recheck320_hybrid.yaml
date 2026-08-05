@@ -1,14 +1,16 @@
-# Full-video RF-DETR Medium P2 inference preset for inference_rf_detr_model.py.
-# Uses FP16 TensorRT, 160x160 SAHI slices, centered 320x320 football recheck,
-# and OC-SORT tracking for the six explicitly listed videos.
+# RF-DETR Medium P2 high-slice-count accuracy experiment for inference_rf_detr_model.py.
+# Uses TensorRT FP16, 160x160 SAHI slices, centered 320x320 football recheck, fused score 0.25.
+# This is intentionally not a performance preset: 1080p produces 135 slices/frame.
+# combining ByteTrack confidence tiers, OC-SORT correction, BoT-SORT CMC, and adaptive CV/CA motion.
 #
-# The source training run name contains "motion_v5", but its saved merged/model
-# configs show the checkpoint architecture is P2 [P2, P3, P4] with motion disabled.
-# This preset follows the saved architecture so checkpoint loading and TensorRT
-# export use the correct graph.
+# Architecture contract: RF-DETR Medium, resolution 576, one class (ID 0 football),
+# projector [P2, P3, P4], motion disabled. Supply the checkpoint at runtime with
+# --checkpoint; do not commit a machine-local checkpoint path into this preset.
+# The 0.5-second fixed-delay window is flushed deterministically at end of each source.
 
 # Runtime controls for dry-run, prompts, verbosity, seeds, and estimates. Options: mapping.
 runtime:
+  performance_profile: fast
   # Bound numerical-library thread pools so RF-DETR does not monopolize the host. Options: mapping.
   cpu:
     # Enable the cross-platform CPU thread budget. Options: true, false.
@@ -45,7 +47,7 @@ model:
   # RF-DETR model size. Options: base, nano, small, medium, large.
   size: medium
   # Checkpoint trained with Medium, one class, 576 resolution, and P2 [P2, P3, P4].
-  pretrain_weights: <path-to-medium-p2-checkpoint>/checkpoint_best_total.pth
+  pretrain_weights: /home/new_users/zhiyu/projects/PitchObjectLab/runs/rf_detr/train/rfdetr_medium_motion_v5_e40_b4_20260710165058/checkpoint_best_ema.pth
   # Explicit checkpoint input resolution. Options: positive integer.
   resolution: 576
   # Explicit checkpoint class count. Options: positive integer.
@@ -67,7 +69,7 @@ model:
     # PyTorch-only settings; retained for the complete schema. Options: mapping.
     pytorch:
       # PyTorch compute precision. Options: fp32, bf16.
-      precision: fp32
+      precision: bf16
     # TensorRT-only settings. TensorRT is CUDA-only and does not silently fall back. Options: mapping.
     tensorrt:
       # TensorRT engine precision. Options: fp16, bf16.
@@ -87,9 +89,9 @@ model:
         # Smallest accepted batch; 1 keeps tail batches valid. Options: 1.
         min_batch_size: 1
         # Batch optimized by TensorRT autotuning. Options: positive integer.
-        opt_batch_size: 4
+        opt_batch_size: 8
         # Largest accepted engine batch. Options: positive integer >= opt_batch_size.
-        max_batch_size: 4
+        max_batch_size: 16
 
   # P2 stride-4 feature-level settings; must match the checkpoint architecture. Options: mapping.
   p2:
@@ -205,7 +207,7 @@ output:
   # Project-relative output root. Options: path string.
   root: runs/rf_detr/inference
   # Timestamped run folder name. Options: string supporting {timestamp}.
-  name: rfdetr_medium_p2_trt_fp16_sahi160_recheck320_ocsort_6videos_{timestamp}
+  name: rfdetr_medium_p2_sahi160_recheck320_hybrid_{timestamp}
   # Allow writing into an existing directory. Options: true, false.
   exist_ok: false
 
@@ -213,12 +215,7 @@ output:
 inference:
   # Explicit image/video/folder/HTTP(S) inputs. Options: list of supported sources.
   sources:
-    - <path-to-video-directory>/video_01.mp4
-    - <path-to-video-directory>/video_02.mp4
-    - <path-to-video-directory>/video_03.mp4
-    - <path-to-video-directory>/video_04.mp4
-    - <path-to-video-directory>/video_05.mp4
-    - <path-to-video-directory>/video_06.mp4
+    - /home/new_users/zhiyu/datasets/soccer/raw/raw_video/1984090406020124673.mp4
   # Recurse into folder sources. Options: true, false.
   recursive: true
   # Maximum discovered sources after type caps. Options: all, null, or positive integer.
@@ -230,13 +227,13 @@ inference:
   # Inference mode. Options: full_image, sahi, class_crop.
   mode: sahi
   # Outer source/frame batch size; active RF-DETR SAHI calls use sahi.batch_size. Options: positive integer.
-  batch_size: 8
+  batch_size: 16
   # Image extensions discovered in folders. Options: extension list.
   image_extensions: [.bmp, .jpeg, .jpg, .png, .tif, .tiff, .webp]
   # Video extensions discovered in folders. Options: extension list.
   video_extensions: [.avi, .m4v, .mkv, .mov, .mp4, .mpeg, .mpg, .webm]
   # Category IDs to render; empty defers to names. Options: ID list.
-  render_class_ids: []
+  render_class_ids: [0]
   # Render only football boxes. Options: name list.
   render_class_names: [football]
   # Save full line-delimited prediction records. Options: true, false.
@@ -256,9 +253,9 @@ inference:
     # Detection-frame batch size; null inherits inference.batch_size, while SAHI model calls remain batch 4.
     batch_size: null
     # Begin each video at its first frame. Options: seconds, MM:SS, HH:MM:SS.
-    start_time: 0
+    start_time: 00:15:00
     # Continue through each video end. Options: all, null, seconds, MM:SS, HH:MM:SS.
-    end_time: all
+    end_time: 00:20:00
     # Process the entire selected range. Options: all, null, or positive duration.
     max_seconds: all
     # Preserve each input video's FPS. Options: null or positive FPS.
@@ -269,10 +266,10 @@ inference:
   tracking:
     # Enable video tracking. Options: true, false.
     enabled: true
-    # Tracking implementation. Options: circle, ocsort, deepocsort, botsort, bytetrack.
-    algorithm: ocsort
+    # Circle is the global default; this preset opts into hybrid. Options: circle, ocsort, deepocsort, botsort, bytetrack, hybrid.
+    algorithm: hybrid
     # Category IDs to track; empty defers to names. Options: ID list.
-    target_class_ids: []
+    target_class_ids: [0]
     # Track only football. Options: name list; empty defaults to football.
     target_class_names: [football]
     # Circle-only base search radius; ignored by OC-SORT. Options: positive number.
@@ -397,6 +394,88 @@ inference:
       track_buffer: 25
       # Nominal video FPS used for buffer timing. Options: positive integer.
       frame_rate: 30
+    # Motion-only all-ball tracker; no ReID, field mask, player context, or main-ball selection.
+    hybrid:
+      # ByteTrack-style detection confidence tiers. Options: mapping.
+      candidate:
+        # Lowest score considered for continuation. Options: 0.0-1.0.
+        low_confidence: 0.25
+        # High-tier boundary. Options: 0.0-1.0, >= low_confidence.
+        high_confidence: 0.50
+        # Minimum score allowed to create a new ID; low-tier boxes never spawn. Options: >= high_confidence.
+        new_track_confidence: 0.50
+        # Require a successful 640px recheck for low-tier continuation. Options: true, false.
+        low_require_recheck: true
+      # Fixed-delay ambiguity handling. Options: mapping.
+      hypothesis:
+        # Future observation window before commit. Options: non-negative seconds.
+        lookahead_seconds: 0.50
+        # Configured hypothesis beam capacity. Options: positive integer.
+        beam_width: 8
+        # Cost gap treated as ambiguous; miss/new is preferred for purity. Options: non-negative float.
+        ambiguity_margin: 0.02
+      # Time-based lifecycle. Options: mapping.
+      lifecycle:
+        # Hits required for confirmation. Options: positive integer.
+        confirmed_hits: 2
+        # Frames in which confirmation hits must occur. Options: integer >= confirmed_hits.
+        confirmation_window: 3
+        # Missing time before retirement; retired IDs are never reused. Options: non-negative seconds.
+        lost_seconds: 1.0
+        # Emit predicted states through short gaps. Options: non-negative seconds.
+        predicted_output_seconds: 0.50
+      # Motion-only association costs and gates. Options: mapping.
+      association:
+        # High-tier center gate. Options: positive pixels.
+        high_gate_pixels: 72.0
+        # Low-tier center gate before low_gate_scale. Options: positive pixels.
+        low_gate_pixels: 56.0
+        # Innovation Mahalanobis gate. Options: positive standard deviations.
+        mahalanobis_gate: 5.0
+        # Normalized Mahalanobis cost weight. Options: non-negative float.
+        weight_mahalanobis: 0.28
+        # Camera-compensated center residual weight. Options: non-negative float.
+        weight_center: 0.28
+        # Observation-direction weight; zero is safer for dense stationary sideline balls. Options: non-negative float.
+        weight_direction: 0.0
+        # Log-size consistency weight. Options: non-negative float.
+        weight_size: 0.14
+        # Fused-confidence cost weight. Options: non-negative float.
+        weight_confidence: 0.10
+        # Additional low-tier gate strictness. Options: positive float.
+        low_gate_scale: 0.75
+      # Adaptive constant-velocity / constant-acceleration model. Options: mapping.
+      motion:
+        # State process-noise scale. Options: positive float.
+        process_noise: 12.0
+        # Center measurement-noise scale. Options: positive float.
+        measurement_noise: 8.0
+        # Acceleration EMA retention. Options: 0.0-1.0.
+        acceleration_smoothing: 0.70
+        # Log-size EMA retention. Options: 0.0-1.0.
+        size_smoothing: 0.80
+        # CV/CA probability EMA retention. Options: 0.0-1.0.
+        model_probability_smoothing: 0.80
+      # Sparse optical flow + RANSAC, ORB + RANSAC, then identity fallback. Options: mapping.
+      cmc:
+        # Enable camera-motion compensation. Options: true, false.
+        cmc_enabled: true
+        # Maximum sparse corners / ORB features. Options: positive integer.
+        cmc_max_corners: 400
+        # Shi-Tomasi corner quality. Options: positive float.
+        cmc_quality_level: 0.01
+        # Minimum corner separation. Options: positive pixels.
+        cmc_min_distance: 7.0
+        # RANSAC reprojection threshold. Options: positive pixels.
+        cmc_ransac_threshold: 3.0
+        # Minimum inliers before accepting CMC. Options: positive integer.
+        cmc_min_inliers: 12
+        # Maximum accepted frame translation. Options: positive pixels.
+        cmc_max_translation: 250.0
+        # Minimum accepted affine scale. Options: positive float.
+        cmc_min_scale: 0.80
+        # Maximum accepted affine scale. Options: >= cmc_min_scale.
+        cmc_max_scale: 1.25
 
 # Class-crop settings retained for mode switching. Options: mapping.
 crop:
@@ -442,7 +521,7 @@ sahi:
     # Enable centered football verification. Options: true, false.
     enabled: true
     # Target category IDs; empty defers to names. Options: ID list.
-    target_class_ids: []
+    target_class_ids: [0]
     # Target category names. Options: name list; empty defaults to football.
     target_class_names: [football]
     # Centered BxB crop side length in pixels. Options: positive integer.
@@ -454,9 +533,15 @@ sahi:
     # Second-stage score weight. Options: non-negative float.
     second_weight: 0.5
     # Keep the first-stage box only when its fused score reaches this threshold. Options: 0.0-1.0.
-    fused_confidence_threshold: 0.5
+    fused_confidence_threshold: 0.25
     # Extra relative padding for second-pass center-hit matching. Options: non-negative float.
     center_padding_ratio: 0.0
+    # Minimum center residual tolerance for tiny boxes. Options: non-negative pixels.
+    match_center_tolerance_pixels: 8.0
+    # Minimum per-axis second/first size ratio. Options: positive float.
+    match_min_size_ratio: 0.25
+    # Maximum per-axis second/first size ratio. Options: float >= match_min_size_ratio.
+    match_max_size_ratio: 4.0
     # Maximum target boxes rechecked per source frame, ranked by score. Options: non-negative integer.
     max_rechecks_per_image: 50
 

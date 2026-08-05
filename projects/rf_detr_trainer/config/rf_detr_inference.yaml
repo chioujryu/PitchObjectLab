@@ -9,6 +9,10 @@ runtime:
     enabled: true
     # Percentage of logical CPUs shared by active model processes. Options: 1-100.
     budget_percent: 50
+    # PyTorch preprocessing threads. auto caps inference/test at 16; explicit positive integers override it.
+    torch_intraop_threads: auto
+  # Runtime optimization profile. Options: safe (PyTorch BF16), fast (TensorRT FP16), or null for explicit model settings.
+  performance_profile: null
   # Print wrapper status text. Options: true, false.
   verbose: true
   # Estimate outputs and exit before model loading/inference. Options: true, false.
@@ -282,6 +286,12 @@ inference:
     target_class_names: [football]
   # Video inference settings. Options: mapping.
   video:
+    # Decode/infer/track/render/encode in one bounded in-memory pass. Options: true, false.
+    streaming: true
+    # Maximum decoded frames retained before a partial model batch is flushed. Options: positive integer.
+    queue_size: 32
+    # Write the rendered MP4. false keeps JSON outputs and skips render/encode. Options: true, false.
+    save_video: true
     # Detection FPS for videos. Options: null to detect every frame, or positive float such as 5.
     detection_fps: null
     # RF-DETR detection-frame batch size. Options: all/null to inherit inference.batch_size, or positive integer.
@@ -325,6 +335,8 @@ inference:
     velocity_smoothing: 0.5
     # Draw trajectory polyline for tracked balls in rendered videos. Options: true, false.
     draw_trajectory: true
+    # Extend the observed trail to the live predicted center during detection gaps. Options: true, false.
+    draw_predicted_trajectory: false
     # Trajectory length in points/frames. null = full history (kept in memory up to 1024 points). Options: null, or a positive integer.
     trajectory_max_points: 30
     # Trail points older than this many video frames are dropped, so the trajectory retracts and disappears after the ball is lost. null = persist (never expire). Options: null, or a positive integer.
@@ -466,7 +478,7 @@ sahi:
   postprocess_match_threshold: 0.5
   # Class-agnostic slice merge. Options: true, false.
   postprocess_class_agnostic: false
-  # RF-DETR SAHI slice/recheck batch size. Options: positive integer.
+  # RF-DETR SAHI slice/recheck batch size. auto starts at 16 and persists any OOM downshift. Options: auto or positive integer.
   batch_size: 4
   # recheck nested configuration block. Options: mapping.
   recheck:

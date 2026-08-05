@@ -141,6 +141,7 @@ runtime:
   cpu:
     enabled: true
     budget_percent: 50
+    torch_intraop_threads: auto
 ```
 
 The total budget is `floor(logical CPUs * budget_percent / 100)`. Training
@@ -148,7 +149,14 @@ shares it across `WORLD_SIZE` or explicit GPU devices, standalone testing
 shares it across `test.parallel.chunks`, and inference uses one model process.
 For example, 32 logical CPUs at 50% produce 16 total threads; six test chunks
 receive two threads each. A run fails before model work starts when the model
-process count is larger than the total thread budget.
+process count is larger than the total thread budget. With
+`torch_intraop_threads: auto`, single-GPU test/inference is capped at 16
+threads even on 64/128-thread hosts. When both 8 and 16 threads fit the CPU
+budget, startup runs a short batched preprocessing benchmark and keeps the
+faster choice in the timing metadata. The RF-DETR per-image preprocessing path
+becomes slower when it fans small operations across dozens of CPU threads.
+Training keeps the full per-process budget. Set a positive integer to override
+the task-aware default and skip this benchmark.
 
 CLI values override YAML, and YAML overrides the defaults:
 
@@ -161,10 +169,13 @@ uv run python test_rf_detr_model.py --no-cpu-limit --dry-run --yes
 
 # Re-enable a limit disabled by YAML.
 uv run python inference_rf_detr_model.py --cpu-limit --cpu-budget-percent 50 --yes
+
+# Explicitly use eight PyTorch preprocessing threads.
+uv run python test_rf_detr_model.py --torch-intraop-threads 8 --yes
 ```
 
 The supported flags on all three entrypoints are `--cpu-budget-percent 1..100`,
-`--cpu-limit`, and `--no-cpu-limit`. The percentage is a cross-platform thread
+`--torch-intraop-threads {auto|N}`, `--cpu-limit`, and `--no-cpu-limit`. The percentage is a cross-platform thread
 budget for PyTorch, OpenMP, BLAS, NumExpr, and OpenCV; it is not a precise CPU
 utilization cap. The startup log, config snapshot metadata, and
 `run_timing.json` record the resolved process split and observed library thread
@@ -341,6 +352,8 @@ Validation and checkpoint defaults:
 train:
   # Save archive checkpoint_<epoch>.pth every epoch.
   checkpoint_interval: 1
+  # Save resumable last.ckpt every epoch; fast profiles may use 2.
+  save_last_interval: 1
   # Run RF-DETR validation loader and metrics every epoch.
   eval_interval: 1
 ```
@@ -404,8 +417,11 @@ test:
     chunks: 6
 ```
 
-Each chunk loads the same configured model and checkpoint. With `chunks: 6`
-and `device: 0`, six replicas run concurrently on GPU 0; with `device: "0,1"`,
+Each chunk loads the same configured model and checkpoint. By default the
+runner clamps `chunks` to the number of unique GPUs, so `chunks: 6` with
+`device: 0` runs one persistent model worker instead of six contending replicas.
+Set `test.parallel.allow_same_gpu_oversubscription: true` only for an explicit
+experiment. With `device: "0,1"`,
 the six workers are assigned to GPUs `0,1,0,1,0,1`. The chunk count must be a
 positive integer no larger than the number of selected test images. Multiple
 replicas on one GPU multiply model-memory demand and do not imply a linear
@@ -455,12 +471,20 @@ Only these backend/precision pairs are valid: `pytorch/fp32`,
 `pytorch/bf16`, `tensorrt/fp16`, and `tensorrt/bf16`. TensorRT is CUDA-only;
 BF16 additionally requires a compatible Ampere-or-newer GPU and TensorRT 10.
 Unsupported hardware, missing optional packages, corrupt or incompatible
-artifacts, and invalid precision combinations fail immediately. The runner
-never silently falls back to PyTorch or another precision.
+artifacts, and invalid precision combinations fail immediately. An application
+may explicitly supply a BF16-reference accuracy callback; a rejected callback
+restores PyTorch BF16 and records the rejected TensorRT metadata. The normal
+CLI does not invent an accuracy result: without such a callback,
+`accuracy_parity.performed` is false and ordinary runtime failures do not
+silently change backend or precision.
 
 Without `engine_path`, the runner exports dynamic-batch ONNX, builds an engine,
-and reuses a cache keyed by the checkpoint/model, TensorRT/CUDA versions, GPU,
-precision, output type, and batch profile. The shipped presets use the
+and reuses a cache keyed by the checkpoint/model, TensorRT/CUDA versions,
+physical GPU UUID/PCI subdevice/VBIOS/driver, precision, output type, and batch
+profile. A model/config-matched ONNX export may be reused across compatible
+devices, but the serialized engine is always keyed to the physical GPU. New
+engines contain batch 1/4/8/16 optimization profiles within the configured
+range and benchmark the usable profiles at startup. The shipped presets use the
 project-local `runs/rf_detr/tensorrt_cache/`; an empty `cache_dir` has the same
 fallback, and every relative cache path is resolved from
 `projects/rf_detr_trainer`. An absolute path or a path
@@ -491,6 +515,47 @@ uv run python test_rf_detr_model.py --config config/rf_detr_test.yaml \
 The full CLI set is `--inference-backend {pytorch,tensorrt}`,
 `--inference-precision {fp32,fp16,bf16}`, `--tensorrt-engine PATH`,
 `--tensorrt-cache-dir PATH`, and `--tensorrt-force-rebuild`.
+
+The evaluator's accelerated path prepares a complete image batch once, performs
+one grouped resize/normalization/H2D transfer, then calls raw PyTorch or
+TensorRT inference. It does not use RF-DETR's legacy per-PIL-image range scans,
+source-image copies, or one-H2D-per-image path. TensorRT execution uses a
+private CUDA stream and reusable events. The sequential evaluator explicitly
+uses reusable output buffers after postprocess has copied detections to CPU;
+arbitrary raw-output callers keep buffer reuse disabled unless they opt in.
+
+### Single-GPU safe and fast profiles
+
+Medium-P2 train, test, and inference presets are provided as matched pairs:
+
+```text
+config/rf_detr_train_medium_p2_performance_{safe,fast}.yaml
+config/rf_detr_test_medium_p2_performance_{safe,fast}.yaml
+config/rf_detr_inference_medium_p2_performance_{safe,fast}.yaml
+```
+
+Replace their checkpoint/dataset/media placeholders first. Safe inference/test
+uses PyTorch BF16, SAHI 320 with 20% overlap, recheck 640, automatic SAHI batch
+4/8/16 selection, and full-scale CMC. Fast uses TensorRT FP16 with the same
+detection geometry and half-scale CMC. The inference pair explicitly maps its
+one checkpoint class to `football`; change `model.num_classes` and
+`dataset.class_names` together for a different checkpoint. Fast training uses fixed shapes,
+`torch.compile`, EMA every two optimizer steps, validation every five epochs,
+and a resumable checkpoint every two epochs. Both training profiles can measure
+microbatches 4/8/16 (50 warmup plus 200 measured backward steps), preserve an
+effective batch of 32, enforce peak VRAM below 90%, and only test DataLoader
+workers 4/8 when the workers-2 wait exceeds 5%. Results are written to
+`train_autotune.json`; Lightning phase timing is written to
+`phase_profile.txt`. Fast training reloads the best checkpoint for one complete
+validation before final test. Use `--performance-profile safe|fast` for the
+equivalent runtime overrides; slice geometry remains owned by the selected
+config.
+
+The word `fast` identifies the candidate policy, not a fabricated accuracy
+certification. A production promotion still needs the fixed-set mAP/football
+recall/tracking gate. When a caller supplies that gate through the acceleration
+API, rejection automatically restores safe PyTorch BF16; otherwise the run
+metadata explicitly says that parity was not performed.
 
 Acceleration covers image/video inference, full-image batches, SAHI, target
 class recheck, and class crop. Standalone full-image segmentation keeps true
@@ -713,6 +778,31 @@ Each run writes rendered media, `predictions.jsonl`, `football_predictions.jsonl
 `class_colors.json`, an `inference_summary.json`, and a config snapshot into the
 output folder.
 
+Video inference defaults to a bounded, single-decode streaming pipeline:
+
+```yaml
+inference:
+  video:
+    streaming: true
+    queue_size: 32
+    save_video: true
+```
+
+Decoded frames are passed directly to the batched evaluator in memory, then
+tracked, rendered, and encoded in source order. This removes the former JPEG
+frame cache and second complete video decode. Set `save_video: false` or
+`--no-save-video` for JSON-only inference. When `detection_fps` skips model
+frames, enabled trackers are still advanced on every source frame so their age
+and motion state remain in video-frame units.
+
+`inference_summary.json` and `run_timing.json` separate decode, frame
+conversion, crop, host preprocessing, H2D, resize/normalize, forward,
+postprocess, tracker/CMC, render, encode, serialization, and orchestration.
+They also record source/detection frames, slice/recheck inputs, actual model
+batches (including one-time autotune work), requested/effective SAHI batches,
+queue peak, OOM retries, and peak allocated/reserved/device VRAM. Runtime
+history uses critical-path wall time rather than summed parallel-worker time.
+
 `football_predictions.jsonl` is the concise downstream interface for ball
 coordinates. It keeps one row per detected football (multiple footballs in one
 frame produce multiple rows) and uses absolute source-image pixels with
@@ -796,6 +886,8 @@ rendering keys sit at the `tracking` top level:
 inference:
   tracking:
     algorithm: ocsort
+    draw_trajectory: true
+    draw_predicted_trajectory: false
     ocsort:
       det_thresh: 0.2
       max_age: 30
@@ -803,6 +895,13 @@ inference:
     bytetrack:
       track_thresh: 0.45
 ```
+
+`draw_trajectory` remains the master switch for trajectory polylines.
+`draw_predicted_trajectory` defaults to `false`; when disabled, the observed trail remains
+visible but is not extended from its last observed point to the live predicted center.
+Current-center dots, search circles, bounding boxes, labels, tracker state, JSONL files, and
+tracking summaries are unchanged. Set it to `true` to restore the previous predicted-head
+rendering behavior for any tracking algorithm.
 
 The tracked class is configurable for every algorithm via
 `inference.tracking.target_class_ids` / `target_class_names`; with both empty it defaults

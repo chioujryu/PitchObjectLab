@@ -118,7 +118,7 @@ sahi:
   overlap_width_ratio: 0.2
   # Let SAHI choose slice resolution automatically. Options: true, false.
   auto_slice_resolution: false
-  # Batch size for SAHI/Ultralytics slice inference. Options: positive integer. Larger is faster but uses more VRAM.
+  # Batch size for slice inference. Options: positive integer; RF-DETR also accepts auto (starts at 16 with persistent OOM downshift).
   batch_size: 1
   # Slice merge postprocess. Options: GREEDYNMM, NMM, NMS, LSNMS.
   postprocess_type: GREEDYNMM
@@ -192,6 +192,8 @@ output:
   max_model_input_batches: 3
   # Number of model input cases per saved grid. Options: positive integer.
   model_input_batch_size: 9
+  # Write every model input case to CSV/JSON. false limits manifests to the saved grid sample and avoids huge per-slice files.
+  full_model_input_manifest: false
   # Subfolder inside each run directory for evaluated dataset cases. Options: datasets, another folder name, or placeholders like datasets_{split}.
   dataset_cases_subdir: datasets
   # Maximum source images used for dataset case output. Options: null for all matching images, or a positive integer.

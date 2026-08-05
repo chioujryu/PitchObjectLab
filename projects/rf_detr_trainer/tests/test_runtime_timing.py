@@ -269,6 +269,61 @@ class RuntimeTimingTest(unittest.TestCase):
             self.assertEqual(throughput["engine_export_seconds"], 2.0)
             self.assertEqual(throughput["engine_build_seconds"], 3.0)
 
+    def test_parallel_history_uses_critical_wall_not_aggregate_worker_time(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output_dir = Path(temp) / "run"
+            output_dir.mkdir()
+            context = trainer.start_run_timing("test", verbose=False)
+            context.update(
+                {
+                    "output_dir": str(output_dir),
+                    "outputs_created": True,
+                    "success": True,
+                    "estimate": {"runtime_units": 20},
+                    "stage_timing": {
+                        "images_or_frames": 20,
+                        "total_seconds": 20.0,
+                        "critical_path_wall_seconds": 11.0,
+                        "aggregate_worker_seconds": 20.0,
+                    },
+                }
+            )
+
+            trainer.finish_run_timing(context)
+
+            data = json.loads((output_dir / "run_timing.json").read_text(encoding="utf-8"))
+            self.assertEqual(data["throughput"]["source"], "stage_timing-critical-path-wall")
+            self.assertEqual(data["throughput"]["steady_state_seconds"], 11.0)
+            self.assertEqual(data["throughput"]["seconds_per_runtime_unit"], 0.55)
+
+    def test_stage_runtime_units_override_frame_count_for_history_rate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output_dir = Path(temp) / "run"
+            output_dir.mkdir()
+            context = trainer.start_run_timing("inference", verbose=False)
+            context.update(
+                {
+                    "output_dir": str(output_dir),
+                    "outputs_created": True,
+                    "success": True,
+                    "estimate": {"runtime_units": 56},
+                    "stage_timing": {
+                        "images_or_frames": 7,
+                        "runtime_units": 56,
+                        "total_seconds": 28.0,
+                    },
+                }
+            )
+
+            trainer.finish_run_timing(context)
+
+            data = json.loads((output_dir / "run_timing.json").read_text(encoding="utf-8"))
+            throughput = data["throughput"]
+            self.assertEqual(throughput["runtime_units"], 56)
+            self.assertEqual(throughput["requested_runtime_units"], 56)
+            self.assertEqual(throughput["source"], "stage_timing-runtime-units")
+            self.assertEqual(throughput["seconds_per_runtime_unit"], 0.5)
+
     def test_tee_text_stream_ignores_closed_log_file(self):
         console = io.StringIO()
         log_file = tempfile.TemporaryFile("w+", encoding="utf-8")
@@ -286,6 +341,26 @@ class RuntimeTimingTest(unittest.TestCase):
             self.assertTrue(console.getvalue().endswith("\x1b[0m"))
         finally:
             log_file.close()
+
+    def test_tee_text_stream_collapses_carriage_return_progress_in_log_only(self):
+        console = io.StringIO()
+        log_file = io.StringIO()
+        tee = trainer.TeeTextStream(console, log_file)
+
+        tee.write("normal line\n")
+        for percent in range(101):
+            tee.write(f"\rprogress {percent}%")
+            tee.flush()
+        tee.write("\n")
+        tee.write("unterminated final state")
+        tee.finalize_log_line()
+
+        self.assertIn("\rprogress 0%", console.getvalue())
+        self.assertIn("\rprogress 100%", console.getvalue())
+        self.assertEqual(
+            log_file.getvalue(),
+            "normal line\nprogress 100%\nunterminated final state\n",
+        )
 
 
 if __name__ == "__main__":

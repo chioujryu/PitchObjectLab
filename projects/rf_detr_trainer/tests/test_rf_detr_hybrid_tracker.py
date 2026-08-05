@@ -1,5 +1,9 @@
 import unittest
+from unittest.mock import patch
 
+import numpy as np
+
+import rf_detr_hybrid_tracker as hybrid_runtime
 from rf_detr_hybrid_tracker import HybridFootballTracker, HybridTrackingConfig
 import rf_detr_video_tracking as video_tracking
 
@@ -141,6 +145,28 @@ class HybridFootballTrackerTest(unittest.TestCase):
         self.assertGreater(track.base_radius, 0.0)
         self.assertEqual(track.missing_frames, 0)
         self.assertEqual(video_tracking.trail_points(track, 1, video_tracking.TrackingConfig()), [(10.0, 10.0), (12.0, 10.0)])
+
+    def test_half_scale_cmc_maps_translation_back_to_full_resolution(self):
+        cfg = HybridTrackingConfig(cmc_processing_scale=0.5, cmc_min_inliers=1)
+        estimator = hybrid_runtime._CameraMotionEstimator(cfg)
+        frame = np.zeros((40, 60, 3), dtype=np.uint8)
+
+        first, _ = estimator.estimate(frame)
+        with patch.object(
+            estimator,
+            "_sparse_flow",
+            return_value=(np.asarray([[1.0, 0.0, 5.0], [0.0, 1.0, 3.0]]), 10),
+        ):
+            affine, diagnostic = estimator.estimate(frame)
+
+        np.testing.assert_allclose(first, [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+        np.testing.assert_allclose(affine[:, 2], [10.0, 6.0])
+        self.assertEqual(diagnostic["processing_scale"], 0.5)
+
+    def test_grouped_cmc_processing_scale_alias(self):
+        cfg = HybridTrackingConfig.from_mapping({"cmc": {"processing_scale": 0.5}})
+
+        self.assertEqual(cfg.cmc_processing_scale, 0.5)
 
 
 if __name__ == "__main__":

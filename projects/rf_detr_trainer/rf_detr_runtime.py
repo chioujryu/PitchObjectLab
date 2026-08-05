@@ -241,7 +241,7 @@ def _prepare_parallel_tensorrt_profiles(
     if settings.backend != "tensorrt":
         raise ValueError("Parallel TensorRT preparation requires backend=tensorrt.")
 
-    profile_groups: dict[tuple[str, tuple[int, int]], dict[str, Any]] = {}
+    profile_groups: dict[tuple[str, ...], dict[str, Any]] = {}
     for requested_device in devices:
         preflight = preflight_rfdetr_inference_acceleration(config, device=requested_device)
         resolved_device = torch.device(preflight["device"])
@@ -250,17 +250,32 @@ def _prepare_parallel_tensorrt_profiles(
                 f"TensorRT preparation requires a CUDA device; got {resolved_device} "
                 f"for requested device {requested_device!r}."
             )
-        properties = torch.cuda.get_device_properties(resolved_device)
-        capability = tuple(int(value) for value in torch.cuda.get_device_capability(resolved_device))
-        key = (str(properties.name), capability)
+        gpu_identity = _acceleration.gpu_runtime_identity(resolved_device)
+        capability = tuple(int(value) for value in gpu_identity.get("compute_capability", ()))
+        # TensorRT engines are tied to the physical GPU, not merely its
+        # marketing name and compute capability.  UUID is authoritative;
+        # PCI/subdevice/VBIOS fields keep the grouping safe on runtimes that do
+        # not expose UUID through torch.
+        key = tuple(
+            str(gpu_identity.get(field) or "")
+            for field in (
+                "uuid",
+                "pci_bus_id",
+                "pci_device_id",
+                "pci_sub_device_id",
+                "vbios_version",
+                "name",
+            )
+        ) + tuple(str(value) for value in capability)
         group = profile_groups.setdefault(
             key,
             {
                 "representative_device": str(resolved_device),
                 "requested_devices": [],
                 "resolved_devices": [],
-                "gpu_name": str(properties.name),
+                "gpu_name": str(gpu_identity.get("name", "unknown")),
                 "compute_capability": list(capability),
+                "gpu_identity": gpu_identity,
                 "preflight": preflight,
             },
         )

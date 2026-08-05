@@ -17,7 +17,9 @@ Notes:
     - test.visual_samples.render_class_names/render_class_ids and test.error_cases.render_class_names/render_class_ids
       independently control which classes are drawn in visual and error-case images.
     - test.error_cases defaults to football diagnostics and writes GT/prediction boxes with scores.
-    - test.parallel.chunks or --chunks starts that many concurrent model replicas for bbox evaluation.
+    - test.parallel.chunks or --chunks requests concurrent bbox-evaluation workers. By default workers are
+      capped to one per resolved device; set test.parallel.allow_same_gpu_oversubscription=true only for
+      an explicit same-device concurrency experiment.
     - Before writing images, metrics, or cache files, the script prints a resource estimate and asks for confirmation unless --yes is used.
 """
 
@@ -26,6 +28,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import pickle
 from collections import Counter
 from collections.abc import Mapping
@@ -33,7 +36,7 @@ from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, MutableMapping, Optional
+from typing import Any, Dict, MutableMapping, Optional, Sequence
 
 import rf_detr_cpu_runtime as cpu_runtime
 
@@ -51,6 +54,7 @@ from colorama import Fore, Style  # noqa: E402
 from tqdm import tqdm  # noqa: E402
 
 import rf_detr_runtime as trainer  # noqa: E402
+from projects.object_detection_common import test_modes as shared_modes  # noqa: E402
 from projects.object_detection_dataset_evaluator.object_detection_dataset_evaluator import (  # noqa: E402
     expand_chunk_devices,
     parse_devices,
@@ -75,6 +79,8 @@ def apply_cli_overrides(config: MutableMapping[str, Any], args: argparse.Namespa
     model = config.setdefault("model", {})
     output = config.setdefault("output", {})
     test = config.setdefault("test", {})
+    if getattr(args, "performance_profile", None) is not None:
+        runtime["performance_profile"] = str(args.performance_profile).strip().lower()
     if args.yes:
         runtime["yes"] = True
         runtime["confirm_before_run"] = False
@@ -120,7 +126,40 @@ def apply_cli_overrides(config: MutableMapping[str, Any], args: argparse.Namespa
     if args.sahi_batch_size is not None:
         test.setdefault("sahi", {})["batch_size"] = args.sahi_batch_size
     if getattr(args, "chunks", None) is not None:
-        test.setdefault("parallel", {})["chunks"] = args.chunks
+        parallel = test.setdefault("parallel", {})
+        parallel["chunks"] = args.chunks
+        parallel.pop("requested_chunks", None)
+    if getattr(args, "allow_same_gpu_oversubscription", None) is not None:
+        test.setdefault("parallel", {})["allow_same_gpu_oversubscription"] = bool(
+            args.allow_same_gpu_oversubscription
+        )
+
+
+def apply_test_performance_profile(config: MutableMapping[str, Any]) -> Optional[str]:
+    """Apply safe/fast standalone-test backend defaults before explicit CLI overrides."""
+    runtime = config.setdefault("runtime", {})
+    if not isinstance(runtime, MutableMapping):
+        raise ValueError("runtime must be a mapping.")
+    legacy_performance = config.get("performance", {})
+    legacy_profile = (
+        legacy_performance.get("profile")
+        if isinstance(legacy_performance, Mapping)
+        else None
+    )
+    profile = trainer.normalize_performance_profile(
+        runtime.get("performance_profile", legacy_profile)
+    )
+    if profile is None:
+        return None
+    runtime["performance_profile"] = profile
+    optimization = config.setdefault("model", {}).setdefault("inference_optimization", {})
+    if profile == "safe":
+        optimization["backend"] = "pytorch"
+        optimization.setdefault("pytorch", {})["precision"] = "bf16"
+    else:
+        optimization["backend"] = "tensorrt"
+        optimization.setdefault("tensorrt", {})["precision"] = "fp16"
+    return profile
 
 
 def normalize_test_parallel_chunks(value: Any) -> int:
@@ -130,8 +169,8 @@ def normalize_test_parallel_chunks(value: Any) -> int:
     return int(value)
 
 
-def standalone_parallel_chunks(config: Mapping[str, Any]) -> int:
-    """Return the normalized standalone-test chunk count (default one)."""
+def _test_parallel_settings(config: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Return validated standalone-test parallel settings."""
     test_settings = config.get("test", {})
     if not isinstance(test_settings, Mapping):
         raise ValueError("test must be a mapping.")
@@ -140,7 +179,23 @@ def standalone_parallel_chunks(config: Mapping[str, Any]) -> int:
         parallel = {}
     if not isinstance(parallel, Mapping):
         raise ValueError("test.parallel must be a mapping.")
-    return normalize_test_parallel_chunks(parallel.get("chunks", 1))
+    return parallel
+
+
+def requested_standalone_parallel_chunks(config: Mapping[str, Any]) -> int:
+    """Return the requested standalone-test chunk count (default one)."""
+    parallel = _test_parallel_settings(config)
+    return normalize_test_parallel_chunks(
+        parallel.get("requested_chunks", parallel.get("chunks", 1))
+    )
+
+
+def allow_same_gpu_oversubscription(config: Mapping[str, Any]) -> bool:
+    """Return whether multiple model replicas may intentionally share a device."""
+    value = _test_parallel_settings(config).get("allow_same_gpu_oversubscription", False)
+    if not isinstance(value, bool):
+        raise ValueError("test.parallel.allow_same_gpu_oversubscription must be a boolean.")
+    return value
 
 
 def _standalone_test_devices(config: Mapping[str, Any]) -> list[str]:
@@ -157,8 +212,35 @@ def _standalone_test_devices(config: Mapping[str, Any]) -> list[str]:
     return parse_devices(effective_model_cfg)
 
 
+def standalone_parallel_chunks(config: Mapping[str, Any]) -> int:
+    """Return the effective worker count after the one-worker-per-device safety cap."""
+    requested = requested_standalone_parallel_chunks(config)
+    if allow_same_gpu_oversubscription(config):
+        return requested
+    unique_devices = len(set(_standalone_test_devices(config)))
+    return min(requested, max(1, unique_devices))
+
+
+def apply_test_parallel_device_policy(config: MutableMapping[str, Any]) -> Optional[str]:
+    """Persist the effective no-oversubscription worker count for all downstream consumers."""
+    requested = requested_standalone_parallel_chunks(config)
+    effective = standalone_parallel_chunks(config)
+    parallel = config.setdefault("test", {}).setdefault("parallel", {})
+    parallel.setdefault("allow_same_gpu_oversubscription", False)
+    if effective >= requested:
+        return None
+    parallel["requested_chunks"] = requested
+    parallel["chunks"] = effective
+    device_count = len(set(_standalone_test_devices(config)))
+    return (
+        f"Capped test.parallel.chunks from {requested} to {effective}: only {device_count} unique "
+        "device(s) were resolved and same-device oversubscription is disabled."
+    )
+
+
 def build_test_parallel_plan(config: Mapping[str, Any], image_count: Optional[int]) -> Dict[str, Any]:
     """Build deterministic chunk/device assignments for estimates and execution."""
+    requested_chunks = requested_standalone_parallel_chunks(config)
     chunks = standalone_parallel_chunks(config)
     if image_count is not None and chunks > int(image_count):
         raise ValueError(
@@ -174,7 +256,13 @@ def build_test_parallel_plan(config: Mapping[str, Any], image_count: Optional[in
             "Multiple concurrent model replicas share one or more devices; this does not increase the "
             "runtime speedup cap and may increase VRAM usage or trigger CUDA OOM downshifts."
         )
+    elif requested_chunks > chunks:
+        same_device_warning = (
+            f"Requested {requested_chunks} chunks but capped execution to {chunks} worker(s), one per "
+            "resolved device. Set test.parallel.allow_same_gpu_oversubscription=true only to opt in."
+        )
     return {
+        "requested_chunks": requested_chunks,
         "chunks": chunks,
         "devices_requested": devices,
         "chunk_devices": assignments,
@@ -431,8 +519,104 @@ def print_inference_timing_summary(result: Mapping[str, Any], output_dir: Path) 
         print(f"Per-image inference stats: {stats_path}")
 
 
+def observed_test_model_work(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Summarize actual full-image, slice, and recheck model inputs from evaluator stats."""
+    source_inputs = 0
+    slice_inputs = 0
+    secondary_inputs = 0
+    recheck_inputs = 0
+    observed_batches = 0
+    for row in rows:
+        slices = max(0, int(row.get("slice_count", 0) or 0))
+        if slices:
+            slice_inputs += slices
+            if float(row.get("base_model_forward_seconds", 0.0) or 0.0) > 0.0:
+                source_inputs += 1
+            recheck = row.get("sahi_recheck", {})
+            if isinstance(recheck, Mapping):
+                recheck_inputs += max(0, int(recheck.get("rechecked", 0) or 0))
+                observed_batches += max(0, int(recheck.get("batch_count", 0) or 0))
+            batch_size = max(1, int(row.get("slice_batch_size", 1) or 1))
+            observed_batches += int(math.ceil(slices / batch_size))
+            continue
+        source_inputs += 1
+        mode = str(row.get("test_mode", row.get("inference_engine", ""))).lower()
+        if "class_crop" in mode:
+            secondary_inputs += 1
+    total_inputs = source_inputs + slice_inputs + secondary_inputs + recheck_inputs
+    return {
+        "source_inputs": source_inputs,
+        "slice_inputs": slice_inputs,
+        "secondary_inputs": secondary_inputs,
+        "recheck_inputs": recheck_inputs,
+        "total_model_inputs": total_inputs,
+        "observed_or_lower_bound_model_batches": observed_batches,
+    }
+
+
 def normalized_stage_timing(result: Mapping[str, Any]) -> Dict[str, Any]:
     """Return additive timing totals in the shared run_timing.json schema."""
+
+    parallel_summary = result.get("parallel_summary")
+    stats = result.get("stats")
+    stats_rows = (
+        [row for row in stats if isinstance(row, Mapping)]
+        if isinstance(stats, list)
+        else []
+    )
+    model_work = observed_test_model_work(stats_rows) if stats_rows else None
+
+    def parallel_speedup_cap() -> int:
+        if not isinstance(parallel_summary, Mapping):
+            return 1
+        assignments = parallel_summary.get("assignments", [])
+        if not isinstance(assignments, list):
+            return 1
+        devices = {
+            str(assignment.get("device"))
+            for assignment in assignments
+            if isinstance(assignment, Mapping) and assignment.get("device") is not None
+        }
+        return max(1, len(devices))
+
+    def add_model_work(timing: Dict[str, Any]) -> Dict[str, Any]:
+        if model_work is None:
+            return timing
+        speedup_cap = parallel_speedup_cap()
+        timing["model_work"] = {
+            **model_work,
+            "parallel_speedup_cap": speedup_cap,
+        }
+        timing.setdefault(
+            "runtime_units",
+            float(model_work["total_model_inputs"]) / float(speedup_cap),
+        )
+        return timing
+
+    def add_parallel_timing(timing: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(parallel_summary, Mapping):
+            timing.setdefault("critical_path_wall_seconds", timing.get("total_seconds", 0.0))
+            timing.setdefault("aggregate_worker_seconds", timing.get("total_seconds", 0.0))
+            return add_model_work(timing)
+        wall_seconds = _float_or_none(parallel_summary.get("wall_seconds"))
+        assignments = parallel_summary.get("assignments", [])
+        aggregate_worker_seconds = 0.0
+        if isinstance(assignments, list):
+            for assignment in assignments:
+                if not isinstance(assignment, Mapping):
+                    continue
+                aggregate_worker_seconds += max(
+                    0.0,
+                    float(_float_or_none(assignment.get("model_load_seconds")) or 0.0),
+                )
+                aggregate_worker_seconds += max(
+                    0.0,
+                    float(_float_or_none(assignment.get("inference_seconds")) or 0.0),
+                )
+        timing["critical_path_wall_seconds"] = max(0.0, float(wall_seconds or 0.0))
+        timing["aggregate_worker_seconds"] = aggregate_worker_seconds
+        timing["parallel_worker_count"] = int(parallel_summary.get("chunks", len(assignments)) or 0)
+        return add_model_work(timing)
 
     existing = result.get("stage_timing")
     if isinstance(existing, Mapping):
@@ -445,13 +629,12 @@ def normalized_stage_timing(result: Mapping[str, Any]) -> Dict[str, Any]:
         timing.setdefault("model_forward_ratio", forward_seconds / total_seconds if total_seconds > 0 else 0.0)
         timing.setdefault("sahi_model_forward_ratio", 0.0)
         timing.setdefault("recheck_model_forward_ratio", 0.0)
-        return timing
-    stats = result.get("stats")
+        return add_parallel_timing(timing)
     if not isinstance(stats, list):
-        return {}
-    rows = [row for row in stats if isinstance(row, Mapping)]
+        return add_parallel_timing({}) if isinstance(parallel_summary, Mapping) else {}
+    rows = stats_rows
     if not rows:
-        return {}
+        return add_parallel_timing({}) if isinstance(parallel_summary, Mapping) else {}
 
     def total(key: str, *, fallback: str | None = None) -> float:
         return sum(
@@ -482,7 +665,7 @@ def normalized_stage_timing(result: Mapping[str, Any]) -> Dict[str, Any]:
             ),
         }
     )
-    return timing
+    return add_parallel_timing(timing)
 
 
 def _non_negative_int_or_none(value: Any) -> Optional[int]:
@@ -512,6 +695,264 @@ def error_case_image_cap(test_settings: Mapping[str, Any]) -> int:
     return max(legacy) if legacy else 25
 
 
+TEST_ESTIMATE_FALLBACK_SIZE = (3840, 2160)
+
+
+def _split_aliases(split: str) -> list[str]:
+    normalized = str(split).strip().lower().replace("_", "-")
+    aliases = [normalized]
+    if normalized == "val":
+        aliases.append("valid")
+    elif normalized == "valid":
+        aliases.append("val")
+    elif normalized == "test-original":
+        aliases.extend(["test_original", "test"])
+    return list(dict.fromkeys(aliases))
+
+
+def _valid_dimensions(record: Mapping[str, Any]) -> Optional[tuple[int, int]]:
+    try:
+        width = int(record.get("width", 0) or 0)
+        height = int(record.get("height", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    return (width, height) if width > 0 and height > 0 else None
+
+
+def _bounded_coco_image_metadata(
+    annotation: Path,
+    limit: Optional[int],
+) -> list[Mapping[str, Any]]:
+    """Incrementally decode only the COCO ``images`` rows needed by max-images."""
+    if limit is not None and limit <= 0:
+        return []
+    decoder = json.JSONDecoder()
+    rows: list[Mapping[str, Any]] = []
+    buffer = ""
+    position = 0
+    array_started = False
+    eof = False
+    with annotation.open("r", encoding="utf-8") as file:
+        while limit is None or len(rows) < limit:
+            if not eof:
+                chunk = file.read(64 * 1024)
+                if chunk:
+                    buffer += chunk
+                else:
+                    eof = True
+            if not array_started:
+                key_at = buffer.find('"images"')
+                if key_at < 0:
+                    if eof:
+                        break
+                    buffer = buffer[-32:]
+                    continue
+                array_at = buffer.find("[", key_at + len('"images"'))
+                if array_at < 0:
+                    if eof:
+                        break
+                    continue
+                array_started = True
+                position = array_at + 1
+
+            while True:
+                while position < len(buffer) and (buffer[position].isspace() or buffer[position] == ","):
+                    position += 1
+                if position >= len(buffer):
+                    break
+                if buffer[position] == "]":
+                    return rows
+                try:
+                    value, end = decoder.raw_decode(buffer, position)
+                except json.JSONDecodeError:
+                    break
+                position = end
+                if isinstance(value, Mapping):
+                    rows.append(value)
+                    if limit is not None and len(rows) >= limit:
+                        return rows
+            if eof:
+                break
+            if array_started and position > 0:
+                buffer = buffer[position:]
+                position = 0
+    return rows
+
+
+def test_estimate_image_dimensions(
+    dataset_plan: Mapping[str, Any],
+    *,
+    split: str,
+    image_count: Optional[int],
+) -> Dict[str, Any]:
+    """Read bounded split metadata for workload estimation, with a 4K upper fallback."""
+    limit = None if image_count is None else max(0, int(image_count))
+    dimensions: list[tuple[int, int]] = []
+    source = "unavailable"
+    records_by_split = dataset_plan.get("records_by_split", {})
+    if isinstance(records_by_split, Mapping):
+        records = None
+        for alias in _split_aliases(split):
+            candidate = records_by_split.get(alias)
+            if isinstance(candidate, list):
+                records = candidate
+                break
+        if records is not None:
+            bounded = records if limit is None else records[:limit]
+            dimensions = [size for record in bounded if isinstance(record, Mapping) if (size := _valid_dimensions(record))]
+            source = "dataset_plan_records"
+
+    if not dimensions:
+        dataset_dir_value = dataset_plan.get("dataset_dir") or dataset_plan.get("cache_dir")
+        if dataset_dir_value:
+            dataset_dir = Path(str(dataset_dir_value))
+            for alias in _split_aliases(split):
+                split_dir = trainer.dataset_split_dir(dataset_dir, alias)
+                annotation = split_dir / "_annotations.coco.json" if split_dir is not None else None
+                if annotation is None or not annotation.exists():
+                    continue
+                try:
+                    images = _bounded_coco_image_metadata(annotation, limit)
+                except (OSError, UnicodeDecodeError):
+                    continue
+                dimensions = [size for image in images if (size := _valid_dimensions(image))]
+                source = "bounded_coco_image_metadata"
+                break
+
+    resolved_count = int(image_count) if image_count is not None else len(dimensions)
+    resolved_count = max(0, resolved_count)
+    metadata_count = min(len(dimensions), resolved_count)
+    dimensions = dimensions[:resolved_count]
+    fallback_count = max(0, resolved_count - len(dimensions))
+    if fallback_count:
+        dimensions.extend([TEST_ESTIMATE_FALLBACK_SIZE] * fallback_count)
+        source = f"{source}+conservative_4k_fallback" if source != "unavailable" else "conservative_4k_fallback"
+    size_counts = Counter(f"{width}x{height}" for width, height in dimensions)
+    return {
+        "dimensions": dimensions,
+        "image_count": resolved_count,
+        "metadata_image_count": metadata_count,
+        "fallback_image_count": fallback_count,
+        "source": source,
+        "size_counts": dict(sorted(size_counts.items())),
+    }
+
+
+def _positive_batch_size(value: Any, *, automatic_default: int) -> tuple[int, Any]:
+    if value is None or (isinstance(value, str) and value.strip().lower() == "auto"):
+        return automatic_default, value if value is not None else automatic_default
+    if isinstance(value, bool):
+        raise ValueError("Model batch size must be a positive integer or auto.")
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError("Model batch size must be a positive integer or auto.")
+    return parsed, value
+
+
+def estimate_standalone_test_model_work(
+    config: Mapping[str, Any],
+    dataset_plan: Mapping[str, Any],
+    *,
+    split: str,
+    image_count: Optional[int],
+) -> Dict[str, Any]:
+    """Estimate model inputs/batches from test mode, dimensions, slices, and recheck cap."""
+    test_settings = config.get("test", {})
+    if not isinstance(test_settings, Mapping):
+        test_settings = {}
+    mode = shared_modes.canonical_test_mode(
+        {
+            "test_mode": config.get("test_mode", test_settings.get("test_mode", {})),
+            "inference": config.get("inference", {}),
+        }
+    )
+    dimension_info = test_estimate_image_dimensions(
+        dataset_plan,
+        split=split,
+        image_count=image_count,
+    )
+    count = int(dimension_info["image_count"])
+    dimensions = list(dimension_info.pop("dimensions"))
+    outer_batch, outer_setting = _positive_batch_size(
+        test_settings.get("batch_size", 4),
+        automatic_default=4,
+    )
+    source_inputs = 0
+    slice_inputs = 0
+    secondary_inputs = 0
+    recheck_inputs = 0
+    model_batches = 0
+    model_batch = outer_batch
+    model_batch_setting: Any = outer_setting
+    recheck_basis = "disabled"
+
+    if mode == shared_modes.SAHI_MODE:
+        sahi = config.get("sahi", test_settings.get("sahi", {}))
+        if not isinstance(sahi, Mapping):
+            sahi = {}
+        model_batch, model_batch_setting = _positive_batch_size(
+            sahi.get("batch_size", 4),
+            automatic_default=16,
+        )
+        slice_counts = [
+            len(
+                shared_modes.generate_slice_windows_for_size(
+                    width=width,
+                    height=height,
+                    slice_width=int(sahi.get("slice_width", width)),
+                    slice_height=int(sahi.get("slice_height", height)),
+                    overlap_width_ratio=float(sahi.get("overlap_width_ratio", 0.2)),
+                    overlap_height_ratio=float(sahi.get("overlap_height_ratio", 0.2)),
+                )
+            )
+            for width, height in dimensions
+        ]
+        slice_inputs = sum(slice_counts)
+        standard_prediction = bool(sahi.get("standard_prediction", True))
+        source_inputs = count if standard_prediction else 0
+        recheck = sahi.get("recheck", {})
+        if not isinstance(recheck, Mapping):
+            recheck = {}
+        if bool(recheck.get("enabled", False)):
+            max_rechecks = max(0, int(recheck.get("max_rechecks_per_image", 50) or 0))
+            recheck_inputs = count * max_rechecks
+            recheck_basis = "conservative_per_image_cap"
+        for group_start in range(0, count, outer_batch):
+            group_slices = slice_counts[group_start : group_start + outer_batch]
+            group_count = len(group_slices)
+            model_batches += int(math.ceil(sum(group_slices) / model_batch))
+            if standard_prediction:
+                model_batches += int(math.ceil(group_count / model_batch))
+            if recheck_inputs:
+                max_rechecks = recheck_inputs // max(1, count)
+                model_batches += int(math.ceil(group_count * max_rechecks / model_batch))
+    elif mode == shared_modes.CLASS_CROP_MODE:
+        # The implementation always runs a source pass and then a crop or fallback pass.
+        source_inputs = count
+        secondary_inputs = count
+        model_batches = 2 * int(math.ceil(count / model_batch)) if count else 0
+    else:
+        source_inputs = count
+        model_batches = int(math.ceil(count / model_batch)) if count else 0
+
+    total_inputs = source_inputs + slice_inputs + secondary_inputs + recheck_inputs
+    return {
+        "mode": mode,
+        "images": count,
+        "source_inputs": source_inputs,
+        "slice_inputs": slice_inputs,
+        "secondary_inputs": secondary_inputs,
+        "recheck_input_cap": recheck_inputs,
+        "recheck_estimate_basis": recheck_basis,
+        "total_model_inputs": total_inputs,
+        "outer_batch_size": outer_batch,
+        "model_batch_size_setting": model_batch_setting,
+        "model_batch_size_assumed": model_batch,
+        "estimated_model_batches": model_batches,
+        "image_dimensions": dimension_info,
+    }
+
+
 def estimate_standalone_test_outputs(
     config: Mapping[str, Any],
     output_dir: Path,
@@ -530,6 +971,14 @@ def estimate_standalone_test_outputs(
     test_limit = trainer.parse_limit_value(test_settings.get("max_images"), "test.max_images")
     if test_limit is not None:
         image_count = min(int(image_count), test_limit) if image_count is not None else test_limit
+    model_work = estimate_standalone_test_model_work(
+        config,
+        dataset_plan,
+        split=split,
+        image_count=int(image_count) if image_count is not None else None,
+    )
+    if image_count is None and model_work["images"]:
+        image_count = int(model_work["images"])
     parallel_plan = build_test_parallel_plan(config, int(image_count) if image_count is not None else None)
     parallel_summary_files = 1 if parallel_plan["chunks"] > 1 else 0
 
@@ -593,12 +1042,14 @@ def estimate_standalone_test_outputs(
         "dataset_case_files": dataset_case_files,
         "plot_files": plot_files,
         "parallel_chunks": parallel_plan["chunks"],
+        "parallel_chunks_requested": parallel_plan["requested_chunks"],
         "parallel_model_replicas": parallel_plan["chunks"],
         "parallel_devices_requested": parallel_plan["devices_requested"],
         "parallel_chunk_devices": parallel_plan["chunk_devices"],
         "parallel_device_worker_counts": parallel_plan["device_worker_counts"],
         "parallel_summary_files": parallel_summary_files,
         "parallel_same_device_warning": parallel_plan["same_device_warning"],
+        "model_work": model_work,
         "tensorrt_cache": tensorrt_artifacts,
         "estimated_total_files": file_count,
         "estimated_disk_usage": trainer.format_bytes(approx_bytes),
@@ -609,13 +1060,14 @@ def estimate_standalone_test_outputs(
         config=config,
         output_dir=output_dir,
         task="test",
-        runtime_units=float(image_count or 0) / float(parallel_plan["unique_device_count"]),
+        runtime_units=float(model_work["total_model_inputs"]) / float(parallel_plan["unique_device_count"]),
         default_rate_key="default_test_seconds_per_image",
         basis={
             "test_images": image_count,
             "split": split,
             "parallel_chunks": parallel_plan["chunks"],
             "parallel_speedup_cap": parallel_plan["unique_device_count"],
+            "model_work": model_work,
         },
         extra_seconds=float(tensorrt_artifacts.get("estimated_build_seconds", 0) or 0),
     )
@@ -666,11 +1118,20 @@ def build_internal_test_config(config: Mapping[str, Any]) -> Dict[str, Any]:
     sahi = test.get("sahi") or internal.get("sahi") or periodic_source.get("sahi") or {}
     error_cases = test.get("error_cases") or periodic_source.get("error_cases") or {}
     visual_samples = dict(test.get("visual_samples") or periodic_source.get("visual_samples") or {})
+    artifacts = dict(test.get("artifacts") or {})
+    full_model_input_manifest = artifacts.get("full_model_input_manifest", False)
+    if not isinstance(full_model_input_manifest, bool):
+        raise ValueError("test.artifacts.full_model_input_manifest must be a boolean.")
+    artifacts["full_model_input_manifest"] = full_model_input_manifest
     parallel_source = test.get("parallel", {}) or {}
     if not isinstance(parallel_source, Mapping):
         raise ValueError("test.parallel must be a mapping.")
     parallel = dict(parallel_source)
     parallel["chunks"] = normalize_test_parallel_chunks(parallel.get("chunks", 1))
+    allow_oversubscription = parallel.get("allow_same_gpu_oversubscription", False)
+    if not isinstance(allow_oversubscription, bool):
+        raise ValueError("test.parallel.allow_same_gpu_oversubscription must be a boolean.")
+    parallel["allow_same_gpu_oversubscription"] = allow_oversubscription
     visual_sample_cap = _non_negative_int_or_none(visual_samples.get("max_images"))
     if visual_samples.get("max_images") is not None:
         visual_samples["max_images"] = visual_sample_cap
@@ -700,11 +1161,13 @@ def build_internal_test_config(config: Mapping[str, Any]) -> Dict[str, Any]:
         "model_input_batch_size": int(test.get("model_input_batch_size", periodic_source.get("model_input_batch_size", 9)) or 9),
         "batch_size": int(test.get("batch_size", periodic_source.get("batch_size", 4)) or 4),
         "error_cases": dict(error_cases),
+        "artifacts": artifacts,
         "conf": model.get("confidence_threshold", 0.25),
         "match_iou_threshold": evaluation.get("match_iou_threshold", 0.5),
         "max_dets": _last_max_det(evaluation),
     }
     internal["test"] = test_settings
+    apply_test_parallel_device_policy(internal)
 
     internal["periodic_test"] = {
         "enabled": False,
@@ -760,8 +1223,23 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
     parser.add_argument("--test-mode", choices=["full_image", "sahi", "class_crop"], help="Test mode override.")
     parser.add_argument("--max-images", type=trainer.parse_scalar, help="Maximum test images to evaluate. Use all/null for all.")
     parser.add_argument("--batch-size", type=int, help="RF-DETR full-image/class-crop evaluator batch size.")
-    parser.add_argument("--sahi-batch-size", type=int, help="RF-DETR SAHI slice/recheck batch size.")
+    parser.add_argument(
+        "--sahi-batch-size",
+        type=trainer.parse_scalar,
+        help="RF-DETR SAHI slice/recheck batch size or auto.",
+    )
+    parser.add_argument(
+        "--performance-profile",
+        choices=["safe", "fast"],
+        help="Apply safe PyTorch BF16 or fast TensorRT FP16 defaults before explicit backend overrides.",
+    )
     parser.add_argument("--chunks", type=int, help="Concurrent standalone test chunks/model replicas.")
+    parser.add_argument(
+        "--allow-same-gpu-oversubscription",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Allow multiple concurrent model replicas on one GPU (disabled by default).",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Validate and print planned output without inference.")
     parser.add_argument("--yes", action="store_true", help="Skip confirmation.")
     cpu_runtime.add_cpu_cli_arguments(parser)
@@ -772,9 +1250,17 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
         if not source_config.is_absolute():
             source_config = (Path.cwd() / source_config).resolve()
         config = load_yaml(source_config)
+        if args.performance_profile is not None:
+            config.setdefault("runtime", {})["performance_profile"] = args.performance_profile
+        selected_performance_profile = apply_test_performance_profile(config)
         apply_cli_overrides(config, args)
         cpu_summary = cpu_runtime.validate_active_config(config, "test", source_config)
         print(cpu_runtime.format_summary(cpu_summary))
+        parallel_policy_message = apply_test_parallel_device_policy(config)
+        if parallel_policy_message:
+            print(Fore.YELLOW + parallel_policy_message)
+        if selected_performance_profile is not None:
+            print(Fore.BLUE + f"Test performance profile: {selected_performance_profile}")
         internal_config = build_internal_test_config(config)
         trainer._require_custom_architecture_checkpoint(internal_config, "Standalone test")
         validate_parallel_test_compatibility(internal_config)
@@ -790,7 +1276,16 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
         output_dir = trainer.build_output_dir(internal_config, timestamp)
         if timing_context is not None:
             timing_context["output_dir"] = str(output_dir)
-        dataset_plan = trainer.build_dataset_plan(internal_config, output_dir, source_config)
+        test_split = str(internal_config.get("test", {}).get("split", "test"))
+        dataset_plan = trainer.build_dataset_plan(
+            internal_config,
+            output_dir,
+            source_config,
+            required_splits=[test_split],
+            required_split_limits={
+                test_split: internal_config.get("test", {}).get("max_images")
+            },
+        )
         bar.update(1)
 
         if output_dir.exists() and not bool(internal_config.get("output", {}).get("exist_ok", False)):

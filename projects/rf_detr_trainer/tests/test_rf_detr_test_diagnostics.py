@@ -17,6 +17,29 @@ from projects.object_detection_dataset_evaluator import object_detection_dataset
 
 
 class RfDetrTestDiagnosticsTest(unittest.TestCase):
+    def test_parallel_stage_timing_preserves_wall_and_worker_aggregate(self):
+        result = {
+            "stats": [
+                {"elapsed_seconds": 10.0, "model_forward_seconds": 8.0},
+                {"elapsed_seconds": 10.0, "model_forward_seconds": 8.0},
+            ],
+            "parallel_summary": {
+                "chunks": 2,
+                "wall_seconds": 11.0,
+                "assignments": [
+                    {"model_load_seconds": 1.0, "inference_seconds": 9.0},
+                    {"model_load_seconds": 1.0, "inference_seconds": 9.0},
+                ],
+            },
+        }
+
+        timing = test_runner.normalized_stage_timing(result)
+
+        self.assertEqual(timing["total_seconds"], 20.0)
+        self.assertEqual(timing["critical_path_wall_seconds"], 11.0)
+        self.assertEqual(timing["aggregate_worker_seconds"], 20.0)
+        self.assertEqual(timing["parallel_worker_count"], 2)
+
     def test_visual_sample_count_caps_error_cases(self):
         config = {
             "model": {"confidence_threshold": 0.25},
@@ -46,6 +69,22 @@ class RfDetrTestDiagnosticsTest(unittest.TestCase):
 
         self.assertIsNone(test_runner.build_internal_test_config(all_config)["test"]["max_images"])
         self.assertEqual(test_runner.build_internal_test_config(limited_config)["test"]["max_images"], 5)
+
+    def test_full_model_input_manifest_policy_is_boolean_and_defaults_off(self):
+        base = {"model": {}, "dataset": {}, "test": {}}
+        self.assertFalse(
+            test_runner.build_internal_test_config(base)["test"]["artifacts"][
+                "full_model_input_manifest"
+            ]
+        )
+
+        invalid = {
+            "model": {},
+            "dataset": {},
+            "test": {"artifacts": {"full_model_input_manifest": "false"}},
+        }
+        with self.assertRaisesRegex(ValueError, "full_model_input_manifest"):
+            test_runner.build_internal_test_config(invalid)
 
     def test_render_football_error_cases_outputs_images_and_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:

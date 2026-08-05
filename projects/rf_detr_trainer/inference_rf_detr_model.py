@@ -25,6 +25,7 @@ import contextlib
 import json
 import math
 import shutil
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -106,7 +107,37 @@ def load_yaml(path: Path) -> Dict[str, Any]:
     return trainer.load_yaml(path)
 
 
+def apply_performance_profile(config: MutableMapping[str, Any], profile: str) -> None:
+    """Apply stable runtime defaults without changing model architecture or slice geometry."""
+    normalized = str(profile).strip().lower()
+    if normalized not in {"safe", "fast"}:
+        raise ValueError("performance profile must be safe or fast.")
+    runtime = config.setdefault("runtime", {})
+    runtime["performance_profile"] = normalized
+    model = config.setdefault("model", {})
+    optimization = model.setdefault("inference_optimization", {})
+    inference = config.setdefault("inference", {})
+    video = inference.setdefault("video", {})
+    video["streaming"] = True
+    tracking = inference.setdefault("tracking", {})
+    hybrid = tracking.setdefault("hybrid", {})
+    cmc = hybrid.setdefault("cmc", {})
+    if normalized == "safe":
+        optimization["backend"] = "pytorch"
+        optimization.setdefault("pytorch", {})["precision"] = "bf16"
+        cmc["processing_scale"] = 1.0
+    else:
+        optimization["backend"] = "tensorrt"
+        optimization.setdefault("tensorrt", {})["precision"] = "fp16"
+        cmc["processing_scale"] = 0.5
+
+
 def apply_cli_overrides(config: MutableMapping[str, Any], args: argparse.Namespace) -> None:
+    configured_profile = getattr(args, "performance_profile", None) or (
+        config.get("runtime", {}) or {}
+    ).get("performance_profile")
+    if configured_profile:
+        apply_performance_profile(config, str(configured_profile))
     runtime = config.setdefault("runtime", {})
     cpu_runtime.apply_cpu_cli_overrides(config, args)
     output = config.setdefault("output", {})
@@ -159,6 +190,18 @@ def apply_cli_overrides(config: MutableMapping[str, Any], args: argparse.Namespa
         inference["batch_size"] = args.batch_size
     if args.video_batch_size is not None:
         inference.setdefault("video", {})["batch_size"] = args.video_batch_size
+    if getattr(args, "sahi_batch_size", None) is not None:
+        config.setdefault("sahi", {})["batch_size"] = args.sahi_batch_size
+    if getattr(args, "video_streaming", None) is not None:
+        inference.setdefault("video", {})["streaming"] = bool(args.video_streaming)
+    if getattr(args, "save_video", None) is not None:
+        inference.setdefault("video", {})["save_video"] = bool(args.save_video)
+    if getattr(args, "cmc_processing_scale", None) is not None:
+        if not 0.0 < float(args.cmc_processing_scale) <= 1.0:
+            raise ValueError("--cmc-processing-scale must be in the range (0, 1].")
+        inference.setdefault("tracking", {}).setdefault("hybrid", {}).setdefault("cmc", {})[
+            "processing_scale"
+        ] = args.cmc_processing_scale
     if args.max_seconds is not None:
         inference.setdefault("video", {})["max_seconds"] = args.max_seconds
     if args.video_start_time is not None:
@@ -360,6 +403,8 @@ def estimate_video_work(item: SourceItem, video_cfg: Mapping[str, Any]) -> Dict[
     """Estimate processed/output video frames without running inference."""
     input_fps = 30.0
     frame_count = 0
+    width = 1920
+    height = 1080
     metadata_source = "fallback"
     if item.local_path and item.local_path.exists():
         with contextlib.suppress(Exception):
@@ -369,6 +414,8 @@ def estimate_video_work(item: SourceItem, video_cfg: Mapping[str, Any]) -> Dict[
             if capture.isOpened():
                 input_fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0) or 30.0
                 frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or width)
+                height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or height)
                 metadata_source = "local-video"
             capture.release()
     window = video_frame_window(frame_count, input_fps, video_cfg)
@@ -390,7 +437,61 @@ def estimate_video_work(item: SourceItem, video_cfg: Mapping[str, Any]) -> Dict[
         "output_frames": output_frames,
         "detection_frames": detection_frames,
         "input_fps": input_fps,
+        "width": width,
+        "height": height,
         "metadata_source": metadata_source,
+    }
+
+
+def estimated_rfdetr_workload(
+    width: int,
+    height: int,
+    units: int,
+    config: Mapping[str, Any],
+) -> Dict[str, int]:
+    """Estimate actual model inputs/batches for full-image or SAHI inference."""
+    unit_count = max(0, int(units))
+    inference = dict(config.get("inference", {}) or {})
+    mode = str(inference.get("mode", "full_image")).strip().lower()
+    if mode != "sahi":
+        batch = inference_batch_size(config)
+        return {
+            "source_units": unit_count,
+            "slice_inputs": 0,
+            "standard_inputs": unit_count,
+            "recheck_input_cap": 0,
+            "model_inputs": unit_count,
+            "model_batches": int(math.ceil(unit_count / max(1, batch))) if unit_count else 0,
+        }
+    sahi = dict(config.get("sahi", {}) or {})
+    windows = evaluator.shared_modes.generate_slice_windows_for_size(
+        width=max(1, int(width)),
+        height=max(1, int(height)),
+        slice_width=int(sahi.get("slice_width", width) or width),
+        slice_height=int(sahi.get("slice_height", height) or height),
+        overlap_width_ratio=float(sahi.get("overlap_width_ratio", 0.2)),
+        overlap_height_ratio=float(sahi.get("overlap_height_ratio", 0.2)),
+    )
+    raw_batch = sahi.get("batch_size", 16)
+    batch = 16 if isinstance(raw_batch, str) and raw_batch.strip().lower() == "auto" else max(1, int(raw_batch or 16))
+    slices_per_unit = len(windows)
+    standard_per_unit = int(bool(sahi.get("standard_prediction", True)))
+    recheck = dict(sahi.get("recheck", {}) or {})
+    recheck_cap_per_unit = (
+        max(0, int(recheck.get("max_rechecks_per_image", 50) or 0))
+        if bool(recheck.get("enabled", False))
+        else 0
+    )
+    primary_batches = math.ceil(slices_per_unit / batch) + standard_per_unit
+    return {
+        "source_units": unit_count,
+        "slice_inputs": unit_count * slices_per_unit,
+        "standard_inputs": unit_count * standard_per_unit,
+        "recheck_input_cap": unit_count * recheck_cap_per_unit,
+        "model_inputs": unit_count * (slices_per_unit + standard_per_unit),
+        # Recheck is content-dependent; report its cap separately and avoid a
+        # worst-case estimate that historically overstates the common path.
+        "model_batches": unit_count * primary_batches,
     }
 
 
@@ -479,6 +580,29 @@ def estimate_outputs(items: Sequence[SourceItem], output_dir: Path, config: Mapp
     video_work = [estimate_video_work(item, video_cfg) for item in items if item.kind == "video"]
     detection_frames = sum(int(work["detection_frames"]) for work in video_work)
     output_frames = sum(int(work["output_frames"]) for work in video_work)
+    video_model_work = [
+        estimated_rfdetr_workload(
+            int(work["width"]),
+            int(work["height"]),
+            int(work["detection_frames"]),
+            config,
+        )
+        for work in video_work
+    ]
+    image_model_work: List[Dict[str, int]] = []
+    for item in items:
+        if item.kind != "image":
+            continue
+        width = height = int(config.get("model", {}).get("resolution") or 640)
+        if item.local_path is not None:
+            with contextlib.suppress(Exception), Image.open(item.local_path) as image:
+                width, height = image.size
+        image_model_work.append(estimated_rfdetr_workload(width, height, 1, config))
+    combined_model_work = image_model_work + video_model_work
+    model_inputs = sum(work["model_inputs"] for work in combined_model_work)
+    model_batches = sum(work["model_batches"] for work in combined_model_work)
+    slice_inputs = sum(work["slice_inputs"] for work in combined_model_work)
+    recheck_input_cap = sum(work["recheck_input_cap"] for work in combined_model_work)
     start_seconds = parse_video_time_seconds(video_cfg.get("start_time", 0), "inference.video.start_time", default=0.0) or 0.0
     end_seconds = parse_video_time_seconds(video_cfg.get("end_time", "all"), "inference.video.end_time", allow_all=True, default=None)
     max_seconds = parse_seconds_limit(video_cfg.get("max_seconds"))
@@ -486,7 +610,8 @@ def estimate_outputs(items: Sequence[SourceItem], output_dir: Path, config: Mapp
     for item in items:
         if item.local_path and item.local_path.exists():
             local_bytes += item.local_path.stat().st_size
-    output_files = 5 + image_count + video_count
+    save_video = bool(video_cfg.get("save_video", True))
+    output_files = 5 + image_count + (video_count if save_video else 0)
     if bool(config.get("inference", {}).get("save_predictions_jsonl", True)):
         output_files += 1
     if bool(
@@ -509,6 +634,10 @@ def estimate_outputs(items: Sequence[SourceItem], output_dir: Path, config: Mapp
         "video_max_seconds": max_seconds if max_seconds is not None else "all",
         "estimated_video_detection_frames": detection_frames,
         "estimated_video_output_frames": output_frames,
+        "estimated_model_inputs": model_inputs,
+        "estimated_model_batches": model_batches,
+        "estimated_sahi_slice_inputs": slice_inputs,
+        "estimated_recheck_input_cap": recheck_input_cap,
         "tensorrt_cache": tensorrt_artifacts,
         "estimated_total_files": output_files,
         "estimated_disk_usage": trainer.format_bytes(estimated_bytes),
@@ -521,7 +650,7 @@ def estimate_outputs(items: Sequence[SourceItem], output_dir: Path, config: Mapp
         config=config,
         output_dir=output_dir,
         task="inference",
-        runtime_units=float(image_count + detection_frames),
+        runtime_units=float(model_batches),
         default_rate_key="default_inference_seconds_per_image",
         basis={
             "image_sources": image_count,
@@ -529,6 +658,7 @@ def estimate_outputs(items: Sequence[SourceItem], output_dir: Path, config: Mapp
             "video_detection_frames": detection_frames,
             "video_output_frames": output_frames,
             "video_work": video_work,
+            "model_work": combined_model_work,
         },
         extra_seconds=render_seconds + float(tensorrt_artifacts.get("estimated_build_seconds", 0) or 0),
     )
@@ -802,9 +932,9 @@ def draw_track_overlays(
         color = track_color(track.track_id) if tracking_cfg.trajectory_per_track_color else base_color
         # Live position: velocity-extrapolated through detection gaps so the ball keeps moving smoothly.
         live_x, live_y = video_tracking.live_center(track, current_frame_index, tracking_cfg)
-        # Historical points (age-filtered, already linearly bridged) plus the live head.
+        # Historical observed points (age-filtered and linearly bridged), optionally plus the predicted live head.
         xy = video_tracking.trail_points(track, current_frame_index, tracking_cfg)
-        if not xy or xy[-1] != (live_x, live_y):
+        if getattr(tracking_cfg, "draw_predicted_trajectory", False) and (not xy or xy[-1] != (live_x, live_y)):
             xy = xy + [(live_x, live_y)]
         if tracking_cfg.draw_trajectory and len(xy) >= 2:
             if tracking_cfg.trajectory_taper:
@@ -931,6 +1061,78 @@ def record_inference_timing_rows(model: Any, rows: Sequence[Mapping[str, Any]]) 
     collected.extend(dict(row) for row in rows if isinstance(row, Mapping))
 
 
+def record_video_pipeline_timing(model: Any, **values: Any) -> None:
+    """Accumulate video-only wall stages and workload counters on the predictor."""
+    state = getattr(model, "_rf_detr_video_pipeline_timing", None)
+    if not isinstance(state, dict):
+        state = {}
+        try:
+            setattr(model, "_rf_detr_video_pipeline_timing", state)
+        except (AttributeError, TypeError):
+            return
+    for key, value in values.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        if key.endswith(("_peak", "_batch_size", "_vram_used_bytes")) or key.startswith("peak_"):
+            state[key] = max(float(state.get(key, 0.0) or 0.0), float(value))
+        else:
+            state[key] = float(state.get(key, 0.0) or 0.0) + float(value)
+
+
+def cuda_memory_telemetry_for_model(model: Any) -> Dict[str, int]:
+    """Return CUDA memory telemetry for the model's actual device.
+
+    ``torch.cuda.max_memory_allocated()`` without a device silently queries the
+    current/default GPU.  That produced a false zero whenever inference used a
+    non-default device such as ``cuda:2``.
+    """
+
+    empty = {
+        "peak_vram_bytes": 0,
+        "peak_vram_reserved_bytes": 0,
+        "device_vram_used_bytes": 0,
+    }
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return empty
+        device: Any = None
+        with contextlib.suppress(Exception):
+            device = trainer.get_inference_acceleration_handle(model).device
+        if device is None:
+            device = getattr(model, "device", None)
+        if device is None:
+            device = getattr(getattr(model, "model", None), "device", None)
+        if device is None:
+            return empty
+        resolved = device if isinstance(device, torch.device) else torch.device(device)
+        if resolved.type != "cuda":
+            return empty
+        result = dict(empty)
+        with contextlib.suppress(Exception):
+            result["peak_vram_bytes"] = int(torch.cuda.max_memory_allocated(resolved))
+        with contextlib.suppress(Exception):
+            result["peak_vram_reserved_bytes"] = int(torch.cuda.max_memory_reserved(resolved))
+        with contextlib.suppress(Exception):
+            free_bytes, total_bytes = torch.cuda.mem_get_info(resolved)
+            # This device-level value includes TensorRT allocations that the
+            # PyTorch caching allocator cannot observe.  On a shared GPU it may
+            # also include other processes, so it is reported separately.
+            result["device_vram_used_bytes"] = max(0, int(total_bytes) - int(free_bytes))
+        return result
+    except Exception:
+        # Timing telemetry must never make an otherwise successful inference
+        # run fail on a third-party predictor or a CPU-only torch build.
+        return empty
+
+
+def peak_vram_bytes_for_model(model: Any) -> int:
+    """Backward-compatible peak PyTorch allocation accessor."""
+
+    return cuda_memory_telemetry_for_model(model)["peak_vram_bytes"]
+
+
 def summarize_inference_timing_rows(model: Any) -> Dict[str, Any]:
     """Aggregate per-image evaluator timing into stable stage totals and ratios."""
     rows = getattr(model, "_rf_detr_inference_timing_rows", [])
@@ -940,26 +1142,116 @@ def summarize_inference_timing_rows(model: Any) -> Dict[str, Any]:
     def total(key: str) -> float:
         return sum(float(row.get(key, 0.0) or 0.0) for row in rows if isinstance(row, Mapping))
 
-    elapsed = total("elapsed_seconds")
+    evaluator_elapsed = total("elapsed_seconds")
     model_forward = total("model_forward_seconds")
     base_forward = total("base_model_forward_seconds")
     sahi_forward = total("sahi_model_forward_seconds")
     recheck_forward = total("recheck_model_forward_seconds")
     preprocess = total("preprocess_seconds")
     postprocess = total("postprocess_seconds")
-    return {
+    crop = total("crop_seconds")
+    host_preprocess = total("host_preprocess_seconds")
+    device_preprocess = total("device_preprocess_seconds")
+    h2d = total("h2d_seconds")
+    resize_normalize = total("resize_normalize_seconds")
+    orchestration = total("orchestration_seconds")
+    autotune = total("autotune_seconds")
+    exclusive_postprocess = total("exclusive_postprocess_seconds")
+    video_timing = getattr(model, "_rf_detr_video_pipeline_timing", {})
+    if not isinstance(video_timing, Mapping):
+        video_timing = {}
+    video_wall = float(video_timing.get("video_pipeline_wall_seconds", 0.0) or 0.0)
+    video_evaluator = float(video_timing.get("video_evaluator_seconds", 0.0) or 0.0)
+    elapsed = evaluator_elapsed + max(0.0, video_wall - video_evaluator)
+    slice_inputs = sum(int(row.get("slice_count", 0) or 0) for row in rows if isinstance(row, Mapping))
+    recheck_inputs = sum(
+        int(
+            dict(row.get("sahi_recheck", {}) or {}).get(
+                "rechecked",
+                dict(row.get("sahi_recheck", {}) or {}).get("candidate_count", 0),
+            )
+            or 0
+        )
+        for row in rows
+        if isinstance(row, Mapping)
+    )
+    workload = getattr(model, "_rf_detr_workload_counters", {})
+    if not isinstance(workload, Mapping):
+        workload = {}
+    slice_inputs = int(workload.get("slice_inputs", slice_inputs) or 0)
+    recheck_inputs = int(workload.get("recheck_inputs", recheck_inputs) or 0)
+    model_batches = int(workload.get("model_batches", 0) or 0)
+
+    def positive_batch_values(key: str) -> List[int]:
+        values: set[int] = set()
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            raw = row.get(key)
+            candidates = raw if isinstance(raw, (list, tuple, set)) else [raw]
+            for candidate in candidates:
+                if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate > 0:
+                    values.add(candidate)
+        return sorted(values)
+
+    summary = {
         "images_or_frames": len(rows),
+        # Timing history for SAHI inference is normalized by actual model
+        # batches, matching estimate_outputs().  Falling back to frames keeps
+        # external/legacy predictors usable when workload counters are absent.
+        "runtime_units": model_batches if model_batches > 0 else len(rows),
         "total_seconds": elapsed,
+        "evaluator_seconds": evaluator_elapsed,
         "model_forward_seconds": model_forward,
         "base_model_forward_seconds": base_forward,
         "sahi_model_forward_seconds": sahi_forward,
         "recheck_model_forward_seconds": recheck_forward,
         "preprocess_seconds": preprocess,
+        "crop_seconds": crop,
+        "host_preprocess_seconds": host_preprocess,
+        "h2d_seconds": h2d,
+        "resize_normalize_seconds": resize_normalize,
+        "device_preprocess_seconds": device_preprocess,
+        "h2d_resize_normalize_seconds": h2d + resize_normalize,
+        "orchestration_seconds": orchestration,
+        "autotune_seconds": autotune,
         "postprocess_seconds": postprocess,
+        "exclusive_postprocess_seconds": exclusive_postprocess,
         "model_forward_ratio": model_forward / elapsed if elapsed > 0 else 0.0,
         "sahi_model_forward_ratio": sahi_forward / elapsed if elapsed > 0 else 0.0,
         "recheck_model_forward_ratio": recheck_forward / elapsed if elapsed > 0 else 0.0,
+        "source_frames": int(video_timing.get("source_frames", 0) or 0),
+        "detection_frames": int(video_timing.get("detection_frames", 0) or 0),
+        "slice_inputs": slice_inputs,
+        "recheck_inputs": recheck_inputs,
+        "model_batches": model_batches,
+        "model_inputs": int(workload.get("model_inputs", 0) or 0),
+        "oom_retries": int(workload.get("oom_retries", 0) or 0),
+        "slice_batches": int(workload.get("slice_batches", 0) or 0),
+        "recheck_batches": int(workload.get("recheck_batches", 0) or 0),
+        "standard_batches": int(workload.get("standard_batches", 0) or 0),
+        "requested_sahi_batch_sizes": positive_batch_values("requested_slice_batch_size"),
+        "effective_sahi_batch_sizes": positive_batch_values("effective_slice_batch_sizes")
+        or positive_batch_values("slice_batch_size"),
+        "observed_sahi_batch_sizes": positive_batch_values("observed_slice_batch_sizes"),
     }
+    for key in (
+        "video_pipeline_wall_seconds",
+        "decode_seconds",
+        "frame_conversion_seconds",
+        "video_evaluator_seconds",
+        "tracker_seconds",
+        "render_seconds",
+        "encode_seconds",
+        "serialization_seconds",
+        "frame_queue_peak",
+        "peak_vram_bytes",
+        "peak_vram_reserved_bytes",
+        "device_vram_used_bytes",
+        "outer_batch_size",
+    ):
+        summary[key] = float(video_timing.get(key, 0.0) or 0.0)
+    return summary
 
 
 def load_rfdetr_model(config: Mapping[str, Any]) -> Any:
@@ -1134,7 +1426,11 @@ def prediction_config_with_batch(prediction_config: Mapping[str, Any], batch_siz
     configured["inference"] = dict(configured.get("inference", {}) or {})
     configured["inference"]["batch_size"] = max(1, int(batch_size))
     configured["sahi"] = dict(configured.get("sahi", {}) or {})
-    configured["sahi"]["batch_size"] = max(1, int(configured["sahi"].get("batch_size", batch_size) or batch_size))
+    requested_sahi_batch = configured["sahi"].get("batch_size", batch_size)
+    if isinstance(requested_sahi_batch, str) and requested_sahi_batch.strip().lower() == "auto":
+        configured["sahi"]["batch_size"] = "auto"
+    else:
+        configured["sahi"]["batch_size"] = max(1, int(requested_sahi_batch or batch_size))
     return configured
 
 
@@ -1563,6 +1859,293 @@ def predict_video_file_batched(
     return all_predictions, target, image_id
 
 
+def predict_video_file_streaming(
+    item: SourceItem,
+    start_image_id: int,
+    model: Any,
+    prediction_config: Mapping[str, Any],
+    categories: Sequence[Mapping[str, Any]],
+    output_dir: Path,
+    render_ids: Sequence[int],
+    video_cfg: Mapping[str, Any],
+    batch_size: int,
+    tracking_config: Optional[Any] = None,
+    tracker_device: str = "cpu",
+    tracking_state_rows: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[List[Dict[str, Any]], Optional[Path], int]:
+    """Decode, batch, track, render, and encode a selected video range once.
+
+    Frames are retained only until either a model batch is full or the bounded
+    queue reaches ``queue_size``. Decoded RGB images are sent directly to the
+    evaluator, avoiding the historical JPEG round trip and second video decode.
+    """
+    import cv2
+
+    assert item.local_path is not None
+    pipeline_started = time.perf_counter()
+    capture = cv2.VideoCapture(str(item.local_path))
+    if not capture.isOpened():
+        raise RuntimeError(f"Could not open video for streaming inference: {item.local_path}")
+    input_fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0) or 30.0
+    output_fps = float(video_cfg.get("output_fps") or input_fps)
+    detection_fps = video_cfg.get("detection_fps")
+    frame_interval = 1
+    if detection_fps is not None:
+        frame_interval = max(1, int(round(input_fps / max(0.001, float(detection_fps)))))
+    width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    frame_window = video_frame_window(frame_count, input_fps, video_cfg)
+    frame_limit = frame_window.output_frames
+    if frame_window.start_frame > 0 and not capture.set(cv2.CAP_PROP_POS_FRAMES, frame_window.start_frame):
+        capture.release()
+        raise RuntimeError(f"Could not seek video for streaming inference: {item.local_path}")
+
+    save_video = bool(video_cfg.get("save_video", True))
+    target: Optional[Path] = None
+    writer: Any = None
+    if save_video:
+        video_dir = output_dir / "videos"
+        video_dir.mkdir(parents=True, exist_ok=True)
+        target = video_dir / f"{trainer.sanitize_name(item.local_path.stem)}_pred.mp4"
+        writer = cv2.VideoWriter(
+            str(target),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            output_fps,
+            (width, height),
+        )
+        if not writer.isOpened():
+            capture.release()
+            writer.release()
+            raise RuntimeError(f"Could not create video writer: {target}")
+
+    batch_config = prediction_config_with_batch(prediction_config, batch_size)
+    queue_size = positive_batch_size(
+        video_cfg.get("queue_size"),
+        "inference.video.queue_size",
+        max(8, batch_size * 2),
+    )
+    queue_size = max(batch_size, queue_size)
+    render_skipped = bool(video_cfg.get("render_skipped_frames", True))
+    tracker = create_tracker(tracking_config, tracker_device, (width, height))
+    hybrid_tracking = is_hybrid_tracker(tracker)
+    all_predictions: List[Dict[str, Any]] = []
+    last_predictions: List[Dict[str, Any]] = []
+    pending_frames: List[Dict[str, Any]] = []
+    pending_detection_count = 0
+    image_id = start_image_id
+    stage = {
+        "decode_seconds": 0.0,
+        "frame_conversion_seconds": 0.0,
+        "video_evaluator_seconds": 0.0,
+        "tracker_seconds": 0.0,
+        "render_seconds": 0.0,
+        "encode_seconds": 0.0,
+        "source_frames": 0,
+        "detection_frames": 0,
+        "frame_queue_peak": 0,
+    }
+
+    def flush_pending() -> None:
+        nonlocal pending_detection_count, image_id, last_predictions
+        if not pending_frames:
+            return
+        detection_packets = [packet for packet in pending_frames if packet["should_detect"]]
+        predictions_by_segment: Dict[int, List[Dict[str, Any]]] = {}
+        if detection_packets:
+            records: List[evaluator.ImageRecord] = []
+            sources: List[Image.Image] = []
+            for packet in detection_packets:
+                packet_image_id = image_id + len(records)
+                absolute_index = int(packet["absolute_frame_index"])
+                records.append(
+                    evaluator.ImageRecord(
+                        image_id=packet_image_id,
+                        file_name=f"{item.local_path.stem}_frame_{absolute_index:06d}.jpg",
+                        # The evaluator receives ``sources`` below and must not
+                        # open this descriptive, intentionally non-existent path.
+                        path=f"memory://{item.local_path.stem}/{absolute_index}",
+                        width=width,
+                        height=height,
+                    )
+                )
+                conversion_started = time.perf_counter()
+                sources.append(
+                    Image.fromarray(
+                        cv2.cvtColor(packet["frame"], cv2.COLOR_BGR2RGB)
+                    )
+                )
+                stage["frame_conversion_seconds"] += time.perf_counter() - conversion_started
+            evaluate_started = time.perf_counter()
+            try:
+                predictions_by_frame, timing_rows, _ = evaluator.call_with_supported_kwargs(
+                    evaluator.predict_images_rfdetr,
+                    records,
+                    model,
+                    batch_config,
+                    output_dir,
+                    sources=sources,
+                )
+            finally:
+                for source_image in sources:
+                    source_image.close()
+            stage["video_evaluator_seconds"] += time.perf_counter() - evaluate_started
+            record_inference_timing_rows(model, timing_rows or [])
+            for packet, frame_predictions in zip(detection_packets, predictions_by_frame):
+                predictions_by_segment[int(packet["segment_frame_index"])] = (
+                    filter_final_inference_predictions(frame_predictions, batch_config)
+                )
+            image_id += len(records)
+
+        for packet in pending_frames:
+            segment_index = int(packet["segment_frame_index"])
+            absolute_index = int(packet["absolute_frame_index"])
+            frame = packet["frame"]
+            should_detect = bool(packet["should_detect"])
+            detected = predictions_by_segment.get(segment_index, []) if should_detect else []
+            frame_predictions: List[Dict[str, Any]]
+            tracker_started = time.perf_counter()
+            if hybrid_tracking:
+                committed = tracker.step(
+                    absolute_index,
+                    absolute_index / input_fps,
+                    frame,
+                    detected,
+                )
+                collect_hybrid_committed(
+                    committed,
+                    all_predictions,
+                    tracking_state_rows,
+                    item.source,
+                    input_fps,
+                    frame_window,
+                )
+                latest = tracker.latest_frame()
+                frame_predictions = list(latest["detections"]) if latest is not None else []
+            elif tracker is not None:
+                # Advance the tracker for every source frame. BoxMot and the
+                # built-in tracker then age tracks in source-frame units rather
+                # than detection-call units when detection_fps is reduced.
+                frame_predictions = tracker.update(absolute_index, detected, frame=frame)
+                for prediction in frame_predictions:
+                    all_predictions.append(
+                        build_video_row(
+                            prediction,
+                            item.source,
+                            absolute_index,
+                            segment_index,
+                            input_fps,
+                            frame_window,
+                        )
+                    )
+            else:
+                frame_predictions = detected if should_detect else last_predictions
+                if should_detect:
+                    for prediction in frame_predictions:
+                        all_predictions.append(
+                            build_video_row(
+                                prediction,
+                                item.source,
+                                absolute_index,
+                                segment_index,
+                                input_fps,
+                                frame_window,
+                            )
+                        )
+            stage["tracker_seconds"] += time.perf_counter() - tracker_started
+            if should_detect or tracker is not None:
+                last_predictions = frame_predictions
+
+            if writer is not None:
+                render_started = time.perf_counter()
+                if should_detect or render_skipped:
+                    pil_frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                    try:
+                        rendered = draw_predictions(
+                            pil_frame,
+                            frame_predictions,
+                            categories,
+                            render_ids,
+                            tracker.tracks if tracker is not None else None,
+                            tracking_config,
+                            absolute_index,
+                        )
+                        frame = cv2.cvtColor(np_image(rendered), cv2.COLOR_RGB2BGR)
+                    finally:
+                        pil_frame.close()
+                stage["render_seconds"] += time.perf_counter() - render_started
+                encode_started = time.perf_counter()
+                writer.write(frame)
+                stage["encode_seconds"] += time.perf_counter() - encode_started
+
+        pending_frames.clear()
+        pending_detection_count = 0
+
+    iterator = tqdm(total=frame_limit, desc=f"Stream video {item.local_path.name}", unit="frame")
+    segment_frame_index = 0
+    absolute_frame_index = frame_window.start_frame
+    try:
+        while True:
+            if frame_limit is not None and segment_frame_index >= frame_limit:
+                break
+            decode_started = time.perf_counter()
+            ok, frame = capture.read()
+            stage["decode_seconds"] += time.perf_counter() - decode_started
+            if not ok:
+                break
+            should_detect = segment_frame_index % frame_interval == 0
+            pending_frames.append(
+                {
+                    "segment_frame_index": segment_frame_index,
+                    "absolute_frame_index": absolute_frame_index,
+                    "should_detect": should_detect,
+                    "frame": frame,
+                }
+            )
+            pending_detection_count += int(should_detect)
+            stage["source_frames"] += 1
+            stage["detection_frames"] += int(should_detect)
+            stage["frame_queue_peak"] = max(stage["frame_queue_peak"], len(pending_frames))
+            if pending_detection_count >= batch_size or len(pending_frames) >= queue_size:
+                flush_pending()
+            segment_frame_index += 1
+            absolute_frame_index += 1
+            iterator.update(1)
+        flush_pending()
+        if hybrid_tracking:
+            collect_hybrid_committed(
+                tracker.flush(),
+                all_predictions,
+                tracking_state_rows,
+                item.source,
+                input_fps,
+                frame_window,
+            )
+    finally:
+        iterator.close()
+        capture.release()
+        if writer is not None:
+            writer.release()
+        pipeline_wall = time.perf_counter() - pipeline_started
+        cuda_memory = cuda_memory_telemetry_for_model(model)
+        record_video_pipeline_timing(
+            model,
+            video_pipeline_wall_seconds=pipeline_wall,
+            decode_seconds=stage["decode_seconds"],
+            frame_conversion_seconds=stage["frame_conversion_seconds"],
+            video_evaluator_seconds=stage["video_evaluator_seconds"],
+            tracker_seconds=stage["tracker_seconds"],
+            render_seconds=stage["render_seconds"],
+            encode_seconds=stage["encode_seconds"],
+            source_frames=stage["source_frames"],
+            detection_frames=stage["detection_frames"],
+            frame_queue_peak=stage["frame_queue_peak"],
+            **cuda_memory,
+            outer_batch_size=batch_size,
+        )
+    return all_predictions, target, image_id
+
+
 def predict_video_file(
     item: SourceItem,
     start_image_id: int,
@@ -1575,9 +2158,24 @@ def predict_video_file(
     tracking_config: Optional[Any] = None,
     tracker_device: str = "cpu",
     tracking_state_rows: Optional[List[Dict[str, Any]]] = None,
-) -> Tuple[List[Dict[str, Any]], Path, int]:
+) -> Tuple[List[Dict[str, Any]], Optional[Path], int]:
     """Predict one video with batched detection frames when configured."""
     configured_batch = positive_batch_size(video_cfg.get("batch_size"), "inference.video.batch_size", 1)
+    if bool(video_cfg.get("streaming", True)):
+        return predict_video_file_streaming(
+            item,
+            start_image_id,
+            model,
+            prediction_config,
+            categories,
+            output_dir,
+            render_ids,
+            video_cfg,
+            configured_batch,
+            tracking_config,
+            tracker_device,
+            tracking_state_rows,
+        )
     if configured_batch <= 1:
         return predict_video_file_one_pass(
             item, start_image_id, model, prediction_config, categories, output_dir, render_ids, video_cfg,
@@ -1673,6 +2271,33 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
     parser.add_argument("--max-videos", type=trainer.parse_scalar, help="Maximum video sources to run. Use all/null for all.")
     parser.add_argument("--batch-size", type=int, help="RF-DETR image-source inference batch size.")
     parser.add_argument("--video-batch-size", type=trainer.parse_scalar, help="RF-DETR video detection-frame batch size. all/null inherits --batch-size.")
+    parser.add_argument(
+        "--sahi-batch-size",
+        type=trainer.parse_scalar,
+        help="RF-DETR SAHI slice/recheck batch size: auto or a positive integer.",
+    )
+    parser.add_argument(
+        "--performance-profile",
+        choices=["safe", "fast"],
+        help="Runtime profile: safe=PyTorch BF16/full-scale CMC; fast=TensorRT FP16/half-scale CMC.",
+    )
+    parser.add_argument(
+        "--video-streaming",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Use one-decode in-memory video inference (default: true).",
+    )
+    parser.add_argument(
+        "--save-video",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Write rendered MP4 output; disable for JSON-only inference.",
+    )
+    parser.add_argument(
+        "--cmc-processing-scale",
+        type=float,
+        help="Hybrid tracker CMC image scale in (0, 1], e.g. 0.5 for fast profile.",
+    )
     parser.add_argument("--max-seconds", type=trainer.parse_scalar, help="Maximum seconds per video to infer. Use all/null for the whole video.")
     parser.add_argument("--video-start-time", help="Video segment start time. Options: seconds, MM:SS, or HH:MM:SS.")
     parser.add_argument("--video-end-time", help="Video segment end time. Options: all/null, seconds, MM:SS, or HH:MM:SS.")
@@ -1859,9 +2484,17 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
                 track_state_rows,
             )
             all_predictions.extend(predictions)
-            outputs.append({"source": item.source, "kind": "video", "output": str(path), "predictions": len(predictions)})
+            outputs.append(
+                {
+                    "source": item.source,
+                    "kind": "video",
+                    "output": str(path) if path is not None else None,
+                    "predictions": len(predictions),
+                }
+            )
     flush_pending_images()
 
+    serialization_started = time.perf_counter()
     colors = {
         str(category_id): {"rgb": list(color), "hex": "#{:02x}{:02x}{:02x}".format(*color)}
         for category_id, color in color_map(categories, all_predictions).items()
@@ -1876,6 +2509,10 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
         output_dir,
         football_rows,
         football_output_config,
+    )
+    record_video_pipeline_timing(
+        model,
+        serialization_seconds=time.perf_counter() - serialization_started,
     )
     stage_timing = summarize_inference_timing_rows(model)
     if timing_context is not None:

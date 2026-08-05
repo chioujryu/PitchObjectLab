@@ -1,0 +1,55 @@
+# Accuracy-preserving single-GPU Medium-P2 video inference profile.
+extends: rf_detr_inference_medium.yaml
+
+runtime:
+  performance_profile: safe
+  cpu:
+    torch_intraop_threads: auto
+
+model:
+  pretrain_weights: /path/to/rfdetr_medium_p2_checkpoint.pth
+  resolution: 576
+  # This matched profile targets the one-class football checkpoint used by the
+  # historical 60-second benchmark. Change both this value and dataset names
+  # together when using a differently trained checkpoint.
+  num_classes: 1
+  p2:
+    enabled: true
+    projector_scale: [P2, P3, P4]
+  inference_optimization:
+    backend: pytorch
+    pytorch:
+      precision: bf16
+
+dataset:
+  class_names: [football]
+
+inference:
+  sources: [/path/to/video.mp4]
+  mode: sahi
+  batch_size: 8
+  video:
+    batch_size: 8
+    streaming: true
+    queue_size: 32
+    save_video: true
+  tracking:
+    enabled: true
+    algorithm: hybrid
+    hybrid:
+      cmc:
+        processing_scale: 1.0
+
+sahi:
+  slice_height: 320
+  slice_width: 320
+  overlap_height_ratio: 0.2
+  overlap_width_ratio: 0.2
+  standard_prediction: false
+  batch_size: auto
+  recheck:
+    enabled: true
+    crop_size: 640
+
+output:
+  name: rfdetr_medium_p2_safe_{timestamp}

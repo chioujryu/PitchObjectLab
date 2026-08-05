@@ -9,6 +9,10 @@ runtime:
     enabled: true
     # Percentage of logical CPUs shared by active model processes. Options: 1-100.
     budget_percent: 50
+    # PyTorch threads. auto keeps the per-process training CPU budget. Options: auto or positive integer.
+    torch_intraop_threads: auto
+  # Training performance profile label persisted into output metadata. Options: safe, fast, null.
+  performance_profile: null
   # Print wrapper status text in bright blue. Options: true, false.
   verbose: true
   # Validate config and estimate output files without starting training. Options: true, false.
@@ -170,6 +174,8 @@ output:
 
 # Training hyperparameters and runtime settings. Options: mapping.
 train:
+  # Autocast dtype used by training and scheduled evaluation. Options: auto, bf16, fp16.
+  amp_dtype: bf16
   # RF-DETR dataset root forwarded into TrainConfig. Options: empty to copy dataset.dataset_dir, or explicit path.
   dataset_dir: /home/new_users/zhiyu/datasets/soccer/spatial_perception/Xbotgo/站立运动员、足球、球门检测数据集V1/outputs/YoloFormat/all_parameters_sahi_object_crop_classcrop_train_val_960_classesall_max_samplesall
   # Dataset file type. Options: roboflow, coco, yolo, o365. roboflow auto-detects Roboflow COCO/YOLO layouts.
@@ -210,6 +216,8 @@ train:
   clip_max_norm: 0.1
   # Save archive checkpoint every N epochs. Options: positive integer.
   checkpoint_interval: 1
+  # Save the resumable last.ckpt every N epochs. Options: positive integer; 1 is safest.
+  save_last_interval: 1
   # Resume checkpoint path. Options: null, or path to RF-DETR .pth/.ckpt checkpoint.
   resume: null
   # Use exponential moving average weights. Options: true, false.

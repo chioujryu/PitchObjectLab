@@ -131,6 +131,27 @@ class DatasetBundle:
     source_kind: str
 
 
+@dataclass(frozen=True)
+class RFDetrDetectionBatch:
+    """Minimal RF-DETR detection payload consumed by the evaluator."""
+
+    xyxy: np.ndarray
+    confidence: np.ndarray
+    class_id: np.ndarray
+
+
+@dataclass(frozen=True)
+class RFDetrFastPredictionBatch:
+    """Fast-path detections with host/device preparation telemetry."""
+
+    detections: List[RFDetrDetectionBatch]
+    host_preprocess_seconds: float
+    h2d_seconds: float
+    resize_normalize_seconds: float
+    prepare_wall_seconds: float
+    device_preprocess_seconds: float
+
+
 class ParallelInferenceError(RuntimeError):
     """Report one or more failed parallel inference chunks with their terminal summary."""
 
@@ -1161,7 +1182,9 @@ def save_annotated_image(image: Image.Image, path: Path, output_info: Mapping[st
         png_info.add_text("config_hash", str(output_info["config_hash"]))
         image.save(path, pnginfo=png_info)
         return
-    image.convert("RGB").save(path, quality=max(1, min(100, int(quality))), optimize=True)
+    # Pillow's optimize pass is CPU-heavy and is not useful for disposable
+    # evaluator diagnostics.  Quality remains unchanged.
+    image.convert("RGB").save(path, quality=max(1, min(100, int(quality))), optimize=False)
 
 
 def render_visual_image(
@@ -2104,7 +2127,12 @@ def rfdetr_image_batch_size(config: Mapping[str, Any]) -> int:
 
 def rfdetr_sahi_batch_size(config: Mapping[str, Any]) -> int:
     """Return the RF-DETR SAHI slice/recheck batch size."""
-    return positive_int_setting(config.get("sahi", {}).get("batch_size"), rfdetr_image_batch_size(config), "sahi.batch_size")
+    value = config.get("sahi", {}).get("batch_size")
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        # Start at the measured single-GPU sweet spot.  The model-scoped OOM
+        # cache below persists a safe downshift for every later slice batch.
+        return 16
+    return positive_int_setting(value, rfdetr_image_batch_size(config), "sahi.batch_size")
 
 
 def batched_sequence(values: Sequence[Any], batch_size: int) -> Iterable[Sequence[Any]]:
@@ -2161,6 +2189,218 @@ def normalize_detection_list(result: Any, expected: int) -> List[Any]:
     raise ValueError(f"RF-DETR returned a single prediction result for {expected} input image(s).")
 
 
+_RFDETR_FALLBACK_SAFE_BATCH_SIZES: Dict[Tuple[Any, ...], int] = {}
+
+
+def _rfdetr_acceleration_handle(model: Any) -> Any:
+    """Return an explicitly attached acceleration handle, if present."""
+    model_state = getattr(model, "__dict__", None)
+    return (
+        model_state.get("_rf_detr_acceleration_handle")
+        if isinstance(model_state, dict)
+        else None
+    )
+
+
+def _rfdetr_safe_batch_cache(model: Any) -> MutableMapping[Tuple[Any, ...], int]:
+    """Return a model-lifetime OOM-safe batch cache without retaining real models globally."""
+    model_state = getattr(model, "__dict__", None)
+    if isinstance(model_state, dict):
+        cache = model_state.get("_rf_detr_safe_batch_sizes")
+        if not isinstance(cache, MutableMapping):
+            cache = {}
+            model_state["_rf_detr_safe_batch_sizes"] = cache
+        return cache
+    return _RFDETR_FALLBACK_SAFE_BATCH_SIZES
+
+
+def _rfdetr_workload_counters(model: Any) -> MutableMapping[str, int]:
+    """Return model-lifetime counters for actual successful inference work."""
+    model_state = getattr(model, "__dict__", None)
+    if not isinstance(model_state, dict):
+        return {}
+    counters = model_state.get("_rf_detr_workload_counters")
+    if not isinstance(counters, MutableMapping):
+        counters = {}
+        model_state["_rf_detr_workload_counters"] = counters
+    return counters
+
+
+def _rfdetr_workload_stage(workload_kind: Optional[str]) -> str:
+    """Normalize evaluator engine labels to compact workload counter names."""
+    kind = str(workload_kind or "full").strip().lower()
+    if "autotune" in kind:
+        return "autotune"
+    if "recheck" in kind:
+        return "recheck"
+    if "slice" in kind:
+        return "slice"
+    if "standard" in kind:
+        return "standard"
+    if "class_crop" in kind:
+        return "class_crop"
+    return "full"
+
+
+def _increment_rfdetr_workload(
+    model: Any,
+    *,
+    workload_kind: Optional[str],
+    inputs: int = 0,
+    batches: int = 0,
+    oom_retries: int = 0,
+) -> None:
+    """Accumulate actual inputs/batches/retries on the live model instance."""
+    counters = _rfdetr_workload_counters(model)
+    if not counters:
+        model_state = getattr(model, "__dict__", None)
+        if not isinstance(model_state, dict):
+            return
+        counters = model_state["_rf_detr_workload_counters"]
+    input_count = max(0, int(inputs))
+    batch_count = max(0, int(batches))
+    retry_count = max(0, int(oom_retries))
+    counters["model_inputs"] = int(counters.get("model_inputs", 0)) + input_count
+    counters["model_batches"] = int(counters.get("model_batches", 0)) + batch_count
+    counters["oom_retries"] = int(counters.get("oom_retries", 0)) + retry_count
+    stage = _rfdetr_workload_stage(workload_kind)
+    counters[f"{stage}_inputs"] = int(counters.get(f"{stage}_inputs", 0)) + input_count
+    counters[f"{stage}_batches"] = int(counters.get(f"{stage}_batches", 0)) + batch_count
+
+
+def _rfdetr_batch_cache_key(
+    model: Any,
+    inputs: Sequence[Any],
+    shape: Optional[Tuple[int, int]],
+) -> Tuple[Any, ...]:
+    """Build an OOM cache key from backend, device, precision, and model input shape."""
+    handle = _rfdetr_acceleration_handle(model)
+    metadata = getattr(handle, "metadata", None)
+    if not isinstance(metadata, Mapping):
+        metadata = {}
+    backend = str(metadata.get("effective_backend", getattr(handle, "backend", "pytorch")))
+    precision = str(metadata.get("effective_precision", getattr(handle, "precision", "unknown")))
+    device = "unknown"
+    with contextlib.suppress(Exception):
+        device = str(getattr(handle, "device"))
+    if device == "unknown":
+        with contextlib.suppress(Exception):
+            device = str(getattr(getattr(model, "model", None), "device"))
+    target_shape: Tuple[Any, ...]
+    if shape is not None:
+        target_shape = tuple(int(value) for value in shape)
+    else:
+        resolution = getattr(getattr(model, "model", None), "resolution", None)
+        target_shape = ("default", int(resolution)) if resolution is not None else ("default",)
+    input_characteristics = tuple(sorted({_rfdetr_input_characteristics(value) for value in inputs}, key=repr))
+    # Model identity is implicit for the instance-bound cache and explicit for
+    # immutable/proxy objects that must use the small fallback cache.
+    return (id(model), backend, precision, device, target_shape, input_characteristics)
+
+
+def _rfdetr_input_characteristics(value: Any) -> Tuple[Any, ...]:
+    """Describe source dimensions/dtype without decoding image pixels."""
+    if isinstance(value, Image.Image):
+        return ("pil", value.mode, int(value.height), int(value.width))
+    if isinstance(value, np.ndarray):
+        return ("numpy", str(value.dtype), tuple(int(dimension) for dimension in value.shape))
+    shape = getattr(value, "shape", None)
+    dtype = getattr(value, "dtype", None)
+    if shape is not None:
+        with contextlib.suppress(Exception):
+            return ("tensor", str(dtype), tuple(int(dimension) for dimension in shape))
+    if isinstance(value, (str, os.PathLike)) and not str(value).startswith(("http://", "https://")):
+        with contextlib.suppress(Exception):
+            with Image.open(value) as image:
+                return ("path", image.mode, int(image.height), int(image.width))
+    return (type(value).__name__,)
+
+
+def _rfdetr_rgb_array(value: Any) -> Optional[np.ndarray]:
+    """Resolve a supported RF-DETR source to a uint8 HWC RGB view/copy."""
+    if isinstance(value, (str, os.PathLike)):
+        with Image.open(value) as image:
+            return np.asarray(image.convert("RGB"), dtype=np.uint8).copy()
+    if isinstance(value, Image.Image):
+        image = value if value.mode == "RGB" else value.convert("RGB")
+        return np.asarray(image, dtype=np.uint8)
+    if isinstance(value, np.ndarray):
+        if value.dtype != np.uint8 or value.ndim != 3 or value.shape[2] != 3:
+            return None
+        return value
+    return None
+
+
+def _rfdetr_fast_predict_batch(
+    model: Any,
+    inputs: Sequence[Any],
+    *,
+    threshold: float,
+    shape: Optional[Tuple[int, int]],
+) -> Optional[RFDetrFastPredictionBatch]:
+    """Use one batched H2D/resize/normalize operation when raw inference is available.
+
+    Returning ``None`` means the input/adapter does not satisfy the fast-path
+    contract and the caller should use the upstream ``predict`` implementation.
+    Runtime/model errors after the contract is accepted intentionally propagate.
+    """
+    handle = _rfdetr_acceleration_handle(model)
+    prepare_batch = getattr(handle, "prepare_batch", None)
+    infer_raw = getattr(handle, "infer_raw", None)
+    postprocess = getattr(handle, "postprocess", None)
+    if not callable(prepare_batch) or not callable(infer_raw) or not callable(postprocess) or not inputs:
+        return None
+    if any(isinstance(value, str) and value.startswith(("http://", "https://")) for value in inputs):
+        # Upstream predict supports URLs; the local high-throughput preprocessor
+        # intentionally supports only local/in-memory sources.
+        return None
+
+    consume_preprocess_timing = getattr(handle, "consume_preprocess_timing", None)
+    if callable(consume_preprocess_timing):
+        consume_preprocess_timing()
+    prepared = prepare_batch(list(inputs), shape=shape)
+    metadata = getattr(handle, "metadata", None)
+    effective_backend = (
+        str(metadata.get("effective_backend", getattr(handle, "backend", "pytorch"))).lower()
+        if isinstance(metadata, Mapping)
+        else str(getattr(handle, "backend", "pytorch")).lower()
+    )
+    reuse_raw = getattr(handle, "infer_raw_reusing_buffers", None)
+    raw_callback = reuse_raw if effective_backend == "tensorrt" and callable(reuse_raw) else infer_raw
+    # This evaluator finishes postprocess and copies detections to CPU before
+    # returning, so TensorRT output buffers can be safely overwritten by the
+    # next sequential batch.
+    outputs = raw_callback(prepared.tensor)
+    results = postprocess(outputs, prepared.target_sizes)
+    if len(results) != len(inputs):
+        raise ValueError(f"RF-DETR raw postprocess returned {len(results)} result(s) for {len(inputs)} inputs.")
+
+    detections: List[RFDetrDetectionBatch] = []
+    for result in results:
+        scores = result["scores"]
+        keep = scores > float(threshold)
+        detections.append(
+            RFDetrDetectionBatch(
+                xyxy=result["boxes"][keep].float().detach().cpu().numpy(),
+                confidence=scores[keep].float().detach().cpu().numpy(),
+                class_id=result["labels"][keep].detach().cpu().numpy(),
+            )
+        )
+    if callable(consume_preprocess_timing):
+        preprocess_timing = consume_preprocess_timing()
+    else:
+        consume_prepared_timing = getattr(prepared, "consume_timing", None)
+        preprocess_timing = consume_prepared_timing() if callable(consume_prepared_timing) else {}
+    return RFDetrFastPredictionBatch(
+        detections=detections,
+        host_preprocess_seconds=max(0.0, float(preprocess_timing.get("host_preprocess_seconds", 0.0))),
+        h2d_seconds=max(0.0, float(preprocess_timing.get("h2d_seconds", 0.0))),
+        resize_normalize_seconds=max(0.0, float(preprocess_timing.get("resize_normalize_seconds", 0.0))),
+        prepare_wall_seconds=max(0.0, float(preprocess_timing.get("prepare_wall_seconds", 0.0))),
+        device_preprocess_seconds=max(0.0, float(preprocess_timing.get("device_preprocess_seconds", 0.0))),
+    )
+
+
 def rfdetr_predict_batches(
     model: Any,
     inputs: Sequence[Any],
@@ -2168,20 +2408,22 @@ def rfdetr_predict_batches(
     threshold: float,
     shape: Optional[Tuple[int, int]],
     batch_size: int,
+    workload_kind: Optional[str] = None,
 ) -> Tuple[List[Any], List[Dict[str, Any]]]:
     """Run RF-DETR model.predict on input batches with CUDA OOM downshift."""
     detections: List[Any] = []
     timing_rows: List[Dict[str, Any]] = []
-    model_state = getattr(model, "__dict__", None)
-    acceleration_handle = (
-        model_state.get("_rf_detr_acceleration_handle")
-        if isinstance(model_state, dict)
-        else None
-    )
+    acceleration_handle = _rfdetr_acceleration_handle(model)
     consume_forward = getattr(acceleration_handle, "consume_forward_seconds", None)
     consume_postprocess = getattr(acceleration_handle, "consume_postprocess_seconds", None)
     stage_aware = callable(consume_forward) and callable(consume_postprocess)
-    active_batch_size = max(1, int(batch_size))
+    requested_batch_size = max(1, int(batch_size))
+    safe_batch_cache = _rfdetr_safe_batch_cache(model)
+    safe_batch_key = _rfdetr_batch_cache_key(model, inputs, shape)
+    cached_batch_size = safe_batch_cache.get(safe_batch_key)
+    active_batch_size = min(requested_batch_size, int(cached_batch_size)) if cached_batch_size else requested_batch_size
+    safe_batch_cache_hit = cached_batch_size is not None
+    oom_retry_count = 0
     index = 0
     batch_index = 0
     while index < len(inputs):
@@ -2191,18 +2433,48 @@ def rfdetr_predict_batches(
             consume_forward()
             consume_postprocess()
         start = time.perf_counter()
+        reported_host_preprocess_seconds = 0.0
+        h2d_seconds = 0.0
+        resize_normalize_seconds = 0.0
+        prepare_wall_seconds = 0.0
+        device_preprocess_seconds = 0.0
+        used_fast_path = False
         try:
             with torch_inference_context():
-                result = call_with_supported_kwargs(
-                    model.predict,
+                fast_result = _rfdetr_fast_predict_batch(
+                    model,
                     current_inputs,
                     threshold=threshold,
                     shape=shape,
                 )
+                if fast_result is None:
+                    result = call_with_supported_kwargs(
+                        model.predict,
+                        current_inputs,
+                        threshold=threshold,
+                        shape=shape,
+                        include_source_image=False,
+                    )
+                else:
+                    result = fast_result.detections
+                    used_fast_path = True
+                    reported_host_preprocess_seconds = fast_result.host_preprocess_seconds
+                    h2d_seconds = fast_result.h2d_seconds
+                    resize_normalize_seconds = fast_result.resize_normalize_seconds
+                    prepare_wall_seconds = fast_result.prepare_wall_seconds
+                    device_preprocess_seconds = fast_result.device_preprocess_seconds
         except Exception as exc:
             if current_size > 1 and is_cuda_oom_error(exc):
                 clear_cuda_cache_if_available()
                 active_batch_size = max(1, current_size // 2)
+                previous_safe = safe_batch_cache.get(safe_batch_key)
+                safe_batch_cache[safe_batch_key] = min(int(previous_safe), active_batch_size) if previous_safe else active_batch_size
+                oom_retry_count += 1
+                _increment_rfdetr_workload(
+                    model,
+                    workload_kind=workload_kind,
+                    oom_retries=1,
+                )
                 blue(
                     f"RF-DETR CUDA OOM at batch_size={current_size}; retrying with batch_size={active_batch_size}.",
                     verbose=True,
@@ -2218,29 +2490,81 @@ def rfdetr_predict_batches(
             # shared acceleration runtime. New RF-DETR paths are stage-aware.
             model_forward_seconds = elapsed
         preprocess_seconds = max(0.0, elapsed - model_forward_seconds - postprocess_seconds)
+        device_preprocess_seconds = min(preprocess_seconds, device_preprocess_seconds)
+        h2d_seconds = min(device_preprocess_seconds, h2d_seconds)
+        resize_normalize_seconds = min(
+            max(0.0, device_preprocess_seconds - h2d_seconds),
+            resize_normalize_seconds,
+        )
+        if used_fast_path:
+            host_preprocess_seconds = min(
+                max(0.0, preprocess_seconds - device_preprocess_seconds),
+                reported_host_preprocess_seconds,
+            )
+        else:
+            host_preprocess_seconds = max(0.0, preprocess_seconds - device_preprocess_seconds)
+        orchestration_seconds = max(
+            0.0,
+            preprocess_seconds - host_preprocess_seconds - device_preprocess_seconds,
+        )
         result_list = normalize_detection_list(result, len(current_inputs))
+        _increment_rfdetr_workload(
+            model,
+            workload_kind=workload_kind,
+            inputs=len(current_inputs),
+            batches=1,
+        )
         per_image_elapsed = elapsed / max(1, len(current_inputs))
         per_image_forward = model_forward_seconds / max(1, len(current_inputs))
         per_image_postprocess = postprocess_seconds / max(1, len(current_inputs))
         per_image_preprocess = preprocess_seconds / max(1, len(current_inputs))
+        per_image_host_preprocess = host_preprocess_seconds / max(1, len(current_inputs))
+        per_image_device_preprocess = device_preprocess_seconds / max(1, len(current_inputs))
+        per_image_h2d = h2d_seconds / max(1, len(current_inputs))
+        per_image_resize_normalize = resize_normalize_seconds / max(1, len(current_inputs))
+        per_image_orchestration = orchestration_seconds / max(1, len(current_inputs))
+        per_image_prepare_wall = prepare_wall_seconds / max(1, len(current_inputs))
         detections.extend(result_list)
         timing_rows.extend(
             {
                 "elapsed_seconds": per_image_elapsed,
                 "preprocess_seconds": per_image_preprocess,
+                "host_preprocess_seconds": per_image_host_preprocess,
+                "device_preprocess_seconds": per_image_device_preprocess,
+                "h2d_seconds": per_image_h2d,
+                "resize_normalize_seconds": per_image_resize_normalize,
+                "h2d_resize_normalize_seconds": per_image_device_preprocess,
+                "orchestration_seconds": per_image_orchestration,
+                "exclusive_preprocess_seconds": (
+                    per_image_host_preprocess + per_image_device_preprocess + per_image_orchestration
+                ),
+                "prepare_wall_seconds": per_image_prepare_wall,
                 "model_forward_seconds": per_image_forward,
                 "postprocess_seconds": per_image_postprocess,
                 "batch_elapsed_seconds": elapsed,
                 "batch_preprocess_seconds": preprocess_seconds,
+                "batch_host_preprocess_seconds": host_preprocess_seconds,
+                "batch_device_preprocess_seconds": device_preprocess_seconds,
+                "batch_h2d_seconds": h2d_seconds,
+                "batch_resize_normalize_seconds": resize_normalize_seconds,
+                "batch_h2d_resize_normalize_seconds": device_preprocess_seconds,
+                "batch_orchestration_seconds": orchestration_seconds,
+                "batch_prepare_wall_seconds": prepare_wall_seconds,
                 "batch_model_forward_seconds": model_forward_seconds,
                 "batch_postprocess_seconds": postprocess_seconds,
                 "batch_size": len(current_inputs),
+                "requested_batch_size": requested_batch_size,
+                "batch_capacity": active_batch_size,
+                "safe_batch_cache_hit": safe_batch_cache_hit,
                 "batch_index": batch_index,
             }
             for _ in current_inputs
         )
         index += len(current_inputs)
         batch_index += 1
+    for row in timing_rows:
+        row["effective_batch_size"] = active_batch_size
+        row["oom_retry_count"] = oom_retry_count
     return detections, timing_rows
 
 
@@ -2309,6 +2633,7 @@ def predict_rfdetr_direct_batch(
         threshold=threshold,
         shape=shape,
         batch_size=batch_size or rfdetr_image_batch_size(config),
+        workload_kind=engine,
     )
     predictions_by_image: List[List[Dict[str, Any]]] = []
     stats: List[Dict[str, Any]] = []
@@ -2326,15 +2651,249 @@ def predict_rfdetr_direct_batch(
                 "predictions": len(predictions),
                 "elapsed_seconds": timing["elapsed_seconds"] + conversion_seconds,
                 "preprocess_seconds": timing.get("preprocess_seconds", 0.0),
+                "host_preprocess_seconds": timing.get("host_preprocess_seconds", timing.get("preprocess_seconds", 0.0)),
+                "device_preprocess_seconds": timing.get("device_preprocess_seconds", 0.0),
+                "h2d_seconds": timing.get("h2d_seconds", 0.0),
+                "resize_normalize_seconds": timing.get("resize_normalize_seconds", 0.0),
+                "h2d_resize_normalize_seconds": timing.get("h2d_resize_normalize_seconds", 0.0),
+                "orchestration_seconds": timing.get("orchestration_seconds", 0.0),
+                "exclusive_preprocess_seconds": timing.get(
+                    "exclusive_preprocess_seconds",
+                    timing.get("preprocess_seconds", 0.0),
+                ),
+                "prepare_wall_seconds": timing.get("prepare_wall_seconds", 0.0),
                 "model_forward_seconds": timing.get("model_forward_seconds", timing["elapsed_seconds"]),
                 "postprocess_seconds": timing.get("postprocess_seconds", 0.0) + conversion_seconds,
                 "batch_elapsed_seconds": timing["batch_elapsed_seconds"],
                 "batch_size": timing["batch_size"],
+                "requested_batch_size": timing.get("requested_batch_size", timing["batch_size"]),
+                "effective_batch_size": timing.get("effective_batch_size", timing["batch_size"]),
+                "batch_capacity": timing.get("batch_capacity", timing["batch_size"]),
+                "safe_batch_cache_hit": bool(timing.get("safe_batch_cache_hit", False)),
+                "oom_retry_count": int(timing.get("oom_retry_count", 0)),
                 "batch_index": timing["batch_index"],
                 "inference_engine": engine,
             }
         )
     return predictions_by_image, stats
+
+
+def _validated_rfdetr_sources(
+    images: Sequence[ImageRecord],
+    sources: Optional[Sequence[Any]],
+) -> Optional[List[Any]]:
+    """Validate optional in-memory sources without changing record serialization."""
+    if sources is None:
+        return None
+    resolved = list(sources)
+    if len(resolved) != len(images):
+        raise ValueError("RF-DETR in-memory sources and image records must have the same length.")
+    return resolved
+
+
+def _rfdetr_source_rgb(image: ImageRecord, source: Any = None) -> Image.Image:
+    """Resolve a record/path/in-memory source as a reusable RGB PIL image."""
+    if source is None:
+        with Image.open(image.path) as source_image:
+            return source_image.convert("RGB")
+    if isinstance(source, Image.Image):
+        return source if source.mode == "RGB" else source.convert("RGB")
+    array = _rfdetr_rgb_array(source)
+    if array is None:
+        raise TypeError(
+            "RF-DETR SAHI/class_crop sources must be PIL RGB images, uint8 HWC RGB arrays, or image paths."
+        )
+    return Image.fromarray(array, mode="RGB")
+
+
+def _rfdetr_auto_batch_profiles(model: Any) -> MutableMapping[Tuple[Any, ...], Dict[str, Any]]:
+    """Return model-lifetime SAHI auto-batch benchmark profiles."""
+    model_state = getattr(model, "__dict__", None)
+    if not isinstance(model_state, dict):
+        return {}
+    profiles = model_state.get("_rf_detr_auto_batch_profiles")
+    if not isinstance(profiles, MutableMapping):
+        profiles = {}
+        model_state["_rf_detr_auto_batch_profiles"] = profiles
+    return profiles
+
+
+def _rfdetr_cuda_benchmark_begin(model: Any) -> Optional[Tuple[Any, Any, int]]:
+    """Reset peak CUDA allocation and return (torch, device, total bytes)."""
+    handle = _rfdetr_acceleration_handle(model)
+    with contextlib.suppress(Exception):
+        import torch
+
+        device = torch.device(getattr(handle, "device"))
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+            torch.cuda.reset_peak_memory_stats(device)
+            total_bytes = int(torch.cuda.get_device_properties(device).total_memory)
+            return torch, device, total_bytes
+    return None
+
+
+def _rfdetr_cuda_benchmark_end(state: Optional[Tuple[Any, Any, int]]) -> Optional[float]:
+    """Return peak allocated/total memory for one synchronized candidate."""
+    if state is None:
+        return None
+    torch, device, total_bytes = state
+    if total_bytes <= 0:
+        return None
+    try:
+        torch.cuda.synchronize(device)
+        free_bytes, _ = torch.cuda.mem_get_info(device)
+        device_used_bytes = max(0, total_bytes - int(free_bytes))
+        pytorch_peak_bytes = int(torch.cuda.max_memory_allocated(device))
+        return float(max(device_used_bytes, pytorch_peak_bytes)) / float(total_bytes)
+    except Exception:
+        # A candidate that leaves CUDA unable to report memory is not eligible.
+        return 1.0
+
+
+def autotune_rfdetr_sahi_batch_size(
+    images: Sequence[ImageRecord],
+    model: Any,
+    config: Mapping[str, Any],
+    *,
+    sources: Sequence[Any],
+    widths: Sequence[int],
+    heights: Sequence[int],
+) -> Tuple[int, Dict[str, Any]]:
+    """Benchmark 4/8/16 on one shared crop sample and cache the fastest safe size."""
+    sample_count = min(16, len(images), len(sources), len(widths), len(heights))
+    if sample_count <= 0:
+        return 16, {
+            "enabled": True,
+            "cache_hit": False,
+            "selected_batch_size": 16,
+            "sample_count": 0,
+            "candidates": [],
+            "tuning_seconds": 0.0,
+            "reason": "no_samples",
+        }
+    model_cfg = config.get("model", {})
+    shape = None
+    if model_cfg.get("image_size") is not None:
+        resolution = int(model_cfg.get("image_size"))
+        shape = (resolution, resolution)
+    profile_key = (
+        "sahi_auto",
+        _rfdetr_batch_cache_key(model, list(sources[:sample_count]), shape),
+    )
+    profiles = _rfdetr_auto_batch_profiles(model)
+    cached = profiles.get(profile_key)
+    if isinstance(cached, Mapping):
+        metadata = dict(cached)
+        metadata["cache_hit"] = True
+        metadata["tuning_seconds"] = 0.0
+        return int(metadata["selected_batch_size"]), metadata
+
+    candidate_sizes = [candidate for candidate in (4, 8, 16) if candidate <= sample_count]
+    if sample_count < 16:
+        provisional_batch_size = max(candidate_sizes, default=1)
+        metadata = {
+            "enabled": True,
+            "cache_hit": False,
+            "selected_batch_size": provisional_batch_size,
+            "sample_count": sample_count,
+            "candidates": [],
+            "tuning_seconds": 0.0,
+            "reason": "insufficient_samples_for_4_8_16",
+        }
+        # Do not cache an incomplete profile. A later outer batch may provide
+        # the full 16-sample benchmark set.
+        return provisional_batch_size, metadata
+
+    candidate_rows: List[Dict[str, Any]] = []
+    tuning_started = time.perf_counter()
+    sample_images = list(images[:sample_count])
+    sample_sources = list(sources[:sample_count])
+    sample_widths = list(widths[:sample_count])
+    sample_heights = list(heights[:sample_count])
+    for candidate in candidate_sizes:
+        cuda_state = _rfdetr_cuda_benchmark_begin(model)
+        candidate_started = time.perf_counter()
+        try:
+            _, stats = predict_rfdetr_direct_batch(
+                sample_images,
+                model,
+                config,
+                sources=sample_sources,
+                widths=sample_widths,
+                heights=sample_heights,
+                batch_size=candidate,
+                engine="rfdetr_autotune",
+            )
+        except Exception as exc:
+            if not is_cuda_oom_error(exc):
+                raise
+            elapsed = time.perf_counter() - candidate_started
+            peak_ratio = _rfdetr_cuda_benchmark_end(cuda_state)
+            candidate_rows.append(
+                {
+                    "requested_batch_size": candidate,
+                    "effective_batch_size": 0,
+                    "elapsed_seconds": elapsed,
+                    "inputs_per_second": 0.0,
+                    "peak_vram_ratio": peak_ratio,
+                    "oom_retries": 1,
+                    "eligible": False,
+                }
+            )
+            continue
+        elapsed = max(1e-12, time.perf_counter() - candidate_started)
+        peak_ratio = _rfdetr_cuda_benchmark_end(cuda_state)
+        effective_sizes = [
+            int(stat.get("effective_batch_size", candidate))
+            for stat in stats
+            if not isinstance(stat.get("effective_batch_size", candidate), bool)
+        ]
+        effective_batch_size = min(effective_sizes, default=candidate)
+        oom_retries = max((int(stat.get("oom_retry_count", 0)) for stat in stats), default=0)
+        eligible = (
+            effective_batch_size >= candidate
+            and oom_retries == 0
+            and (peak_ratio is None or peak_ratio < 0.9)
+        )
+        candidate_rows.append(
+            {
+                "requested_batch_size": candidate,
+                "effective_batch_size": effective_batch_size,
+                "elapsed_seconds": elapsed,
+                "inputs_per_second": sample_count / elapsed,
+                "peak_vram_ratio": peak_ratio,
+                "oom_retries": oom_retries,
+                "eligible": eligible,
+            }
+        )
+
+    eligible_rows = [row for row in candidate_rows if bool(row["eligible"])]
+    if eligible_rows:
+        selected_row = max(
+            eligible_rows,
+            key=lambda row: (float(row["inputs_per_second"]), int(row["requested_batch_size"])),
+        )
+        selected_batch_size = int(selected_row["requested_batch_size"])
+        reason = "fastest_under_90pct_vram"
+    else:
+        successful_rows = [row for row in candidate_rows if int(row["effective_batch_size"]) > 0]
+        selected_batch_size = min(
+            (int(row["effective_batch_size"]) for row in successful_rows),
+            default=1,
+        )
+        reason = "safe_fallback"
+    metadata = {
+        "enabled": True,
+        "cache_hit": False,
+        "selected_batch_size": selected_batch_size,
+        "sample_count": sample_count,
+        "candidates": candidate_rows,
+        "tuning_seconds": max(0.0, time.perf_counter() - tuning_started),
+        "reason": reason,
+    }
+    profiles[profile_key] = dict(metadata)
+    return selected_batch_size, metadata
 
 
 def predict_image_sahi(
@@ -2371,7 +2930,7 @@ def predict_image_sahi(
             "merge_buffer_length": sahi_cfg.get("merge_buffer_length"),
             "verbose": int(sahi_cfg.get("verbose", 0)),
             "progress_bar": bool(progress_cfg.get("slices", False)),
-            "batch_size": int(sahi_cfg.get("batch_size", 1)),
+            "batch_size": rfdetr_sahi_batch_size(config),
             "exclude_classes_by_name": sahi_cfg.get("exclude_classes_by_name") or None,
             "exclude_classes_by_id": sahi_cfg.get("exclude_classes_by_id") or None,
         }
@@ -2610,6 +3169,12 @@ def apply_sahi_recheck_batch(
                 "enabled": False,
                 "model_forward_seconds": 0.0,
                 "preprocess_seconds": 0.0,
+                "host_preprocess_seconds": 0.0,
+                "device_preprocess_seconds": 0.0,
+                "h2d_seconds": 0.0,
+                "resize_normalize_seconds": 0.0,
+                "prepare_wall_seconds": 0.0,
+                "crop_seconds": 0.0,
                 "postprocess_seconds": 0.0,
                 "elapsed_seconds": 0.0,
                 "batch_count": 0,
@@ -2626,6 +3191,12 @@ def apply_sahi_recheck_batch(
                 "target_class_ids": [],
                 "model_forward_seconds": 0.0,
                 "preprocess_seconds": 0.0,
+                "host_preprocess_seconds": 0.0,
+                "device_preprocess_seconds": 0.0,
+                "h2d_seconds": 0.0,
+                "resize_normalize_seconds": 0.0,
+                "prepare_wall_seconds": 0.0,
+                "crop_seconds": 0.0,
                 "postprocess_seconds": 0.0,
                 "elapsed_seconds": 0.0,
                 "batch_count": 0,
@@ -2656,6 +3227,12 @@ def apply_sahi_recheck_batch(
             "filtered": 0,
             "model_forward_seconds": 0.0,
             "preprocess_seconds": 0.0,
+            "host_preprocess_seconds": 0.0,
+            "device_preprocess_seconds": 0.0,
+            "h2d_seconds": 0.0,
+            "resize_normalize_seconds": 0.0,
+            "prepare_wall_seconds": 0.0,
+            "crop_seconds": 0.0,
             "postprocess_seconds": 0.0,
             "elapsed_seconds": 0.0,
             "batch_count": 0,
@@ -2690,7 +3267,9 @@ def apply_sahi_recheck_batch(
                 continue
             center = coco_bbox_center(prediction.get("bbox", [0, 0, 0, 0]))
             x, y, width, height = centered_square_window(center, crop_size, image.width, image.height)
+            crop_started_ns = time.monotonic_ns()
             crop = source_rgb.crop((x, y, x + width, y + height))
+            stats[image_index]["crop_seconds"] += (time.monotonic_ns() - crop_started_ns) / 1_000_000_000.0
             task_records.append(image)
             task_sources.append(crop)
             task_widths.append(width)
@@ -2729,11 +3308,19 @@ def apply_sahi_recheck_batch(
                 second_stat.get("model_forward_seconds", second_stat.get("elapsed_seconds", 0.0))
             )
             stats[image_index]["preprocess_seconds"] += float(second_stat.get("preprocess_seconds", 0.0))
+            stats[image_index]["host_preprocess_seconds"] += float(second_stat.get("host_preprocess_seconds", 0.0))
+            stats[image_index]["device_preprocess_seconds"] += float(second_stat.get("device_preprocess_seconds", 0.0))
+            stats[image_index]["h2d_seconds"] += float(second_stat.get("h2d_seconds", 0.0))
+            stats[image_index]["resize_normalize_seconds"] += float(second_stat.get("resize_normalize_seconds", 0.0))
+            stats[image_index]["prepare_wall_seconds"] += float(second_stat.get("prepare_wall_seconds", 0.0))
             stats[image_index]["postprocess_seconds"] += float(second_stat.get("postprocess_seconds", 0.0))
             batch_index = second_stat.get("batch_index")
             if isinstance(batch_index, int) and not isinstance(batch_index, bool) and batch_index >= 0:
                 batch_indices_by_image[image_index].add(batch_index)
-            batch_size = second_stat.get("batch_size")
+            batch_size = second_stat.get(
+                "effective_batch_size",
+                second_stat.get("batch_capacity", second_stat.get("batch_size")),
+            )
             if isinstance(batch_size, int) and not isinstance(batch_size, bool) and batch_size > 0:
                 batch_sizes_by_image[image_index].add(batch_size)
             projected = shared_modes.project_predictions_to_original(second_predictions, x, y, image.width, image.height)
@@ -2828,12 +3415,15 @@ def predict_images_rfdetr_full(
     config: Mapping[str, Any],
     *,
     batch_size: Optional[int] = None,
+    sources: Optional[Sequence[Any]] = None,
 ) -> Tuple[List[List[Dict[str, Any]]], List[Dict[str, Any]]]:
     """Run batched RF-DETR full-image inference."""
+    resolved_sources = _validated_rfdetr_sources(images, sources)
     predictions_by_image, stats = predict_rfdetr_direct_batch(
         images,
         model,
         config,
+        sources=resolved_sources,
         batch_size=batch_size or rfdetr_image_batch_size(config),
         engine="rfdetr",
     )
@@ -2842,6 +3432,8 @@ def predict_images_rfdetr_full(
         model_forward_seconds = float(stat.get("model_forward_seconds", elapsed_seconds))
         preprocess_seconds = float(stat.get("preprocess_seconds", 0.0))
         postprocess_seconds = float(stat.get("postprocess_seconds", 0.0))
+        host_preprocess_seconds = float(stat.get("host_preprocess_seconds", preprocess_seconds))
+        device_preprocess_seconds = float(stat.get("device_preprocess_seconds", 0.0))
         stat.update(
             {
                 "base_model_forward_seconds": model_forward_seconds,
@@ -2849,7 +3441,16 @@ def predict_images_rfdetr_full(
                 "recheck_model_forward_seconds": 0.0,
                 "model_forward_seconds": model_forward_seconds,
                 "preprocess_seconds": preprocess_seconds,
+                "crop_seconds": 0.0,
+                "host_preprocess_seconds": host_preprocess_seconds,
+                "device_preprocess_seconds": device_preprocess_seconds,
+                "h2d_resize_normalize_seconds": device_preprocess_seconds,
+                "orchestration_seconds": max(
+                    0.0,
+                    preprocess_seconds - host_preprocess_seconds - device_preprocess_seconds,
+                ),
                 "postprocess_seconds": postprocess_seconds,
+                "exclusive_postprocess_seconds": postprocess_seconds,
                 "model_forward_ratio": model_forward_seconds / elapsed_seconds if elapsed_seconds > 0.0 else 0.0,
                 "sahi_model_forward_ratio": 0.0,
                 "recheck_model_forward_ratio": 0.0,
@@ -2862,20 +3463,24 @@ def predict_images_rfdetr_sahi(
     images: Sequence[ImageRecord],
     model: Any,
     config: Mapping[str, Any],
+    *,
+    sources: Optional[Sequence[Any]] = None,
 ) -> Tuple[List[List[Dict[str, Any]]], List[Dict[str, Any]]]:
     """Run batched direct RF-DETR SAHI-style sliced prediction."""
     if not images:
         return [], []
     sahi_started = time.perf_counter()
     sahi_cfg = config["sahi"]
-    slice_batch_size = rfdetr_sahi_batch_size(config)
+    requested_slice_batch_size = rfdetr_sahi_batch_size(config)
+    slice_batch_size = requested_slice_batch_size
+    auto_batch_enabled = (
+        isinstance(sahi_cfg.get("batch_size"), str)
+        and str(sahi_cfg.get("batch_size")).strip().lower() == "auto"
+    )
+    auto_batch_metadata: Optional[Dict[str, Any]] = None
+    resolved_sources = _validated_rfdetr_sources(images, sources)
     windows_by_image: List[List[Tuple[int, int, int, int]]] = []
     source_rgbs: List[Image.Image] = []
-    task_records: List[ImageRecord] = []
-    task_sources: List[Image.Image] = []
-    task_widths: List[int] = []
-    task_heights: List[int] = []
-    task_meta: List[Tuple[int, int, int, int, int]] = []
 
     for image_index, image in enumerate(images):
         windows = shared_modes.generate_slice_windows_for_size(
@@ -2887,32 +3492,55 @@ def predict_images_rfdetr_sahi(
             overlap_height_ratio=float(sahi_cfg.get("overlap_height_ratio", 0.2)),
         )
         windows_by_image.append(windows)
-        with Image.open(image.path) as source_image:
-            source_rgb = source_image.convert("RGB")
+        source_rgb = _rfdetr_source_rgb(
+            image,
+            resolved_sources[image_index] if resolved_sources is not None else None,
+        )
         source_rgbs.append(source_rgb)
-        for x, y, width, height in windows:
-            task_records.append(image)
-            task_sources.append(source_rgb.crop((x, y, x + width, y + height)))
-            task_widths.append(width)
-            task_heights.append(height)
-            task_meta.append((image_index, x, y, width, height))
 
     sahi_model_forward_by_image = [0.0 for _ in images]
     base_model_forward_by_image = [0.0 for _ in images]
     model_postprocess_by_image = [0.0 for _ in images]
+    model_host_preprocess_by_image = [0.0 for _ in images]
+    model_device_preprocess_by_image = [0.0 for _ in images]
+    model_h2d_by_image = [0.0 for _ in images]
+    model_resize_normalize_by_image = [0.0 for _ in images]
+    model_prepare_wall_by_image = [0.0 for _ in images]
+    crop_seconds_by_image = [0.0 for _ in images]
     all_predictions: List[List[Dict[str, Any]]] = [[] for _ in images]
-    if task_records:
+    effective_slice_batches_by_image: List[set] = [set() for _ in images]
+    observed_slice_batches_by_image: List[set] = [set() for _ in images]
+    pending_records: List[ImageRecord] = []
+    pending_sources: List[Image.Image] = []
+    pending_widths: List[int] = []
+    pending_heights: List[int] = []
+    pending_meta: List[Tuple[int, int, int, int, int]] = []
+
+    def flush_slice_batch() -> None:
+        """Infer one bounded crop batch and release its PIL crop objects."""
+        nonlocal slice_batch_size, auto_batch_metadata
+        if not pending_records:
+            return
+        if auto_batch_enabled and auto_batch_metadata is None:
+            slice_batch_size, auto_batch_metadata = autotune_rfdetr_sahi_batch_size(
+                pending_records,
+                model,
+                config,
+                sources=pending_sources,
+                widths=pending_widths,
+                heights=pending_heights,
+            )
         slice_predictions_by_task, slice_stats = predict_rfdetr_direct_batch(
-            task_records,
+            pending_records,
             model,
             config,
-            sources=task_sources,
-            widths=task_widths,
-            heights=task_heights,
+            sources=pending_sources,
+            widths=pending_widths,
+            heights=pending_heights,
             batch_size=slice_batch_size,
             engine="rfdetr_slice",
         )
-        for meta, crop_predictions, stat in zip(task_meta, slice_predictions_by_task, slice_stats):
+        for meta, crop_predictions, stat in zip(pending_meta, slice_predictions_by_task, slice_stats):
             image_index, x, y, _, _ = meta
             image = images[image_index]
             all_predictions[image_index].extend(
@@ -2922,12 +3550,61 @@ def predict_images_rfdetr_sahi(
                 stat.get("model_forward_seconds", stat.get("elapsed_seconds", 0.0))
             )
             model_postprocess_by_image[image_index] += float(stat.get("postprocess_seconds", 0.0))
+            model_host_preprocess_by_image[image_index] += float(stat.get("host_preprocess_seconds", 0.0))
+            model_device_preprocess_by_image[image_index] += float(stat.get("device_preprocess_seconds", 0.0))
+            model_h2d_by_image[image_index] += float(stat.get("h2d_seconds", 0.0))
+            model_resize_normalize_by_image[image_index] += float(stat.get("resize_normalize_seconds", 0.0))
+            model_prepare_wall_by_image[image_index] += float(stat.get("prepare_wall_seconds", 0.0))
+            effective_batch = stat.get("effective_batch_size", stat.get("batch_capacity"))
+            if isinstance(effective_batch, int) and not isinstance(effective_batch, bool) and effective_batch > 0:
+                effective_slice_batches_by_image[image_index].add(effective_batch)
+            observed_batch = stat.get("batch_size")
+            if isinstance(observed_batch, int) and not isinstance(observed_batch, bool) and observed_batch > 0:
+                observed_slice_batches_by_image[image_index].add(observed_batch)
+        pending_records.clear()
+        pending_sources.clear()
+        pending_widths.clear()
+        pending_heights.clear()
+        pending_meta.clear()
+
+    # Materialize at most one requested model batch of crops at a time.  This
+    # is especially important when an outer video batch contains many frames.
+    for image_index, (image, source_rgb, windows) in enumerate(zip(images, source_rgbs, windows_by_image)):
+        for x, y, width, height in windows:
+            crop_started_ns = time.monotonic_ns()
+            crop = source_rgb.crop((x, y, x + width, y + height))
+            crop_seconds_by_image[image_index] += (time.monotonic_ns() - crop_started_ns) / 1_000_000_000.0
+            pending_records.append(image)
+            pending_sources.append(crop)
+            pending_widths.append(width)
+            pending_heights.append(height)
+            pending_meta.append((image_index, x, y, width, height))
+            if (
+                auto_batch_enabled
+                and auto_batch_metadata is None
+                and len(pending_records) in {4, 8, 16}
+            ):
+                candidate_batch_size, candidate_metadata = autotune_rfdetr_sahi_batch_size(
+                    pending_records,
+                    model,
+                    config,
+                    sources=pending_sources,
+                    widths=pending_widths,
+                    heights=pending_heights,
+                )
+                if bool(candidate_metadata.get("cache_hit")) or len(pending_records) >= 16:
+                    slice_batch_size = candidate_batch_size
+                    auto_batch_metadata = candidate_metadata
+            if len(pending_records) >= slice_batch_size:
+                flush_slice_batch()
+    flush_slice_batch()
 
     if bool(sahi_cfg.get("standard_prediction", True)):
         full_predictions_by_image, full_stats = predict_rfdetr_direct_batch(
             images,
             model,
             config,
+            sources=source_rgbs,
             batch_size=slice_batch_size,
             engine="rfdetr_standard",
         )
@@ -2937,6 +3614,11 @@ def predict_images_rfdetr_sahi(
                 stat.get("model_forward_seconds", stat.get("elapsed_seconds", 0.0))
             )
             model_postprocess_by_image[image_index] += float(stat.get("postprocess_seconds", 0.0))
+            model_host_preprocess_by_image[image_index] += float(stat.get("host_preprocess_seconds", 0.0))
+            model_device_preprocess_by_image[image_index] += float(stat.get("device_preprocess_seconds", 0.0))
+            model_h2d_by_image[image_index] += float(stat.get("h2d_seconds", 0.0))
+            model_resize_normalize_by_image[image_index] += float(stat.get("resize_normalize_seconds", 0.0))
+            model_prepare_wall_by_image[image_index] += float(stat.get("prepare_wall_seconds", 0.0))
 
     postprocess_start = time.perf_counter()
     postprocessed: List[List[Dict[str, Any]]] = []
@@ -2963,10 +3645,18 @@ def predict_images_rfdetr_sahi(
         + sum(model_postprocess_by_image)
         + postprocess_elapsed
         + sum(float(row.get("postprocess_seconds", 0.0)) for row in recheck_stats)
+        + float((auto_batch_metadata or {}).get("tuning_seconds", 0.0))
     )
     preprocess_per_image = max(0.0, total_sahi_elapsed - known_stage_total) / max(1, len(images))
     stats: List[Dict[str, Any]] = []
+    autotune_per_image = float((auto_batch_metadata or {}).get("tuning_seconds", 0.0)) / max(1, len(images))
     for image_index, image in enumerate(images):
+        effective_slice_batch_sizes = sorted(effective_slice_batches_by_image[image_index])
+        effective_slice_batch_size = (
+            min(effective_slice_batch_sizes)
+            if effective_slice_batch_sizes
+            else slice_batch_size
+        )
         recheck_model_forward_seconds = float(recheck_stats[image_index].get("model_forward_seconds", 0.0))
         recheck_postprocess_seconds = float(recheck_stats[image_index].get("postprocess_seconds", 0.0))
         base_model_forward_seconds = base_model_forward_by_image[image_index]
@@ -2982,7 +3672,36 @@ def predict_images_rfdetr_sahi(
             + recheck_postprocess_seconds
         )
         preprocess_seconds = preprocess_per_image
-        elapsed_seconds = preprocess_seconds + model_forward_seconds + total_postprocess_seconds
+        crop_seconds = crop_seconds_by_image[image_index] + float(recheck_stats[image_index].get("crop_seconds", 0.0))
+        host_preprocess_seconds = (
+            model_host_preprocess_by_image[image_index]
+            + float(recheck_stats[image_index].get("host_preprocess_seconds", 0.0))
+        )
+        device_preprocess_seconds = (
+            model_device_preprocess_by_image[image_index]
+            + float(recheck_stats[image_index].get("device_preprocess_seconds", 0.0))
+        )
+        h2d_seconds = model_h2d_by_image[image_index] + float(recheck_stats[image_index].get("h2d_seconds", 0.0))
+        resize_normalize_seconds = model_resize_normalize_by_image[image_index] + float(
+            recheck_stats[image_index].get("resize_normalize_seconds", 0.0)
+        )
+        prepare_wall_seconds = (
+            model_prepare_wall_by_image[image_index]
+            + float(recheck_stats[image_index].get("prepare_wall_seconds", 0.0))
+        )
+        elapsed_seconds = preprocess_seconds + model_forward_seconds + total_postprocess_seconds + autotune_per_image
+        recheck_crop_seconds = float(recheck_stats[image_index].get("crop_seconds", 0.0))
+        exclusive_postprocess_seconds = max(0.0, total_postprocess_seconds - recheck_crop_seconds)
+        orchestration_seconds = max(
+            0.0,
+            elapsed_seconds
+            - autotune_per_image
+            - model_forward_seconds
+            - exclusive_postprocess_seconds
+            - crop_seconds
+            - host_preprocess_seconds
+            - device_preprocess_seconds,
+        )
         stats.append(
             {
                 "image_id": image.image_id,
@@ -2993,14 +3712,32 @@ def predict_images_rfdetr_sahi(
                 "elapsed_seconds": elapsed_seconds,
                 "inference_engine": "direct_sahi",
                 "slice_count": len(windows_by_image[image_index]),
-                "slice_batch_size": slice_batch_size,
+                "requested_slice_batch_size": requested_slice_batch_size,
+                "slice_batch_size_setting": sahi_cfg.get("batch_size", slice_batch_size),
+                "slice_batch_size": effective_slice_batch_size,
+                "effective_slice_batch_sizes": effective_slice_batch_sizes,
+                "observed_slice_batch_sizes": sorted(observed_slice_batches_by_image[image_index]),
+                "sahi_batch_autotune": auto_batch_metadata or {"enabled": False},
+                "autotune_seconds": autotune_per_image,
                 "sahi_recheck": recheck_stats[image_index],
                 "base_model_forward_seconds": base_model_forward_seconds,
                 "sahi_model_forward_seconds": sahi_model_forward_seconds,
                 "recheck_model_forward_seconds": recheck_model_forward_seconds,
                 "model_forward_seconds": model_forward_seconds,
                 "preprocess_seconds": preprocess_seconds,
+                "crop_seconds": crop_seconds,
+                "host_preprocess_seconds": host_preprocess_seconds,
+                "device_preprocess_seconds": device_preprocess_seconds,
+                "h2d_seconds": h2d_seconds,
+                "resize_normalize_seconds": resize_normalize_seconds,
+                "h2d_resize_normalize_seconds": device_preprocess_seconds,
+                "prepare_wall_seconds": prepare_wall_seconds,
+                "orchestration_seconds": orchestration_seconds,
+                "exclusive_preprocess_seconds": (
+                    host_preprocess_seconds + device_preprocess_seconds + orchestration_seconds
+                ),
                 "postprocess_seconds": total_postprocess_seconds,
+                "exclusive_postprocess_seconds": exclusive_postprocess_seconds,
                 "model_forward_ratio": model_forward_seconds / elapsed_seconds if elapsed_seconds > 0.0 else 0.0,
                 "sahi_model_forward_ratio": sahi_model_forward_seconds / elapsed_seconds if elapsed_seconds > 0.0 else 0.0,
                 "recheck_model_forward_ratio": recheck_model_forward_seconds / elapsed_seconds if elapsed_seconds > 0.0 else 0.0,
@@ -3013,16 +3750,24 @@ def predict_images_rfdetr_class_crop(
     images: Sequence[ImageRecord],
     model: Any,
     config: Mapping[str, Any],
+    *,
+    sources: Optional[Sequence[Any]] = None,
 ) -> Tuple[List[List[Dict[str, Any]]], List[Dict[str, Any]]]:
     """Run batched RF-DETR class-crop inference."""
     if not images:
         return [], []
     class_crop_started = time.perf_counter()
     crop_cfg = shared_modes.default_crop_config(config)
+    resolved_sources = _validated_rfdetr_sources(images, sources)
+    source_rgbs = [
+        _rfdetr_source_rgb(image, resolved_sources[index] if resolved_sources is not None else None)
+        for index, image in enumerate(images)
+    ]
     source_predictions_by_image, source_stats = predict_rfdetr_direct_batch(
         images,
         model,
         config,
+        sources=source_rgbs,
         confidence=float(crop_cfg.get("source_conf", config["model"].get("confidence_threshold", 0.25))),
         batch_size=rfdetr_image_batch_size(config),
         engine="rfdetr_class_crop_source",
@@ -3035,18 +3780,38 @@ def predict_images_rfdetr_class_crop(
     crop_widths: List[int] = []
     crop_heights: List[int] = []
     crop_meta: List[Dict[str, Any]] = []
+    crop_seconds_by_image = [0.0 for _ in images]
+    selection_seconds_by_image = [0.0 for _ in images]
 
     def include_source_stages(stat: MutableMapping[str, Any], source_stat: Mapping[str, Any]) -> None:
-        for key in ("preprocess_seconds", "model_forward_seconds", "postprocess_seconds"):
-            source_fallback = source_stat.get("elapsed_seconds", 0.0) if key == "model_forward_seconds" else 0.0
-            stat_fallback = stat.get("elapsed_seconds", 0.0) if key == "model_forward_seconds" else 0.0
-            stat[key] = float(source_stat.get(key, source_fallback)) + float(stat.get(key, stat_fallback))
+        def stage_value(row: Mapping[str, Any], key: str) -> float:
+            if key == "model_forward_seconds":
+                return float(row.get(key, row.get("elapsed_seconds", 0.0)))
+            if key == "host_preprocess_seconds":
+                return float(row.get(key, row.get("preprocess_seconds", 0.0)))
+            if key == "h2d_resize_normalize_seconds":
+                return float(row.get(key, row.get("device_preprocess_seconds", 0.0)))
+            return float(row.get(key, 0.0))
+
+        for key in (
+            "preprocess_seconds",
+            "host_preprocess_seconds",
+            "device_preprocess_seconds",
+            "h2d_seconds",
+            "resize_normalize_seconds",
+            "h2d_resize_normalize_seconds",
+            "prepare_wall_seconds",
+            "model_forward_seconds",
+            "postprocess_seconds",
+        ):
+            stat[key] = stage_value(source_stat, key) + stage_value(stat, key)
         stat["elapsed_seconds"] = sum(
             float(stat.get(key, 0.0))
             for key in ("preprocess_seconds", "model_forward_seconds", "postprocess_seconds")
         )
 
     for image_index, (image, source_predictions) in enumerate(zip(images, source_predictions_by_image)):
+        selection_started_ns = time.monotonic_ns()
         window = shared_modes.select_crop_window_from_predictions(
             source_predictions,
             crop_cfg,
@@ -3054,12 +3819,18 @@ def predict_images_rfdetr_class_crop(
             image.width,
             image.height,
         )
+        selection_seconds_by_image[image_index] = (
+            time.monotonic_ns() - selection_started_ns
+        ) / 1_000_000_000.0
         if window is None:
             fallback_indices.append(image_index)
             continue
         crop_x, crop_y, crop_w, crop_h, matches = window
-        with Image.open(image.path) as source_image:
-            crop_image = source_image.convert("RGB").crop((crop_x, crop_y, crop_x + crop_w, crop_y + crop_h))
+        crop_started_ns = time.monotonic_ns()
+        crop_image = source_rgbs[image_index].crop((crop_x, crop_y, crop_x + crop_w, crop_y + crop_h))
+        crop_seconds_by_image[image_index] = (
+            time.monotonic_ns() - crop_started_ns
+        ) / 1_000_000_000.0
         crop_records.append(image)
         crop_sources.append(crop_image)
         crop_widths.append(crop_w)
@@ -3081,12 +3852,16 @@ def predict_images_rfdetr_class_crop(
             fallback_images,
             model,
             config,
+            sources=[source_rgbs[index] for index in fallback_indices],
             batch_size=rfdetr_image_batch_size(config),
             engine="rfdetr",
         )
         for image_index, predictions, stat in zip(fallback_indices, fallback_predictions_by_image, fallback_stats):
             image = images[image_index]
             include_source_stages(stat, source_stats[image_index])
+            stat["postprocess_seconds"] = float(stat.get("postprocess_seconds", 0.0)) + selection_seconds_by_image[
+                image_index
+            ]
             stat.update(
                 {
                     "test_mode": "class_crop",
@@ -3118,8 +3893,15 @@ def predict_images_rfdetr_class_crop(
             image = images[image_index]
             crop_x = int(meta["crop_x"])
             crop_y = int(meta["crop_y"])
+            projection_started_ns = time.monotonic_ns()
             projected = shared_modes.project_predictions_to_original(crop_predictions, crop_x, crop_y, image.width, image.height)
+            projection_seconds = (time.monotonic_ns() - projection_started_ns) / 1_000_000_000.0
             include_source_stages(stat, source_stats[image_index])
+            stat["postprocess_seconds"] = (
+                float(stat.get("postprocess_seconds", 0.0))
+                + selection_seconds_by_image[image_index]
+                + projection_seconds
+            )
             stat.update(
                 {
                     "width": image.width,
@@ -3147,10 +3929,29 @@ def predict_images_rfdetr_class_crop(
             "predictions": 0,
             "elapsed_seconds": float(source_stats[index].get("elapsed_seconds", 0.0)),
             "preprocess_seconds": float(source_stats[index].get("preprocess_seconds", 0.0)),
+            "host_preprocess_seconds": float(
+                source_stats[index].get(
+                    "host_preprocess_seconds",
+                    source_stats[index].get("preprocess_seconds", 0.0),
+                )
+            ),
+            "device_preprocess_seconds": float(source_stats[index].get("device_preprocess_seconds", 0.0)),
+            "h2d_seconds": float(source_stats[index].get("h2d_seconds", 0.0)),
+            "resize_normalize_seconds": float(source_stats[index].get("resize_normalize_seconds", 0.0)),
+            "h2d_resize_normalize_seconds": float(
+                source_stats[index].get(
+                    "h2d_resize_normalize_seconds",
+                    source_stats[index].get("device_preprocess_seconds", 0.0),
+                )
+            ),
+            "prepare_wall_seconds": float(source_stats[index].get("prepare_wall_seconds", 0.0)),
             "model_forward_seconds": float(
                 source_stats[index].get("model_forward_seconds", source_stats[index].get("elapsed_seconds", 0.0))
             ),
-            "postprocess_seconds": float(source_stats[index].get("postprocess_seconds", 0.0)),
+            "postprocess_seconds": (
+                float(source_stats[index].get("postprocess_seconds", 0.0))
+                + selection_seconds_by_image[index]
+            ),
             "inference_engine": "rfdetr_class_crop",
             "test_mode": "class_crop",
         }
@@ -3162,15 +3963,51 @@ def predict_images_rfdetr_class_crop(
         + float(stat.get("postprocess_seconds", 0.0))
         for stat in resolved_stats
     )
-    extra_preprocess_per_image = max(
+    extra_orchestration_per_image = max(
         0.0,
-        time.perf_counter() - class_crop_started - known_stage_seconds,
+        time.perf_counter()
+        - class_crop_started
+        - known_stage_seconds
+        - sum(crop_seconds_by_image),
     ) / max(1, len(resolved_stats))
-    for stat in resolved_stats:
+    for image_index, stat in enumerate(resolved_stats):
         model_forward_seconds = float(stat.get("model_forward_seconds", stat.get("elapsed_seconds", 0.0)))
-        preprocess_seconds = float(stat.get("preprocess_seconds", 0.0)) + extra_preprocess_per_image
+        model_preprocess_seconds = float(stat.get("preprocess_seconds", 0.0))
+        crop_seconds = crop_seconds_by_image[image_index]
+        host_preprocess_seconds = min(
+            model_preprocess_seconds,
+            max(0.0, float(stat.get("host_preprocess_seconds", model_preprocess_seconds))),
+        )
+        device_preprocess_seconds = min(
+            max(0.0, model_preprocess_seconds - host_preprocess_seconds),
+            max(0.0, float(stat.get("device_preprocess_seconds", 0.0))),
+        )
+        h2d_seconds = min(
+            device_preprocess_seconds,
+            max(0.0, float(stat.get("h2d_seconds", 0.0))),
+        )
+        resize_normalize_seconds = min(
+            max(0.0, device_preprocess_seconds - h2d_seconds),
+            max(0.0, float(stat.get("resize_normalize_seconds", 0.0))),
+        )
+        orchestration_seconds = (
+            max(
+                0.0,
+                model_preprocess_seconds - host_preprocess_seconds - device_preprocess_seconds,
+            )
+            + extra_orchestration_per_image
+        )
+        exclusive_preprocess_seconds = (
+            host_preprocess_seconds + device_preprocess_seconds + orchestration_seconds
+        )
+        preprocess_seconds = exclusive_preprocess_seconds + crop_seconds
         postprocess_seconds = float(stat.get("postprocess_seconds", 0.0))
-        elapsed_seconds = preprocess_seconds + model_forward_seconds + postprocess_seconds
+        elapsed_seconds = (
+            crop_seconds
+            + exclusive_preprocess_seconds
+            + model_forward_seconds
+            + postprocess_seconds
+        )
         stat.update(
             {
                 "base_model_forward_seconds": model_forward_seconds,
@@ -3178,7 +4015,17 @@ def predict_images_rfdetr_class_crop(
                 "recheck_model_forward_seconds": 0.0,
                 "model_forward_seconds": model_forward_seconds,
                 "preprocess_seconds": preprocess_seconds,
+                "crop_seconds": crop_seconds,
+                "host_preprocess_seconds": host_preprocess_seconds,
+                "device_preprocess_seconds": device_preprocess_seconds,
+                "h2d_seconds": h2d_seconds,
+                "resize_normalize_seconds": resize_normalize_seconds,
+                "h2d_resize_normalize_seconds": device_preprocess_seconds,
+                "prepare_wall_seconds": float(stat.get("prepare_wall_seconds", 0.0)),
+                "orchestration_seconds": orchestration_seconds,
+                "exclusive_preprocess_seconds": exclusive_preprocess_seconds,
                 "postprocess_seconds": postprocess_seconds,
+                "exclusive_postprocess_seconds": postprocess_seconds,
                 "elapsed_seconds": elapsed_seconds,
                 "model_forward_ratio": model_forward_seconds / elapsed_seconds if elapsed_seconds > 0.0 else 0.0,
                 "sahi_model_forward_ratio": 0.0,
@@ -3194,17 +4041,19 @@ def predict_images_rfdetr(
     config: Mapping[str, Any],
     output_dir: Path,
     visual_image_ids: Optional[Sequence[int]] = None,
+    *,
+    sources: Optional[Sequence[Any]] = None,
 ) -> Tuple[List[List[Dict[str, Any]]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Run batched RF-DETR inference for the configured test mode."""
     _ = output_dir
     _ = visual_image_ids
     mode = shared_modes.canonical_test_mode(config)
     if mode == shared_modes.SAHI_MODE:
-        predictions, stats = predict_images_rfdetr_sahi(images, inference_model, config)
+        predictions, stats = predict_images_rfdetr_sahi(images, inference_model, config, sources=sources)
     elif mode == shared_modes.CLASS_CROP_MODE:
-        predictions, stats = predict_images_rfdetr_class_crop(images, inference_model, config)
+        predictions, stats = predict_images_rfdetr_class_crop(images, inference_model, config, sources=sources)
     else:
-        predictions, stats = predict_images_rfdetr_full(images, inference_model, config)
+        predictions, stats = predict_images_rfdetr_full(images, inference_model, config, sources=sources)
     return predictions, stats, []
 
 
@@ -3370,15 +4219,23 @@ def inference_worker(
 
     effective_batch_sizes = set()
     for stat in all_stats:
-        value = stat.get("batch_size")
-        if isinstance(value, bool):
-            continue
-        try:
-            batch_size = int(value)
-        except (TypeError, ValueError):
-            continue
-        if batch_size > 0:
-            effective_batch_sizes.add(batch_size)
+        values = stat.get("effective_slice_batch_sizes")
+        if not isinstance(values, list) or not values:
+            values = [
+                stat.get(
+                    "slice_batch_size",
+                    stat.get("effective_batch_size", stat.get("batch_size")),
+                )
+            ]
+        for value in values:
+            if isinstance(value, bool):
+                continue
+            try:
+                batch_size = int(value)
+            except (TypeError, ValueError):
+                continue
+            if batch_size > 0:
+                effective_batch_sizes.add(batch_size)
     return {
         "predictions": all_predictions,
         "stats": all_stats,
@@ -4383,11 +5240,21 @@ def summarize_inference_timing(stats_rows: Sequence[Mapping[str, Any]]) -> Dict[
 
     stage_fields = (
         "preprocess_seconds",
+        "exclusive_preprocess_seconds",
+        "crop_seconds",
+        "host_preprocess_seconds",
+        "device_preprocess_seconds",
+        "h2d_seconds",
+        "resize_normalize_seconds",
+        "prepare_wall_seconds",
+        "orchestration_seconds",
+        "autotune_seconds",
         "base_model_forward_seconds",
         "sahi_model_forward_seconds",
         "recheck_model_forward_seconds",
         "model_forward_seconds",
         "postprocess_seconds",
+        "exclusive_postprocess_seconds",
     )
     stage_totals = {
         field: sum(float(row.get(field, 0.0)) for row in stats_rows)
@@ -4397,11 +5264,26 @@ def summarize_inference_timing(stats_rows: Sequence[Mapping[str, Any]]) -> Dict[
     summary.update(
         {
             "avg_preprocess_seconds_per_image": stage_totals["preprocess_seconds"] / image_count,
+            "avg_exclusive_preprocess_seconds_per_image": (
+                stage_totals["exclusive_preprocess_seconds"] / image_count
+            ),
+            "avg_crop_seconds_per_image": stage_totals["crop_seconds"] / image_count,
+            "avg_host_preprocess_seconds_per_image": stage_totals["host_preprocess_seconds"] / image_count,
+            "avg_device_preprocess_seconds_per_image": stage_totals["device_preprocess_seconds"] / image_count,
+            "avg_h2d_seconds_per_image": stage_totals["h2d_seconds"] / image_count,
+            "avg_resize_normalize_seconds_per_image": stage_totals["resize_normalize_seconds"] / image_count,
+            "avg_h2d_resize_normalize_seconds_per_image": (
+                stage_totals["h2d_seconds"] + stage_totals["resize_normalize_seconds"]
+            ) / image_count,
+            "avg_prepare_wall_seconds_per_image": stage_totals["prepare_wall_seconds"] / image_count,
+            "avg_orchestration_seconds_per_image": stage_totals["orchestration_seconds"] / image_count,
+            "avg_autotune_seconds_per_image": stage_totals["autotune_seconds"] / image_count,
             "avg_base_model_forward_seconds_per_image": stage_totals["base_model_forward_seconds"] / image_count,
             "avg_sahi_model_forward_seconds_per_image": stage_totals["sahi_model_forward_seconds"] / image_count,
             "avg_recheck_model_forward_seconds_per_image": stage_totals["recheck_model_forward_seconds"] / image_count,
             "avg_model_forward_seconds_per_image": stage_totals["model_forward_seconds"] / image_count,
             "avg_postprocess_seconds_per_image": stage_totals["postprocess_seconds"] / image_count,
+            "avg_exclusive_postprocess_seconds_per_image": stage_totals["exclusive_postprocess_seconds"] / image_count,
         }
     )
     total_elapsed = sum(elapsed_values)
@@ -4996,8 +5878,18 @@ def normalize_config(config: MutableMapping[str, Any], source_config: Path) -> T
     inference_cfg["batch_size"] = positive_int_setting(inference_cfg.get("batch_size"), 1, "inference.batch_size")
     if "chunks" in inference_cfg:
         inference_cfg["chunks"] = _positive_inference_chunks(inference_cfg.get("chunks"))
-    sahi_cfg["batch_size"] = positive_int_setting(sahi_cfg.get("batch_size"), inference_cfg["batch_size"], "sahi.batch_size")
     model_type = str(model_cfg.get("type", "ultralytics")).strip().lower()
+    sahi_batch_setting = sahi_cfg.get("batch_size")
+    if isinstance(sahi_batch_setting, str) and sahi_batch_setting.strip().lower() == "auto":
+        if model_type not in RFDETR_MODEL_TYPES:
+            raise ValueError("sahi.batch_size=auto is currently supported only for RF-DETR models.")
+        sahi_cfg["batch_size"] = "auto"
+    else:
+        sahi_cfg["batch_size"] = positive_int_setting(
+            sahi_batch_setting,
+            inference_cfg["batch_size"],
+            "sahi.batch_size",
+        )
     if mode != shared_modes.SAHI_MODE and model_type not in {"ultralytics", "rfdetr", "rf-detr", "rf_detr"}:
         raise ValueError("Direct full_image/class_crop inference supports model.type: ultralytics or rfdetr.")
 
@@ -5035,6 +5927,7 @@ def normalize_config(config: MutableMapping[str, Any], source_config: Path) -> T
     output_cfg.setdefault("save_model_input_batches", True)
     output_cfg.setdefault("max_model_input_batches", 3)
     output_cfg.setdefault("model_input_batch_size", 9)
+    output_cfg.setdefault("full_model_input_manifest", False)
     output_cfg.setdefault("visual_sampling_mode", "random")
     output_cfg.setdefault("visual_sample_order", "sample")
     output_cfg.setdefault("visual_filter_source", "ground_truth")

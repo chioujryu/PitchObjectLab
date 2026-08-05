@@ -59,6 +59,7 @@ class HybridTrackingConfig:
     cmc_max_translation: float = 250.0
     cmc_min_scale: float = 0.80
     cmc_max_scale: float = 1.25
+    cmc_processing_scale: float = 1.0
 
     def __post_init__(self) -> None:
         for name in ("low_confidence", "high_confidence", "new_track_confidence"):
@@ -77,6 +78,8 @@ class HybridTrackingConfig:
                 raise ValueError(f"hybrid.{name} must be >= 1")
         if self.confirmed_hits > self.confirmation_window:
             raise ValueError("hybrid.confirmed_hits must not exceed confirmation_window")
+        if not 0.0 < float(self.cmc_processing_scale) <= 1.0:
+            raise ValueError("hybrid.cmc_processing_scale must be in the range (0, 1]")
 
     @classmethod
     def from_mapping(cls, raw: Optional[Mapping[str, Any]]) -> "HybridTrackingConfig":
@@ -101,7 +104,7 @@ class HybridTrackingConfig:
             "cmc": {
                 "cmc_enabled", "cmc_max_corners", "cmc_quality_level", "cmc_min_distance",
                 "cmc_ransac_threshold", "cmc_min_inliers", "cmc_max_translation", "cmc_min_scale",
-                "cmc_max_scale"
+                "cmc_max_scale", "cmc_processing_scale", "processing_scale"
             },
         }
         values: Dict[str, Any] = {}
@@ -112,7 +115,7 @@ class HybridTrackingConfig:
                 for child, child_value in value.items():
                     if child not in groups[key]:
                         raise ValueError(f"unknown inference.tracking.hybrid.{key}.{child}")
-                    values[child] = child_value
+                    values["cmc_processing_scale" if child == "processing_scale" else child] = child_value
             elif key in cls.__dataclass_fields__:
                 values[key] = value
             else:
@@ -216,6 +219,15 @@ class _CameraMotionEstimator:
         if not self.cfg.cmc_enabled or frame is None:
             return identity, {"method": "identity", "success": False, "reason": "disabled_or_no_frame", "inliers": 0}
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if getattr(frame, "ndim", 0) == 3 else np.asarray(frame)
+        processing_scale = float(self.cfg.cmc_processing_scale)
+        if processing_scale < 1.0:
+            gray = cv2.resize(
+                gray,
+                None,
+                fx=processing_scale,
+                fy=processing_scale,
+                interpolation=cv2.INTER_AREA,
+            )
         if self.previous_gray is None:
             self.previous_gray = gray.copy()
             return identity, {"method": "identity", "success": False, "reason": "first_frame", "inliers": 0}
@@ -229,17 +241,29 @@ class _CameraMotionEstimator:
             method = "orb"
         if affine is None:
             return identity, {"method": "identity", "success": False, "reason": "estimation_failed", "inliers": 0}
+        if processing_scale < 1.0:
+            # A uniform resize preserves the affine linear terms. Translation
+            # is measured in the reduced pixel coordinate system and must be
+            # mapped back before it is applied to full-resolution tracks.
+            affine = np.asarray(affine, dtype=np.float64).copy()
+            affine[:, 2] /= processing_scale
         valid, reason = self._validate(affine)
         if not valid:
-            return identity, {"method": "identity", "success": False, "reason": reason, "inliers": int(inliers)}
-        return affine.astype(np.float64), {"method": method, "success": True, "reason": None, "inliers": int(inliers)}
+            return identity, {
+                "method": "identity", "success": False, "reason": reason,
+                "inliers": int(inliers), "processing_scale": processing_scale,
+            }
+        return affine.astype(np.float64), {
+            "method": method, "success": True, "reason": None,
+            "inliers": int(inliers), "processing_scale": processing_scale,
+        }
 
     def _sparse_flow(self, previous: np.ndarray, current: np.ndarray) -> Tuple[Optional[np.ndarray], int]:
         points = cv2.goodFeaturesToTrack(
             previous,
             maxCorners=self.cfg.cmc_max_corners,
             qualityLevel=self.cfg.cmc_quality_level,
-            minDistance=self.cfg.cmc_min_distance,
+            minDistance=max(1.0, self.cfg.cmc_min_distance * self.cfg.cmc_processing_scale),
         )
         if points is None or len(points) < self.cfg.cmc_min_inliers:
             return None, 0
@@ -252,7 +276,10 @@ class _CameraMotionEstimator:
         if len(source) < self.cfg.cmc_min_inliers:
             return None, 0
         affine, mask = cv2.estimateAffinePartial2D(
-            source, target, method=cv2.RANSAC, ransacReprojThreshold=self.cfg.cmc_ransac_threshold
+            source,
+            target,
+            method=cv2.RANSAC,
+            ransacReprojThreshold=self.cfg.cmc_ransac_threshold * self.cfg.cmc_processing_scale,
         )
         inliers = int(mask.sum()) if mask is not None else 0
         if affine is None or inliers < self.cfg.cmc_min_inliers:
@@ -272,7 +299,10 @@ class _CameraMotionEstimator:
         source = np.float32([key_a[match.queryIdx].pt for match in matches])
         target = np.float32([key_b[match.trainIdx].pt for match in matches])
         affine, mask = cv2.estimateAffinePartial2D(
-            source, target, method=cv2.RANSAC, ransacReprojThreshold=self.cfg.cmc_ransac_threshold
+            source,
+            target,
+            method=cv2.RANSAC,
+            ransacReprojThreshold=self.cfg.cmc_ransac_threshold * self.cfg.cmc_processing_scale,
         )
         inliers = int(mask.sum()) if mask is not None else 0
         if affine is None or inliers < self.cfg.cmc_min_inliers:

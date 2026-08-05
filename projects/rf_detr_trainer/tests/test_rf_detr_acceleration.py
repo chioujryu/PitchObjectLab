@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import torch
 
 import rf_detr_acceleration as acceleration
@@ -162,6 +163,17 @@ class ResolveConfigTest(unittest.TestCase):
         self.assertEqual(resolved.precision, "bf16")
         self.assertEqual(resolved.tensorrt.profile, acceleration.TensorRTProfile(1, 8, 64))
 
+    def test_resolves_reusable_output_buffer_opt_in_strictly(self):
+        resolved = acceleration.resolve_acceleration_config(
+            {"backend": "tensorrt", "tensorrt": {"reuse_output_buffers": True}}
+        )
+        self.assertTrue(resolved.tensorrt.reuse_output_buffers)
+
+        with self.assertRaisesRegex(ValueError, "reuse_output_buffers"):
+            acceleration.resolve_acceleration_config(
+                {"backend": "tensorrt", "tensorrt": {"reuse_output_buffers": "true"}}
+            )
+
     def test_engine_path_derives_adjacent_manifest(self):
         resolved = acceleration.resolve_acceleration_config(
             {"backend": "tensorrt", "tensorrt": {"engine_path": "models/rfdetr.engine"}}
@@ -210,6 +222,15 @@ class ResolveConfigTest(unittest.TestCase):
                     "tensorrt": {"profile": {"min_batch_size": 2, "opt_batch_size": 8, "max_batch_size": 8}},
                 }
             )
+
+    def test_common_tensorrt_profiles_cover_batch_1_4_8_16_and_explicit_optimum(self):
+        profiles = acceleration.tensorrt_optimization_profiles(
+            acceleration.TensorRTProfile(1, 7, 16)
+        )
+
+        self.assertEqual([profile.opt_batch_size for profile in profiles], [1, 4, 7, 8, 16])
+        self.assertTrue(all(profile.min_batch_size == 1 for profile in profiles))
+        self.assertTrue(all(profile.max_batch_size == 16 for profile in profiles))
 
 
 class PyTorchOptimizationTest(unittest.TestCase):
@@ -281,8 +302,162 @@ class PyTorchOptimizationTest(unittest.TestCase):
         self.assertGreaterEqual(handle.consume_postprocess_seconds(), 0.0)
         self.assertEqual(handle.consume_postprocess_seconds(), 0.0)
 
+    def test_handle_reusable_output_pool_allocates_once_per_thread_and_batch(self):
+        model = _FakeRFDETR()
+        handle = acceleration.apply_pytorch_optimization(model, acceleration.resolve_acceleration_config({}))
+        allocations = []
+
+        def allocate(batch_size):
+            allocations.append(batch_size)
+            return {
+                "pred_boxes": torch.empty(batch_size, 2, 4),
+                "pred_logits": torch.empty(batch_size, 2, 3),
+            }
+
+        handle._allocate_output_buffers = allocate
+        handle._infer_into = lambda _tensor, buffers: buffers
+        tensor = torch.zeros(4, 3, 32, 32)
+
+        first = handle.infer_raw_reusing_buffers(tensor)
+        second = handle.infer_raw_reusing_buffers(tensor)
+
+        self.assertEqual(allocations, [4])
+        self.assertIs(first["pred_boxes"], second["pred_boxes"])
+        handle.clear_reusable_output_buffers()
+        after_clear = handle.infer_raw_reusing_buffers(tensor)
+        self.assertEqual(allocations, [4, 4])
+
+        handle._reuse_output_buffers_by_default = True
+        routed = handle.infer_raw(tensor)
+        self.assertEqual(allocations, [4, 4])
+        self.assertIs(routed["pred_boxes"], after_clear["pred_boxes"])
+
+
+class FastBatchPreparationTest(unittest.TestCase):
+    def test_uint8_hwc_images_are_batched_scaled_and_normalized_once(self):
+        first = np.zeros((2, 3, 3), dtype=np.uint8)
+        second = np.full((2, 3, 3), 255, dtype=np.uint8)
+
+        prepared = acceleration.prepare_inference_batch(
+            [first, second],
+            shape=(2, 3),
+            device="cpu",
+        )
+
+        self.assertEqual(prepared.tensor.shape, (2, 3, 2, 3))
+        self.assertTrue(prepared.tensor.is_contiguous())
+        self.assertEqual(prepared.target_sizes.tolist(), [[2, 3], [2, 3]])
+        self.assertAlmostEqual(prepared.tensor[0, 0, 0, 0].item(), -0.485 / 0.229, places=5)
+        self.assertAlmostEqual(prepared.tensor[1, 0, 0, 0].item(), (1.0 - 0.485) / 0.229, places=5)
+        timing = prepared.consume_timing()
+        self.assertGreaterEqual(timing["host_preprocess_seconds"], 0.0)
+        self.assertEqual(timing["h2d_seconds"], 0.0)
+        self.assertEqual(timing["resize_normalize_seconds"], 0.0)
+        self.assertEqual(timing["device_preprocess_seconds"], 0.0)
+        self.assertEqual(timing["total_seconds"], timing["host_preprocess_seconds"])
+
+    def test_uniform_pil_crops_use_the_same_batch_contract(self):
+        from PIL import Image
+
+        crops = [
+            Image.fromarray(np.full((3, 4, 3), value, dtype=np.uint8))
+            for value in (0, 127, 255)
+        ]
+
+        prepared = acceleration.prepare_inference_batch(
+            crops,
+            shape=(3, 4),
+            device="cpu",
+            mean=(0.0, 0.0, 0.0),
+            std=(1.0, 1.0, 1.0),
+        )
+
+        self.assertEqual(prepared.tensor.shape, (3, 3, 3, 4))
+        self.assertEqual(prepared.target_sizes.tolist(), [[3, 4], [3, 4], [3, 4]])
+        self.assertAlmostEqual(prepared.tensor[1].mean().item(), 127.0 / 255.0, places=6)
+
+    def test_mixed_source_sizes_are_grouped_resized_and_returned_in_order(self):
+        images = [
+            torch.zeros(3, 2, 2),
+            torch.ones(3, 3, 4),
+            torch.full((3, 2, 2), 0.5),
+        ]
+
+        prepared = acceleration.prepare_inference_batch(
+            images,
+            shape=4,
+            device=torch.device("cpu"),
+            mean=(0.0, 0.0, 0.0),
+            std=(1.0, 1.0, 1.0),
+        )
+
+        self.assertEqual(prepared.tensor.shape, (3, 3, 4, 4))
+        self.assertEqual(prepared.target_sizes.tolist(), [[2, 2], [3, 4], [2, 2]])
+        self.assertAlmostEqual(prepared.tensor[0].mean().item(), 0.0, places=6)
+        self.assertAlmostEqual(prepared.tensor[1].mean().item(), 1.0, places=6)
+        self.assertAlmostEqual(prepared.tensor[2].mean().item(), 0.5, places=6)
+
+    def test_handle_prepares_using_model_normalization_and_resolution(self):
+        model = _FakeRFDETR()
+        model.means = (0.0, 0.0, 0.0)
+        model.stds = (1.0, 1.0, 1.0)
+        handle = acceleration.apply_pytorch_optimization(model, acceleration.resolve_acceleration_config({}))
+
+        prepared = handle.prepare_batch(torch.ones(3, 4, 5))
+
+        self.assertEqual(prepared.tensor.shape, (1, 3, 32, 32))
+        self.assertEqual(prepared.target_sizes.tolist(), [[4, 5]])
+        self.assertAlmostEqual(prepared.tensor.mean().item(), 1.0, places=6)
+        first = handle.consume_preprocess_timing()
+        second = handle.consume_preprocess_timing()
+        self.assertEqual(first["batches"], 1)
+        self.assertEqual(second["batches"], 0)
+
+    def test_deferred_preprocess_timing_is_idempotent_and_uses_exclusive_stages(self):
+        h2d = MagicMock()
+        h2d.consume_seconds.return_value = 0.02
+        resize = MagicMock()
+        resize.consume_seconds.return_value = 0.03
+        timing = acceleration.PreprocessTiming(
+            host_seconds=0.01,
+            prepare_wall_seconds=0.015,
+            h2d=h2d,
+            resize_normalize=resize,
+        )
+
+        first = timing.consume()
+        second = timing.consume()
+
+        self.assertEqual(first, second)
+        self.assertAlmostEqual(first["device_preprocess_seconds"], 0.05)
+        self.assertAlmostEqual(first["total_seconds"], 0.06)
+        self.assertAlmostEqual(first["prepare_wall_seconds"], 0.015)
+        h2d.consume_seconds.assert_called_once_with()
+        resize.consume_seconds.assert_called_once_with()
+
+    def test_rejects_ambiguous_tensor_layout_without_full_image_reductions(self):
+        with self.assertRaisesRegex(ValueError, "CHW"):
+            acceleration.prepare_inference_batch(
+                torch.zeros(4, 5, 3),
+                shape=4,
+                device="cpu",
+            )
+
 
 class TensorRTUtilityTest(unittest.TestCase):
+    def test_forward_timing_recorder_returns_reusable_events_after_consumption(self):
+        recorder = acceleration.ForwardTimingRecorder()
+        start = MagicMock()
+        start.elapsed_time.return_value = 12.5
+        end = MagicMock()
+        release = MagicMock()
+
+        recorder.add_cuda_events(start, end, release=release)
+
+        self.assertAlmostEqual(recorder.consume_seconds(), 0.0125)
+        end.synchronize.assert_called_once_with()
+        release.assert_called_once_with()
+
     def test_preflight_fp32_does_not_import_optional_dependencies(self):
         with patch.object(acceleration.importlib, "import_module") as importer:
             result = acceleration.preflight_inference_acceleration({}, device="cpu")
@@ -539,12 +714,37 @@ class TensorRTUtilityTest(unittest.TestCase):
         runner = object.__new__(acceleration.TensorRTRunner)
         incomplete = SimpleNamespace(query=lambda: False)
         complete = SimpleNamespace(query=lambda: True)
+        runner._completion_events = MagicMock()
         runner._pending_bindings = [(incomplete, {"input": object()}), (complete, {"input": object()})]
 
         runner._release_completed_bindings()
 
         self.assertEqual(len(runner._pending_bindings), 1)
         self.assertIs(runner._pending_bindings[0][0], incomplete)
+        runner._completion_events.release.assert_called_once_with(complete)
+
+    def test_runner_rejects_new_manifest_from_another_physical_gpu_before_deserialize(self):
+        runner = object.__new__(acceleration.TensorRTRunner)
+        runner.device = torch.device("cuda:0")
+        runner.manifest = {"identity": {"gpu": {"uuid": "GPU-engine-device"}}}
+        properties = SimpleNamespace(uuid="selected-device")
+
+        with patch.object(acceleration.torch.cuda, "device", return_value=nullcontext()), patch.object(
+            acceleration.torch.cuda, "get_device_properties", return_value=properties
+        ), self.assertRaisesRegex(RuntimeError, "physical GPU UUID"):
+            runner._validate_physical_device()
+
+    def test_runner_allows_legacy_manifest_without_physical_uuid(self):
+        runner = object.__new__(acceleration.TensorRTRunner)
+        runner.device = torch.device("cuda:0")
+        runner.manifest = {
+            "identity": {"gpu": {"name": "NVIDIA GeForce RTX 5090", "compute_capability": [12, 0]}}
+        }
+
+        with patch.object(acceleration.torch.cuda, "get_device_properties") as properties:
+            runner._validate_physical_device()
+
+        properties.assert_not_called()
 
     def test_chunking_preserves_dynamic_tail(self):
         self.assertEqual(acceleration.chunk_batch_ranges(135, 64), [(0, 64), (64, 128), (128, 135)])
@@ -584,6 +784,81 @@ class TensorRTUtilityTest(unittest.TestCase):
             with self.subTest(batch_size=batch_size):
                 result = runner.infer(torch.zeros(batch_size, 3, 4, 4))
                 self.assertEqual(result["pred_boxes"].shape[0], batch_size)
+
+    @staticmethod
+    def _multi_profile_runner_on_cpu():
+        runner = object.__new__(acceleration.TensorRTRunner)
+        runner.device = torch.device("cpu")
+        runner.input_dtype = torch.float32
+        runner.min_shape = (1, 3, 4, 4)
+        runner.opt_shape = (1, 3, 4, 4)
+        runner.max_shape = (16, 3, 4, 4)
+        runner.max_batch_size = 16
+        runner.profile_shapes = (
+            ((1, 3, 4, 4), (1, 3, 4, 4), (16, 3, 4, 4)),
+            ((1, 3, 4, 4), (4, 3, 4, 4), (16, 3, 4, 4)),
+            ((1, 3, 4, 4), (8, 3, 4, 4), (16, 3, 4, 4)),
+            ((1, 3, 4, 4), (16, 3, 4, 4), (16, 3, 4, 4)),
+        )
+        runner._selected_profile_index = 0
+        runner._semantic_output_names = {"pred_boxes": "dets", "pred_logits": "labels"}
+        runner._output_shapes = {"dets": (-1, 2, 4), "labels": (-1, 2, 3)}
+        runner._output_dtypes = {"dets": torch.float32, "labels": torch.float32}
+        return runner
+
+    def test_profile_selection_prefers_autotuned_profile_and_falls_back_by_optimum(self):
+        runner = self._multi_profile_runner_on_cpu()
+        runner._selected_profile_index = 2
+
+        self.assertEqual(runner._profile_index_for_batch(4), 2)
+        runner.profile_shapes = (runner.profile_shapes[0], runner.profile_shapes[1])
+        runner._selected_profile_index = 9
+        self.assertEqual(runner._profile_index_for_batch(4), 1)
+
+    def test_caller_owned_output_buffers_can_be_reused_without_reallocation(self):
+        runner = self._multi_profile_runner_on_cpu()
+        buffers = runner.allocate_output_buffers(4)
+
+        def fake_chunk(_tensor, *, output_bindings=None, profile_index=None):
+            self.assertIsNone(profile_index)
+            return acceleration.normalize_raw_outputs(output_bindings)
+
+        runner._infer_chunk = fake_chunk
+        tensor = torch.zeros(4, 3, 4, 4)
+        first = runner.infer_into(tensor, buffers)
+        second = runner.infer_into(tensor, buffers)
+
+        self.assertIs(first["pred_boxes"], buffers["pred_boxes"])
+        self.assertIs(second["pred_logits"], buffers["pred_logits"])
+        with self.assertRaisesRegex(ValueError, "must contain"):
+            runner.infer_into(tensor, {"pred_boxes": buffers["pred_boxes"]})
+
+    def test_profile_autotune_selects_lowest_median_without_global_synchronize(self):
+        runner = self._multi_profile_runner_on_cpu()
+        durations = {0: 0.004, 1: 0.002, 2: 0.003, 3: 0.005}
+        runner.allocate_output_buffers = lambda _batch: {}
+        runner.infer_into = lambda _tensor, _buffers: {}
+        runner.synchronize = MagicMock()
+        runner.consume_forward_seconds = lambda: durations[runner._selected_profile_index]
+
+        with patch.object(acceleration.torch.cuda, "synchronize") as global_sync:
+            report = runner.autotune_profiles(4, warmup_iterations=0, measure_iterations=3)
+
+        self.assertEqual(report["selected_profile_index"], 1)
+        self.assertEqual(runner._selected_profile_index, 1)
+        self.assertEqual(runner.synchronize.call_count, 12)
+        global_sync.assert_not_called()
+
+    def test_activate_profile_uses_private_stream_async_api(self):
+        runner = object.__new__(acceleration.TensorRTRunner)
+        runner._active_profile_index = 0
+        runner._stream = SimpleNamespace(cuda_stream=123)
+        runner._context = SimpleNamespace(set_optimization_profile_async=MagicMock(return_value=True))
+
+        runner._activate_profile(2)
+
+        runner._context.set_optimization_profile_async.assert_called_once_with(2, 123)
+        self.assertEqual(runner._active_profile_index, 2)
 
     def test_manifest_detects_engine_corruption(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -683,6 +958,138 @@ class TensorRTArtifactCacheTest(unittest.TestCase):
         self.assertEqual(current['cache_key'], repeated['cache_key'])
         self.assertNotEqual(current['cache_key'], old['cache_key'])
 
+    def test_physical_gpu_uuid_and_vbios_are_part_of_cache_key(self):
+        first_identity = self._identity()
+        first_identity["gpu"].update(
+            {
+                "uuid": "GPU-first",
+                "pci_bus_id": "00000000:16:00.0",
+                "pci_sub_device_id": "0xf3181569",
+                "vbios_version": "98.02.2e.80.10",
+            }
+        )
+        second_identity = json.loads(json.dumps(first_identity))
+        second_identity["gpu"]["uuid"] = "GPU-second"
+        third_identity = json.loads(json.dumps(first_identity))
+        third_identity["gpu"]["vbios_version"] = "98.02.2e.80.0f"
+
+        first = acceleration._manifest_template(first_identity)
+        second = acceleration._manifest_template(second_identity)
+        third = acceleration._manifest_template(third_identity)
+
+        self.assertNotEqual(first["cache_key"], second["cache_key"])
+        self.assertNotEqual(first["cache_key"], third["cache_key"])
+
+    def test_gpu_identity_combines_torch_properties_with_matching_nvidia_smi_row(self):
+        properties = SimpleNamespace(
+            uuid="f95dc184-c651-6edb-cdb0-6b17d64e57de",
+            pci_domain_id=0,
+            pci_bus_id=22,
+            pci_device_id=0,
+            total_memory=32_000,
+            multi_processor_count=170,
+            L2_cache_size=96_000,
+            memory_bus_width=512,
+            is_multi_gpu_board=False,
+        )
+        smi = {
+            "uuid": "GPU-f95dc184-c651-6edb-cdb0-6b17d64e57de",
+            "pci_bus_id": "00000000:16:00.0",
+            "pci_device_id": "0x2b8510de",
+            "pci_sub_device_id": "0xf3181569",
+            "vbios_version": "98.02.2E.80.10",
+            "driver_version": "580.82.07",
+        }
+        with patch.object(acceleration.torch.cuda, "device", return_value=nullcontext()), patch.object(
+            acceleration.torch.cuda, "get_device_properties", return_value=properties
+        ), patch.object(acceleration.torch.cuda, "get_device_capability", return_value=(12, 0)), patch.object(
+            acceleration.torch.cuda, "get_device_name", return_value="NVIDIA GeForce RTX 5090"
+        ), patch.object(acceleration, "_nvidia_smi_gpu_details", return_value=smi):
+            identity = acceleration._gpu_runtime_identity(torch.device("cuda:0"))
+
+        self.assertEqual(identity["uuid"], smi["uuid"])
+        self.assertEqual(identity["pci_bus_id"], smi["pci_bus_id"])
+        self.assertEqual(identity["pci_sub_device_id"], smi["pci_sub_device_id"])
+        self.assertEqual(identity["vbios_version"], smi["vbios_version"])
+        self.assertEqual(identity["driver_version"], smi["driver_version"])
+        self.assertEqual(identity["compute_capability"], [12, 0])
+        self.assertEqual(identity["multiprocessor_count"], 170)
+
+    def test_nvidia_smi_details_select_the_physical_uuid_not_logical_index(self):
+        output = "\n".join(
+            [
+                "GPU-first, 00000000:16:00.0, 0x2B8510DE, 0xF3181569, bios-a, 580.82.07",
+                "GPU-second, 00000000:27:00.0, 0x2B8510DE, 0xF3181569, bios-b, 580.82.07",
+            ]
+        )
+        completed = SimpleNamespace(returncode=0, stdout=output)
+        with patch.object(acceleration.shutil, "which", return_value="/usr/bin/nvidia-smi"), patch.object(
+            acceleration.subprocess, "run", return_value=completed
+        ) as run:
+            details = acceleration._nvidia_smi_gpu_details("second")
+
+        self.assertEqual(details["uuid"], "GPU-second")
+        self.assertEqual(details["pci_bus_id"], "00000000:27:00.0")
+        self.assertEqual(details["vbios_version"], "bios-b")
+        run.assert_called_once()
+
+    def test_public_gpu_identity_wrapper_uses_the_cache_identity_implementation(self):
+        expected = {"uuid": "GPU-test", "pci_bus_id": "00000000:01:00.0"}
+        with patch.object(
+            acceleration, "_preflight_device", return_value=torch.device("cuda:3")
+        ) as resolve, patch.object(acceleration, "_require_cuda") as require, patch.object(
+            acceleration, "_gpu_runtime_identity", return_value=expected
+        ) as identify:
+            result = acceleration.gpu_runtime_identity(3)
+
+        self.assertEqual(result, expected)
+        self.assertIsNot(result, expected)
+        resolve.assert_called_once_with(3)
+        require.assert_called_once_with(torch.device("cuda:3"))
+        identify.assert_called_once_with(torch.device("cuda:3"))
+
+    def test_onnx_cache_key_ignores_physical_gpu_and_tensorrt_only_fields(self):
+        first = self._identity()
+        first["gpu"].update({"uuid": "GPU-first", "vbios_version": "bios-a"})
+        first["runtime"]["nvidia_driver"] = "driver-a"
+        first["optimization_profiles"] = [{"opt_batch_size": 4}]
+        second = json.loads(json.dumps(first))
+        second["gpu"].update({"uuid": "GPU-second", "vbios_version": "bios-b"})
+        second["runtime"].update({"nvidia_driver": "driver-b", "tensorrt": "10.16.2"})
+        second["precision"] = "bf16"
+        second["profile"]["opt_batch_size"] = 16
+        second["optimization_profiles"] = [{"opt_batch_size": 16}]
+
+        first_onnx = acceleration._onnx_manifest_template(first)
+        second_onnx = acceleration._onnx_manifest_template(second)
+
+        self.assertEqual(first_onnx["cache_key"], second_onnx["cache_key"])
+        self.assertNotIn("gpu", first_onnx["identity"])
+        self.assertNotIn("tensorrt", first_onnx["identity"]["runtime"])
+
+    def test_onnx_cache_manifest_rejects_corrupted_export(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            onnx = root / "model.onnx"
+            manifest_path = root / "model.onnx.manifest.json"
+            onnx.write_bytes(b"valid-onnx")
+            expected = acceleration._onnx_manifest_template(self._identity())
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        **expected,
+                        "onnx_sha256": hashlib.sha256(b"valid-onnx").hexdigest(),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            acceleration._validate_cached_onnx(onnx, manifest_path, expected)
+            onnx.write_bytes(b"corrupt-onnx")
+
+            with self.assertRaisesRegex(RuntimeError, "hash"):
+                acceleration._validate_cached_onnx(onnx, manifest_path, expected)
+
     def test_cache_miss_hit_force_rebuild_and_manifest_last_atomic_publish(self):
         with tempfile.TemporaryDirectory() as temporary:
             cache_dir = Path(temporary)
@@ -737,6 +1144,53 @@ class TensorRTArtifactCacheTest(unittest.TestCase):
                 hashlib.sha256(b"fake-engine-2").hexdigest(),
             )
             self.assertFalse(any(path.name.endswith(".tmp") for path in cache_dir.iterdir()))
+
+    def test_two_physical_gpu_engine_keys_share_one_validated_onnx_export(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cache_dir = Path(temporary)
+            settings = self._settings(cache_dir)
+            first_identity = self._identity("shared-onnx")
+            first_identity["gpu"].update({"uuid": "GPU-first", "vbios_version": "bios-a"})
+            first_identity["runtime"]["nvidia_driver"] = "driver-a"
+            second_identity = json.loads(json.dumps(first_identity))
+            second_identity["gpu"].update({"uuid": "GPU-second", "vbios_version": "bios-b"})
+            second_identity["runtime"]["nvidia_driver"] = "driver-b"
+            exports = []
+            builds = []
+
+            def fake_export(_model, output_dir, _settings):
+                exports.append(Path(output_dir))
+                exported = Path(output_dir) / "exported.onnx"
+                exported.write_bytes(b"shared-onnx")
+                return exported
+
+            def fake_build(_onnx_path, engine_path, _settings, **_kwargs):
+                payload = f"engine-{len(builds)}".encode()
+                builds.append(payload)
+                Path(engine_path).write_bytes(payload)
+                return Path(engine_path)
+
+            with patch.object(
+                acceleration, "_import_tensorrt", return_value=SimpleNamespace(__version__="10.16.0")
+            ), patch.object(
+                acceleration, "_build_identity", side_effect=[first_identity, second_identity]
+            ), patch.object(
+                acceleration, "_export_dynamic_onnx", side_effect=fake_export
+            ), patch.object(
+                acceleration, "build_tensorrt_engine", side_effect=fake_build
+            ), patch.object(
+                acceleration, "_model_device", return_value=torch.device("cuda:0")
+            ), patch.object(acceleration.torch.cuda, "device", return_value=nullcontext()):
+                first = acceleration.prepare_tensorrt_engine(object(), settings, segmentation=False)
+                second = acceleration.prepare_tensorrt_engine(object(), settings, segmentation=False)
+
+            self.assertEqual(len(exports), 1)
+            self.assertEqual(len(builds), 2)
+            self.assertNotEqual(first.engine_path, second.engine_path)
+            self.assertEqual(first.onnx_path, second.onnx_path)
+            self.assertTrue(first.onnx_path.is_file())
+            self.assertFalse(first.manifest["onnx_cache_hit"])
+            self.assertTrue(second.manifest["onnx_cache_hit"])
 
     def test_export_abi_change_rebuilds_once_then_hits_new_cache(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -904,7 +1358,7 @@ class _FakeBuildConfig:
     def __init__(self):
         self.workspace = None
         self.flag = None
-        self.profile = None
+        self.profiles = []
 
     def set_memory_pool_limit(self, pool, size):
         self.workspace = (pool, size)
@@ -913,7 +1367,8 @@ class _FakeBuildConfig:
         self.flag = flag
 
     def add_optimization_profile(self, profile):
-        self.profile = profile
+        self.profiles.append(profile)
+        return len(self.profiles) - 1
 
 
 class _FakeBuilder:
@@ -924,7 +1379,6 @@ class _FakeBuilder:
     def __init__(self, _logger):
         type(self).last = self
         self.network = _FakeNetwork()
-        self.profile = _FakeProfile()
         self.config = _FakeBuildConfig()
 
     def create_network(self, _flag):
@@ -934,7 +1388,7 @@ class _FakeBuilder:
         return self.config
 
     def create_optimization_profile(self):
-        return self.profile
+        return _FakeProfile()
 
     def build_serialized_network(self, _network, _config):
         return b"fake-engine"
@@ -990,8 +1444,15 @@ class TensorRTBuilderTest(unittest.TestCase):
             builder = _FakeBuilder.last
             self.assertEqual(builder.config.flag, "bf16")
             self.assertEqual(
-                builder.profile.shapes,
-                ("input", (1, 3, 32, 32), (7, 3, 32, 32), (64, 3, 32, 32)),
+                [profile.shapes[2][0] for profile in builder.config.profiles],
+                [1, 4, 7, 8, 16],
+            )
+            self.assertTrue(
+                all(
+                    profile.shapes[1] == (1, 3, 32, 32)
+                    and profile.shapes[3] == (64, 3, 32, 32)
+                    for profile in builder.config.profiles
+                )
             )
             self.assertEqual(engine.read_bytes(), b"fake-engine")
 
@@ -1019,6 +1480,91 @@ class TensorRTPredictAdapterTest(unittest.TestCase):
         self.assertEqual(adapter.infer_raw(torch.zeros(1, 3, 32, 32))["pred_boxes"].shape, (1, 2, 4))
         restored = adapter.restore_pytorch_model()
         self.assertIs(restored.model.model, original)
+
+    def test_accuracy_parity_hook_preserves_metric_details_and_callback_errors(self):
+        handle = SimpleNamespace()
+
+        accepted = acceleration.run_inference_accuracy_parity_check(
+            handle,
+            lambda _handle: {"accepted": True, "delta_map": -0.2, "football_recall_delta": -0.004},
+        )
+        failed = acceleration.run_inference_accuracy_parity_check(
+            handle,
+            lambda _handle: (_ for _ in ()).throw(RuntimeError("validation unavailable")),
+        )
+
+        self.assertTrue(accepted["accepted"])
+        self.assertEqual(accepted["reference_precision"], "bf16")
+        self.assertEqual(accepted["details"]["delta_map"], -0.2)
+        self.assertFalse(failed["accepted"])
+        self.assertIn("validation unavailable", failed["error"])
+
+    def test_configure_falls_back_to_pytorch_bf16_when_parity_gate_rejects_fp16(self):
+        source = _FakeRFDETR(device="cuda:0")
+        settings = acceleration.resolve_acceleration_config(
+            {
+                "backend": "tensorrt",
+                "tensorrt": {
+                    "precision": "fp16",
+                    "profile": {"min_batch_size": 1, "opt_batch_size": 4, "max_batch_size": 4},
+                },
+            },
+            resolution=32,
+        )
+        manifest = {
+            "engine_sha256": "engine-hash",
+            "identity": {"gpu": {"uuid": "GPU-test"}},
+        }
+        artifact = acceleration.TensorRTArtifact(
+            engine_path=Path("fake.engine"),
+            manifest_path=Path("fake.engine.manifest.json"),
+            onnx_path=None,
+            cache_hit=True,
+            manifest=manifest,
+        )
+        runner = SimpleNamespace(
+            device=torch.device("cuda:0"),
+            engine_path=Path("fake.engine"),
+            resolution=32,
+            input_dtype=torch.float32,
+            forward_timing=acceleration.ForwardTimingRecorder(),
+            infer=lambda tensor: {
+                "pred_boxes": torch.zeros(tensor.shape[0], 2, 4),
+                "pred_logits": torch.zeros(tensor.shape[0], 2, 3),
+            },
+            autotune_profiles=MagicMock(
+                return_value={
+                    "batch_size": 4,
+                    "selected_profile_index": 0,
+                    "benchmarked": False,
+                    "profiles": [],
+                }
+            ),
+            warmup=MagicMock(return_value=0.01),
+            consume_forward_seconds=MagicMock(return_value=0.0),
+            infer_into=MagicMock(),
+            allocate_output_buffers=MagicMock(),
+        )
+
+        with patch.object(acceleration, "prepare_tensorrt_engine", return_value=artifact), patch.object(
+            acceleration, "TensorRTRunner", return_value=runner
+        ), patch.object(acceleration, "_require_cuda"):
+            handle = acceleration.configure_inference_acceleration(
+                source,
+                settings,
+                parity_check=lambda candidate: {
+                    "accepted": False,
+                    "candidate_backend": candidate.backend,
+                    "delta_map": -0.7,
+                },
+            )
+
+        self.assertEqual(handle.backend, "pytorch")
+        self.assertEqual(handle.precision, "bf16")
+        self.assertEqual(handle.metadata["requested_backend"], "tensorrt")
+        self.assertEqual(handle.metadata["effective_backend"], "pytorch")
+        self.assertEqual(handle.metadata["accuracy_parity"]["details"]["delta_map"], -0.7)
+        self.assertEqual(source.optimize_calls, [{"compile": False, "dtype": torch.bfloat16}])
 
 
 if __name__ == "__main__":

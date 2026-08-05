@@ -10,6 +10,8 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import statistics
+import time
 from collections.abc import Mapping, MutableMapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -20,6 +22,8 @@ from rf_detr_config import load_yaml
 
 DEFAULT_CPU_LIMIT_ENABLED = True
 DEFAULT_CPU_BUDGET_PERCENT = 50.0
+DEFAULT_TORCH_INTRAOP_THREADS = "auto"
+DEFAULT_GPU_INFERENCE_THREAD_CAP = 16
 THREAD_ENVIRONMENT_VARIABLES = (
     "OMP_NUM_THREADS",
     "MKL_NUM_THREADS",
@@ -41,6 +45,7 @@ class CpuRuntimePolicy:
     model_processes: int
     threads_per_process: Optional[int]
     source_config: str
+    auto_tune_intraop: bool = False
 
 
 _ACTIVE_POLICY: Optional[CpuRuntimePolicy] = None
@@ -77,6 +82,31 @@ def validate_budget_percent(value: Any) -> float:
     return parsed
 
 
+def parse_torch_intraop_threads(value: Any) -> str | int:
+    """Parse ``auto`` or an explicit positive PyTorch intra-op thread count."""
+    if value is None:
+        return DEFAULT_TORCH_INTRAOP_THREADS
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        return DEFAULT_TORCH_INTRAOP_THREADS
+    if isinstance(value, bool):
+        raise ValueError(
+            "runtime.cpu.torch_intraop_threads must be auto or a positive integer, not a boolean."
+        )
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "runtime.cpu.torch_intraop_threads must be auto or a positive integer, "
+            f"got {value!r}."
+        ) from exc
+    if parsed <= 0:
+        raise ValueError(
+            "runtime.cpu.torch_intraop_threads must be auto or a positive integer, "
+            f"got {value!r}."
+        )
+    return parsed
+
+
 def cpu_settings(config: Mapping[str, Any]) -> tuple[bool, float]:
     """Read validated ``runtime.cpu`` settings with stable defaults."""
     runtime = config.get("runtime", {})
@@ -94,6 +124,23 @@ def cpu_settings(config: Mapping[str, Any]) -> tuple[bool, float]:
     return enabled, budget_percent
 
 
+def torch_intraop_setting(config: Mapping[str, Any]) -> str | int:
+    """Read the task-aware PyTorch intra-op override from ``runtime.cpu``."""
+    runtime = config.get("runtime", {})
+    if runtime is None:
+        runtime = {}
+    if not isinstance(runtime, Mapping):
+        raise ValueError("runtime must be a mapping.")
+    cpu = runtime.get("cpu", {})
+    if cpu is None:
+        cpu = {}
+    if not isinstance(cpu, Mapping):
+        raise ValueError("runtime.cpu must be a mapping.")
+    return parse_torch_intraop_threads(
+        cpu.get("torch_intraop_threads", DEFAULT_TORCH_INTRAOP_THREADS)
+    )
+
+
 def add_cpu_cli_arguments(parser: argparse.ArgumentParser) -> None:
     """Add the shared CPU-budget CLI to an entrypoint parser."""
     parser.add_argument(
@@ -108,13 +155,22 @@ def add_cpu_cli_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Logical-CPU thread budget percentage, from 1 to 100 (default: 50).",
     )
+    parser.add_argument(
+        "--torch-intraop-threads",
+        default=None,
+        help=(
+            "PyTorch intra-op threads: auto, or a positive integer. Auto caps single-GPU "
+            "test/inference preprocessing at 16 threads."
+        ),
+    )
 
 
 def apply_cpu_cli_overrides(config: MutableMapping[str, Any], args: argparse.Namespace) -> None:
     """Persist CPU CLI overrides into the merged config snapshot."""
     cpu_limit = getattr(args, "cpu_limit", None)
     cpu_budget_percent = getattr(args, "cpu_budget_percent", None)
-    if cpu_limit is None and cpu_budget_percent is None:
+    torch_intraop_threads = getattr(args, "torch_intraop_threads", None)
+    if cpu_limit is None and cpu_budget_percent is None and torch_intraop_threads is None:
         return
     runtime = config.setdefault("runtime", {})
     if not isinstance(runtime, MutableMapping):
@@ -126,6 +182,8 @@ def apply_cpu_cli_overrides(config: MutableMapping[str, Any], args: argparse.Nam
         cpu["enabled"] = bool(cpu_limit)
     if cpu_budget_percent is not None:
         cpu["budget_percent"] = validate_budget_percent(cpu_budget_percent)
+    if torch_intraop_threads is not None:
+        cpu["torch_intraop_threads"] = parse_torch_intraop_threads(torch_intraop_threads)
 
 
 def _positive_int(value: Any) -> Optional[int]:
@@ -184,6 +242,18 @@ def infer_model_processes(
             if chunks is None:
                 raise ValueError("test.parallel.chunks must be a positive integer.")
             configured = chunks
+            allow_oversubscription = parallel.get("allow_same_gpu_oversubscription", False)
+            if not isinstance(allow_oversubscription, bool):
+                raise ValueError("test.parallel.allow_same_gpu_oversubscription must be a boolean.")
+            if not allow_oversubscription:
+                model = config.get("model", {})
+                if not isinstance(model, Mapping):
+                    model = {}
+                unique_devices = (
+                    _device_process_count(model.get("device"), integer_is_count=False)
+                    or 1
+                )
+                configured = min(configured, unique_devices)
     elif normalized_task == "train":
         train = config.get("train", {})
         if not isinstance(train, Mapping):
@@ -215,6 +285,7 @@ def resolve_cpu_policy(
 ) -> CpuRuntimePolicy:
     """Resolve and validate the complete CPU policy for one process."""
     enabled, budget_percent = cpu_settings(config)
+    requested_intraop = torch_intraop_setting(config)
     available = max(1, int(logical_cpus if logical_cpus is not None else (os.cpu_count() or 1)))
     model_processes = infer_model_processes(config, task, env)
     total_budget: Optional[int] = None
@@ -228,7 +299,23 @@ def resolve_cpu_policy(
                 f"budget_percent={budget_percent:g}. Reduce test.parallel.chunks/train devices, "
                 "increase runtime.cpu.budget_percent, or use --no-cpu-limit explicitly."
             )
-        threads_per_process = max(1, total_budget // model_processes)
+        budget_threads_per_process = max(1, total_budget // model_processes)
+        if requested_intraop == "auto":
+            threads_per_process = budget_threads_per_process
+            if str(task).strip().lower() in {"inference", "test"}:
+                # The RF-DETR PIL/tensor preprocessing hot path becomes dramatically
+                # slower when tiny image operations fan out across dozens of threads.
+                threads_per_process = min(
+                    threads_per_process,
+                    DEFAULT_GPU_INFERENCE_THREAD_CAP,
+                )
+        else:
+            if requested_intraop > budget_threads_per_process:
+                raise ValueError(
+                    "runtime.cpu.torch_intraop_threads exceeds the per-process CPU budget: "
+                    f"requested={requested_intraop}, budget={budget_threads_per_process}."
+                )
+            threads_per_process = requested_intraop
     return CpuRuntimePolicy(
         task=str(task),
         enabled=enabled,
@@ -238,7 +325,77 @@ def resolve_cpu_policy(
         model_processes=model_processes,
         threads_per_process=threads_per_process,
         source_config=str(source_config.expanduser().resolve()),
+        auto_tune_intraop=(
+            enabled
+            and requested_intraop == "auto"
+            and str(task).strip().lower() in {"inference", "test"}
+            and bool(threads_per_process is not None and threads_per_process >= 16)
+        ),
     )
+
+
+def benchmark_torch_intraop_candidates(
+    torch_module: Any,
+    candidates: Sequence[int] = (8, 16),
+    *,
+    warmup_iterations: int = 2,
+    measured_iterations: int = 5,
+) -> tuple[int, list[Dict[str, Any]]]:
+    """Select the faster short-batch preprocessing thread count.
+
+    The workload mirrors the host portion of the RF-DETR fast preprocessor:
+    uint8 batch conversion followed by in-place scaling and normalization.  It
+    deliberately avoids model forward so startup tuning remains short and does
+    not allocate GPU memory.
+    """
+
+    allowed = sorted({int(value) for value in candidates if int(value) > 0})
+    if not allowed:
+        raise ValueError("CPU intra-op benchmark requires at least one positive candidate.")
+    if len(allowed) == 1:
+        torch_module.set_num_threads(allowed[0])
+        return allowed[0], [{"threads": allowed[0], "median_seconds": 0.0, "samples": []}]
+
+    sample = torch_module.randint(
+        0,
+        256,
+        (8, 3, 320, 320),
+        dtype=torch_module.uint8,
+        device="cpu",
+    )
+    mean = torch_module.tensor((0.485, 0.456, 0.406), dtype=torch_module.float32).view(1, 3, 1, 1)
+    std = torch_module.tensor((0.229, 0.224, 0.225), dtype=torch_module.float32).view(1, 3, 1, 1)
+
+    def run_once() -> None:
+        converted = sample.to(dtype=torch_module.float32)
+        converted.div_(255.0).sub_(mean).div_(std)
+        converted.contiguous()
+
+    rows: list[Dict[str, Any]] = []
+    original_threads = int(torch_module.get_num_threads())
+    try:
+        for threads in allowed:
+            torch_module.set_num_threads(threads)
+            for _ in range(max(0, int(warmup_iterations))):
+                run_once()
+            samples: list[float] = []
+            for _ in range(max(1, int(measured_iterations))):
+                started = time.perf_counter()
+                run_once()
+                samples.append(time.perf_counter() - started)
+            rows.append(
+                {
+                    "threads": threads,
+                    "median_seconds": statistics.median(samples),
+                    "samples": samples,
+                }
+            )
+        selected = int(min(rows, key=lambda row: (row["median_seconds"], row["threads"]))["threads"])
+        torch_module.set_num_threads(selected)
+        return selected, rows
+    except Exception:
+        torch_module.set_num_threads(original_threads)
+        raise
 
 
 def _preparse_args(
@@ -331,6 +488,19 @@ def apply_loaded_runtime(policy: Optional[CpuRuntimePolicy] = None) -> Dict[str,
         assert active.threads_per_process is not None
         torch.set_num_threads(active.threads_per_process)
         torch.set_num_interop_threads(1)
+        if active.auto_tune_intraop:
+            candidates = tuple(
+                value for value in (8, 16) if value <= active.threads_per_process
+            )
+            if len(candidates) >= 2:
+                benchmark_started = time.perf_counter()
+                selected, rows = benchmark_torch_intraop_candidates(torch, candidates)
+                summary["torch_intraop_auto_benchmark"] = {
+                    "candidates": rows,
+                    "selected_threads": selected,
+                    "elapsed_seconds": time.perf_counter() - benchmark_started,
+                    "workload": "uint8_batch8_3x320x320_scale_normalize",
+                }
     summary["torch_intraop_threads"] = int(torch.get_num_threads())
     summary["torch_interop_threads"] = int(torch.get_num_interop_threads())
     try:
@@ -402,7 +572,7 @@ def format_summary(summary: Optional[Mapping[str, Any]] = None) -> str:
         f"logical={values.get('logical_cpus')}, "
         f"budget={values.get('total_thread_budget')} ({float(values.get('budget_percent', 0)):g}%), "
         f"model_processes={values.get('model_processes')}, "
-        f"threads/process={values.get('threads_per_process')}, "
+        f"threads/process={values.get('torch_intraop_threads', values.get('threads_per_process'))}, "
         f"torch_interop={values.get('torch_interop_threads', 1)}, "
         f"opencv={values.get('opencv_threads', 1)}."
     )

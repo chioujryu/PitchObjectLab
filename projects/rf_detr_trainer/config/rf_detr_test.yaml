@@ -9,6 +9,10 @@ runtime:
     enabled: true
     # Percentage of logical CPUs shared by active model processes. Options: 1-100.
     budget_percent: 50
+    # PyTorch preprocessing threads. auto caps single-GPU test at 16. Options: auto or positive integer.
+    torch_intraop_threads: auto
+  # Runtime optimization profile label stored in run metadata. Options: safe, fast, null.
+  performance_profile: null
   # Print wrapper status text. Options: true, false.
   verbose: true
   # Estimate outputs and exit before model loading/inference. Options: true, false.
@@ -136,6 +140,12 @@ test:
   parallel:
     # Balanced test-data chunks and concurrent model replicas. Options: positive integer; 1 disables multiprocessing and preserves the single-model path.
     chunks: 1
+    # Permit multiple complete model replicas on one GPU. Keep false for single-GPU execution.
+    allow_same_gpu_oversubscription: false
+  # Diagnostic artifact controls. Options: mapping.
+  artifacts:
+    # Write one manifest row per generated model input/slice. false stores only rendered-grid cases and counts.
+    full_model_input_manifest: false
   # Test mode selector block. Options: mapping.
   test_mode:
     # Test mode. Options: full_image, class_crop, sahi.
@@ -177,7 +187,7 @@ test:
     postprocess_match_threshold: 0.5
     # Class-agnostic slice merge. Options: true, false.
     postprocess_class_agnostic: false
-    # RF-DETR SAHI slice/recheck batch size. Options: positive integer.
+    # RF-DETR SAHI slice/recheck batch size. auto starts at 16 and persists any OOM downshift. Options: auto or positive integer.
     batch_size: 4
     # recheck nested configuration block. Options: mapping.
     recheck:

@@ -1,0 +1,18 @@
+# Accuracy-gated single-GPU Medium-P2 TensorRT SAHI evaluation profile.
+extends: rf_detr_test_medium_p2_performance_safe.yaml
+
+runtime:
+  performance_profile: fast
+
+model:
+  inference_optimization:
+    backend: tensorrt
+    tensorrt:
+      precision: fp16
+      profile:
+        min_batch_size: 1
+        opt_batch_size: 8
+        max_batch_size: 16
+
+output:
+  name: rfdetr_medium_p2_test_fast_{timestamp}

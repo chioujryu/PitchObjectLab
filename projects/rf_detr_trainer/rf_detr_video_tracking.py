@@ -152,6 +152,7 @@ _HYBRID_OPTION_GROUPS = {
     "cmc": {
         "cmc_enabled", "cmc_max_corners", "cmc_quality_level", "cmc_min_distance", "cmc_ransac_threshold",
         "cmc_min_inliers", "cmc_max_translation", "cmc_min_scale", "cmc_max_scale",
+        "cmc_processing_scale", "processing_scale",
     },
 }
 
@@ -194,6 +195,7 @@ class TrackingConfig:
     use_velocity_prediction: bool = False
     velocity_smoothing: float = 0.5
     draw_trajectory: bool = True
+    draw_predicted_trajectory: bool = False
     trajectory_max_points: Optional[int] = 30
     trajectory_max_age_frames: Optional[int] = 30
     trajectory_width: int = 2
@@ -406,6 +408,7 @@ def parse_tracking_config(
         use_velocity_prediction=_as_bool(raw.get("use_velocity_prediction"), False),
         velocity_smoothing=velocity_smoothing,
         draw_trajectory=_as_bool(raw.get("draw_trajectory"), True),
+        draw_predicted_trajectory=_as_bool(raw.get("draw_predicted_trajectory"), False),
         trajectory_max_points=_as_optional_int(raw.get("trajectory_max_points", 30), "trajectory_max_points"),
         trajectory_max_age_frames=trajectory_max_age_frames,
         trajectory_width=trajectory_width,

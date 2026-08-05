@@ -39,11 +39,96 @@ class CpuPolicyTests(unittest.TestCase):
         self.assertEqual(policy.model_processes, 1)
         self.assertEqual(policy.threads_per_process, 16)
 
+    def test_inference_auto_caps_large_hosts_at_sixteen_threads(self):
+        policy = cpu_runtime.resolve_cpu_policy(
+            {"runtime": {"cpu": {"enabled": True, "budget_percent": 50}}},
+            "inference",
+            CONFIG_DIR / "rf_detr_inference.yaml",
+            logical_cpus=128,
+            env={},
+        )
+
+        self.assertEqual(policy.total_thread_budget, 64)
+        self.assertEqual(policy.threads_per_process, 16)
+        self.assertTrue(policy.auto_tune_intraop)
+
+    def test_train_auto_keeps_full_per_process_budget(self):
+        policy = cpu_runtime.resolve_cpu_policy(
+            {"runtime": {"cpu": {"enabled": True, "budget_percent": 50}}},
+            "train",
+            CONFIG_DIR / "rf_detr_train.yaml",
+            logical_cpus=128,
+            env={},
+        )
+
+        self.assertEqual(policy.threads_per_process, 64)
+
+    def test_explicit_intraop_thread_override(self):
+        policy = cpu_runtime.resolve_cpu_policy(
+            {
+                "runtime": {
+                    "cpu": {
+                        "enabled": True,
+                        "budget_percent": 50,
+                        "torch_intraop_threads": 8,
+                    }
+                }
+            },
+            "test",
+            CONFIG_DIR / "rf_detr_test.yaml",
+            logical_cpus=128,
+            env={},
+        )
+
+        self.assertEqual(policy.threads_per_process, 8)
+        self.assertFalse(policy.auto_tune_intraop)
+
+    def test_auto_intraop_benchmark_selects_and_records_fastest_candidate(self):
+        policy = cpu_runtime.CpuRuntimePolicy(
+            task="inference",
+            enabled=True,
+            budget_percent=50,
+            logical_cpus=128,
+            total_thread_budget=64,
+            model_processes=1,
+            threads_per_process=16,
+            source_config="test.yaml",
+            auto_tune_intraop=True,
+        )
+        state = {"threads": 24, "interop": 24}
+        fake_torch = types.SimpleNamespace(
+            set_num_threads=lambda value: state.__setitem__("threads", value),
+            set_num_interop_threads=lambda value: state.__setitem__("interop", value),
+            get_num_threads=lambda: state["threads"],
+            get_num_interop_threads=lambda: state["interop"],
+        )
+        fake_cv2 = types.SimpleNamespace(setNumThreads=lambda _value: None, getNumThreads=lambda: 1)
+        rows = [
+            {"threads": 8, "median_seconds": 0.01, "samples": [0.01]},
+            {"threads": 16, "median_seconds": 0.02, "samples": [0.02]},
+        ]
+
+        with patch.dict(sys.modules, {"torch": fake_torch, "cv2": fake_cv2}), patch.object(
+            cpu_runtime,
+            "benchmark_torch_intraop_candidates",
+            side_effect=lambda module, candidates: (module.set_num_threads(8) or 8, rows),
+        ):
+            summary = cpu_runtime.apply_loaded_runtime(policy)
+
+        self.assertEqual(summary["torch_intraop_threads"], 8)
+        self.assertEqual(summary["torch_intraop_auto_benchmark"]["selected_threads"], 8)
+        self.assertEqual([row["threads"] for row in rows], [8, 16])
+
     def test_test_chunks_share_the_total_budget(self):
         policy = cpu_runtime.resolve_cpu_policy(
             {
                 "runtime": {"cpu": {"enabled": True, "budget_percent": 50}},
-                "test": {"parallel": {"chunks": 6}},
+                "test": {
+                    "parallel": {
+                        "chunks": 6,
+                        "allow_same_gpu_oversubscription": True,
+                    }
+                },
             },
             "test",
             CONFIG_DIR / "rf_detr_test.yaml",
@@ -124,7 +209,7 @@ class CpuPolicyTests(unittest.TestCase):
         self.assertTrue(policy.enabled)
         self.assertEqual(policy.budget_percent, 75)
         self.assertEqual(policy.total_thread_budget, 24)
-        self.assertEqual(policy.threads_per_process, 24)
+        self.assertEqual(policy.threads_per_process, 16)
 
     def test_topology_cli_is_applied_before_numerical_imports(self):
         config_path = CONFIG_DIR / "rf_detr_test.yaml"
@@ -141,9 +226,9 @@ class CpuPolicyTests(unittest.TestCase):
                 for name in cpu_runtime.THREAD_ENVIRONMENT_VARIABLES
             }
 
-        self.assertEqual(policy.model_processes, 6)
-        self.assertEqual(policy.threads_per_process, 2)
-        self.assertEqual(set(environment.values()), {"2"})
+        self.assertEqual(policy.model_processes, 1)
+        self.assertEqual(policy.threads_per_process, 16)
+        self.assertEqual(set(environment.values()), {"16"})
 
     def test_train_device_cli_is_applied_before_numerical_imports(self):
         config_path = CONFIG_DIR / "rf_detr_train.yaml"
@@ -169,7 +254,12 @@ class CpuPolicyTests(unittest.TestCase):
             cpu_runtime.resolve_cpu_policy(
                 {
                     "runtime": {"cpu": {"enabled": True, "budget_percent": 50}},
-                    "test": {"parallel": {"chunks": 17}},
+                    "test": {
+                        "parallel": {
+                            "chunks": 17,
+                            "allow_same_gpu_oversubscription": True,
+                        }
+                    },
                 },
                 "test",
                 CONFIG_DIR / "rf_detr_test.yaml",
@@ -223,14 +313,16 @@ class CpuPolicyTests(unittest.TestCase):
     def test_cpu_cli_flags_validate_and_override(self):
         parser = argparse.ArgumentParser()
         cpu_runtime.add_cpu_cli_arguments(parser)
-        args = parser.parse_args(["--no-cpu-limit", "--cpu-budget-percent", "80"])
+        args = parser.parse_args(
+            ["--no-cpu-limit", "--cpu-budget-percent", "80", "--torch-intraop-threads", "8"]
+        )
         config = {"runtime": {"cpu": {"enabled": True, "budget_percent": 50}}}
 
         cpu_runtime.apply_cpu_cli_overrides(config, args)
 
         self.assertEqual(
             config["runtime"]["cpu"],
-            {"enabled": False, "budget_percent": 80.0},
+            {"enabled": False, "budget_percent": 80.0, "torch_intraop_threads": 8},
         )
 
 
@@ -243,22 +335,19 @@ class CpuPresetTests(unittest.TestCase):
             raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
             (extended if "extends" in raw else standalone).append(path)
             merged = load_yaml(path)
-            self.assertEqual(
-                merged.get("runtime", {}).get("cpu"),
-                {"enabled": True, "budget_percent": 50},
-                path.name,
-            )
+            cpu = merged.get("runtime", {}).get("cpu", {})
+            self.assertTrue(cpu.get("enabled"), path.name)
+            self.assertEqual(cpu.get("budget_percent"), 50, path.name)
+            cpu_runtime.parse_torch_intraop_threads(cpu.get("torch_intraop_threads", "auto"))
 
-        self.assertEqual(len(paths), 57)
-        self.assertEqual(len(standalone), 43)
-        self.assertEqual(len(extended), 14)
+        self.assertGreaterEqual(len(paths), 57)
+        self.assertTrue(standalone)
+        self.assertTrue(extended)
         for path in standalone:
             raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-            self.assertEqual(
-                raw.get("runtime", {}).get("cpu"),
-                {"enabled": True, "budget_percent": 50},
-                path.name,
-            )
+            cpu = raw.get("runtime", {}).get("cpu", {})
+            self.assertTrue(cpu.get("enabled"), path.name)
+            self.assertEqual(cpu.get("budget_percent"), 50, path.name)
 
     def test_explicit_zero_num_workers_survives_test_config_translation(self):
         import test_rf_detr_model as test_runner

@@ -1,0 +1,37 @@
+# Accuracy-preserving single-GPU Medium-P2 BF16 training profile.
+extends: rf_detr_train.yaml
+
+runtime:
+  performance_profile: safe
+  cpu:
+    torch_intraop_threads: auto
+
+model:
+  size: medium
+  resolution: 576
+  amp: true
+  p2:
+    enabled: true
+    projector_scale: [P2, P3, P4]
+
+dataset:
+  dataset_dir: /path/to/rfdetr_dataset
+
+train:
+  dataset_dir: /path/to/rfdetr_dataset
+  amp_dtype: bf16
+  batch_size: auto
+  auto_batch_target_effective: 32
+  grad_accum_steps: 8
+  num_workers: 2
+  multi_scale: true
+  expanded_scales: true
+  use_ema: true
+  ema_update_interval: 1
+  eval_interval: 1
+  compute_val_loss: true
+  checkpoint_interval: 5
+  save_last_interval: 1
+
+output:
+  name: rfdetr_medium_p2_train_safe_{timestamp}

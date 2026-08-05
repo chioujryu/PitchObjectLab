@@ -327,6 +327,8 @@ inference:
     velocity_smoothing: 0.5
     # Draw trajectory polyline for tracked balls in rendered videos. Options: true, false.
     draw_trajectory: true
+    # Extend the observed trail to the live predicted center during detection gaps. Options: true, false.
+    draw_predicted_trajectory: false
     # Trajectory length in points/frames. null = full history (kept in memory up to 1024 points). Options: null, or a positive integer.
     trajectory_max_points: 30
     # Trail points older than this many video frames are dropped, so the trajectory retracts and disappears after the ball is lost. null = persist (never expire). Options: null, or a positive integer.

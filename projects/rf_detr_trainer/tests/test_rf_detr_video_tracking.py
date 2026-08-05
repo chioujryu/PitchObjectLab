@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -173,6 +174,14 @@ class TrackingConfigTest(unittest.TestCase):
     def test_max_missing_frames_defaults_to_finite(self):
         cfg = vt.parse_tracking_config({"inference": {"tracking": {"enabled": True}}}, CATEGORIES)
         self.assertEqual(cfg.max_missing_frames, 30)  # omitted -> finite hygiene default
+
+    def test_predicted_trajectory_defaults_off_and_can_be_enabled(self):
+        default_cfg = vt.parse_tracking_config({"inference": {"tracking": {"enabled": True}}}, CATEGORIES)
+        enabled_cfg = vt.parse_tracking_config(
+            {"inference": {"tracking": {"draw_predicted_trajectory": True}}}, CATEGORIES
+        )
+        self.assertFalse(default_cfg.draw_predicted_trajectory)
+        self.assertTrue(enabled_cfg.draw_predicted_trajectory)
 
     def test_invalid_radius_raises(self):
         with self.assertRaises(ValueError):
@@ -379,6 +388,60 @@ class TrackVisibilityTest(unittest.TestCase):
 # --- O4: synthetic end-to-end video test (no RF-DETR model) -----------------
 
 import inference_rf_detr_model as inference_runner  # noqa: E402
+
+
+class TrackOverlayRenderingTest(unittest.TestCase):
+    def _predicted_track(self):
+        from collections import deque
+
+        return vt.TrackedBall(
+            track_id=1,
+            center_x=20.0,
+            center_y=10.0,
+            base_radius=50.0,
+            velocity_x=5.0,
+            velocity_y=0.0,
+            velocity_initialized=True,
+            hits=2,
+            first_frame_index=0,
+            last_seen_frame_index=2,
+            points=deque([(0, 10.0, 10.0), (2, 20.0, 10.0)]),
+        )
+
+    def test_predicted_trajectory_off_keeps_observed_bridge_and_live_markers(self):
+        draw = mock.Mock()
+        cfg = make_config(
+            draw_predicted_trajectory=False,
+            trajectory_taper=False,
+            draw_current_center=True,
+            draw_search_circle=True,
+            use_velocity_prediction=True,
+        )
+
+        inference_runner.draw_track_overlays(draw, [self._predicted_track()], cfg, [1], current_frame_index=4)
+
+        self.assertEqual(draw.line.call_args.args[0], [(10.0, 10.0), (20.0, 10.0)])
+        color = inference_runner.track_color(1)
+        self.assertEqual(
+            draw.ellipse.call_args_list,
+            [
+                mock.call([-20.0, -40.0, 80.0, 60.0], outline=color, width=1),
+                mock.call([27.0, 7.0, 33.0, 13.0], fill=color),
+            ],
+        )
+
+    def test_predicted_trajectory_on_restores_live_head(self):
+        draw = mock.Mock()
+        cfg = make_config(
+            draw_predicted_trajectory=True,
+            trajectory_taper=False,
+            draw_current_center=False,
+            use_velocity_prediction=True,
+        )
+
+        inference_runner.draw_track_overlays(draw, [self._predicted_track()], cfg, [1], current_frame_index=4)
+
+        self.assertEqual(draw.line.call_args.args[0], [(10.0, 10.0), (20.0, 10.0), (30.0, 10.0)])
 
 
 class TrackerFactoryTest(unittest.TestCase):
@@ -623,6 +686,195 @@ class SyntheticVideoTrackingTest(unittest.TestCase):
                     self.assertTrue(all(row["score"] == 0.5 for row in rows))
                     self.assertTrue(rendered_scores)
                     self.assertTrue(all(score == 0.5 for score in rendered_scores))
+
+    def test_streaming_uses_memory_sources_and_can_skip_video_output(self):
+        captured = {}
+
+        def memory_predict(records, _model, _config, _output_dir, *, sources=None):
+            captured["paths"] = [record.path for record in records]
+            captured["sources"] = list(sources or [])
+            return ([[] for _ in records], [], [])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            video_path = Path(tmp) / "clip.mp4"
+            _write_synthetic_video(video_path, frames=3)
+            output_dir = Path(tmp) / "json_only"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            item = inference_runner.SourceItem(
+                source=str(video_path), kind="video", is_url=False, local_path=video_path
+            )
+            with mock.patch.object(
+                inference_runner.evaluator,
+                "predict_images_rfdetr",
+                side_effect=memory_predict,
+            ):
+                rows, target, next_image_id = inference_runner.predict_video_file(
+                    item,
+                    1,
+                    None,
+                    {},
+                    CATEGORIES,
+                    output_dir,
+                    [],
+                    {
+                        "batch_size": 3,
+                        "streaming": True,
+                        "save_video": False,
+                        "start_time": 0,
+                        "end_time": "all",
+                        "max_seconds": "all",
+                    },
+                )
+
+        self.assertEqual(rows, [])
+        self.assertIsNone(target)
+        self.assertEqual(next_image_id, 4)
+        self.assertTrue(all(path.startswith("memory://") for path in captured["paths"]))
+        self.assertEqual(len(captured["sources"]), 3)
+
+    def test_streaming_advances_tracker_on_detection_gaps(self):
+        class RecordingTracker:
+            def __init__(self):
+                self.calls = []
+                self.tracks = []
+
+            def update(self, frame_index, predictions, frame=None):
+                self.calls.append((frame_index, len(predictions), frame is not None))
+                return [dict(row) for row in predictions]
+
+        tracker = RecordingTracker()
+        with tempfile.TemporaryDirectory() as tmp:
+            video_path = Path(tmp) / "clip.mp4"
+            _write_synthetic_video(video_path, frames=6)
+            output_dir = Path(tmp) / "gaps"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            item = inference_runner.SourceItem(
+                source=str(video_path), kind="video", is_url=False, local_path=video_path
+            )
+            with mock.patch.object(
+                inference_runner.evaluator,
+                "predict_images_rfdetr",
+                _fake_predict_images_rfdetr,
+            ), mock.patch.object(
+                inference_runner,
+                "create_tracker",
+                return_value=tracker,
+            ):
+                inference_runner.predict_video_file(
+                    item,
+                    1,
+                    None,
+                    {},
+                    CATEGORIES,
+                    output_dir,
+                    [],
+                    {
+                        "batch_size": 2,
+                        "streaming": True,
+                        "save_video": False,
+                        "detection_fps": 15,
+                        "start_time": 0,
+                        "end_time": "all",
+                        "max_seconds": "all",
+                    },
+                    inference_runner.video_tracking.TrackingConfig(enabled=True),
+                )
+
+        self.assertEqual([frame for frame, _, _ in tracker.calls], list(range(6)))
+        self.assertEqual([count for _, count, _ in tracker.calls], [1, 0, 1, 0, 1, 0])
+        self.assertTrue(all(has_frame for _, _, has_frame in tracker.calls))
+
+    def test_streaming_queue_backpressure_flushes_before_detection_batch_is_full(self):
+        observed_batch_lengths = []
+
+        def empty_predict(records, _model, _config, _output_dir, *, sources=None):
+            self.assertEqual(len(records), len(sources or []))
+            observed_batch_lengths.append(len(records))
+            return [list() for _ in records], [], []
+
+        model = SimpleNamespace()
+        with tempfile.TemporaryDirectory() as tmp:
+            video_path = Path(tmp) / "clip.mp4"
+            _write_synthetic_video(video_path, frames=8)
+            output_dir = Path(tmp) / "backpressure"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            item = inference_runner.SourceItem(
+                source=str(video_path), kind="video", is_url=False, local_path=video_path
+            )
+            with mock.patch.object(
+                inference_runner.evaluator,
+                "predict_images_rfdetr",
+                side_effect=empty_predict,
+            ):
+                inference_runner.predict_video_file(
+                    item,
+                    1,
+                    model,
+                    {},
+                    CATEGORIES,
+                    output_dir,
+                    [],
+                    {
+                        "batch_size": 4,
+                        "queue_size": 4,
+                        "streaming": True,
+                        "save_video": False,
+                        "detection_fps": 15,
+                        "start_time": 0,
+                        "end_time": "all",
+                        "max_seconds": "all",
+                    },
+                )
+
+        self.assertEqual(observed_batch_lengths, [2, 2])
+        timing = model._rf_detr_video_pipeline_timing
+        self.assertEqual(timing["frame_queue_peak"], 4)
+        self.assertEqual(timing["outer_batch_size"], 4)
+        self.assertEqual(timing["source_frames"], 8)
+        self.assertEqual(timing["detection_frames"], 4)
+        self.assertIn("frame_conversion_seconds", timing)
+
+    def test_streaming_fails_fast_when_video_encoder_cannot_open(self):
+        import cv2
+
+        class ClosedWriter:
+            released = False
+
+            def isOpened(self):
+                return False
+
+            def release(self):
+                self.released = True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            video_path = Path(tmp) / "clip.mp4"
+            _write_synthetic_video(video_path, frames=2)
+            output_dir = Path(tmp) / "encoder_failure"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            item = inference_runner.SourceItem(
+                source=str(video_path), kind="video", is_url=False, local_path=video_path
+            )
+            closed_writer = ClosedWriter()
+            with mock.patch.object(cv2, "VideoWriter", return_value=closed_writer):
+                with self.assertRaisesRegex(RuntimeError, "Could not create video writer"):
+                    inference_runner.predict_video_file(
+                        item,
+                        1,
+                        SimpleNamespace(),
+                        {},
+                        CATEGORIES,
+                        output_dir,
+                        [],
+                        {
+                            "batch_size": 1,
+                            "streaming": True,
+                            "save_video": True,
+                            "start_time": 0,
+                            "end_time": "all",
+                            "max_seconds": "all",
+                        },
+                    )
+            self.assertTrue(closed_writer.released)
 
 
 if __name__ == "__main__":

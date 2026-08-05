@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import tempfile
 import types
@@ -10,8 +11,6 @@ import unittest
 from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import MagicMock, patch
-
-import torch
 
 import rf_detr_runtime
 import test_rf_detr_model as test_runner
@@ -41,7 +40,15 @@ def _cli_args(**updates):
     return argparse.Namespace(**values)
 
 
-def _config(*, chunks=1, device="0", size="medium", mode="full_image", evaluation_type="bbox"):
+def _config(
+    *,
+    chunks=1,
+    device="0",
+    size="medium",
+    mode="full_image",
+    evaluation_type="bbox",
+    allow_oversubscription=True,
+):
     return {
         "runtime": {"time_estimate": {"use_history": False, "default_test_seconds_per_image": 1.0}},
         "model": {"size": size, "device": device, "extra_model_args": {}},
@@ -49,7 +56,10 @@ def _config(*, chunks=1, device="0", size="medium", mode="full_image", evaluatio
         "output": {"max_model_input_batches": 0},
         "evaluation": {"type": evaluation_type, "classwise": False},
         "test": {
-            "parallel": {"chunks": chunks},
+            "parallel": {
+                "chunks": chunks,
+                "allow_same_gpu_oversubscription": allow_oversubscription,
+            },
             "test_mode": {"mode": mode},
             "split": "test",
             "max_images": None,
@@ -131,6 +141,7 @@ class ParallelConfigTests(unittest.TestCase):
         tensorrt_presets = {
             "rf_detr_test_p2_tensorrt_fp16_example.yaml",
             "rf_detr_test_tracknet_tensorrt_fp16_example.yaml",
+            "rf_detr_test_medium_p2_performance_fast.yaml",
         }
         real_temporal_tracknet_presets = {
             "rf_detr_test_small_tracknet_v5.yaml",
@@ -146,7 +157,15 @@ class ParallelConfigTests(unittest.TestCase):
                 optimization = config["model"]["inference_optimization"]
                 expected_backend = "tensorrt" if path.name in tensorrt_presets else "pytorch"
                 self.assertEqual(optimization["backend"], expected_backend)
-                self.assertEqual(optimization["pytorch"]["precision"], "fp32")
+                expected_pytorch_precision = (
+                    "bf16"
+                    if config.get("runtime", {}).get("performance_profile") in {"safe", "fast"}
+                    else "fp32"
+                )
+                self.assertEqual(
+                    optimization["pytorch"]["precision"],
+                    expected_pytorch_precision,
+                )
                 self.assertIn(optimization["tensorrt"]["precision"], {"fp16", "bf16"})
                 if path.name == legacy_tracknet_preset:
                     self.assertFalse(config["model"]["p2"]["enabled"])
@@ -182,6 +201,40 @@ class ParallelConfigTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, "test.parallel.chunks"):
                 test_runner.normalize_test_parallel_chunks(value)
 
+    def test_single_gpu_caps_requested_chunks_to_one_by_default(self):
+        config = _config(chunks=4, device="0", allow_oversubscription=False)
+
+        plan = test_runner.build_test_parallel_plan(config, image_count=20)
+        message = test_runner.apply_test_parallel_device_policy(config)
+
+        self.assertEqual(plan["requested_chunks"], 4)
+        self.assertEqual(plan["chunks"], 1)
+        self.assertEqual(plan["chunk_devices"], ["cuda:0"])
+        self.assertIn("capped execution", plan["same_device_warning"].lower())
+        self.assertIn("Capped test.parallel.chunks from 4 to 1", message)
+        self.assertEqual(config["test"]["parallel"]["requested_chunks"], 4)
+        self.assertEqual(config["test"]["parallel"]["chunks"], 1)
+
+    def test_same_gpu_oversubscription_requires_boolean_opt_in(self):
+        config = _config(chunks=2)
+        config["test"]["parallel"]["allow_same_gpu_oversubscription"] = "false"
+
+        with self.assertRaisesRegex(ValueError, "allow_same_gpu_oversubscription"):
+            test_runner.build_test_parallel_plan(config, image_count=2)
+
+    def test_two_devices_cap_four_requested_chunks_to_two(self):
+        config = _config(
+            chunks=4,
+            device="cuda:0,cuda:1",
+            allow_oversubscription=False,
+        )
+
+        plan = test_runner.build_test_parallel_plan(config, image_count=8)
+
+        self.assertEqual(plan["requested_chunks"], 4)
+        self.assertEqual(plan["chunks"], 2)
+        self.assertEqual(plan["chunk_devices"], ["cuda:0", "cuda:1"])
+
     def test_estimate_round_robins_devices_adds_summary_and_caps_speedup(self):
         config = _config(chunks=6, device="0,1")
         plan = {"action": "existing", "source_format": "rfdetr", "split_counts": {"test": 12}}
@@ -201,6 +254,117 @@ class ParallelConfigTests(unittest.TestCase):
             _config(chunks=1, device="0,1"), Path("/tmp/out-single"), plan
         )
         self.assertEqual(estimate["estimated_total_files"], single["estimated_total_files"] + 1)
+
+    def test_sahi_estimate_counts_exact_1080p_slices_recheck_and_batches(self):
+        config = _config(chunks=1, mode="sahi")
+        config["test"]["batch_size"] = 4
+        config["test"]["sahi"] = {
+            "slice_width": 320,
+            "slice_height": 320,
+            "overlap_width_ratio": 0.2,
+            "overlap_height_ratio": 0.2,
+            "standard_prediction": True,
+            "batch_size": 8,
+            "recheck": {"enabled": True, "max_rechecks_per_image": 3},
+        }
+        plan = {
+            "action": "existing",
+            "source_format": "rfdetr",
+            "split_counts": {"test": 2},
+            "records_by_split": {
+                "test": [
+                    {"width": 1920, "height": 1080},
+                    {"width": 1920, "height": 1080},
+                ]
+            },
+        }
+
+        estimate = test_runner.estimate_standalone_test_outputs(config, Path("/tmp/out"), plan)
+        work = estimate["model_work"]
+
+        self.assertEqual(work["slice_inputs"], 64)
+        self.assertEqual(work["source_inputs"], 2)
+        self.assertEqual(work["recheck_input_cap"], 6)
+        self.assertEqual(work["total_model_inputs"], 72)
+        self.assertEqual(work["estimated_model_batches"], 10)
+        self.assertEqual(work["image_dimensions"]["source"], "dataset_plan_records")
+        self.assertEqual(estimate["runtime_units"], 72.0)
+        self.assertEqual(estimate["runtime_estimate_basis"]["model_work"], work)
+
+    def test_sahi_estimate_reads_only_limited_split_coco_metadata(self):
+        with tempfile.TemporaryDirectory() as temp:
+            dataset = Path(temp) / "dataset"
+            test_dir = dataset / "test"
+            test_dir.mkdir(parents=True)
+            images = [
+                {"id": index, "file_name": f"image_{index:03d}.jpg", "width": 1920, "height": 1080}
+                for index in range(20)
+            ]
+            (test_dir / "_annotations.coco.json").write_text(
+                json.dumps({"images": images, "annotations": [], "categories": []}),
+                encoding="utf-8",
+            )
+            config = _config(chunks=1, mode="sahi")
+            config["test"]["max_images"] = 10
+            config["test"]["sahi"] = {
+                "slice_width": 320,
+                "slice_height": 320,
+                "overlap_width_ratio": 0.2,
+                "overlap_height_ratio": 0.2,
+                "standard_prediction": False,
+                "batch_size": 8,
+                "recheck": {"enabled": False},
+            }
+            plan = {
+                "action": "none",
+                "source_format": "rfdetr",
+                "dataset_dir": dataset,
+                "split_counts": {"test": 20},
+            }
+
+            estimate = test_runner.estimate_standalone_test_outputs(config, Path(temp) / "out", plan)
+
+        dimensions = estimate["model_work"]["image_dimensions"]
+        self.assertEqual(dimensions["metadata_image_count"], 10)
+        self.assertEqual(dimensions["fallback_image_count"], 0)
+        self.assertEqual(dimensions["source"], "bounded_coco_image_metadata")
+        self.assertEqual(estimate["model_work"]["slice_inputs"], 320)
+
+    def test_stage_timing_history_uses_observed_model_work_per_device(self):
+        rows = [
+            {
+                "elapsed_seconds": 5.0,
+                "model_forward_seconds": 1.0,
+                "base_model_forward_seconds": 0.1,
+                "slice_count": 32,
+                "slice_batch_size": 8,
+                "sahi_recheck": {"rechecked": 2, "batch_count": 1},
+            },
+            {
+                "elapsed_seconds": 5.0,
+                "model_forward_seconds": 1.0,
+                "base_model_forward_seconds": 0.1,
+                "slice_count": 32,
+                "slice_batch_size": 8,
+                "sahi_recheck": {"rechecked": 2, "batch_count": 1},
+            },
+        ]
+        timing = test_runner.normalized_stage_timing(
+            {
+                "stats": rows,
+                "parallel_summary": {
+                    "chunks": 2,
+                    "wall_seconds": 5.0,
+                    "assignments": [
+                        {"device": "cuda:0", "inference_seconds": 5.0},
+                        {"device": "cuda:1", "inference_seconds": 5.0},
+                    ],
+                },
+            }
+        )
+
+        self.assertEqual(timing["model_work"]["total_model_inputs"], 70)
+        self.assertEqual(timing["runtime_units"], 35.0)
 
     def test_estimate_rejects_more_chunks_than_known_images(self):
         with self.assertRaisesRegex(ValueError, "test.parallel.chunks.*6.*5"):
@@ -301,7 +465,7 @@ class ParallelWiringTests(unittest.TestCase):
 
 
 class SpawnFactoryTests(unittest.TestCase):
-    def test_parallel_preparation_builds_once_per_gpu_compatibility_profile(self):
+    def test_parallel_preparation_builds_one_engine_per_physical_gpu(self):
         config = _config(chunks=3, device="0,1,2")
         config["model"]["inference_optimization"] = {
             "backend": "tensorrt",
@@ -316,11 +480,16 @@ class SpawnFactoryTests(unittest.TestCase):
                 "device": f"cuda:{device}",
             }
 
-        def properties(device):
-            return types.SimpleNamespace(name="same-gpu" if device.index in {0, 1} else "other-gpu")
-
-        def capability(device):
-            return (8, 9) if device.index in {0, 1} else (8, 6)
+        def gpu_identity(device):
+            return {
+                "name": "same-gpu" if device.index in {0, 1} else "other-gpu",
+                "uuid": f"GPU-{device.index}",
+                "pci_bus_id": f"00000000:{device.index:02x}:00.0",
+                "pci_device_id": "0x0001",
+                "pci_sub_device_id": "0x0002",
+                "vbios_version": "1.0",
+                "compute_capability": [8, 9] if device.index in {0, 1} else [8, 6],
+            }
 
         def build_runtime(_config, _output_dir, *, device):
             built_devices.append(device)
@@ -348,9 +517,7 @@ class SpawnFactoryTests(unittest.TestCase):
         ), patch.object(
             rf_detr_runtime, "preflight_rfdetr_inference_acceleration", side_effect=preflight
         ), patch.object(
-            torch.cuda, "get_device_properties", side_effect=properties
-        ), patch.object(
-            torch.cuda, "get_device_capability", side_effect=capability
+            rf_detr_runtime._acceleration, "gpu_runtime_identity", side_effect=gpu_identity
         ), patch.object(
             rf_detr_runtime, "build_rfdetr_evaluator_runtime", side_effect=build_runtime
         ), patch.object(
@@ -362,11 +529,11 @@ class SpawnFactoryTests(unittest.TestCase):
                 ["0", "1", "2"],
             )
 
-        self.assertEqual(built_devices, ["cuda:0", "cuda:2"])
-        self.assertEqual(len(result["profiles"]), 2)
+        self.assertEqual(built_devices, ["cuda:0", "cuda:1", "cuda:2"])
+        self.assertEqual(len(result["profiles"]), 3)
         self.assertEqual(result["device_artifacts"]["0"]["engine_path"], "/cache/1/model.engine")
-        self.assertEqual(result["device_artifacts"]["1"]["engine_path"], "/cache/1/model.engine")
-        self.assertEqual(result["device_artifacts"]["2"]["engine_path"], "/cache/2/model.engine")
+        self.assertEqual(result["device_artifacts"]["1"]["engine_path"], "/cache/2/model.engine")
+        self.assertEqual(result["device_artifacts"]["2"]["engine_path"], "/cache/3/model.engine")
 
     def test_factory_overrides_devices_attaches_motion_and_aligns_classes(self):
         model = MagicMock()

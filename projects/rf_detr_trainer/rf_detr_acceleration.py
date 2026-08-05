@@ -12,6 +12,7 @@ current runtime identity differs.  There is no implicit backend fallback.
 from __future__ import annotations
 
 import contextlib
+import csv
 import hashlib
 import importlib
 import importlib.metadata
@@ -20,6 +21,8 @@ import math
 import os
 import re
 import shutil
+import statistics
+import subprocess
 import sys
 import tempfile
 import threading
@@ -33,7 +36,8 @@ import torch
 
 
 _MANIFEST_SCHEMA_VERSION = 2
-_TENSORRT_EXPORT_ABI_VERSION = 3
+_ONNX_CACHE_SCHEMA_VERSION = 1
+_TENSORRT_EXPORT_ABI_VERSION = 4
 _TENSORRT_EXPORT_SHAPE_CONTRACT = "dynamic-batch-static-nchw"
 _ACCELERATION_MARKER = "_pitch_object_lab_inference_acceleration"
 _FORWARD_RECORDER_MARKER = "_pitch_object_lab_forward_timing_recorder"
@@ -69,7 +73,26 @@ class TensorRTSettings:
     cache_dir: Path | None = None
     workspace_gib: float = 4.0
     force_rebuild: bool = False
+    reuse_output_buffers: bool = False
     profile: TensorRTProfile = field(default_factory=TensorRTProfile)
+
+
+def tensorrt_optimization_profiles(profile: TensorRTProfile) -> tuple[TensorRTProfile, ...]:
+    """Expand one dynamic range into common batch-tuned TensorRT profiles.
+
+    Every profile preserves the configured min/max range so real tail batches
+    remain valid. Profiles are tuned for batch 1/4/8/16 plus an explicitly
+    configured optimization batch when it is different.
+    """
+
+    candidates = {
+        profile.opt_batch_size,
+        *(batch for batch in (1, 4, 8, 16) if profile.min_batch_size <= batch <= profile.max_batch_size),
+    }
+    return tuple(
+        TensorRTProfile(profile.min_batch_size, batch, profile.max_batch_size)
+        for batch in sorted(candidates)
+    )
 
 
 @dataclass(frozen=True)
@@ -100,6 +123,60 @@ class TensorRTArtifact:
     build_seconds: float = 0.0
 
 
+class PreprocessTiming:
+    """Deferred, idempotent host/H2D/device preprocessing telemetry."""
+
+    def __init__(
+        self,
+        *,
+        host_seconds: float,
+        prepare_wall_seconds: float,
+        h2d: ForwardTimingRecorder | None = None,
+        resize_normalize: ForwardTimingRecorder | None = None,
+    ) -> None:
+        self.host_seconds = max(0.0, float(host_seconds))
+        self.prepare_wall_seconds = max(0.0, float(prepare_wall_seconds))
+        self.h2d = h2d
+        self.resize_normalize = resize_normalize
+        self._lock = threading.Lock()
+        self._consumed: dict[str, float] | None = None
+
+    def consume(self) -> dict[str, float]:
+        with self._lock:
+            if self._consumed is not None:
+                return dict(self._consumed)
+            h2d_seconds = self.h2d.consume_seconds() if self.h2d is not None else 0.0
+            resize_seconds = (
+                self.resize_normalize.consume_seconds()
+                if self.resize_normalize is not None
+                else 0.0
+            )
+            device_seconds = h2d_seconds + resize_seconds
+            self._consumed = {
+                "host_preprocess_seconds": self.host_seconds,
+                "h2d_seconds": h2d_seconds,
+                "resize_normalize_seconds": resize_seconds,
+                "device_preprocess_seconds": device_seconds,
+                "prepare_wall_seconds": self.prepare_wall_seconds,
+                "total_seconds": self.host_seconds + device_seconds,
+            }
+            return dict(self._consumed)
+
+
+@dataclass(frozen=True)
+class PreparedInferenceBatch:
+    """A normalized NCHW batch and its original ``(height, width)`` sizes."""
+
+    tensor: torch.Tensor
+    target_sizes: torch.Tensor
+    _timing: PreprocessTiming = field(repr=False, compare=False)
+
+    def consume_timing(self) -> dict[str, float]:
+        """Resolve only this batch's deferred CUDA events and return stage timing."""
+
+        return self._timing.consume()
+
+
 @dataclass
 class AccelerationHandle:
     """Stable interface consumed by inference and standalone segmentation test."""
@@ -111,6 +188,16 @@ class AccelerationHandle:
     _infer_raw: Callable[[torch.Tensor], Mapping[str, torch.Tensor]] | None = None
     _forward_recorder: ForwardTimingRecorder | None = None
     _postprocess_recorder: ForwardTimingRecorder | None = None
+    _infer_into: Callable[[torch.Tensor, Mapping[str, torch.Tensor]], Mapping[str, torch.Tensor]] | None = None
+    _allocate_output_buffers: Callable[[int], dict[str, torch.Tensor]] | None = None
+    _reuse_output_buffers_by_default: bool = False
+    _reusable_output_buffers: dict[tuple[int, int], dict[str, torch.Tensor]] = field(
+        default_factory=dict,
+        repr=False,
+    )
+    _reusable_output_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _preprocess_timings: list[PreprocessTiming] = field(default_factory=list, repr=False)
+    _preprocess_timing_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     @property
     def backend(self) -> str:
@@ -134,9 +221,97 @@ class AccelerationHandle:
     def infer_raw(self, tensor: torch.Tensor) -> dict[str, torch.Tensor]:
         """Run raw model inference and return RF-DETR postprocessor keys."""
 
+        if self._reuse_output_buffers_by_default:
+            return self.infer_raw_reusing_buffers(tensor)
         if self._infer_raw is None:
             raise RuntimeError("This acceleration handle does not expose raw inference.")
         return normalize_raw_outputs(self._infer_raw(tensor))
+
+    def infer_raw_reusing_buffers(self, tensor: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Infer into a per-thread/batch output pool for sequential postprocessing.
+
+        Returned tensors are overwritten by the next call with the same batch
+        size on the same thread. Callers must finish postprocessing before that
+        next call; use :meth:`infer_raw` with reuse disabled when retaining raw
+        outputs across calls.
+        """
+
+        if self._infer_into is None or self._allocate_output_buffers is None:
+            if self._infer_raw is None:
+                raise RuntimeError("This acceleration handle does not expose raw inference.")
+            return normalize_raw_outputs(self._infer_raw(tensor))
+        if not isinstance(tensor, torch.Tensor) or tensor.ndim != 4 or tensor.shape[0] <= 0:
+            raise ValueError("Reusable RF-DETR inference requires a non-empty rank-4 tensor.")
+        key = (threading.get_ident(), int(tensor.shape[0]))
+        with self._reusable_output_lock:
+            buffers = self._reusable_output_buffers.get(key)
+            if buffers is None:
+                buffers = self._allocate_output_buffers(key[1])
+                self._reusable_output_buffers[key] = buffers
+        return normalize_raw_outputs(self._infer_into(tensor, buffers))
+
+    def clear_reusable_output_buffers(self) -> None:
+        """Release handle-owned output pools after pending inference is consumed."""
+
+        with self._reusable_output_lock:
+            self._reusable_output_buffers.clear()
+
+    def prepare_batch(
+        self,
+        images: Any,
+        *,
+        shape: int | tuple[int, int] | None = None,
+        non_blocking: bool = True,
+    ) -> PreparedInferenceBatch:
+        """Prepare images once as a contiguous batch for :meth:`infer_raw`.
+
+        Unlike upstream ``predict()``, this path avoids a source-image copy,
+        per-image CUDA transfers, and full-image min/max reductions.  Integer
+        images are scaled from bytes while floating-point tensor inputs retain
+        RF-DETR's documented ``[0, 1]`` contract.
+        """
+
+        resolution = (
+            shape
+            if shape is not None
+            else (self.settings.resolution or _model_resolution(self.model, self.settings))
+        )
+        mean = getattr(self.model, "means", (0.485, 0.456, 0.406))
+        std = getattr(self.model, "stds", (0.229, 0.224, 0.225))
+        prepared = prepare_inference_batch(
+            images,
+            shape=resolution,
+            device=self.device,
+            mean=mean,
+            std=std,
+            num_channels=_model_num_channels(self.model),
+            non_blocking=non_blocking,
+        )
+        with self._preprocess_timing_lock:
+            self._preprocess_timings.append(prepared._timing)
+        return prepared
+
+    def consume_preprocess_timing(self) -> dict[str, float | int]:
+        """Consume and aggregate preprocessing telemetry since the previous call."""
+
+        with self._preprocess_timing_lock:
+            timings = self._preprocess_timings
+            self._preprocess_timings = []
+        keys = (
+            "host_preprocess_seconds",
+            "h2d_seconds",
+            "resize_normalize_seconds",
+            "device_preprocess_seconds",
+            "prepare_wall_seconds",
+            "total_seconds",
+        )
+        result: dict[str, float | int] = {key: 0.0 for key in keys}
+        for timing in timings:
+            report = timing.consume()
+            for key in keys:
+                result[key] = float(result[key]) + float(report[key])
+        result["batches"] = len(timings)
+        return result
 
     def postprocess(self, outputs: Mapping[str, torch.Tensor], target_sizes: torch.Tensor) -> Any:
         """Use the original RF-DETR postprocessor for bbox/mask decoding."""
@@ -174,15 +349,21 @@ class ForwardTimingRecorder:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._wall_seconds = 0.0
-        self._cuda_events: list[tuple[Any, Any]] = []
+        self._cuda_events: list[tuple[Any, Any, Callable[[], None] | None]] = []
 
     def add_wall_seconds(self, seconds: float) -> None:
         with self._lock:
             self._wall_seconds += max(0.0, float(seconds))
 
-    def add_cuda_events(self, start: Any, end: Any) -> None:
+    def add_cuda_events(
+        self,
+        start: Any,
+        end: Any,
+        *,
+        release: Callable[[], None] | None = None,
+    ) -> None:
         with self._lock:
-            self._cuda_events.append((start, end))
+            self._cuda_events.append((start, end, release))
 
     def consume_seconds(self) -> float:
         with self._lock:
@@ -191,9 +372,13 @@ class ForwardTimingRecorder:
             self._wall_seconds = 0.0
             self._cuda_events = []
         cuda_seconds = 0.0
-        for start, end in events:
-            end.synchronize()
-            cuda_seconds += float(start.elapsed_time(end)) / 1000.0
+        for start, end, release in events:
+            try:
+                end.synchronize()
+                cuda_seconds += float(start.elapsed_time(end)) / 1000.0
+            finally:
+                if release is not None:
+                    release()
         return wall_seconds + cuda_seconds
 
 
@@ -402,6 +587,9 @@ def resolve_acceleration_config(
     force_rebuild = bool(trt_source.get("force_rebuild", False))
     if engine_path is not None and force_rebuild:
         raise ValueError("TensorRT force_rebuild cannot be used with an explicit engine_path.")
+    reuse_output_buffers = trt_source.get("reuse_output_buffers", False)
+    if not isinstance(reuse_output_buffers, bool):
+        raise ValueError("TensorRT reuse_output_buffers must be true or false.")
 
     workspace = trt_source.get("workspace_gib", 4)
     if isinstance(workspace, bool):
@@ -458,6 +646,7 @@ def resolve_acceleration_config(
             cache_dir=resolve_tensorrt_cache_dir(trt_source.get("cache_dir")),
             workspace_gib=workspace_gib,
             force_rebuild=force_rebuild,
+            reuse_output_buffers=reuse_output_buffers,
             profile=TensorRTProfile(min_batch, opt_batch, max_batch),
         ),
         resolution=resolved_resolution,
@@ -516,6 +705,270 @@ def normalize_raw_outputs(outputs: Any) -> dict[str, torch.Tensor]:
     return normalized
 
 
+def _resolved_image_shape(shape: int | tuple[int, int]) -> tuple[int, int]:
+    if isinstance(shape, bool):
+        raise ValueError("Inference image shape must be a positive integer or (height, width) pair.")
+    if isinstance(shape, int):
+        dimensions = (shape, shape)
+    else:
+        try:
+            dimensions = tuple(shape)
+        except TypeError:
+            raise ValueError("Inference image shape must be a positive integer or (height, width) pair.") from None
+        if len(dimensions) != 2:
+            raise ValueError("Inference image shape must contain exactly height and width.")
+    if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in dimensions):
+        raise ValueError(f"Inference image shape values must be positive integers; got {dimensions!r}.")
+    return int(dimensions[0]), int(dimensions[1])
+
+
+def _image_to_chw_float_tensor(image: Any, num_channels: int) -> torch.Tensor:
+    """Convert one path/PIL/NumPy/CHW Tensor image without value reductions."""
+
+    if isinstance(image, (str, Path)):
+        try:
+            from PIL import Image
+        except ImportError as exc:  # pragma: no cover - RF-DETR requires Pillow
+            raise ImportError("Pillow is required to prepare path-based RF-DETR images.") from exc
+        with Image.open(image) as opened:
+            return _image_to_chw_float_tensor(opened, num_channels)
+
+    if isinstance(image, torch.Tensor):
+        if image.ndim != 3 or int(image.shape[0]) != num_channels:
+            raise ValueError(
+                f"Tensor images must be CHW with {num_channels} channels; got {tuple(image.shape)}."
+            )
+        if image.dtype == torch.uint8:
+            return image.to(dtype=torch.float32).div_(255.0)
+        if not image.is_floating_point():
+            raise ValueError(f"Tensor images must use uint8 or floating dtype; got {image.dtype}.")
+        return image.to(dtype=torch.float32)
+
+    try:
+        import numpy as np
+    except ImportError as exc:  # pragma: no cover - RF-DETR requires NumPy
+        raise ImportError("NumPy is required to prepare PIL/array RF-DETR images.") from exc
+    try:
+        # One owned contiguous copy is deliberate: PIL-backed arrays can be
+        # read-only, and the final batch otherwise triggers another hidden copy.
+        array = np.array(image, copy=True, order="C")
+    except Exception as exc:
+        raise TypeError(
+            "RF-DETR batch images must be paths, PIL images, NumPy arrays, or CHW torch tensors."
+        ) from exc
+    if array.ndim == 2 and num_channels == 1:
+        array = array[:, :, None]
+    if array.ndim != 3 or int(array.shape[2]) != num_channels:
+        raise ValueError(
+            f"Array/PIL images must be HWC with {num_channels} channels; got {tuple(array.shape)}."
+        )
+    tensor = torch.from_numpy(array).permute(2, 0, 1)
+    if tensor.dtype == torch.uint8:
+        return tensor.to(dtype=torch.float32).div_(255.0)
+    if not tensor.is_floating_point():
+        raise ValueError(f"Array images must use uint8 or floating dtype; got {tensor.dtype}.")
+    return tensor.to(dtype=torch.float32)
+
+
+def _stack_uniform_array_images(
+    images: list[Any],
+    num_channels: int,
+) -> tuple[torch.Tensor, list[tuple[int, int]]] | None:
+    """Stack the common PIL/NumPy SAHI case before converting to Torch."""
+
+    if any(isinstance(image, (str, Path, torch.Tensor)) for image in images):
+        return None
+    try:
+        import numpy as np
+    except ImportError as exc:  # pragma: no cover - RF-DETR requires NumPy
+        raise ImportError("NumPy is required to prepare PIL/array RF-DETR images.") from exc
+    arrays = [np.asarray(image) for image in images]
+    for array in arrays:
+        if array.ndim == 2 and num_channels == 1:
+            continue
+        if array.ndim != 3 or int(array.shape[2]) != num_channels:
+            raise ValueError(
+                f"Array/PIL images must be HWC with {num_channels} channels; got {tuple(array.shape)}."
+            )
+    normalized_arrays = [array[:, :, None] if array.ndim == 2 else array for array in arrays]
+    if len({(tuple(array.shape), str(array.dtype)) for array in normalized_arrays}) != 1:
+        return None
+    # np.stack makes one owned contiguous allocation, avoiding one NumPy copy,
+    # float conversion, and Torch allocation for every SAHI crop.
+    stacked = np.stack(normalized_arrays, axis=0)
+    tensor = torch.from_numpy(stacked).permute(0, 3, 1, 2)
+    if tensor.dtype == torch.uint8:
+        tensor = tensor.to(dtype=torch.float32).div_(255.0)
+    elif tensor.is_floating_point():
+        tensor = tensor.to(dtype=torch.float32)
+    else:
+        raise ValueError(f"Array images must use uint8 or floating dtype; got {tensor.dtype}.")
+    sizes = [(int(array.shape[0]), int(array.shape[1])) for array in normalized_arrays]
+    return tensor, sizes
+
+
+def _record_cuda_call(
+    recorder: ForwardTimingRecorder,
+    device: torch.device,
+    callback: Callable[[], Any],
+) -> Any:
+    """Record one current-stream CUDA stage without synchronizing it."""
+
+    with torch.cuda.device(device):
+        stream = torch.cuda.current_stream(device)
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record(stream)
+        result = callback()
+        end.record(stream)
+    recorder.add_cuda_events(start, end)
+    return result
+
+
+def prepare_inference_batch(
+    images: Any,
+    *,
+    shape: int | tuple[int, int],
+    device: str | torch.device,
+    mean: Iterable[float] = (0.485, 0.456, 0.406),
+    std: Iterable[float] = (0.229, 0.224, 0.225),
+    num_channels: int = 3,
+    non_blocking: bool = True,
+) -> PreparedInferenceBatch:
+    """Build one normalized RF-DETR batch with grouped resize and one H2D per shape.
+
+    Inputs with a common source size (the normal SAHI case) are stacked before
+    transfer and resized in one CUDA operation.  Mixed source sizes are grouped
+    so the path remains lossless without falling back to one transfer per image.
+    The function intentionally does not scan floating images for values outside
+    ``[0, 1]``; callers of this fast path own that documented input contract.
+    """
+
+    prepare_started = time.perf_counter()
+    target_shape = _resolved_image_shape(shape)
+    target_device = device if isinstance(device, torch.device) else torch.device(device)
+    channels = _positive_int(num_channels, "inference image channels")
+    image_list = images if isinstance(images, list) else [images]
+    if not image_list:
+        raise ValueError("RF-DETR inference batch cannot be empty.")
+
+    mean_values = tuple(float(value) for value in mean)
+    std_values = tuple(float(value) for value in std)
+    if len(mean_values) != channels or len(std_values) != channels or any(value <= 0 for value in std_values):
+        raise ValueError(
+            f"RF-DETR normalization requires {channels} means and positive stds; "
+            f"got mean={mean_values!r}, std={std_values!r}."
+        )
+
+    uniform_array_batch = _stack_uniform_array_images(image_list, channels)
+    if uniform_array_batch is not None:
+        host_batch, original_sizes = uniform_array_batch
+        group_batches = [(tuple(range(len(image_list))), host_batch)]
+    else:
+        tensors = [_image_to_chw_float_tensor(image, channels) for image in image_list]
+        original_sizes = [(int(tensor.shape[1]), int(tensor.shape[2])) for tensor in tensors]
+        groups: dict[tuple[str, tuple[int, ...]], list[tuple[int, torch.Tensor]]] = {}
+        for index, tensor in enumerate(tensors):
+            key = (str(tensor.device), tuple(int(value) for value in tensor.shape))
+            groups.setdefault(key, []).append((index, tensor))
+        group_batches = []
+        for members in groups.values():
+            indices, group_tensors = zip(*members)
+            group_batches.append((tuple(indices), torch.stack(group_tensors, dim=0)))
+
+    target_sizes_cpu = torch.tensor(original_sizes, dtype=torch.int64)
+    host_seconds = time.perf_counter() - prepare_started
+    h2d_timing = ForwardTimingRecorder() if target_device.type == "cuda" else None
+    resize_timing = ForwardTimingRecorder() if target_device.type == "cuda" else None
+
+    resized_by_index: list[torch.Tensor | None] = [None] * len(image_list)
+    single_group_batch: torch.Tensor | None = None
+    for indices, source_batch in group_batches:
+        def move() -> torch.Tensor:
+            return source_batch.to(
+                device=target_device,
+                dtype=torch.float32,
+                non_blocking=bool(non_blocking),
+            )
+
+        batch = (
+            _record_cuda_call(h2d_timing, target_device, move)
+            if h2d_timing is not None
+            else move()
+        )
+        if tuple(batch.shape[-2:]) != target_shape:
+            def resize() -> torch.Tensor:
+                return torch.nn.functional.interpolate(
+                    batch,
+                    size=target_shape,
+                    mode="bilinear",
+                    align_corners=False,
+                    antialias=True,
+                )
+
+            batch = (
+                _record_cuda_call(resize_timing, target_device, resize)
+                if resize_timing is not None
+                else resize()
+            )
+        if len(group_batches) == 1:
+            single_group_batch = batch
+        else:
+            for batch_index, image_index in enumerate(indices):
+                resized_by_index[image_index] = batch[batch_index]
+
+    if single_group_batch is not None:
+        batch_tensor = single_group_batch
+    else:
+        if any(value is None for value in resized_by_index):  # pragma: no cover - defensive invariant
+            raise RuntimeError("RF-DETR batch grouping lost one or more images.")
+        def stack_resized() -> torch.Tensor:
+            return torch.stack(
+                [value for value in resized_by_index if value is not None],
+                dim=0,
+            )
+
+        batch_tensor = (
+            _record_cuda_call(resize_timing, target_device, stack_resized)
+            if resize_timing is not None
+            else stack_resized()
+        )
+
+    def normalize_batch() -> torch.Tensor:
+        mean_tensor = batch_tensor.new_tensor(mean_values).view(1, channels, 1, 1)
+        std_tensor = batch_tensor.new_tensor(std_values).view(1, channels, 1, 1)
+        return batch_tensor.sub_(mean_tensor).div_(std_tensor).contiguous()
+
+    batch_tensor = (
+        _record_cuda_call(resize_timing, target_device, normalize_batch)
+        if resize_timing is not None
+        else normalize_batch()
+    )
+
+    def move_sizes() -> torch.Tensor:
+        return target_sizes_cpu.to(device=target_device, non_blocking=bool(non_blocking))
+
+    target_sizes = (
+        _record_cuda_call(h2d_timing, target_device, move_sizes)
+        if h2d_timing is not None
+        else move_sizes()
+    )
+    prepare_wall_seconds = time.perf_counter() - prepare_started
+    if target_device.type != "cuda":
+        host_seconds = prepare_wall_seconds
+    timing = PreprocessTiming(
+        host_seconds=host_seconds,
+        prepare_wall_seconds=prepare_wall_seconds,
+        h2d=h2d_timing,
+        resize_normalize=resize_timing,
+    )
+    return PreparedInferenceBatch(
+        tensor=batch_tensor,
+        target_sizes=target_sizes,
+        _timing=timing,
+    )
+
+
 def _pytorch_raw_infer(model: Any, precision: str) -> Callable[[torch.Tensor], dict[str, torch.Tensor]]:
     context = getattr(model, "model", None)
     if context is None:
@@ -559,8 +1012,12 @@ def _base_metadata(settings: InferenceOptimizationConfig) -> dict[str, Any]:
         "engine_path": None,
         "manifest_path": None,
         "engine_sha256": None,
+        "onnx_path": None,
+        "onnx_cache_key": None,
+        "onnx_cache_hit": None,
         "timing_cache_path": None,
         "batch_profile": asdict(profile),
+        "reuse_output_buffers": False,
     }
 
 
@@ -946,6 +1403,99 @@ def _loaded_model_state_sha256(model: Any) -> str:
     return digest.hexdigest()
 
 
+def _normalized_gpu_uuid(value: Any) -> str | None:
+    text = str(value or "").strip().lower()
+    if not text or text in {"none", "n/a", "unknown"}:
+        return None
+    return text.removeprefix("gpu-")
+
+
+def _nvidia_smi_gpu_details(cuda_uuid: str | None) -> dict[str, str]:
+    """Return immutable device/driver identifiers without requiring NVML bindings."""
+
+    executable = shutil.which("nvidia-smi")
+    normalized_uuid = _normalized_gpu_uuid(cuda_uuid)
+    if executable is None or normalized_uuid is None:
+        return {}
+    fields = (
+        "uuid",
+        "pci.bus_id",
+        "pci.device_id",
+        "pci.sub_device_id",
+        "vbios_version",
+        "driver_version",
+    )
+    try:
+        completed = subprocess.run(
+            [
+                executable,
+                f"--query-gpu={','.join(fields)}",
+                "--format=csv,noheader,nounits",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if completed.returncode != 0:
+        return {}
+    for row in csv.reader(completed.stdout.splitlines(), skipinitialspace=True):
+        if len(row) != len(fields) or _normalized_gpu_uuid(row[0]) != normalized_uuid:
+            continue
+        values = [str(value).strip() for value in row]
+        return {
+            "uuid": values[0],
+            "pci_bus_id": values[1].lower(),
+            "pci_device_id": values[2].lower(),
+            "pci_sub_device_id": values[3].lower(),
+            "vbios_version": values[4],
+            "driver_version": values[5],
+        }
+    return {}
+
+
+def _gpu_runtime_identity(device: torch.device) -> dict[str, Any]:
+    """Fingerprint the physical CUDA device that will deserialize the engine."""
+
+    with torch.cuda.device(device):
+        properties = torch.cuda.get_device_properties(device)
+        capability = torch.cuda.get_device_capability(device)
+        gpu_name = torch.cuda.get_device_name(device)
+    uuid = _normalized_gpu_uuid(getattr(properties, "uuid", None))
+    domain = getattr(properties, "pci_domain_id", None)
+    bus = getattr(properties, "pci_bus_id", None)
+    slot = getattr(properties, "pci_device_id", None)
+    torch_pci_bus_id = None
+    if all(isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in (domain, bus, slot)):
+        torch_pci_bus_id = f"{int(domain):08x}:{int(bus):02x}:{int(slot):02x}.0"
+    smi = _nvidia_smi_gpu_details(uuid)
+    return {
+        "name": str(gpu_name),
+        "uuid": smi.get("uuid") or (f"GPU-{uuid}" if uuid is not None else None),
+        "pci_bus_id": smi.get("pci_bus_id") or torch_pci_bus_id,
+        "pci_device_id": smi.get("pci_device_id"),
+        "pci_sub_device_id": smi.get("pci_sub_device_id"),
+        "vbios_version": smi.get("vbios_version"),
+        "driver_version": smi.get("driver_version"),
+        "compute_capability": [int(capability[0]), int(capability[1])],
+        "total_memory_bytes": int(getattr(properties, "total_memory", 0)),
+        "multiprocessor_count": int(getattr(properties, "multi_processor_count", 0)),
+        "l2_cache_size_bytes": int(getattr(properties, "L2_cache_size", 0)),
+        "memory_bus_width_bits": int(getattr(properties, "memory_bus_width", 0)),
+        "is_multi_gpu_board": bool(getattr(properties, "is_multi_gpu_board", False)),
+    }
+
+
+def gpu_runtime_identity(device: str | torch.device | int | None = None) -> dict[str, Any]:
+    """Return the public physical-GPU identity used by TensorRT cache keys."""
+
+    resolved = _preflight_device(device)
+    _require_cuda(resolved)
+    return dict(_gpu_runtime_identity(resolved))
+
+
 def _build_identity(
     model: Any,
     settings: InferenceOptimizationConfig,
@@ -957,9 +1507,7 @@ def _build_identity(
 ) -> dict[str, Any]:
     device = _model_device(model)
     _require_cuda(device, bf16=settings.tensorrt.precision == "bf16")
-    with torch.cuda.device(device):
-        capability = torch.cuda.get_device_capability(device)
-        gpu_name = torch.cuda.get_device_name(device)
+    gpu_identity = _gpu_runtime_identity(device)
     resolution = _model_resolution(model, settings)
     output_names = ["dets", "labels", "masks"] if segmentation else ["dets", "labels"]
     return {
@@ -993,19 +1541,21 @@ def _build_identity(
             "output_ranks": {"dets": 3, "labels": 3, **({"masks": 4} if segmentation else {})},
         },
         "precision": settings.tensorrt.precision,
+        "workspace_gib": settings.tensorrt.workspace_gib,
         "profile": asdict(settings.tensorrt.profile),
+        "optimization_profiles": [
+            asdict(profile) for profile in tensorrt_optimization_profiles(settings.tensorrt.profile)
+        ],
         "runtime": {
             "rfdetr": _package_version("rfdetr"),
             "onnx": _package_version("onnx"),
             "tensorrt": str(getattr(trt, "__version__", "unknown")),
             "torch": str(torch.__version__),
             "cuda": str(torch.version.cuda),
+            "nvidia_driver": gpu_identity.get("driver_version"),
             "python": sys.version.split()[0],
         },
-        "gpu": {
-            "name": gpu_name,
-            "compute_capability": [int(capability[0]), int(capability[1])],
-        },
+        "gpu": gpu_identity,
     }
 
 
@@ -1016,6 +1566,51 @@ def _manifest_template(identity: Mapping[str, Any]) -> dict[str, Any]:
         "cache_key": cache_key,
         "identity": _jsonable(identity),
     }
+
+
+def _onnx_cache_identity(engine_identity: Mapping[str, Any]) -> dict[str, Any]:
+    """Remove TensorRT/physical-GPU fields that cannot affect exported ONNX."""
+
+    identity = dict(_jsonable(engine_identity))
+    identity.pop("gpu", None)
+    identity.pop("precision", None)
+    identity.pop("workspace_gib", None)
+    identity.pop("profile", None)
+    identity.pop("optimization_profiles", None)
+    runtime = dict(identity.get("runtime", {}))
+    runtime.pop("tensorrt", None)
+    runtime.pop("nvidia_driver", None)
+    identity["runtime"] = runtime
+    return identity
+
+
+def _onnx_manifest_template(engine_identity: Mapping[str, Any]) -> dict[str, Any]:
+    identity = _onnx_cache_identity(engine_identity)
+    return {
+        "schema_version": _ONNX_CACHE_SCHEMA_VERSION,
+        "cache_key": hashlib.sha256(_canonical_json(identity)).hexdigest(),
+        "identity": identity,
+    }
+
+
+def _validate_cached_onnx(
+    onnx_path: Path,
+    manifest_path: Path,
+    expected: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not onnx_path.is_file():
+        raise FileNotFoundError(f"Cached ONNX model does not exist: {onnx_path}")
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Cached ONNX manifest does not exist: {manifest_path}")
+    manifest = _read_manifest(manifest_path)
+    if manifest.get("schema_version") != _ONNX_CACHE_SCHEMA_VERSION:
+        raise RuntimeError(f"Unsupported ONNX cache manifest schema: {manifest.get('schema_version')!r}.")
+    for key in ("cache_key", "identity"):
+        if _jsonable(manifest.get(key)) != _jsonable(expected.get(key)):
+            raise RuntimeError(f"Cached ONNX manifest {key} does not match the requested model/export runtime.")
+    if manifest.get("onnx_sha256") != sha256_file(onnx_path):
+        raise RuntimeError(f"Cached ONNX hash does not match its manifest: {onnx_path}")
+    return manifest
 
 
 def _read_manifest(path: Path) -> dict[str, Any]:
@@ -1195,20 +1790,30 @@ def build_tensorrt_engine(
         if set_timing_cache(timing_cache, ignore_mismatch=False) is False:
             raise RuntimeError("TensorRT rejected the timing cache for this builder configuration.")
 
-    profile = builder.create_optimization_profile()
     channels = input_shape[1]
     if channels <= 0:
         raise RuntimeError(f"ONNX input channel dimension must be fixed; got {input_shape}.")
-    resolved = settings.tensorrt.profile
-    accepted = profile.set_shape(
-        input_tensor.name,
-        (resolved.min_batch_size, channels, resolution, resolution),
-        (resolved.opt_batch_size, channels, resolution, resolution),
-        (resolved.max_batch_size, channels, resolution, resolution),
-    )
-    if accepted is False:
-        raise RuntimeError("TensorRT rejected the requested dynamic-batch optimization profile.")
-    build_config.add_optimization_profile(profile)
+    for resolved in tensorrt_optimization_profiles(settings.tensorrt.profile):
+        profile = builder.create_optimization_profile()
+        accepted = profile.set_shape(
+            input_tensor.name,
+            (resolved.min_batch_size, channels, resolution, resolution),
+            (resolved.opt_batch_size, channels, resolution, resolution),
+            (resolved.max_batch_size, channels, resolution, resolution),
+        )
+        if accepted is False:
+            raise RuntimeError(
+                "TensorRT rejected dynamic-batch optimization profile "
+                f"{resolved.min_batch_size}/{resolved.opt_batch_size}/{resolved.max_batch_size}."
+            )
+        profile_index = build_config.add_optimization_profile(profile)
+        if profile_index is False or (
+            isinstance(profile_index, int) and not isinstance(profile_index, bool) and profile_index < 0
+        ):
+            raise RuntimeError(
+                "TensorRT could not add dynamic-batch optimization profile "
+                f"{resolved.min_batch_size}/{resolved.opt_batch_size}/{resolved.max_batch_size}."
+            )
 
     serialized = builder.build_serialized_network(network, build_config)
     if serialized is None:
@@ -1572,6 +2177,7 @@ def prepare_tensorrt_engine(
         segmentation=bool(segmentation),
     )
     expected = _manifest_template(identity)
+    onnx_expected = _onnx_manifest_template(identity)
     supplied_engine = settings.tensorrt.engine_path
     supplied_manifest = settings.tensorrt.manifest_path
     if supplied_engine is not None and supplied_manifest is not None:
@@ -1588,9 +2194,19 @@ def prepare_tensorrt_engine(
     cache_root = (settings.tensorrt.cache_dir or _default_cache_dir()).resolve()
     artifact_dir = cache_root / expected["cache_key"]
     engine_path = artifact_dir / "model.engine"
-    onnx_path = artifact_dir / "model.onnx"
     manifest_path = artifact_dir / "model.engine.manifest.json"
     timing_cache_path = artifact_dir / "timing.cache"
+    onnx_cache_root = cache_root / "onnx"
+    onnx_artifact_dir = onnx_cache_root / onnx_expected["cache_key"]
+    onnx_path = onnx_artifact_dir / "model.onnx"
+    onnx_manifest_path = onnx_artifact_dir / "model.onnx.manifest.json"
+
+    def validated_onnx_path() -> Path | None:
+        try:
+            _validate_cached_onnx(onnx_path, onnx_manifest_path, onnx_expected)
+        except (FileNotFoundError, RuntimeError):
+            return None
+        return onnx_path
 
     def cached_artifact() -> TensorRTArtifact | None:
         if settings.tensorrt.force_rebuild:
@@ -1602,7 +2218,7 @@ def prepare_tensorrt_engine(
         return TensorRTArtifact(
             engine_path=engine_path,
             manifest_path=manifest_path,
-            onnx_path=onnx_path if onnx_path.is_file() else None,
+            onnx_path=validated_onnx_path(),
             cache_hit=True,
             manifest=manifest,
             timing_cache_path=timing_cache_path if timing_cache_path.is_file() else None,
@@ -1624,6 +2240,44 @@ def prepare_tensorrt_engine(
             return None
         return timing_cache_path
 
+    def shared_onnx_artifact() -> tuple[Path, float, bool]:
+        cached_onnx = validated_onnx_path()
+        if cached_onnx is not None:
+            return cached_onnx, 0.0, True
+        onnx_cache_root.mkdir(parents=True, exist_ok=True)
+        onnx_lock_path = onnx_cache_root / f".{onnx_expected['cache_key']}.lock"
+        with _ArtifactLock(onnx_lock_path):
+            cached_onnx = validated_onnx_path()
+            if cached_onnx is not None:
+                return cached_onnx, 0.0, True
+            temporary_onnx_dir = Path(
+                tempfile.mkdtemp(
+                    prefix=f".{onnx_expected['cache_key']}.",
+                    suffix=".tmp",
+                    dir=onnx_cache_root,
+                )
+            )
+            try:
+                export_started = time.perf_counter()
+                exported_path = _export_dynamic_onnx(model, temporary_onnx_dir, settings)
+                export_seconds = time.perf_counter() - export_started
+                temporary_onnx = temporary_onnx_dir / "model.onnx"
+                if exported_path.resolve() != temporary_onnx.resolve():
+                    shutil.copy2(exported_path, temporary_onnx)
+                onnx_manifest = {
+                    **onnx_expected,
+                    "onnx_sha256": sha256_file(temporary_onnx),
+                    "created_unix_seconds": time.time(),
+                }
+                _atomic_write_json(temporary_onnx_dir / "manifest.json", onnx_manifest)
+                onnx_artifact_dir.mkdir(parents=True, exist_ok=True)
+                os.replace(temporary_onnx, onnx_path)
+                # Publish the manifest last so readers reject partial exports.
+                os.replace(temporary_onnx_dir / "manifest.json", onnx_manifest_path)
+                return onnx_path, export_seconds, False
+            finally:
+                shutil.rmtree(temporary_onnx_dir, ignore_errors=True)
+
     cached = cached_artifact()
     if cached is not None:
         return cached
@@ -1637,12 +2291,9 @@ def prepare_tensorrt_engine(
         temporary_dir = Path(tempfile.mkdtemp(prefix=f".{expected['cache_key']}.", suffix=".tmp", dir=cache_root))
         try:
             build_device = _model_device(model)
-            export_started = time.perf_counter()
-            exported_path = _export_dynamic_onnx(model, temporary_dir, settings)
-            export_seconds = time.perf_counter() - export_started
+            shared_onnx, export_seconds, onnx_cache_hit = shared_onnx_artifact()
             temporary_onnx = temporary_dir / "model.onnx"
-            if exported_path.resolve() != temporary_onnx.resolve():
-                shutil.copy2(exported_path, temporary_onnx)
+            shutil.copy2(shared_onnx, temporary_onnx)
 
             # Export moves the original RF-DETR model back to CUDA.  Release it
             # before the TensorRT builder allocates tactic/workspace memory.
@@ -1666,7 +2317,10 @@ def prepare_tensorrt_engine(
             manifest = {
                 **expected,
                 "engine_sha256": sha256_file(temporary_engine),
-                "onnx_sha256": sha256_file(temporary_onnx),
+                "onnx_sha256": sha256_file(shared_onnx),
+                "onnx_cache_key": onnx_expected["cache_key"],
+                "onnx_cache_hit": onnx_cache_hit,
+                "onnx_manifest_path": str(onnx_manifest_path),
                 "created_unix_seconds": time.time(),
             }
             if temporary_timing_cache.is_file():
@@ -1680,7 +2334,6 @@ def prepare_tensorrt_engine(
 
             artifact_dir.mkdir(parents=True, exist_ok=True)
             # Publish the manifest last so readers never accept a partial artifact.
-            os.replace(temporary_onnx, onnx_path)
             os.replace(temporary_engine, engine_path)
             if temporary_timing_cache.is_file():
                 os.replace(temporary_timing_cache, timing_cache_path)
@@ -1688,7 +2341,7 @@ def prepare_tensorrt_engine(
             return TensorRTArtifact(
                 engine_path=engine_path,
                 manifest_path=manifest_path,
-                onnx_path=onnx_path,
+                onnx_path=shared_onnx,
                 cache_hit=False,
                 manifest=manifest,
                 timing_cache_path=timing_cache_path if timing_cache_path.is_file() else None,
@@ -1728,6 +2381,27 @@ def chunk_batch_ranges(total: int, maximum: int) -> list[tuple[int, int]]:
     return [(start, min(start + maximum, total)) for start in range(0, total, maximum)]
 
 
+class _CudaEventPool:
+    """Reuse CUDA events after their recorded work has completed."""
+
+    def __init__(self, device: torch.device, *, enable_timing: bool) -> None:
+        self.device = device
+        self.enable_timing = enable_timing
+        self._events: list[Any] = []
+        self._lock = threading.Lock()
+
+    def acquire(self) -> Any:
+        with self._lock:
+            if self._events:
+                return self._events.pop()
+        with torch.cuda.device(self.device):
+            return torch.cuda.Event(enable_timing=self.enable_timing)
+
+    def release(self, event: Any) -> None:
+        with self._lock:
+            self._events.append(event)
+
+
 class TensorRTRunner:
     """TensorRT 10 runner using Torch CUDA tensors and ``execute_async_v3``."""
 
@@ -1752,6 +2426,7 @@ class TensorRTRunner:
         self.device = torch.device(device or "cuda:0")
         _require_cuda(self.device)
         self._trt = trt_module if trt_module is not None else _import_tensorrt()
+        self._validate_physical_device()
         logger = _trt_logger(self._trt)
         with torch.cuda.device(self.device):
             self._runtime = self._trt.Runtime(logger)
@@ -1759,8 +2434,12 @@ class TensorRTRunner:
             if self._engine is None:
                 raise RuntimeError(f"TensorRT could not deserialize engine: {self.engine_path}")
             self._context = self._engine.create_execution_context()
+            self._stream = torch.cuda.Stream(device=self.device)
         if self._context is None:
             raise RuntimeError("TensorRT could not create an execution context.")
+        self._execution_lock = threading.Lock()
+        self._timing_events = _CudaEventPool(self.device, enable_timing=True)
+        self._completion_events = _CudaEventPool(self.device, enable_timing=False)
         self._input_names: list[str] = []
         self._output_names: list[str] = []
         for index in range(int(self._engine.num_io_tensors)):
@@ -1779,18 +2458,40 @@ class TensorRTRunner:
                 f"TensorRT RF-DETR project engines require FP32 input I/O; {self.input_name!r} is "
                 f"{self.input_dtype}."
             )
-        profile_shapes = self._engine.get_tensor_profile_shape(self.input_name, 0)
-        if len(profile_shapes) != 3:
-            raise RuntimeError("TensorRT engine did not expose min/opt/max input shapes.")
-        self.min_shape, self.opt_shape, self.max_shape = tuple(tuple(int(v) for v in shape) for shape in profile_shapes)
-        if len(self.max_shape) != 4 or self.max_shape[2] != self.max_shape[3]:
-            raise RuntimeError(f"TensorRT RF-DETR engine must use fixed square NCHW input; got {self.max_shape}.")
-        if self.min_shape[2:] != self.max_shape[2:] or self.opt_shape[2:] != self.max_shape[2:]:
-            raise RuntimeError("TensorRT RF-DETR engine may only have a dynamic batch dimension.")
-        self.max_batch_size = self.max_shape[0]
+        profile_count = int(getattr(self._engine, "num_optimization_profiles", 1))
+        if profile_count <= 0:
+            raise RuntimeError("TensorRT engine does not contain an optimization profile.")
+        resolved_profile_shapes: list[tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]] = []
+        for profile_index in range(profile_count):
+            profile_shapes = self._engine.get_tensor_profile_shape(self.input_name, profile_index)
+            if len(profile_shapes) != 3:
+                raise RuntimeError(
+                    f"TensorRT profile {profile_index} did not expose min/opt/max input shapes."
+                )
+            resolved_shapes = tuple(tuple(int(value) for value in shape) for shape in profile_shapes)
+            minimum, optimum, maximum = resolved_shapes
+            if len(maximum) != 4 or maximum[2] != maximum[3]:
+                raise RuntimeError(
+                    "TensorRT RF-DETR engine must use fixed square NCHW input; "
+                    f"profile {profile_index} has {maximum}."
+                )
+            if minimum[1:] != maximum[1:] or optimum[1:] != maximum[1:]:
+                raise RuntimeError(
+                    "TensorRT RF-DETR optimization profiles may only vary the batch dimension."
+                )
+            resolved_profile_shapes.append(resolved_shapes)
+        self.profile_shapes = tuple(resolved_profile_shapes)
+        self.min_shape, self.opt_shape, self.max_shape = self.profile_shapes[0]
+        if any(shapes[2][1:] != self.max_shape[1:] for shapes in self.profile_shapes[1:]):
+            raise RuntimeError("TensorRT optimization profiles disagree on channel/spatial input shape.")
+        self.max_batch_size = max(shapes[2][0] for shapes in self.profile_shapes)
         self.resolution = self.max_shape[2]
+        self._selected_profile_index = 0
+        active_profile = getattr(self._context, "active_optimization_profile", 0)
+        self._active_profile_index = int(active_profile) if isinstance(active_profile, int) else 0
         self._semantic_output_names: dict[str, str] = {}
         self._output_shapes: dict[str, tuple[int, ...]] = {}
+        self._output_dtypes: dict[str, torch.dtype] = {}
         for name in self._output_names:
             semantic_name = _OUTPUT_NAME_MAP.get(name)
             if semantic_name is None or semantic_name in self._semantic_output_names:
@@ -1802,6 +2503,7 @@ class TensorRTRunner:
                 )
             self._semantic_output_names[semantic_name] = name
             self._output_shapes[name] = tuple(int(value) for value in self._engine.get_tensor_shape(name))
+            self._output_dtypes[name] = dtype
         missing_outputs = {"pred_boxes", "pred_logits"} - set(self._semantic_output_names)
         if missing_outputs:
             raise RuntimeError(
@@ -1810,6 +2512,32 @@ class TensorRTRunner:
         self._validate_output_shapes()
         self._pending_bindings: list[tuple[Any, dict[str, torch.Tensor]]] = []
         self._validate_engine_contract()
+
+    def _validate_physical_device(self) -> None:
+        """Reject a new-style engine before deserializing it on another GPU."""
+
+        if self.manifest is None:
+            return
+        identity = self.manifest.get("identity")
+        gpu_identity = identity.get("gpu") if isinstance(identity, Mapping) else None
+        expected_uuid = (
+            _normalized_gpu_uuid(gpu_identity.get("uuid"))
+            if isinstance(gpu_identity, Mapping)
+            else None
+        )
+        # Older manifests did not record a physical UUID. They retain their
+        # historical behavior, while all engines produced by this version are
+        # protected before TensorRT has a chance to deserialize an alien plan.
+        if expected_uuid is None:
+            return
+        with torch.cuda.device(self.device):
+            properties = torch.cuda.get_device_properties(self.device)
+        actual_uuid = _normalized_gpu_uuid(getattr(properties, "uuid", None))
+        if actual_uuid != expected_uuid:
+            raise RuntimeError(
+                "TensorRT engine physical GPU UUID does not match the selected CUDA device: "
+                f"manifest=GPU-{expected_uuid}, device=GPU-{actual_uuid or 'unknown'}."
+            )
 
     def _validate_output_shapes(self) -> None:
         boxes_name = self._semantic_output_names["pred_boxes"]
@@ -1855,16 +2583,35 @@ class TensorRTRunner:
         profile = identity.get("profile")
         if not isinstance(profile, Mapping):
             raise RuntimeError("TensorRT manifest does not contain a batch profile.")
-        actual_batches = (self.min_shape[0], self.opt_shape[0], self.max_shape[0])
-        expected_batches = (
-            profile.get("min_batch_size"),
-            profile.get("opt_batch_size"),
-            profile.get("max_batch_size"),
-        )
-        if actual_batches != expected_batches:
-            raise RuntimeError(
-                f"TensorRT engine batch profile {actual_batches} does not match manifest {expected_batches}."
-            )
+        profile_shapes = getattr(self, "profile_shapes", ((self.min_shape, self.opt_shape, self.max_shape),))
+        actual_profiles = [
+            {
+                "min_batch_size": shapes[0][0],
+                "opt_batch_size": shapes[1][0],
+                "max_batch_size": shapes[2][0],
+            }
+            for shapes in profile_shapes
+        ]
+        expected_profiles = identity.get("optimization_profiles")
+        if expected_profiles is not None:
+            if _jsonable(actual_profiles) != _jsonable(expected_profiles):
+                raise RuntimeError(
+                    f"TensorRT engine optimization profiles {actual_profiles} do not match manifest "
+                    f"{expected_profiles}."
+                )
+        else:
+            # Schema-v2 manifests created before export ABI v4 contain one
+            # profile only and remain directly loadable for compatibility.
+            expected_batches = {
+                "min_batch_size": profile.get("min_batch_size"),
+                "opt_batch_size": profile.get("opt_batch_size"),
+                "max_batch_size": profile.get("max_batch_size"),
+            }
+            if len(actual_profiles) != 1 or actual_profiles[0] != expected_batches:
+                raise RuntimeError(
+                    f"TensorRT engine batch profile {actual_profiles} does not match manifest "
+                    f"{expected_batches}."
+                )
         expected_outputs = identity.get("outputs")
         if not isinstance(expected_outputs, list):
             raise RuntimeError("TensorRT manifest does not contain its output names.")
@@ -1909,55 +2656,196 @@ class TensorRTRunner:
                 )
 
     def _release_completed_bindings(self) -> None:
-        self._pending_bindings = [
-            (event, bindings) for event, bindings in self._pending_bindings if not bool(event.query())
+        pending: list[tuple[Any, dict[str, torch.Tensor]]] = []
+        for event, bindings in self._pending_bindings:
+            if bool(event.query()):
+                pool = getattr(self, "_completion_events", None)
+                if pool is not None:
+                    pool.release(event)
+            else:
+                pending.append((event, bindings))
+        self._pending_bindings = pending
+
+    def _profile_index_for_batch(self, batch_size: int) -> int:
+        profiles = [
+            (index, shapes)
+            for index, shapes in enumerate(self.profile_shapes)
+            if shapes[0][0] <= batch_size <= shapes[2][0]
         ]
+        if not profiles:
+            raise ValueError(f"No TensorRT optimization profile supports batch size {batch_size}.")
+        if any(index == self._selected_profile_index for index, _shapes in profiles):
+            return self._selected_profile_index
+        return min(profiles, key=lambda item: abs(item[1][1][0] - batch_size))[0]
 
-    def _infer_chunk(self, tensor: torch.Tensor) -> dict[str, torch.Tensor]:
+    def _activate_profile(self, profile_index: int) -> None:
+        if profile_index == self._active_profile_index:
+            return
+        callback = getattr(self._context, "set_optimization_profile_async", None)
+        if not callable(callback):
+            raise RuntimeError("TensorRT execution context cannot switch optimization profiles.")
+        accepted = callback(profile_index, self._stream.cuda_stream)
+        if accepted is False:
+            raise RuntimeError(f"TensorRT rejected optimization profile {profile_index}.")
+        self._active_profile_index = profile_index
+
+    def output_shapes(self, batch_size: int) -> dict[str, tuple[int, ...]]:
+        """Return semantic output shapes for one supported, unchunked batch."""
+
+        batch = _positive_int(batch_size, "TensorRT output batch size")
+        self._profile_index_for_batch(batch)
+        result: dict[str, tuple[int, ...]] = {}
+        for semantic_name, engine_name in self._semantic_output_names.items():
+            dimensions = list(self._output_shapes[engine_name])
+            if dimensions[0] < 0:
+                dimensions[0] = batch
+            if dimensions[0] != batch or any(value <= 0 for value in dimensions):
+                raise RuntimeError(
+                    f"TensorRT output {engine_name!r} cannot resolve batch {batch} from "
+                    f"{self._output_shapes[engine_name]}."
+                )
+            result[semantic_name] = tuple(dimensions)
+        return result
+
+    def allocate_output_buffers(self, batch_size: int) -> dict[str, torch.Tensor]:
+        """Allocate caller-owned outputs that may be reused with :meth:`infer_into`."""
+
+        shapes = self.output_shapes(batch_size)
+        return {
+            semantic_name: torch.empty(
+                shape,
+                dtype=self._output_dtypes[engine_name],
+                device=self.device,
+            )
+            for semantic_name, engine_name in self._semantic_output_names.items()
+            for shape in (shapes[semantic_name],)
+        }
+
+    def _validate_output_buffers(
+        self,
+        batch_size: int,
+        output_buffers: Mapping[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        expected_shapes = self.output_shapes(batch_size)
+        if set(output_buffers) != set(expected_shapes):
+            raise ValueError(
+                f"TensorRT reusable outputs must contain {sorted(expected_shapes)}; "
+                f"got {sorted(str(name) for name in output_buffers)}."
+            )
+        engine_buffers: dict[str, torch.Tensor] = {}
+        for semantic_name, expected_shape in expected_shapes.items():
+            value = output_buffers[semantic_name]
+            engine_name = self._semantic_output_names[semantic_name]
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(f"TensorRT reusable output {semantic_name!r} must be a torch.Tensor.")
+            if value.device != self.device or value.dtype != self._output_dtypes[engine_name]:
+                raise ValueError(
+                    f"TensorRT reusable output {semantic_name!r} must use "
+                    f"{self.device}/{self._output_dtypes[engine_name]}; got {value.device}/{value.dtype}."
+                )
+            if tuple(value.shape) != expected_shape or not value.is_contiguous():
+                raise ValueError(
+                    f"TensorRT reusable output {semantic_name!r} must be contiguous with shape "
+                    f"{expected_shape}; got {tuple(value.shape)}."
+                )
+            engine_buffers[engine_name] = value
+        return engine_buffers
+
+    def _infer_chunk(
+        self,
+        tensor: torch.Tensor,
+        *,
+        output_bindings: Mapping[str, torch.Tensor] | None = None,
+        profile_index: int | None = None,
+    ) -> dict[str, torch.Tensor]:
         with torch.cuda.device(self.device):
-            self._release_completed_bindings()
             if tensor.device != self.device:
-                tensor = tensor.to(self.device)
+                tensor = tensor.to(self.device, non_blocking=True)
             tensor = tensor.to(dtype=self.input_dtype).contiguous()
-            accepted = self._context.set_input_shape(self.input_name, tuple(tensor.shape))
-            if accepted is False:
-                raise RuntimeError(f"TensorRT rejected input shape {tuple(tensor.shape)}.")
+            caller_stream = torch.cuda.current_stream(self.device)
+            with self._execution_lock:
+                self._release_completed_bindings()
+                self._stream.wait_stream(caller_stream)
+                with torch.cuda.stream(self._stream):
+                    selected_profile = (
+                        profile_index
+                        if profile_index is not None
+                        else self._profile_index_for_batch(int(tensor.shape[0]))
+                    )
+                    self._activate_profile(selected_profile)
+                    accepted = self._context.set_input_shape(self.input_name, tuple(tensor.shape))
+                    if accepted is False:
+                        raise RuntimeError(f"TensorRT rejected input shape {tuple(tensor.shape)}.")
 
-            bindings: dict[str, torch.Tensor] = {self.input_name: tensor}
-            for name in self._output_names:
-                shape = tuple(int(value) for value in self._context.get_tensor_shape(name))
-                if any(value < 0 for value in shape):
-                    raise RuntimeError(f"TensorRT output {name!r} still has unresolved shape {shape}.")
-                dtype = _torch_dtype_for_trt(self._trt, self._engine.get_tensor_dtype(name))
-                bindings[name] = torch.empty(shape, dtype=dtype, device=self.device)
-            for name, value in bindings.items():
-                accepted = self._context.set_tensor_address(name, int(value.data_ptr()))
-                if accepted is False:
-                    raise RuntimeError(f"TensorRT rejected tensor address for {name!r}.")
-            stream = torch.cuda.current_stream(self.device)
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-            start_event.record(stream)
-            if not self._context.execute_async_v3(stream_handle=stream.cuda_stream):
-                raise RuntimeError("TensorRT execute_async_v3() failed.")
-            end_event.record(stream)
-            self.forward_timing.add_cuda_events(start_event, end_event)
-            # TensorRT executes outside PyTorch's allocator awareness.  Retain
-            # every registered input/output allocation until the completion
-            # event has fired so dtype/device temporaries cannot be recycled.
-            self._pending_bindings.append((end_event, bindings))
+                    bindings: dict[str, torch.Tensor] = {self.input_name: tensor}
+                    for name in self._output_names:
+                        shape = tuple(int(value) for value in self._context.get_tensor_shape(name))
+                        if any(value < 0 for value in shape):
+                            raise RuntimeError(f"TensorRT output {name!r} still has unresolved shape {shape}.")
+                        reusable = output_bindings.get(name) if output_bindings is not None else None
+                        if reusable is not None:
+                            if tuple(reusable.shape) != shape:
+                                raise RuntimeError(
+                                    f"TensorRT reusable output {name!r} shape changed from "
+                                    f"{tuple(reusable.shape)} to {shape}."
+                                )
+                            bindings[name] = reusable
+                        else:
+                            bindings[name] = torch.empty(
+                                shape,
+                                dtype=self._output_dtypes[name],
+                                device=self.device,
+                            )
+                    for name, value in bindings.items():
+                        accepted = self._context.set_tensor_address(name, int(value.data_ptr()))
+                        if accepted is False:
+                            raise RuntimeError(f"TensorRT rejected tensor address for {name!r}.")
+
+                    start_event = self._timing_events.acquire()
+                    end_event = self._timing_events.acquire()
+                    completion_event = self._completion_events.acquire()
+                    start_event.record(self._stream)
+                    executed = self._context.execute_async_v3(stream_handle=self._stream.cuda_stream)
+                    end_event.record(self._stream)
+                    completion_event.record(self._stream)
+                if not executed:
+                    self._stream.synchronize()
+                    self._timing_events.release(start_event)
+                    self._timing_events.release(end_event)
+                    self._completion_events.release(completion_event)
+                    raise RuntimeError("TensorRT execute_async_v3() failed.")
+
+                def release_timing_events() -> None:
+                    self._timing_events.release(start_event)
+                    self._timing_events.release(end_event)
+
+                self.forward_timing.add_cuda_events(
+                    start_event,
+                    end_event,
+                    release=release_timing_events,
+                )
+                # TensorRT executes outside PyTorch's allocator awareness. Keep
+                # all bindings alive until the private execution stream finishes.
+                self._pending_bindings.append((completion_event, bindings))
+                caller_stream.wait_event(completion_event)
+                for name in self._output_names:
+                    bindings[name].record_stream(caller_stream)
         return normalize_raw_outputs({name: bindings[name] for name in self._output_names})
 
-    def infer(self, tensor: torch.Tensor) -> dict[str, torch.Tensor]:
+    def _validate_input(self, tensor: torch.Tensor) -> None:
         if not isinstance(tensor, torch.Tensor) or tensor.ndim != 4:
             raise ValueError("TensorRT RF-DETR input must be a rank-4 NCHW torch.Tensor.")
         if tensor.shape[0] <= 0:
             raise ValueError("TensorRT RF-DETR input batch cannot be empty.")
         if tuple(tensor.shape[1:]) != tuple(self.max_shape[1:]):
             raise ValueError(
-                f"TensorRT RF-DETR input must have shape [N, {', '.join(str(v) for v in self.max_shape[1:])}]; "
+                f"TensorRT RF-DETR input must have shape "
+                f"[N, {', '.join(str(value) for value in self.max_shape[1:])}]; "
                 f"got {tuple(tensor.shape)}."
             )
+
+    def infer(self, tensor: torch.Tensor) -> dict[str, torch.Tensor]:
+        self._validate_input(tensor)
         chunks = [self._infer_chunk(tensor[start:end]) for start, end in chunk_batch_ranges(tensor.shape[0], self.max_batch_size)]
         if len(chunks) == 1:
             return chunks[0]
@@ -1966,19 +2854,109 @@ class TensorRTRunner:
             raise RuntimeError("TensorRT output keys changed between dynamic-batch chunks.")
         return {key: torch.cat([chunk[key] for chunk in chunks], dim=0) for key in sorted(keys)}
 
+    def infer_into(
+        self,
+        tensor: torch.Tensor,
+        output_buffers: Mapping[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        """Infer into caller-owned buffers, avoiding per-call output allocation.
+
+        The batch must fit one optimization profile. The caller may reuse the
+        returned buffers after consuming them on the same CUDA stream; the next
+        invocation waits for that stream before overwriting the buffers.
+        """
+
+        self._validate_input(tensor)
+        batch_size = int(tensor.shape[0])
+        if batch_size > self.max_batch_size:
+            raise ValueError(
+                f"TensorRT infer_into batch {batch_size} exceeds unchunked maximum {self.max_batch_size}."
+            )
+        engine_buffers = self._validate_output_buffers(batch_size, output_buffers)
+        return self._infer_chunk(tensor, output_bindings=engine_buffers)
+
+    def autotune_profiles(
+        self,
+        batch_size: int,
+        *,
+        warmup_iterations: int = 1,
+        measure_iterations: int = 3,
+    ) -> dict[str, Any]:
+        """Benchmark compatible profiles on the private stream and select the fastest."""
+
+        batch = _positive_int(batch_size, "TensorRT profile autotune batch size")
+        warmups = int(warmup_iterations)
+        measurements = _positive_int(measure_iterations, "TensorRT profile autotune iterations")
+        if warmups < 0:
+            raise ValueError("TensorRT profile autotune warmup iterations cannot be negative.")
+        candidates = [
+            index
+            for index, shapes in enumerate(self.profile_shapes)
+            if shapes[0][0] <= batch <= shapes[2][0]
+        ]
+        if not candidates:
+            raise ValueError(f"No TensorRT optimization profile supports autotune batch size {batch}.")
+        if len(candidates) == 1:
+            self._selected_profile_index = candidates[0]
+            return {
+                "batch_size": batch,
+                "selected_profile_index": candidates[0],
+                "benchmarked": False,
+                "profiles": [],
+            }
+
+        dummy = torch.zeros((batch, *self.max_shape[1:]), dtype=self.input_dtype, device=self.device)
+        output_buffers = self.allocate_output_buffers(batch)
+        reports: list[dict[str, Any]] = []
+        for profile_index in candidates:
+            self._selected_profile_index = profile_index
+            for _ in range(warmups):
+                self.infer_into(dummy, output_buffers)
+                self.synchronize()
+                self.consume_forward_seconds()
+            durations: list[float] = []
+            for _ in range(measurements):
+                self.infer_into(dummy, output_buffers)
+                self.synchronize()
+                durations.append(self.consume_forward_seconds())
+            reports.append(
+                {
+                    "profile_index": profile_index,
+                    "opt_batch_size": self.profile_shapes[profile_index][1][0],
+                    "median_forward_seconds": statistics.median(durations),
+                    "measurements": durations,
+                }
+            )
+        selected = min(reports, key=lambda report: report["median_forward_seconds"])
+        self._selected_profile_index = int(selected["profile_index"])
+        return {
+            "batch_size": batch,
+            "selected_profile_index": self._selected_profile_index,
+            "benchmarked": True,
+            "profiles": reports,
+        }
+
     __call__ = infer
 
     def consume_forward_seconds(self) -> float:
-        seconds = self.forward_timing.consume_seconds()
-        self._release_completed_bindings()
+        with self._execution_lock:
+            seconds = self.forward_timing.consume_seconds()
+            self._release_completed_bindings()
         return seconds
+
+    def synchronize(self) -> None:
+        """Wait only for this runner's private stream, never the whole device."""
+
+        with self._execution_lock:
+            self._stream.synchronize()
+            self._release_completed_bindings()
 
     def warmup(self, batch_size: int = 1) -> float:
         batch_size = min(_positive_int(batch_size, "warmup batch size"), self.max_batch_size)
         started = time.perf_counter()
         dummy = torch.zeros((batch_size, *self.max_shape[1:]), dtype=self.input_dtype, device=self.device)
         self.infer(dummy)
-        torch.cuda.synchronize(self.device)
+        self.synchronize()
         return time.perf_counter() - started
 
 
@@ -2074,6 +3052,54 @@ def install_tensorrt_backend(
     return TensorRTPredictAdapter(model, runner, release_pytorch_cuda=release_pytorch_cuda)
 
 
+def run_inference_accuracy_parity_check(
+    handle: AccelerationHandle,
+    callback: Callable[[AccelerationHandle], bool | Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Run a caller-supplied BF16-reference accuracy gate for a candidate backend.
+
+    The acceleration layer cannot infer dataset mAP, class recall, or tracking
+    tolerances from raw tensors. The callback owns those metrics and returns a
+    bool or a mapping containing boolean ``accepted``/``passed`` plus details.
+    Callback exceptions are represented as a failed gate so callers may safely
+    fall back instead of deploying an unverified FP16 engine.
+    """
+
+    started = time.perf_counter()
+    try:
+        result = callback(handle)
+        if isinstance(result, bool):
+            accepted = result
+            details: dict[str, Any] = {}
+        elif isinstance(result, Mapping):
+            details = dict(result)
+            raw_accepted = details.get("accepted", details.get("passed"))
+            if not isinstance(raw_accepted, bool):
+                raise ValueError("Accuracy parity result must contain boolean 'accepted' or 'passed'.")
+            accepted = raw_accepted
+        else:
+            raise TypeError("Accuracy parity callback must return bool or a mapping.")
+        return {
+            "performed": True,
+            "reference_backend": "pytorch",
+            "reference_precision": "bf16",
+            "accepted": accepted,
+            "seconds": time.perf_counter() - started,
+            "details": _jsonable(details),
+            "error": None,
+        }
+    except Exception as exc:
+        return {
+            "performed": True,
+            "reference_backend": "pytorch",
+            "reference_precision": "bf16",
+            "accepted": False,
+            "seconds": time.perf_counter() - started,
+            "details": {},
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
 def configure_inference_acceleration(
     model: Any,
     config_or_settings: Mapping[str, Any] | InferenceOptimizationConfig,
@@ -2083,6 +3109,9 @@ def configure_inference_acceleration(
     model_identity: Mapping[str, Any] | None = None,
     segmentation: bool | None = None,
     device: str | torch.device | None = None,
+    parity_check: Callable[[AccelerationHandle], bool | Mapping[str, Any]] | None = None,
+    fallback_on_parity_failure: bool = True,
+    reuse_output_buffers: bool | None = None,
 ) -> AccelerationHandle:
     """Fail-fast high-level configuration for PyTorch or TensorRT inference."""
 
@@ -2093,6 +3122,13 @@ def configure_inference_acceleration(
     )
     if settings.backend == "pytorch":
         return apply_pytorch_optimization(model, settings)
+    if reuse_output_buffers is not None and not isinstance(reuse_output_buffers, bool):
+        raise ValueError("reuse_output_buffers override must be true or false.")
+    effective_reuse_output_buffers = (
+        settings.tensorrt.reuse_output_buffers
+        if reuse_output_buffers is None
+        else reuse_output_buffers
+    )
 
     runner_device = _preflight_device(device) if device is not None else _model_device(model)
     artifact = prepare_tensorrt_engine(
@@ -2113,6 +3149,10 @@ def configure_inference_acceleration(
         expected_manifest=artifact.manifest,
     )
     load_seconds = time.perf_counter() - load_started
+    autotune_started = time.perf_counter()
+    autotune_batch = min(settings.tensorrt.profile.opt_batch_size, 16)
+    profile_autotune = runner.autotune_profiles(autotune_batch)
+    autotune_seconds = time.perf_counter() - autotune_started
     adapter = install_tensorrt_backend(model, runner)
     warmup_seconds = runner.warmup(1)
     runner.consume_forward_seconds()  # Warm-up is reported separately, never charged to the first image batch.
@@ -2123,14 +3163,27 @@ def configure_inference_acceleration(
             "export_seconds": artifact.export_seconds,
             "build_seconds": artifact.build_seconds,
             "load_seconds": load_seconds,
+            "profile_autotune_seconds": autotune_seconds,
+            "profile_autotune": profile_autotune,
             "warmup_seconds": warmup_seconds,
             "engine_path": str(artifact.engine_path),
             "manifest_path": str(artifact.manifest_path),
             "engine_sha256": artifact.manifest.get("engine_sha256"),
+            "onnx_path": str(artifact.onnx_path) if artifact.onnx_path is not None else None,
+            "onnx_cache_key": artifact.manifest.get("onnx_cache_key"),
+            "onnx_cache_hit": artifact.manifest.get("onnx_cache_hit"),
             "timing_cache_path": str(artifact.timing_cache_path) if artifact.timing_cache_path is not None else None,
+            "gpu_identity": dict(artifact.manifest.get("identity", {}).get("gpu", {})),
+            "accuracy_parity": {
+                "performed": False,
+                "reference_backend": "pytorch",
+                "reference_precision": "bf16",
+                "accepted": None,
+            },
+            "reuse_output_buffers": effective_reuse_output_buffers,
         }
     )
-    return AccelerationHandle(
+    handle = AccelerationHandle(
         model=adapter,
         settings=settings,
         metadata=metadata,
@@ -2138,13 +3191,49 @@ def configure_inference_acceleration(
         _infer_raw=runner.infer,
         _forward_recorder=runner.forward_timing,
         _postprocess_recorder=getattr(model, "__dict__", {}).get(_POSTPROCESS_RECORDER_MARKER),
+        _infer_into=runner.infer_into,
+        _allocate_output_buffers=runner.allocate_output_buffers,
+        _reuse_output_buffers_by_default=effective_reuse_output_buffers,
     )
+    if parity_check is None:
+        return handle
+
+    parity = run_inference_accuracy_parity_check(handle, parity_check)
+    handle.metadata["accuracy_parity"] = parity
+    if bool(parity["accepted"]):
+        return handle
+    if not fallback_on_parity_failure:
+        reason = parity.get("error") or parity.get("details") or "accuracy gate rejected TensorRT"
+        raise RuntimeError(f"TensorRT FP16 accuracy parity failed: {reason}")
+
+    restored = adapter.restore_pytorch_model()
+    fallback_settings = InferenceOptimizationConfig(
+        backend="pytorch",
+        pytorch_precision="bf16",
+        tensorrt=settings.tensorrt,
+        resolution=settings.resolution,
+    )
+    fallback = apply_pytorch_optimization(restored, fallback_settings)
+    fallback.metadata.update(
+        {
+            "requested_backend": "tensorrt",
+            "requested_precision": settings.tensorrt.precision,
+            "effective_backend": "pytorch",
+            "effective_precision": "bf16",
+            "fallback_reason": "TensorRT accuracy parity failed",
+            "accuracy_parity": parity,
+            "rejected_tensorrt": metadata,
+        }
+    )
+    return fallback
 
 
 __all__ = [
     "AccelerationHandle",
     "ForwardTimingRecorder",
     "InferenceOptimizationConfig",
+    "PreprocessTiming",
+    "PreparedInferenceBatch",
     "TensorRTArtifact",
     "TensorRTPredictAdapter",
     "TensorRTProfile",
@@ -2154,11 +3243,15 @@ __all__ = [
     "build_tensorrt_engine",
     "chunk_batch_ranges",
     "configure_inference_acceleration",
+    "gpu_runtime_identity",
     "install_tensorrt_backend",
     "normalize_raw_outputs",
+    "prepare_inference_batch",
     "preflight_inference_acceleration",
     "prepare_tensorrt_engine",
     "resolve_acceleration_config",
+    "run_inference_accuracy_parity_check",
     "sha256_file",
+    "tensorrt_optimization_profiles",
     "validate_engine_manifest",
 ]

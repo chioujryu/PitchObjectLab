@@ -16,6 +16,24 @@ import inference_rf_detr_model as inference_runner  # noqa: E402
 
 
 class RfDetrInferenceTest(unittest.TestCase):
+    def test_peak_vram_uses_the_models_nondefault_cuda_device(self):
+        import torch
+
+        model = object()
+        handle = SimpleNamespace(device=torch.device("cuda:2"))
+        with patch.object(
+            inference_runner.trainer,
+            "get_inference_acceleration_handle",
+            return_value=handle,
+        ), patch.object(torch.cuda, "is_available", return_value=True), patch.object(
+            torch.cuda,
+            "max_memory_allocated",
+            return_value=123456,
+        ) as peak:
+            self.assertEqual(inference_runner.peak_vram_bytes_for_model(model), 123456)
+
+        peak.assert_called_once_with(torch.device("cuda:2"))
+
     def test_discover_mixed_folder_sources(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -102,12 +120,91 @@ class RfDetrInferenceTest(unittest.TestCase):
         self.assertEqual(inference_runner.video_batch_size(config), 8)
         self.assertEqual(inference_runner.video_batch_size({"inference": {"batch_size": 8, "video": {"batch_size": 3}}}), 3)
 
+    def test_sahi_workload_estimator_counts_1080p_slice_inputs(self):
+        config = {
+            "inference": {"mode": "sahi"},
+            "sahi": {
+                "slice_height": 320,
+                "slice_width": 320,
+                "overlap_height_ratio": 0.2,
+                "overlap_width_ratio": 0.2,
+                "standard_prediction": False,
+                "batch_size": 4,
+                "recheck": {"enabled": True, "max_rechecks_per_image": 50},
+            },
+        }
+
+        workload = inference_runner.estimated_rfdetr_workload(1920, 1080, 1800, config)
+
+        self.assertEqual(workload["slice_inputs"], 57_600)
+        self.assertEqual(workload["model_inputs"], 57_600)
+        self.assertEqual(workload["model_batches"], 14_400)
+        self.assertEqual(workload["recheck_input_cap"], 90_000)
+
+    def test_performance_profiles_do_not_change_slice_geometry(self):
+        base = {
+            "runtime": {},
+            "model": {"inference_optimization": {}},
+            "inference": {"video": {}, "tracking": {"hybrid": {"cmc": {}}}},
+            "sahi": {"slice_width": 320, "slice_height": 320},
+        }
+        safe = json.loads(json.dumps(base))
+        fast = json.loads(json.dumps(base))
+
+        inference_runner.apply_performance_profile(safe, "safe")
+        inference_runner.apply_performance_profile(fast, "fast")
+
+        self.assertEqual(safe["sahi"], fast["sahi"])
+        self.assertEqual(safe["model"]["inference_optimization"]["backend"], "pytorch")
+        self.assertEqual(fast["model"]["inference_optimization"]["backend"], "tensorrt")
+        self.assertEqual(
+            fast["inference"]["tracking"]["hybrid"]["cmc"]["processing_scale"],
+            0.5,
+        )
+
+    def test_medium_p2_performance_presets_keep_the_32_slice_safe_workload(self):
+        safe = inference_runner.load_yaml(
+            PROJECT_DIR / "config" / "rf_detr_inference_medium_p2_performance_safe.yaml"
+        )
+        fast = inference_runner.load_yaml(
+            PROJECT_DIR / "config" / "rf_detr_inference_medium_p2_performance_fast.yaml"
+        )
+
+        for config in (safe, fast):
+            workload = inference_runner.estimated_rfdetr_workload(1920, 1080, 1800, config)
+            self.assertEqual(workload["slice_inputs"], 57_600)
+            self.assertEqual(config["model"]["num_classes"], 1)
+            self.assertEqual(config["dataset"]["class_names"], ["football"])
+            self.assertFalse(config["sahi"]["standard_prediction"])
+            self.assertTrue(config["inference"]["tracking"]["enabled"])
+            self.assertEqual(config["inference"]["tracking"]["algorithm"], "hybrid")
+        self.assertEqual(
+            safe["inference"]["tracking"]["hybrid"]["cmc"]["processing_scale"],
+            1.0,
+        )
+        self.assertEqual(
+            fast["inference"]["tracking"]["hybrid"]["cmc"]["processing_scale"],
+            0.5,
+        )
+
     def test_prediction_config_includes_batch_size(self):
         config = {"model": {"confidence_threshold": 0.3}, "inference": {"mode": "full_image", "batch_size": 7}}
 
         prediction_config = inference_runner.build_prediction_config(config, [{"id": 0, "name": "ball"}])
 
         self.assertEqual(prediction_config["inference"]["batch_size"], 7)
+
+    def test_prediction_config_preserves_auto_sahi_batch_tuning(self):
+        config = {
+            "model": {"confidence_threshold": 0.3},
+            "inference": {"mode": "sahi", "batch_size": 8},
+            "sahi": {"batch_size": "auto"},
+        }
+
+        prediction_config = inference_runner.prediction_config_with_batch(config, 8)
+
+        self.assertEqual(prediction_config["inference"]["batch_size"], 8)
+        self.assertEqual(prediction_config["sahi"]["batch_size"], "auto")
 
     def test_football_output_resolves_default_name_case_insensitively(self):
         categories = [{"id": 0, "name": "Football"}, {"id": 1, "name": "player"}]
@@ -303,6 +400,7 @@ class RfDetrInferenceTest(unittest.TestCase):
 
     def test_stage_timing_summary_includes_sahi_and_recheck_ratios(self):
         model = SimpleNamespace()
+        model._rf_detr_workload_counters = {"model_batches": 3}
         inference_runner.record_inference_timing_rows(
             model,
             [
@@ -312,6 +410,16 @@ class RfDetrInferenceTest(unittest.TestCase):
                     "sahi_model_forward_seconds": 1.0,
                     "recheck_model_forward_seconds": 0.5,
                     "postprocess_seconds": 0.5,
+                    "crop_seconds": 0.1,
+                    "host_preprocess_seconds": 0.2,
+                    "h2d_seconds": 0.03,
+                    "resize_normalize_seconds": 0.07,
+                    "device_preprocess_seconds": 0.1,
+                    "orchestration_seconds": 0.1,
+                    "exclusive_postprocess_seconds": 0.4,
+                    "requested_slice_batch_size": 16,
+                    "effective_slice_batch_sizes": [8],
+                    "observed_slice_batch_sizes": [3, 8],
                 }
             ],
         )
@@ -319,9 +427,18 @@ class RfDetrInferenceTest(unittest.TestCase):
         summary = inference_runner.summarize_inference_timing_rows(model)
 
         self.assertEqual(summary["images_or_frames"], 1)
+        self.assertEqual(summary["runtime_units"], 3)
         self.assertAlmostEqual(summary["model_forward_ratio"], 0.75)
         self.assertAlmostEqual(summary["sahi_model_forward_ratio"], 0.5)
         self.assertAlmostEqual(summary["recheck_model_forward_ratio"], 0.25)
+        self.assertEqual(summary["requested_sahi_batch_sizes"], [16])
+        self.assertEqual(summary["effective_sahi_batch_sizes"], [8])
+        self.assertEqual(summary["observed_sahi_batch_sizes"], [3, 8])
+        self.assertAlmostEqual(summary["crop_seconds"], 0.1)
+        self.assertAlmostEqual(summary["host_preprocess_seconds"], 0.2)
+        self.assertAlmostEqual(summary["h2d_seconds"], 0.03)
+        self.assertAlmostEqual(summary["resize_normalize_seconds"], 0.07)
+        self.assertAlmostEqual(summary["exclusive_postprocess_seconds"], 0.4)
 
     def test_final_prediction_filter_uses_fused_threshold_for_all_classes(self):
         config = {
@@ -449,15 +566,39 @@ class RfDetrInferenceTest(unittest.TestCase):
         self.assertIs(result, rf_model)
         model_cls.assert_called_once_with()
 
+    def test_all_trajectory_presets_disable_predicted_trajectory_by_default(self):
+        config_dir = PROJECT_DIR / "config"
+        trajectory_presets = 0
+        for path in sorted(config_dir.glob("rf_detr_inference*.yaml")):
+            config = inference_runner.load_yaml(path)
+            tracking = config.get("inference", {}).get("tracking", {})
+            if "draw_trajectory" not in tracking:
+                continue
+            trajectory_presets += 1
+            with self.subTest(config=path.name):
+                self.assertIn("draw_predicted_trajectory", tracking)
+                self.assertFalse(tracking["draw_predicted_trajectory"])
+        # New derived presets may inherit trajectory rendering.  The contract
+        # is the per-preset safety setting above, not a frozen file count.
+        self.assertGreaterEqual(trajectory_presets, 17)
+
     def test_all_inference_configs_declare_optional_architecture_blocks(self):
         config_dir = PROJECT_DIR / "config"
         p2_video_preset = "rf_detr_inference_medium_p2_video_1984090152231178242_003.yaml"
         combined_preset = "rf_detr_inference_medium_p2_tensorrt_sahi160_recheck320_ocsort_6videos.yaml"
         tensorrt_presets = {
             combined_preset,
+            "rf_detr_inference_medium_p2_performance_fast.yaml",
+            "rf_detr_inference_medium_p2_sahi160_recheck320_hybrid.yaml",
             "rf_detr_inference_tracknet_tensorrt_fp16_example.yaml",
             "rf_detr_inference_large_p2_tensorrt_fp16_smoke.yaml",
             "rf_detr_inference_small_p2.yaml",
+        }
+        bf16_pytorch_presets = {
+            "rf_detr_inference_medium_p2_performance_fast.yaml",
+            "rf_detr_inference_medium_p2_performance_safe.yaml",
+            "rf_detr_inference_medium_p2_sahi160_recheck320_hybrid.yaml",
+            "rf_detr_inference_medium_p2_sahi320_recheck640_hybrid.yaml",
         }
         real_temporal_tracknet_presets = {
             "rf_detr_inference_small_tracknet_v5.yaml",
@@ -485,7 +626,11 @@ class RfDetrInferenceTest(unittest.TestCase):
                 self.assertTrue(resolved_football.target_class_ids)
                 expected_backend = "tensorrt" if path.name in tensorrt_presets else "pytorch"
                 self.assertEqual(model["inference_optimization"]["backend"], expected_backend)
-                self.assertEqual(model["inference_optimization"]["pytorch"]["precision"], "fp32")
+                expected_pytorch_precision = "bf16" if path.name in bf16_pytorch_presets else "fp32"
+                self.assertEqual(
+                    model["inference_optimization"]["pytorch"]["precision"],
+                    expected_pytorch_precision,
+                )
                 self.assertIn(model["inference_optimization"]["tensorrt"]["precision"], {"fp16", "bf16"})
                 if path.name == combined_preset:
                     self.assertEqual(model["inference_optimization"]["tensorrt"]["precision"], "fp16")

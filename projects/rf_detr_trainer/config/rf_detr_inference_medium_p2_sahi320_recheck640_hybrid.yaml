@@ -45,7 +45,7 @@ model:
   # RF-DETR model size. Options: base, nano, small, medium, large.
   size: medium
   # Checkpoint trained with Medium, one class, 576 resolution, and P2 [P2, P3, P4].
-  pretrain_weights: ""
+  pretrain_weights: /home/new_users/zhiyu/projects/PitchObjectLab/runs/rf_detr/train/rfdetr_medium_motion_v5_e40_b4_20260710165058/checkpoint_best_ema.pth
   # Explicit checkpoint input resolution. Options: positive integer.
   resolution: 576
   # Explicit checkpoint class count. Options: positive integer.
@@ -67,7 +67,7 @@ model:
     # PyTorch-only settings; retained for the complete schema. Options: mapping.
     pytorch:
       # PyTorch compute precision. Options: fp32, bf16.
-      precision: fp32
+      precision: bf16
     # TensorRT-only settings. TensorRT is CUDA-only and does not silently fall back. Options: mapping.
     tensorrt:
       # TensorRT engine precision. Options: fp16, bf16.
@@ -213,12 +213,7 @@ output:
 inference:
   # Explicit image/video/folder/HTTP(S) inputs. Options: list of supported sources.
   sources:
-    - <path-to-video-directory>/video_01.mp4
-    - <path-to-video-directory>/video_02.mp4
-    - <path-to-video-directory>/video_03.mp4
-    - <path-to-video-directory>/video_04.mp4
-    - <path-to-video-directory>/video_05.mp4
-    - <path-to-video-directory>/video_06.mp4
+    - /home/new_users/zhiyu/datasets/soccer/raw/raw_video/1984090406020124673.mp4
   # Recurse into folder sources. Options: true, false.
   recursive: true
   # Maximum discovered sources after type caps. Options: all, null, or positive integer.
@@ -256,9 +251,9 @@ inference:
     # Detection-frame batch size; null inherits inference.batch_size, while SAHI model calls remain batch 4.
     batch_size: null
     # Begin each video at its first frame. Options: seconds, MM:SS, HH:MM:SS.
-    start_time: 0
+    start_time: 00:10:00
     # Continue through each video end. Options: all, null, seconds, MM:SS, HH:MM:SS.
-    end_time: all
+    end_time: 00:11:00
     # Process the entire selected range. Options: all, null, or positive duration.
     max_seconds: all
     # Preserve each input video's FPS. Options: null or positive FPS.
@@ -293,6 +288,8 @@ inference:
     velocity_smoothing: 0.5
     # Draw trajectory polylines. Options: true, false.
     draw_trajectory: true
+    # Extend the observed trail to the live predicted center during detection gaps. Options: true, false.
+    draw_predicted_trajectory: false
     # Maximum retained/rendered trajectory points. Options: null or positive integer.
     trajectory_max_points: 30
     # Expire trail points after this many source frames. Options: null or positive integer.
