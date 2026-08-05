@@ -114,4 +114,11 @@ inference:
     output_fps: null
     render_skipped_frames: true
   tracking:
+    # Tracking is disabled in this TensorRT architecture example. Options: true, false.
     enabled: false
+    # Draw a live predicted center during detection gaps; Hybrid also limits it to predicted_output_seconds. Options: true, false.
+    draw_predicted_center: false
+    # Hide target-class detections whose Hybrid tracks never become confirmed. Hybrid-only; must remain false for other algorithms. Options: true, false.
+    render_confirmed_only: false
+    # Filter unconfirmed target-class detections from predictions.jsonl and football_predictions.jsonl only. Hybrid-only; must remain false for other algorithms. Options: true, false.
+    export_confirmed_only: false

@@ -30,7 +30,6 @@ class HybridTrackingConfig:
     new_track_confidence: float = 0.50
     low_require_recheck: bool = True
     lookahead_seconds: float = 0.50
-    beam_width: int = 8
     ambiguity_margin: float = 0.02
     confirmed_hits: int = 2
     confirmation_window: int = 3
@@ -73,7 +72,7 @@ class HybridTrackingConfig:
         for name in ("lookahead_seconds", "lost_seconds", "predicted_output_seconds"):
             if float(getattr(self, name)) < 0.0:
                 raise ValueError(f"hybrid.{name} must be non-negative")
-        for name in ("beam_width", "confirmed_hits", "confirmation_window", "cmc_min_inliers"):
+        for name in ("confirmed_hits", "confirmation_window", "cmc_min_inliers"):
             if int(getattr(self, name)) < 1:
                 raise ValueError(f"hybrid.{name} must be >= 1")
         if self.confirmed_hits > self.confirmation_window:
@@ -89,7 +88,7 @@ class HybridTrackingConfig:
             "candidate": {
                 "low_confidence", "high_confidence", "new_track_confidence", "low_require_recheck"
             },
-            "hypothesis": {"lookahead_seconds", "beam_width", "ambiguity_margin"},
+            "hypothesis": {"lookahead_seconds", "ambiguity_margin"},
             "lifecycle": {
                 "confirmed_hits", "confirmation_window", "lost_seconds", "predicted_output_seconds"
             },
@@ -113,9 +112,15 @@ class HybridTrackingConfig:
                 if not isinstance(value, Mapping):
                     raise ValueError(f"inference.tracking.hybrid.{key} must be a mapping")
                 for child, child_value in value.items():
+                    if key == "hypothesis" and child == "beam_width":
+                        raise ValueError(
+                            "inference.tracking.hybrid.hypothesis.beam_width is unsupported; remove it"
+                        )
                     if child not in groups[key]:
                         raise ValueError(f"unknown inference.tracking.hybrid.{key}.{child}")
                     values["cmc_processing_scale" if child == "processing_scale" else child] = child_value
+            elif key == "beam_width":
+                raise ValueError("inference.tracking.hybrid.beam_width is unsupported; remove it")
             elif key in cls.__dataclass_fields__:
                 values[key] = value
             else:
@@ -184,6 +189,32 @@ class _Track:
     @property
     def last_seen_frame_index(self) -> int:
         return int(self.last_frame_index)
+
+
+@dataclass(frozen=True)
+class HybridTrackSnapshot:
+    """Immutable overlay state captured at one processed frame.
+
+    Delayed consumers must use these snapshots instead of ``tracker.tracks``:
+    the latter continues advancing while an older video frame waits to commit.
+    """
+
+    track_id: int
+    center_x: float
+    center_y: float
+    velocity_x: float
+    velocity_y: float
+    base_radius: float
+    missing_frames: int
+    hits: int
+    first_frame_index: int
+    last_seen_frame_index: int
+    points: Tuple[Tuple[int, float, float], ...]
+    status: str
+    observed_this_frame: bool
+    seconds_since_observed: float
+    last_timestamp: float
+    last_observed_timestamp: float
 
 
 def _bbox_values(row: Mapping[str, Any]) -> Tuple[float, float, float, float]:
@@ -322,16 +353,25 @@ class _CameraMotionEstimator:
 class HybridFootballTracker:
     """All-ball, motion-only tracker with two confidence tiers and delayed commits."""
 
-    def __init__(self, cfg: HybridTrackingConfig, target_class_ids: Set[int], history_maxlen: int = 30) -> None:
+    def __init__(
+        self,
+        cfg: HybridTrackingConfig,
+        target_class_ids: Set[int],
+        history_maxlen: int = 30,
+        confirmation_backfill: bool = False,
+    ) -> None:
         self.cfg = cfg
         self.target_class_ids = {int(value) for value in target_class_ids}
         self.tracks: List[_Track] = []
         self._history_maxlen = max(1, int(history_maxlen))
+        self._confirmation_backfill = bool(confirmation_backfill)
         self.next_id = 1
-        self._pending: Deque[Dict[str, Any]] = deque()
+        self._pending: Deque[Tuple[int, Dict[str, Any]]] = deque()
         self._latest: Optional[Dict[str, Any]] = None
         self._last_frame_index: Optional[int] = None
         self._last_timestamp: Optional[float] = None
+        self._processed_count = 0
+        self._confirmed_track_ids: Set[int] = set()
         self._cmc = _CameraMotionEstimator(cfg)
 
     def reset(self) -> None:
@@ -342,6 +382,8 @@ class HybridFootballTracker:
         self._latest = None
         self._last_frame_index = None
         self._last_timestamp = None
+        self._processed_count = 0
+        self._confirmed_track_ids.clear()
         self._cmc.reset()
 
     def step(
@@ -361,28 +403,37 @@ class HybridFootballTracker:
         affine, cmc_diagnostic = self._cmc.estimate(frame)
         self._apply_camera_motion(affine)
         normalized = self._normalize(detections)
-        rows, states = self._process(frame_index, timestamp, detections, normalized)
+        rows, states, snapshots = self._process(frame_index, timestamp, detections, normalized)
         frame_result = {
                 "frame_index": frame_index,
                 "timestamp": timestamp,
                 "detections": rows,
                 "track_states": states,
+                "track_snapshots": snapshots,
                 "cmc": cmc_diagnostic,
-                "hypothesis": {"beam_width": self.cfg.beam_width, "retained": 1},
         }
         self._latest = frame_result
-        self._pending.append(frame_result)
+        sequence_index = self._processed_count
+        self._processed_count += 1
+        self._pending.append((sequence_index, frame_result))
         self._last_frame_index = frame_index
         self._last_timestamp = timestamp
         committed: List[Dict[str, Any]] = []
         epsilon = 1.0e-9
-        while self._pending and timestamp - float(self._pending[0]["timestamp"]) + epsilon >= self.cfg.lookahead_seconds:
-            committed.append(self._pending.popleft())
+        confirmation_delay = self.cfg.confirmation_window - 1 if self._confirmation_backfill else 0
+        while self._pending:
+            pending_sequence, pending_frame = self._pending[0]
+            time_ready = timestamp - float(pending_frame["timestamp"]) + epsilon >= self.cfg.lookahead_seconds
+            confirmation_ready = sequence_index - pending_sequence >= confirmation_delay
+            if not (time_ready and confirmation_ready):
+                break
+            self._pending.popleft()
+            committed.append(self._finalize_packet(pending_frame))
         return committed
 
     def flush(self) -> List[Dict[str, Any]]:
         """Commit all delayed frames exactly once, preserving input order."""
-        remaining = list(self._pending)
+        remaining = [self._finalize_packet(frame) for _sequence, frame in self._pending]
         self._pending.clear()
         return remaining
 
@@ -400,6 +451,12 @@ class HybridFootballTracker:
     def latest_frame(self) -> Optional[Dict[str, Any]]:
         """Return the newest provisional frame for rendering; exports must use committed frames."""
         return self._latest
+
+
+    @property
+    def confirmed_track_ids(self) -> frozenset[int]:
+        """All IDs that ever reached confirmed status in the current source segment."""
+        return frozenset(self._confirmed_track_ids)
 
 
     def confirmed_tracks(self) -> List[_Track]:
@@ -458,7 +515,7 @@ class HybridFootballTracker:
         timestamp: float,
         original: Sequence[Mapping[str, Any]],
         detections: Sequence[_Detection],
-    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Tuple[HybridTrackSnapshot, ...]]:
         for track in self.tracks:
             self._predict(track, timestamp)
             track.association = {"stage": "miss", "cost": None, "detection_index": None}
@@ -533,7 +590,16 @@ class HybridFootballTracker:
             )
         ]
         states.sort(key=lambda row: row["track_id"])
-        return rows, states
+        snapshots = tuple(
+            self._snapshot_track(
+                track,
+                timestamp,
+                observed=track.track_id in matched_track_ids or track.last_frame_index == frame_index,
+            )
+            for track in sorted(self.tracks, key=lambda item: item.track_id)
+            if track.status in {"tentative", "confirmed", "lost"}
+        )
+        return rows, states, snapshots
 
     def _associate(
         self, tracks: Sequence[_Track], detections: Sequence[_Detection], gate_pixels: float, stage: str
@@ -623,6 +689,8 @@ class HybridFootballTracker:
         )
         self.next_id += 1
         self.tracks.append(track)
+        if status == "confirmed":
+            self._confirmed_track_ids.add(track.track_id)
         return track
 
     def _correct(
@@ -666,6 +734,8 @@ class HybridFootballTracker:
             track.status = "confirmed"
         elif track.status == "tentative" and track.hits >= self.cfg.confirmed_hits and track.age_frames <= self.cfg.confirmation_window:
             track.status = "confirmed"
+        if track.status == "confirmed":
+            self._confirmed_track_ids.add(track.track_id)
         track.association = {"stage": stage, "cost": cost, "detection_index": detection.index}
         track.points.append((frame_index, detection.cx, detection.cy))
 
@@ -699,3 +769,34 @@ class HybridFootballTracker:
             "hits": track.hits,
             "age_frames": track.age_frames,
         }
+
+    def _snapshot_track(self, track: _Track, timestamp: float, observed: bool) -> HybridTrackSnapshot:
+        return HybridTrackSnapshot(
+            track_id=int(track.track_id),
+            center_x=float(track.center_x),
+            center_y=float(track.center_y),
+            velocity_x=float(track.velocity_x),
+            velocity_y=float(track.velocity_y),
+            base_radius=float(track.base_radius),
+            missing_frames=int(track.missing_frames),
+            hits=int(track.hits),
+            first_frame_index=int(track.first_frame_index),
+            last_seen_frame_index=int(track.last_seen_frame_index),
+            points=tuple((int(index), float(x), float(y)) for index, x, y in track.points),
+            status=str(track.status),
+            observed_this_frame=bool(observed),
+            seconds_since_observed=float(timestamp - track.last_observed_timestamp),
+            last_timestamp=float(timestamp),
+            last_observed_timestamp=float(track.last_observed_timestamp),
+        )
+
+    def _finalize_packet(self, packet: Dict[str, Any]) -> Dict[str, Any]:
+        """Attach source-final confirmation knowledge available at commit time.
+
+        Per-frame detection lifecycle fields remain raw.  Render/export policy
+        consumes the separate final-ID registry so an unfiltered JSON export
+        still records that the first hit was tentative.
+        """
+        confirmed_ids = frozenset(self._confirmed_track_ids)
+        packet["confirmed_track_ids"] = confirmed_ids
+        return packet

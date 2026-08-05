@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import FrozenInstanceError
 from unittest.mock import patch
 
 import numpy as np
@@ -19,6 +20,7 @@ def det(cx, cy, score=0.9, *, recheck_pass=True, size=10.0):
 
 class HybridFootballTrackerTest(unittest.TestCase):
     def make_tracker(self, **overrides):
+        confirmation_backfill = bool(overrides.pop("confirmation_backfill", False))
         values = {
             "lookahead_seconds": 0.10,
             "high_confidence": 0.50,
@@ -33,7 +35,11 @@ class HybridFootballTrackerTest(unittest.TestCase):
             "low_gate_pixels": 24.0,
         }
         values.update(overrides)
-        return HybridFootballTracker(HybridTrackingConfig(**values), target_class_ids={0})
+        return HybridFootballTracker(
+            HybridTrackingConfig(**values),
+            target_class_ids={0},
+            confirmation_backfill=confirmation_backfill,
+        )
 
     def test_step_has_fixed_delay_and_flush_is_deterministic(self):
         tracker = self.make_tracker()
@@ -167,6 +173,94 @@ class HybridFootballTrackerTest(unittest.TestCase):
         cfg = HybridTrackingConfig.from_mapping({"cmc": {"processing_scale": 0.5}})
 
         self.assertEqual(cfg.cmc_processing_scale, 0.5)
+
+    def test_removed_beam_width_is_rejected_and_metadata_is_absent(self):
+        with self.assertRaisesRegex(ValueError, r"hypothesis\.beam_width is unsupported"):
+            HybridTrackingConfig.from_mapping({"hypothesis": {"beam_width": 8}})
+
+        tracker = self.make_tracker(lookahead_seconds=0.0)
+        packet = tracker.step(0, 0.0, None, [det(10, 10)])[0]
+
+        self.assertNotIn("hypothesis", packet)
+
+    def test_hit_miss_hit_commits_first_row_with_final_id_registry(self):
+        tracker = self.make_tracker(lookahead_seconds=0.10, confirmation_backfill=True)
+
+        self.assertEqual(tracker.step(0, 0.0, None, [det(10, 10)]), [])
+        self.assertEqual(tracker.step(1, 0.05, None, []), [])
+        committed = tracker.step(2, 0.10, None, [det(12, 10)])
+
+        self.assertEqual([packet["frame_index"] for packet in committed], [0])
+        first = committed[0]
+        self.assertEqual(first["confirmed_track_ids"], frozenset({1}))
+        self.assertEqual(first["detections"][0]["track_id"], 1)
+        # Raw detection and diagnostic lifecycle fields remain historical; the
+        # renderer uses confirmed_track_ids to backfill the stable ID display.
+        self.assertFalse(first["detections"][0]["track_confirmed"])
+        self.assertEqual(first["detections"][0]["track_status"], "tentative")
+        self.assertEqual(first["track_states"][0]["status"], "tentative")
+        self.assertEqual([packet["frame_index"] for packet in tracker.flush()], [1, 2])
+
+    def test_backfill_commit_waits_for_both_time_and_confirmation_delays(self):
+        tracker = self.make_tracker(lookahead_seconds=0.10, confirmation_backfill=True)
+
+        self.assertEqual(tracker.step(0, 0.00, None, [det(10, 10)]), [])
+        # Time lookahead has elapsed and the track is already confirmed, but the
+        # complete three-frame confirmation decision window has not elapsed.
+        self.assertEqual(tracker.step(1, 0.20, None, [det(11, 10)]), [])
+        committed = tracker.step(2, 0.21, None, [])
+
+        self.assertEqual([packet["frame_index"] for packet in committed], [0])
+        self.assertEqual(committed[0]["confirmed_track_ids"], frozenset({1}))
+
+    def test_eos_singleton_remains_unconfirmed_when_pending_is_flushed(self):
+        tracker = self.make_tracker(lookahead_seconds=0.0, confirmation_backfill=True)
+
+        self.assertEqual(tracker.step(0, 0.0, None, [det(10, 10)]), [])
+        packet = tracker.flush()[0]
+
+        self.assertEqual(packet["confirmed_track_ids"], frozenset())
+        self.assertFalse(packet["detections"][0]["track_confirmed"])
+        self.assertEqual(packet["detections"][0]["track_status"], "tentative")
+        self.assertEqual(packet["track_states"][0]["status"], "tentative")
+        self.assertEqual(tracker.confirmed_track_ids, frozenset())
+
+    def test_confirmed_registry_survives_retirement_and_ids_are_not_reused(self):
+        tracker = self.make_tracker(lookahead_seconds=0.0, lost_seconds=0.01)
+        tracker.step(0, 0.0, None, [det(10, 10)])
+        tracker.step(1, 0.01, None, [det(11, 10)])
+        tracker.step(2, 0.10, None, [])
+
+        replacement = tracker.step(3, 0.11, None, [det(200, 200)])[0]
+
+        self.assertEqual(tracker.confirmed_track_ids, frozenset({1}))
+        self.assertEqual(replacement["detections"][0]["track_id"], 2)
+
+    def test_track_snapshots_are_immutable_and_do_not_follow_live_state(self):
+        tracker = self.make_tracker(lookahead_seconds=0.0)
+        first = tracker.step(0, 0.0, None, [det(10, 10)])[0]
+        snapshot = first["track_snapshots"][0]
+
+        tracker.step(1, 1 / 30, None, [det(12, 10)])
+
+        self.assertEqual((snapshot.center_x, snapshot.center_y), (10.0, 10.0))
+        self.assertEqual(snapshot.points, ((0, 10.0, 10.0),))
+        self.assertTrue(snapshot.observed_this_frame)
+        self.assertEqual(snapshot.seconds_since_observed, 0.0)
+        with self.assertRaises(FrozenInstanceError):
+            snapshot.center_x = 99.0
+
+    def test_lost_confirmed_track_reacquires_without_reconfirmation(self):
+        tracker = self.make_tracker(lookahead_seconds=0.0)
+        first = tracker.step(0, 0.0, None, [det(10, 10)])[0]
+        tracker.step(1, 1 / 30, None, [det(12, 10)])
+        lost = tracker.step(2, 2 / 30, None, [])[0]
+        reacquired = tracker.step(3, 3 / 30, None, [det(14, 10)])[0]
+
+        self.assertEqual(lost["track_snapshots"][0].status, "lost")
+        self.assertEqual(reacquired["detections"][0]["track_id"], first["detections"][0]["track_id"])
+        self.assertTrue(reacquired["detections"][0]["track_confirmed"])
+        self.assertEqual(reacquired["detections"][0]["track_status"], "confirmed")
 
 
 if __name__ == "__main__":

@@ -888,6 +888,10 @@ inference:
     algorithm: ocsort
     draw_trajectory: true
     draw_predicted_trajectory: false
+    draw_current_center: true
+    draw_predicted_center: false
+    render_confirmed_only: false  # Hybrid-only
+    export_confirmed_only: false  # Hybrid-only
     ocsort:
       det_thresh: 0.2
       max_age: 30
@@ -899,9 +903,40 @@ inference:
 `draw_trajectory` remains the master switch for trajectory polylines.
 `draw_predicted_trajectory` defaults to `false`; when disabled, the observed trail remains
 visible but is not extended from its last observed point to the live predicted center.
-Current-center dots, search circles, bounding boxes, labels, tracker state, JSONL files, and
-tracking summaries are unchanged. Set it to `true` to restore the previous predicted-head
-rendering behavior for any tracking algorithm.
+`draw_current_center` controls only the current frame's real observed center. Its filled-dot
+radius is fixed at 3 pixels and is independent of `trajectory_width`; the latter affects only
+the trajectory line (including the existing old-to-new taper when `trajectory_taper: true`).
+`draw_predicted_center` separately controls the live predicted dot during detection gaps for
+every tracker. Hybrid never draws that dot beyond
+`hybrid.lifecycle.predicted_output_seconds`, even when the switch is enabled. Search circles,
+internal motion prediction, reassociation, and diagnostic tracker output are unaffected by
+these rendering switches.
+
+Hybrid can suppress false-positive display and export independently:
+
+```yaml
+inference:
+  tracking:
+    algorithm: hybrid
+    render_confirmed_only: true
+    export_confirmed_only: false
+    trajectory_width: 4
+```
+
+`render_confirmed_only` hides target-class boxes, labels, centers, and trails for tracks that
+never satisfy Hybrid's confirmation rule, as well as target-class detections with no track ID.
+The shipped Hybrid presets use the existing two-hits-in-three-frames rule, backfill a track's
+tentative first frame after final confirmation, and show its stable ID from that first frame.
+A confirmed track resumes immediately after a lost/reacquired match. Non-target classes are
+not filtered.
+
+`export_confirmed_only` applies the same final-confirmation filter only to
+`predictions.jsonl` and `football_predictions.jsonl`. It never filters
+`track_states.jsonl` or `tracking_summary.json`, which retain tentative, lost, and predicted
+diagnostics. `inference_summary.json` reports the published `prediction_count` plus
+`raw_prediction_count` and `suppressed_unconfirmed_count`. Both confirmation switches default
+to `false` for older external YAML files, and setting either to `true` with a non-Hybrid
+algorithm is an error.
 
 The tracked class is configurable for every algorithm via
 `inference.tracking.target_class_ids` / `target_class_names`; with both empty it defaults
@@ -909,7 +944,9 @@ to `football`. The `predictions.jsonl` track fields and `tracking_summary.json` 
 same regardless of algorithm, so downstream tooling does not change when you switch.
 Hybrid additionally writes `track_states.jsonl`. `predictions.jsonl` contains only
 committed observed detections; predicted-only lifecycle rows, CMC diagnostics, covariance,
-and ambiguity metadata live in `track_states.jsonl`.
+and ambiguity metadata live in `track_states.jsonl`. Hybrid uses fixed-delay ambiguity
+handling through `hybrid.hypothesis.lookahead_seconds` and `ambiguity_margin`; `beam_width`
+is unsupported and is rejected instead of being silently ignored.
 
 The boxmot trackers require the dependency (already pinned in `pyproject.toml`):
 

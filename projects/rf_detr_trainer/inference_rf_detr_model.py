@@ -839,6 +839,38 @@ def build_standard_football_rows(
     return rows
 
 
+def filter_confirmed_hybrid_exports(
+    predictions: Sequence[Mapping[str, Any]],
+    tracking_config: Optional[Any],
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Filter only formal Hybrid video detections when explicitly requested.
+
+    Image detections and non-target classes are outside the Hybrid tracker and
+    remain untouched.  Diagnostic state rows never pass through this helper.
+    """
+    enabled = bool(
+        tracking_config is not None
+        and getattr(tracking_config, "enabled", False)
+        and getattr(tracking_config, "algorithm", "circle") == "hybrid"
+        and getattr(tracking_config, "export_confirmed_only", False)
+    )
+    published: List[Dict[str, Any]] = []
+    suppressed = 0
+    for prediction in predictions:
+        row = dict(prediction)
+        is_video = row.get("frame_index") is not None
+        is_target = (
+            enabled
+            and is_video
+            and int(row.get("category_id", -1)) in tracking_config.target_class_ids
+        )
+        if is_target and not bool(row.get("track_final_confirmed", False)):
+            suppressed += 1
+            continue
+        published.append(row)
+    return published, suppressed
+
+
 def build_temporal_football_rows(
     temporal_rows: Sequence[Mapping[str, Any]],
     football_config: FootballOutputConfig,
@@ -922,15 +954,23 @@ def draw_track_overlays(
     tracking_cfg: Any,
     target_ids: Sequence[int],
     current_frame_index: Optional[int] = None,
+    confirmed_track_ids: Optional[Sequence[int]] = None,
 ) -> None:
     """Draw trajectory trails, optional search circles, and current-center dots for visible tracks."""
     base_color = class_color(int(target_ids[0])) if target_ids else class_color(1)
     width = max(1, int(tracking_cfg.trajectory_width))
+    final_ids = {int(value) for value in (confirmed_track_ids or ())}
     for track in tracks:
-        if not video_tracking.is_track_visible(track, current_frame_index, tracking_cfg):
+        if not video_tracking.is_track_visible(
+            track,
+            current_frame_index,
+            tracking_cfg,
+            final_confirmed=int(track.track_id) in final_ids,
+        ):
             continue
         color = track_color(track.track_id) if tracking_cfg.trajectory_per_track_color else base_color
-        # Live position: velocity-extrapolated through detection gaps so the ball keeps moving smoothly.
+        # Live position is used by the optional predicted head/search gate.  The
+        # observed dot below is intentionally anchored to the latest real hit.
         live_x, live_y = video_tracking.live_center(track, current_frame_index, tracking_cfg)
         # Historical observed points (age-filtered and linearly bridged), optionally plus the predicted live head.
         xy = video_tracking.trail_points(track, current_frame_index, tracking_cfg)
@@ -947,9 +987,67 @@ def draw_track_overlays(
         if tracking_cfg.draw_search_circle:
             radius = video_tracking.effective_radius(track, tracking_cfg)
             draw.ellipse([live_x - radius, live_y - radius, live_x + radius, live_y + radius], outline=color, width=1)
-        if tracking_cfg.draw_current_center:
-            dot = max(2, width + 1)
-            draw.ellipse([live_x - dot, live_y - dot, live_x + dot, live_y + dot], fill=color)
+        draw_observed = video_tracking.should_draw_observed_center(
+            track, current_frame_index, tracking_cfg
+        )
+        draw_predicted = video_tracking.should_draw_predicted_center(
+            track, current_frame_index, tracking_cfg
+        )
+        if draw_observed or draw_predicted:
+            center_x, center_y = (track.center_x, track.center_y) if draw_observed else (live_x, live_y)
+            # Trajectory width affects only trajectory lines.  Center markers
+            # are kept visually stable across presets.
+            dot_radius = 3
+            draw.ellipse(
+                [
+                    center_x - dot_radius,
+                    center_y - dot_radius,
+                    center_x + dot_radius,
+                    center_y + dot_radius,
+                ],
+                fill=color,
+            )
+
+
+def hybrid_packet_confirmed_ids(packet: Mapping[str, Any]) -> frozenset[int]:
+    """Return the source-local final-confirmation registry attached at commit time."""
+    return frozenset(int(value) for value in packet.get("confirmed_track_ids", ()))
+
+
+def hybrid_packet_detections(packet: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """Copy committed detections and annotate their final confirmation outcome."""
+    confirmed_ids = hybrid_packet_confirmed_ids(packet)
+    rows: List[Dict[str, Any]] = []
+    for prediction in packet.get("detections", ()):
+        row = dict(prediction)
+        track_id = row.get("track_id")
+        final_confirmed = track_id is not None and int(track_id) in confirmed_ids
+        row["track_final_confirmed"] = bool(final_confirmed)
+        rows.append(row)
+    return rows
+
+
+def prediction_visible_for_confirmed_render(
+    prediction: Mapping[str, Any],
+    tracking_cfg: Optional[Any],
+    confirmed_track_ids: Optional[Sequence[int]],
+) -> bool:
+    """Apply Hybrid's render-only confirmation filter to target detections."""
+    if (
+        tracking_cfg is None
+        or not getattr(tracking_cfg, "enabled", False)
+        or getattr(tracking_cfg, "algorithm", "circle") != "hybrid"
+        or not getattr(tracking_cfg, "render_confirmed_only", False)
+    ):
+        return True
+    if int(prediction.get("category_id", -1)) not in tracking_cfg.target_class_ids:
+        return True
+    track_id = prediction.get("track_id")
+    if track_id is None:
+        return False
+    if confirmed_track_ids is not None:
+        return int(track_id) in {int(value) for value in confirmed_track_ids}
+    return bool(prediction.get("track_final_confirmed", prediction.get("track_confirmed", False)))
 
 
 def draw_predictions(
@@ -960,6 +1058,7 @@ def draw_predictions(
     tracks: Optional[Sequence[Any]] = None,
     tracking_cfg: Optional[Any] = None,
     current_frame_index: Optional[int] = None,
+    confirmed_track_ids: Optional[Sequence[int]] = None,
 ) -> Image.Image:
     canvas = image.convert("RGB")
     draw = ImageDraw.Draw(canvas)
@@ -971,11 +1070,37 @@ def draw_predictions(
         font = ImageFont.load_default()
     has_tracked_rows = any(prediction.get("track_id") is not None for prediction in predictions)
     tracking_active = tracking_cfg is not None and getattr(tracking_cfg, "enabled", False) and (bool(tracks) or has_tracked_rows)
+    confirmed_render_ids = {
+        int(value) for value in (confirmed_track_ids or ())
+    } if (
+        tracking_cfg is not None
+        and getattr(tracking_cfg, "algorithm", "circle") == "hybrid"
+        and getattr(tracking_cfg, "render_confirmed_only", False)
+    ) else set()
     if tracking_active and tracks:
-        draw_track_overlays(draw, tracks, tracking_cfg, sorted(tracking_cfg.target_class_ids), current_frame_index)
+        overlay_tracks = list(tracks)
+        if confirmed_render_ids:
+            overlay_tracks = [
+                track for track in overlay_tracks if int(track.track_id) in confirmed_render_ids
+            ]
+        elif (
+            getattr(tracking_cfg, "algorithm", "circle") == "hybrid"
+            and getattr(tracking_cfg, "render_confirmed_only", False)
+        ):
+            overlay_tracks = []
+        draw_track_overlays(
+            draw,
+            overlay_tracks,
+            tracking_cfg,
+            sorted(tracking_cfg.target_class_ids),
+            current_frame_index,
+            confirmed_render_ids,
+        )
     for prediction in predictions:
         category_id = int(prediction.get("category_id", 0))
         if render_set and category_id not in render_set:
+            continue
+        if not prediction_visible_for_confirmed_render(prediction, tracking_cfg, confirmed_track_ids):
             continue
         x, y, width, height = [float(value) for value in prediction.get("bbox", [0, 0, 0, 0])[:4]]
         color = class_color(category_id)
@@ -985,7 +1110,13 @@ def draw_predictions(
             tracking_active
             and tracking_cfg.label_track_id
             and prediction.get("track_id") is not None
-            and prediction.get("track_confirmed")
+            and (
+                prediction.get("track_confirmed")
+                or (
+                    bool(confirmed_render_ids)
+                    and int(prediction["track_id"]) in confirmed_render_ids
+                )
+            )
         ):
             label = f"{id_to_name.get(category_id, category_id)} #{int(prediction['track_id'])} {float(prediction.get('score', 0.0)):.2f}"
         text_bbox = draw.textbbox((x + 2, y + 2), label, font=font)
@@ -1367,6 +1498,7 @@ def create_tracker(
             hybrid_cfg,
             target_class_ids=tracking_config.target_class_ids,
             history_maxlen=tracking_config.trajectory_max_points or 300,
+            confirmation_backfill=True,
         )
     import rf_detr_boxmot_tracker as boxmot_tracking
 
@@ -1518,7 +1650,7 @@ def collect_hybrid_committed(
     for packet in packets:
         absolute_frame_index = int(packet["frame_index"])
         segment_frame_index = absolute_frame_index - frame_window.start_frame
-        for prediction in packet.get("detections", []):
+        for prediction in hybrid_packet_detections(packet):
             all_predictions.append(
                 build_video_row(
                     prediction,
@@ -1540,9 +1672,80 @@ def collect_hybrid_committed(
                 timestamp_seconds=absolute_frame_index / input_fps,
                 segment_timestamp_seconds=segment_frame_index / input_fps,
                 cmc=dict(packet.get("cmc", {})),
-                hypothesis=dict(packet.get("hypothesis", {})),
             )
+            if packet.get("hypothesis"):
+                row["hypothesis"] = dict(packet["hypothesis"])
             tracking_state_rows.append(row)
+
+
+def consume_hybrid_committed(
+    packets: Sequence[Mapping[str, Any]],
+    *,
+    frame_buffer: MutableMapping[int, Tuple[Any, bool]],
+    writer: Any,
+    all_predictions: List[Dict[str, Any]],
+    tracking_state_rows: Optional[List[Dict[str, Any]]],
+    source: str,
+    input_fps: float,
+    frame_window: VideoFrameWindow,
+    categories: Sequence[Mapping[str, Any]],
+    render_ids: Sequence[int],
+    tracking_config: Any,
+) -> Tuple[float, float]:
+    """Publish and render committed Hybrid packets against their original frames.
+
+    Returns ``(render_seconds, encode_seconds)`` so the streaming pipeline can
+    preserve its stage telemetry.  A frame is removed from the buffer only when
+    the tracker commits the matching immutable packet.
+    """
+    import cv2
+
+    collect_hybrid_committed(
+        packets,
+        all_predictions,
+        tracking_state_rows,
+        source,
+        input_fps,
+        frame_window,
+    )
+    render_seconds = 0.0
+    encode_seconds = 0.0
+    if writer is None:
+        return render_seconds, encode_seconds
+    for packet in packets:
+        absolute_frame_index = int(packet["frame_index"])
+        buffered = frame_buffer.pop(absolute_frame_index, None)
+        if buffered is None:
+            raise RuntimeError(
+                f"Hybrid tracker committed frame {absolute_frame_index} without its buffered source frame"
+            )
+        frame, should_render = buffered
+        if should_render:
+            render_started = time.perf_counter()
+            pil_frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            rendered: Optional[Image.Image] = None
+            try:
+                confirmed_ids = hybrid_packet_confirmed_ids(packet)
+                rendered = draw_predictions(
+                    pil_frame,
+                    hybrid_packet_detections(packet),
+                    categories,
+                    render_ids,
+                    packet.get("track_snapshots", ()),
+                    tracking_config,
+                    absolute_frame_index,
+                    confirmed_ids,
+                )
+                frame = cv2.cvtColor(np_image(rendered), cv2.COLOR_RGB2BGR)
+            finally:
+                if rendered is not None and rendered is not pil_frame:
+                    rendered.close()
+                pil_frame.close()
+            render_seconds += time.perf_counter() - render_started
+        encode_started = time.perf_counter()
+        writer.write(frame)
+        encode_seconds += time.perf_counter() - encode_started
+    return render_seconds, encode_seconds
 
 
 
@@ -1558,7 +1761,7 @@ def predict_video_file_one_pass(
     tracking_config: Optional[Any] = None,
     tracker_device: str = "cpu",
     tracking_state_rows: Optional[List[Dict[str, Any]]] = None,
-) -> Tuple[List[Dict[str, Any]], Path, int]:
+) -> Tuple[List[Dict[str, Any]], Optional[Path], int]:
     import cv2
 
     assert item.local_path is not None
@@ -1576,22 +1779,39 @@ def predict_video_file_one_pass(
     frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     frame_window = video_frame_window(frame_count, input_fps, video_cfg)
     frame_limit = frame_window.output_frames
-    if frame_window.start_frame > 0:
-        capture.set(cv2.CAP_PROP_POS_FRAMES, frame_window.start_frame)
-    video_dir = output_dir / "videos"
-    video_dir.mkdir(parents=True, exist_ok=True)
-    target = video_dir / f"{trainer.sanitize_name(item.local_path.stem)}_pred.mp4"
-    writer = cv2.VideoWriter(str(target), cv2.VideoWriter_fourcc(*"mp4v"), output_fps, (width, height))
-    if not writer.isOpened():
-        raise RuntimeError(f"Could not create video writer: {target}")
+    if frame_window.start_frame > 0 and not capture.set(cv2.CAP_PROP_POS_FRAMES, frame_window.start_frame):
+        capture.release()
+        raise RuntimeError(f"Could not seek video for one-pass inference: {item.local_path}")
+    save_video = bool(video_cfg.get("save_video", True))
+    target: Optional[Path] = None
+    writer: Any = None
+    if save_video:
+        video_dir = output_dir / "videos"
+        video_dir.mkdir(parents=True, exist_ok=True)
+        target = video_dir / f"{trainer.sanitize_name(item.local_path.stem)}_pred.mp4"
+        writer = cv2.VideoWriter(
+            str(target), cv2.VideoWriter_fourcc(*"mp4v"), output_fps, (width, height)
+        )
+        if not writer.isOpened():
+            capture.release()
+            writer.release()
+            raise RuntimeError(f"Could not create video writer: {target}")
 
     all_predictions: List[Dict[str, Any]] = []
     last_predictions: List[Dict[str, Any]] = []
     frame_cache_dir = output_dir / "_frame_cache"
     frame_cache_dir.mkdir(parents=True, exist_ok=True)
     render_skipped = bool(video_cfg.get("render_skipped_frames", True))
-    tracker = create_tracker(tracking_config, tracker_device, (width, height))
+    try:
+        tracker = create_tracker(tracking_config, tracker_device, (width, height))
+    except Exception:
+        capture.release()
+        if writer is not None:
+            writer.release()
+        shutil.rmtree(frame_cache_dir, ignore_errors=True)
+        raise
     hybrid_tracking = is_hybrid_tracker(tracker)
+    hybrid_frame_buffer: Dict[int, Tuple[Any, bool]] = {}
     iterator = tqdm(total=frame_limit, desc=f"Inference video {item.local_path.name}", unit="frame")
     segment_frame_index = 0
     absolute_frame_index = frame_window.start_frame
@@ -1604,11 +1824,15 @@ def predict_video_file_one_pass(
             if not ok:
                 break
             should_detect = segment_frame_index % frame_interval == 0
-            frame_predictions = last_predictions
+            detected: List[Dict[str, Any]] = []
             if should_detect:
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 frame_path = frame_cache_dir / "current_frame.jpg"
-                Image.fromarray(rgb).save(frame_path, quality=92)
+                frame_image = Image.fromarray(rgb)
+                try:
+                    frame_image.save(frame_path, quality=92)
+                finally:
+                    frame_image.close()
                 record = evaluator.ImageRecord(
                     image_id=image_id,
                     file_name=f"{item.local_path.stem}_frame_{absolute_frame_index:06d}.jpg",
@@ -1616,37 +1840,74 @@ def predict_video_file_one_pass(
                     width=width,
                     height=height,
                 )
-                frame_predictions, timing, _ = evaluator.predict_image(
+                detected, timing, _ = evaluator.predict_image(
                     record, model, prediction_config, output_dir, save_visual=False
                 )
                 record_inference_timing_rows(model, [timing])
-                frame_predictions = filter_final_inference_predictions(frame_predictions, prediction_config)
-                if hybrid_tracking:
-                    committed = tracker.step(
-                        absolute_frame_index, absolute_frame_index / input_fps, frame, frame_predictions
+                detected = filter_final_inference_predictions(detected, prediction_config)
+                image_id += 1
+            if hybrid_tracking:
+                if writer is not None:
+                    hybrid_frame_buffer[absolute_frame_index] = (
+                        frame,
+                        bool(should_detect or render_skipped),
                     )
-                    collect_hybrid_committed(
-                        committed, all_predictions, tracking_state_rows, item.source, input_fps, frame_window
-                    )
-                    latest = tracker.latest_frame()
-                    frame_predictions = list(latest["detections"]) if latest is not None else []
-                elif tracker is not None:
-                    frame_predictions = tracker.update(absolute_frame_index, frame_predictions, frame=frame)
-                if not hybrid_tracking:
+                committed = tracker.step(
+                    absolute_frame_index,
+                    absolute_frame_index / input_fps,
+                    frame,
+                    detected,
+                )
+                consume_hybrid_committed(
+                    committed,
+                    frame_buffer=hybrid_frame_buffer,
+                    writer=writer,
+                    all_predictions=all_predictions,
+                    tracking_state_rows=tracking_state_rows,
+                    source=item.source,
+                    input_fps=input_fps,
+                    frame_window=frame_window,
+                    categories=categories,
+                    render_ids=render_ids,
+                    tracking_config=tracking_config,
+                )
+            else:
+                if tracker is not None:
+                    # Track age is measured in source frames, including frames
+                    # skipped by a reduced detection_fps setting.
+                    frame_predictions = tracker.update(absolute_frame_index, detected, frame=frame)
                     for prediction in frame_predictions:
                         all_predictions.append(
                             build_video_row(
-                                prediction, item.source, absolute_frame_index, segment_frame_index,
-                                input_fps, frame_window,
+                                prediction,
+                                item.source,
+                                absolute_frame_index,
+                                segment_frame_index,
+                                input_fps,
+                                frame_window,
                             )
                         )
-                last_predictions = frame_predictions
-                image_id += 1
-            if should_detect or render_skipped:
-                pil_frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                frame = cv2.cvtColor(
-                    np_image(
-                        draw_predictions(
+                else:
+                    frame_predictions = detected if should_detect else last_predictions
+                    if should_detect:
+                        for prediction in frame_predictions:
+                            all_predictions.append(
+                                build_video_row(
+                                    prediction,
+                                    item.source,
+                                    absolute_frame_index,
+                                    segment_frame_index,
+                                    input_fps,
+                                    frame_window,
+                                )
+                            )
+                if should_detect or tracker is not None:
+                    last_predictions = frame_predictions
+                if writer is not None and (should_detect or render_skipped):
+                    pil_frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                    rendered: Optional[Image.Image] = None
+                    try:
+                        rendered = draw_predictions(
                             pil_frame,
                             frame_predictions,
                             categories,
@@ -1655,22 +1916,38 @@ def predict_video_file_one_pass(
                             tracking_config,
                             absolute_frame_index,
                         )
-                    ),
-                    cv2.COLOR_RGB2BGR,
-                )
-            writer.write(frame)
+                        frame = cv2.cvtColor(np_image(rendered), cv2.COLOR_RGB2BGR)
+                    finally:
+                        if rendered is not None and rendered is not pil_frame:
+                            rendered.close()
+                        pil_frame.close()
+                if writer is not None:
+                    writer.write(frame)
             segment_frame_index += 1
             absolute_frame_index += 1
             iterator.update(1)
         if hybrid_tracking:
-            collect_hybrid_committed(
-                tracker.flush(), all_predictions, tracking_state_rows, item.source, input_fps, frame_window
+            consume_hybrid_committed(
+                tracker.flush(),
+                frame_buffer=hybrid_frame_buffer,
+                writer=writer,
+                all_predictions=all_predictions,
+                tracking_state_rows=tracking_state_rows,
+                source=item.source,
+                input_fps=input_fps,
+                frame_window=frame_window,
+                categories=categories,
+                render_ids=render_ids,
+                tracking_config=tracking_config,
             )
+            if hybrid_frame_buffer:
+                raise RuntimeError("Hybrid tracker flush did not commit every buffered source frame")
 
     finally:
         iterator.close()
         capture.release()
-        writer.release()
+        if writer is not None:
+            writer.release()
         shutil.rmtree(frame_cache_dir, ignore_errors=True)
     return all_predictions, target, image_id
 
@@ -1688,7 +1965,7 @@ def predict_video_file_batched(
     tracking_config: Optional[Any] = None,
     tracker_device: str = "cpu",
     tracking_state_rows: Optional[List[Dict[str, Any]]] = None,
-) -> Tuple[List[Dict[str, Any]], Path, int]:
+) -> Tuple[List[Dict[str, Any]], Optional[Path], int]:
     """Batch RF-DETR detection frames, then render the selected video range."""
     import cv2
 
@@ -1750,7 +2027,11 @@ def predict_video_file_batched(
             if segment_frame_index % frame_interval == 0:
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 frame_path = frame_cache_dir / f"frame_{absolute_frame_index:010d}.jpg"
-                Image.fromarray(rgb).save(frame_path, quality=92)
+                frame_image = Image.fromarray(rgb)
+                try:
+                    frame_image.save(frame_path, quality=92)
+                finally:
+                    frame_image.close()
                 pending_records.append(
                     evaluator.ImageRecord(
                         image_id=image_id,
@@ -1768,6 +2049,9 @@ def predict_video_file_batched(
             absolute_frame_index += 1
             detect_iterator.update(1)
         flush_pending()
+    except Exception:
+        shutil.rmtree(frame_cache_dir, ignore_errors=True)
+        raise
     finally:
         detect_iterator.close()
         capture.release()
@@ -1780,18 +2064,33 @@ def predict_video_file_batched(
         render_capture.release()
         shutil.rmtree(frame_cache_dir, ignore_errors=True)
         raise RuntimeError(f"Could not seek video for batched render: {item.local_path}")
-    video_dir = output_dir / "videos"
-    video_dir.mkdir(parents=True, exist_ok=True)
-    target = video_dir / f"{trainer.sanitize_name(item.local_path.stem)}_pred.mp4"
-    writer = cv2.VideoWriter(str(target), cv2.VideoWriter_fourcc(*"mp4v"), output_fps, (width, height))
-    if not writer.isOpened():
-        render_capture.release()
-        shutil.rmtree(frame_cache_dir, ignore_errors=True)
-        raise RuntimeError(f"Could not create video writer: {target}")
+    save_video = bool(video_cfg.get("save_video", True))
+    target: Optional[Path] = None
+    writer: Any = None
+    if save_video:
+        video_dir = output_dir / "videos"
+        video_dir.mkdir(parents=True, exist_ok=True)
+        target = video_dir / f"{trainer.sanitize_name(item.local_path.stem)}_pred.mp4"
+        writer = cv2.VideoWriter(
+            str(target), cv2.VideoWriter_fourcc(*"mp4v"), output_fps, (width, height)
+        )
+        if not writer.isOpened():
+            render_capture.release()
+            writer.release()
+            shutil.rmtree(frame_cache_dir, ignore_errors=True)
+            raise RuntimeError(f"Could not create video writer: {target}")
 
     render_skipped = bool(video_cfg.get("render_skipped_frames", True))
-    tracker = create_tracker(tracking_config, tracker_device, (width, height))
+    try:
+        tracker = create_tracker(tracking_config, tracker_device, (width, height))
+    except Exception:
+        render_capture.release()
+        if writer is not None:
+            writer.release()
+        shutil.rmtree(frame_cache_dir, ignore_errors=True)
+        raise
     hybrid_tracking = is_hybrid_tracker(tracker)
+    hybrid_frame_buffer: Dict[int, Tuple[Any, bool]] = {}
     last_predictions: List[Dict[str, Any]] = []
     segment_frame_index = 0
     render_iterator = tqdm(total=frame_limit, desc=f"Render video {item.local_path.name}", unit="frame")
@@ -1804,34 +2103,67 @@ def predict_video_file_batched(
                 break
             absolute_frame_index = frame_window.start_frame + segment_frame_index
             should_detect = segment_frame_index % frame_interval == 0
-            frame_predictions = last_predictions
-            if should_detect:
-                frame_predictions = predictions_by_segment.get(segment_frame_index, [])
-                if hybrid_tracking:
-                    committed = tracker.step(
-                        absolute_frame_index, absolute_frame_index / input_fps, frame, frame_predictions
+            detected = predictions_by_segment.get(segment_frame_index, []) if should_detect else []
+            if hybrid_tracking:
+                if writer is not None:
+                    hybrid_frame_buffer[absolute_frame_index] = (
+                        frame,
+                        bool(should_detect or render_skipped),
                     )
-                    collect_hybrid_committed(
-                        committed, all_predictions, tracking_state_rows, item.source, input_fps, frame_window
-                    )
-                    latest = tracker.latest_frame()
-                    frame_predictions = list(latest["detections"]) if latest is not None else []
-                elif tracker is not None:
-                    frame_predictions = tracker.update(absolute_frame_index, frame_predictions, frame=frame)
-                if not hybrid_tracking:
+                committed = tracker.step(
+                    absolute_frame_index,
+                    absolute_frame_index / input_fps,
+                    frame,
+                    detected,
+                )
+                consume_hybrid_committed(
+                    committed,
+                    frame_buffer=hybrid_frame_buffer,
+                    writer=writer,
+                    all_predictions=all_predictions,
+                    tracking_state_rows=tracking_state_rows,
+                    source=item.source,
+                    input_fps=input_fps,
+                    frame_window=frame_window,
+                    categories=categories,
+                    render_ids=render_ids,
+                    tracking_config=tracking_config,
+                )
+            else:
+                if tracker is not None:
+                    frame_predictions = tracker.update(absolute_frame_index, detected, frame=frame)
                     for prediction in frame_predictions:
                         all_predictions.append(
                             build_video_row(
-                                prediction, item.source, absolute_frame_index, segment_frame_index,
-                                input_fps, frame_window,
+                                prediction,
+                                item.source,
+                                absolute_frame_index,
+                                segment_frame_index,
+                                input_fps,
+                                frame_window,
                             )
                         )
-                last_predictions = frame_predictions
-            if should_detect or render_skipped:
-                pil_frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                frame = cv2.cvtColor(
-                    np_image(
-                        draw_predictions(
+                else:
+                    frame_predictions = detected if should_detect else last_predictions
+                    if should_detect:
+                        for prediction in frame_predictions:
+                            all_predictions.append(
+                                build_video_row(
+                                    prediction,
+                                    item.source,
+                                    absolute_frame_index,
+                                    segment_frame_index,
+                                    input_fps,
+                                    frame_window,
+                                )
+                            )
+                if should_detect or tracker is not None:
+                    last_predictions = frame_predictions
+                if writer is not None and (should_detect or render_skipped):
+                    pil_frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                    rendered: Optional[Image.Image] = None
+                    try:
+                        rendered = draw_predictions(
                             pil_frame,
                             frame_predictions,
                             categories,
@@ -1840,21 +2172,36 @@ def predict_video_file_batched(
                             tracking_config,
                             absolute_frame_index,
                         )
-                    ),
-                    cv2.COLOR_RGB2BGR,
-                )
-            writer.write(frame)
+                        frame = cv2.cvtColor(np_image(rendered), cv2.COLOR_RGB2BGR)
+                    finally:
+                        if rendered is not None and rendered is not pil_frame:
+                            rendered.close()
+                        pil_frame.close()
+                if writer is not None:
+                    writer.write(frame)
             segment_frame_index += 1
             render_iterator.update(1)
+        if hybrid_tracking:
+            consume_hybrid_committed(
+                tracker.flush(),
+                frame_buffer=hybrid_frame_buffer,
+                writer=writer,
+                all_predictions=all_predictions,
+                tracking_state_rows=tracking_state_rows,
+                source=item.source,
+                input_fps=input_fps,
+                frame_window=frame_window,
+                categories=categories,
+                render_ids=render_ids,
+                tracking_config=tracking_config,
+            )
+            if hybrid_frame_buffer:
+                raise RuntimeError("Hybrid tracker flush did not commit every buffered source frame")
     finally:
         render_iterator.close()
         render_capture.release()
-        if hybrid_tracking:
-            collect_hybrid_committed(
-                tracker.flush(), all_predictions, tracking_state_rows, item.source, input_fps, frame_window
-            )
-
-        writer.release()
+        if writer is not None:
+            writer.release()
         shutil.rmtree(frame_cache_dir, ignore_errors=True)
     return all_predictions, target, image_id
 
@@ -1927,8 +2274,15 @@ def predict_video_file_streaming(
     )
     queue_size = max(batch_size, queue_size)
     render_skipped = bool(video_cfg.get("render_skipped_frames", True))
-    tracker = create_tracker(tracking_config, tracker_device, (width, height))
+    try:
+        tracker = create_tracker(tracking_config, tracker_device, (width, height))
+    except Exception:
+        capture.release()
+        if writer is not None:
+            writer.release()
+        raise
     hybrid_tracking = is_hybrid_tracker(tracker)
+    hybrid_frame_buffer: Dict[int, Tuple[Any, bool]] = {}
     all_predictions: List[Dict[str, Any]] = []
     last_predictions: List[Dict[str, Any]] = []
     pending_frames: List[Dict[str, Any]] = []
@@ -2006,22 +2360,34 @@ def predict_video_file_streaming(
             frame_predictions: List[Dict[str, Any]]
             tracker_started = time.perf_counter()
             if hybrid_tracking:
+                if writer is not None:
+                    hybrid_frame_buffer[absolute_index] = (
+                        frame,
+                        bool(should_detect or render_skipped),
+                    )
                 committed = tracker.step(
                     absolute_index,
                     absolute_index / input_fps,
                     frame,
                     detected,
                 )
-                collect_hybrid_committed(
+                stage["tracker_seconds"] += time.perf_counter() - tracker_started
+                render_elapsed, encode_elapsed = consume_hybrid_committed(
                     committed,
-                    all_predictions,
-                    tracking_state_rows,
-                    item.source,
-                    input_fps,
-                    frame_window,
+                    frame_buffer=hybrid_frame_buffer,
+                    writer=writer,
+                    all_predictions=all_predictions,
+                    tracking_state_rows=tracking_state_rows,
+                    source=item.source,
+                    input_fps=input_fps,
+                    frame_window=frame_window,
+                    categories=categories,
+                    render_ids=render_ids,
+                    tracking_config=tracking_config,
                 )
-                latest = tracker.latest_frame()
-                frame_predictions = list(latest["detections"]) if latest is not None else []
+                stage["render_seconds"] += render_elapsed
+                stage["encode_seconds"] += encode_elapsed
+                frame_predictions = []
             elif tracker is not None:
                 # Advance the tracker for every source frame. BoxMot and the
                 # built-in tracker then age tracks in source-frame units rather
@@ -2052,14 +2418,16 @@ def predict_video_file_streaming(
                                 frame_window,
                             )
                         )
-            stage["tracker_seconds"] += time.perf_counter() - tracker_started
+            if not hybrid_tracking:
+                stage["tracker_seconds"] += time.perf_counter() - tracker_started
             if should_detect or tracker is not None:
                 last_predictions = frame_predictions
 
-            if writer is not None:
+            if writer is not None and not hybrid_tracking:
                 render_started = time.perf_counter()
                 if should_detect or render_skipped:
                     pil_frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                    rendered: Optional[Image.Image] = None
                     try:
                         rendered = draw_predictions(
                             pil_frame,
@@ -2072,6 +2440,8 @@ def predict_video_file_streaming(
                         )
                         frame = cv2.cvtColor(np_image(rendered), cv2.COLOR_RGB2BGR)
                     finally:
+                        if rendered is not None and rendered is not pil_frame:
+                            rendered.close()
                         pil_frame.close()
                 stage["render_seconds"] += time.perf_counter() - render_started
                 encode_started = time.perf_counter()
@@ -2113,14 +2483,23 @@ def predict_video_file_streaming(
             iterator.update(1)
         flush_pending()
         if hybrid_tracking:
-            collect_hybrid_committed(
+            render_elapsed, encode_elapsed = consume_hybrid_committed(
                 tracker.flush(),
-                all_predictions,
-                tracking_state_rows,
-                item.source,
-                input_fps,
-                frame_window,
+                frame_buffer=hybrid_frame_buffer,
+                writer=writer,
+                all_predictions=all_predictions,
+                tracking_state_rows=tracking_state_rows,
+                source=item.source,
+                input_fps=input_fps,
+                frame_window=frame_window,
+                categories=categories,
+                render_ids=render_ids,
+                tracking_config=tracking_config,
             )
+            stage["render_seconds"] += render_elapsed
+            stage["encode_seconds"] += encode_elapsed
+            if hybrid_frame_buffer:
+                raise RuntimeError("Hybrid tracker flush did not commit every buffered source frame")
     finally:
         iterator.close()
         capture.release()
@@ -2459,6 +2838,9 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
             image_batch_size,
         )
         all_predictions.extend(rows)
+        for image_output in image_outputs:
+            image_output["raw_predictions"] = int(image_output.get("predictions", 0))
+            image_output["suppressed_unconfirmed"] = 0
         outputs.extend(image_outputs)
         pending_images.clear()
 
@@ -2484,27 +2866,37 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
                 track_state_rows,
             )
             all_predictions.extend(predictions)
+            published_for_source, suppressed_for_source = filter_confirmed_hybrid_exports(
+                predictions,
+                tracking_config,
+            )
             outputs.append(
                 {
                     "source": item.source,
                     "kind": "video",
                     "output": str(path) if path is not None else None,
-                    "predictions": len(predictions),
+                    "predictions": len(published_for_source),
+                    "raw_predictions": len(predictions),
+                    "suppressed_unconfirmed": suppressed_for_source,
                 }
             )
     flush_pending_images()
 
     serialization_started = time.perf_counter()
+    published_predictions, suppressed_unconfirmed_count = filter_confirmed_hybrid_exports(
+        all_predictions,
+        tracking_config,
+    )
     colors = {
         str(category_id): {"rgb": list(color), "hex": "#{:02x}{:02x}{:02x}".format(*color)}
         for category_id, color in color_map(categories, all_predictions).items()
     }
     trainer.write_json(output_dir / "class_colors.json", {"categories": categories, "colors": colors})
     if bool(config.get("inference", {}).get("save_predictions_jsonl", True)):
-        write_predictions_jsonl(output_dir / "predictions.jsonl", all_predictions)
+        write_predictions_jsonl(output_dir / "predictions.jsonl", published_predictions)
     if tracking_config.enabled and tracking_config.algorithm == "hybrid":
         write_predictions_jsonl(output_dir / "track_states.jsonl", track_state_rows)
-    football_rows = build_standard_football_rows(all_predictions, football_output_config, categories)
+    football_rows = build_standard_football_rows(published_predictions, football_output_config, categories)
     football_summary = write_football_predictions_output(
         output_dir,
         football_rows,
@@ -2521,7 +2913,9 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
         output_dir / "inference_summary.json",
         {
             "outputs": outputs,
-            "prediction_count": len(all_predictions),
+            "prediction_count": len(published_predictions),
+            "raw_prediction_count": len(all_predictions),
+            "suppressed_unconfirmed_count": suppressed_unconfirmed_count,
             **football_summary,
             "stage_timing": stage_timing,
         },

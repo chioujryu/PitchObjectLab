@@ -178,6 +178,10 @@ class RfDetrInferenceTest(unittest.TestCase):
             self.assertFalse(config["sahi"]["standard_prediction"])
             self.assertTrue(config["inference"]["tracking"]["enabled"])
             self.assertEqual(config["inference"]["tracking"]["algorithm"], "hybrid")
+            self.assertFalse(config["inference"]["tracking"]["draw_predicted_center"])
+            self.assertTrue(config["inference"]["tracking"]["render_confirmed_only"])
+            self.assertFalse(config["inference"]["tracking"]["export_confirmed_only"])
+            self.assertEqual(config["inference"]["tracking"]["trajectory_width"], 4)
         self.assertEqual(
             safe["inference"]["tracking"]["hybrid"]["cmc"]["processing_scale"],
             1.0,
@@ -532,6 +536,108 @@ class RfDetrInferenceTest(unittest.TestCase):
         for key in ("segment_frame_index", "segment_timestamp_seconds", "video_start_seconds", "video_end_seconds", "video_effective_end_seconds"):
             self.assertIn(key, row)
 
+    def test_hybrid_render_and_export_confirmation_switches_are_independent(self):
+        rows = [
+            {
+                "category_id": 1,
+                "frame_index": 0,
+                "track_id": 1,
+                "track_final_confirmed": True,
+            },
+            {
+                "category_id": 1,
+                "frame_index": 0,
+                "track_id": 2,
+                "track_final_confirmed": False,
+            },
+            {
+                "category_id": 1,
+                "frame_index": 0,
+                "track_id": None,
+                "track_final_confirmed": False,
+            },
+            {"category_id": 0, "frame_index": 0, "track_id": None},
+        ]
+        for render_only in (False, True):
+            for export_only in (False, True):
+                with self.subTest(render_only=render_only, export_only=export_only):
+                    cfg = inference_runner.video_tracking.TrackingConfig(
+                        enabled=True,
+                        algorithm="hybrid",
+                        target_class_ids={1},
+                        render_confirmed_only=render_only,
+                        export_confirmed_only=export_only,
+                    )
+                    published, suppressed = inference_runner.filter_confirmed_hybrid_exports(rows, cfg)
+                    visible = [
+                        row
+                        for row in rows
+                        if inference_runner.prediction_visible_for_confirmed_render(row, cfg, {1})
+                    ]
+
+                    self.assertEqual(len(published), 2 if export_only else 4)
+                    self.assertEqual(suppressed, 2 if export_only else 0)
+                    self.assertEqual(len(visible), 2 if render_only else 4)
+
+    def test_committed_first_hit_keeps_raw_lifecycle_but_renders_stable_id(self):
+        from PIL import Image
+
+        packet = {
+            "confirmed_track_ids": frozenset({7}),
+            "detections": [{
+                "category_id": 1,
+                "bbox": [5, 5, 8, 8],
+                "score": 0.9,
+                "track_id": 7,
+                "track_confirmed": False,
+                "track_status": "tentative",
+            }],
+        }
+        rows = inference_runner.hybrid_packet_detections(packet)
+        self.assertFalse(rows[0]["track_confirmed"])
+        self.assertEqual(rows[0]["track_status"], "tentative")
+        self.assertTrue(rows[0]["track_final_confirmed"])
+
+        cfg = inference_runner.video_tracking.TrackingConfig(
+            enabled=True,
+            algorithm="hybrid",
+            target_class_ids={1},
+            render_confirmed_only=True,
+            label_track_id=True,
+        )
+        draw = unittest.mock.Mock()
+        draw.textbbox.return_value = (0, 0, 20, 10)
+        with patch.object(inference_runner.ImageDraw, "Draw", return_value=draw):
+            inference_runner.draw_predictions(
+                Image.new("RGB", (30, 30)),
+                rows,
+                [{"id": 1, "name": "football"}],
+                [],
+                tracking_cfg=cfg,
+                current_frame_index=0,
+                confirmed_track_ids={7},
+            )
+
+        self.assertIn("football #7", draw.text.call_args.args[1])
+
+    def test_confirmed_export_filter_keeps_images_and_non_target_video_rows(self):
+        cfg = inference_runner.video_tracking.TrackingConfig(
+            enabled=True,
+            algorithm="hybrid",
+            target_class_ids={1},
+            export_confirmed_only=True,
+        )
+        rows = [
+            {"category_id": 1, "image_id": 1, "track_id": None},
+            {"category_id": 0, "frame_index": 2, "track_id": None},
+            {"category_id": 1, "frame_index": 2, "track_id": None},
+        ]
+
+        published, suppressed = inference_runner.filter_confirmed_hybrid_exports(rows, cfg)
+
+        self.assertEqual(published, rows[:2])
+        self.assertEqual(suppressed, 1)
+
     def test_load_model_attaches_motion_only_when_enabled(self):
         rf_model = SimpleNamespace(model=object())
         model_cls = unittest.mock.Mock(return_value=rf_model)
@@ -581,6 +687,59 @@ class RfDetrInferenceTest(unittest.TestCase):
         # New derived presets may inherit trajectory rendering.  The contract
         # is the per-preset safety setting above, not a frozen file count.
         self.assertGreaterEqual(trajectory_presets, 17)
+
+    def test_all_tracking_presets_explicitly_declare_confirmation_render_controls(self):
+        config_dir = PROJECT_DIR / "config"
+        tracking_paths = []
+        hybrid_paths = set()
+        required_keys = (
+            "draw_predicted_center",
+            "render_confirmed_only",
+            "export_confirmed_only",
+        )
+
+        for path in sorted(config_dir.glob("rf_detr_inference*.yaml")):
+            raw_text = path.read_text(encoding="utf-8")
+            if "\n  tracking:\n" not in raw_text:
+                continue
+            tracking_paths.append(path)
+            config = inference_runner.load_yaml(path)
+            tracking = config["inference"]["tracking"]
+            algorithm = tracking.get("algorithm", "circle")
+
+            with self.subTest(config=path.name):
+                for key in required_keys:
+                    declaration = f"\n    {key}:"
+                    self.assertEqual(raw_text.count(declaration), 1)
+                    declaration_line = next(
+                        index
+                        for index, line in enumerate(raw_text.splitlines())
+                        if line.startswith(f"    {key}:")
+                    )
+                    preceding_line = raw_text.splitlines()[declaration_line - 1].strip()
+                    self.assertTrue(preceding_line.startswith("#"), f"{key} needs an inline schema comment")
+
+                self.assertFalse(tracking["draw_predicted_center"])
+                self.assertNotIn("beam_width", raw_text)
+                if algorithm == "hybrid":
+                    hybrid_paths.add(path.name)
+                    self.assertTrue(tracking["render_confirmed_only"])
+                    self.assertFalse(tracking["export_confirmed_only"])
+                    self.assertEqual(tracking["trajectory_width"], 4)
+                else:
+                    self.assertFalse(tracking["render_confirmed_only"])
+                    self.assertFalse(tracking["export_confirmed_only"])
+
+        self.assertEqual(len(tracking_paths), 21)
+        self.assertEqual(
+            hybrid_paths,
+            {
+                "rf_detr_inference_medium_p2_performance_fast.yaml",
+                "rf_detr_inference_medium_p2_performance_safe.yaml",
+                "rf_detr_inference_medium_p2_sahi160_recheck320_hybrid.yaml",
+                "rf_detr_inference_medium_p2_sahi320_recheck640_hybrid.yaml",
+            },
+        )
 
     def test_all_inference_configs_declare_optional_architecture_blocks(self):
         config_dir = PROJECT_DIR / "config"

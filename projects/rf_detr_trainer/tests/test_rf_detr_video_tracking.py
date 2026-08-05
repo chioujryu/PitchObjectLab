@@ -183,9 +183,45 @@ class TrackingConfigTest(unittest.TestCase):
         self.assertFalse(default_cfg.draw_predicted_trajectory)
         self.assertTrue(enabled_cfg.draw_predicted_trajectory)
 
+    def test_center_and_confirmation_policy_defaults_are_backward_compatible(self):
+        cfg = vt.parse_tracking_config({"inference": {"tracking": {"enabled": True}}}, CATEGORIES)
+
+        self.assertFalse(cfg.draw_predicted_center)
+        self.assertFalse(cfg.render_confirmed_only)
+        self.assertFalse(cfg.export_confirmed_only)
+
+    def test_center_and_hybrid_confirmation_policies_are_parsed(self):
+        cfg = vt.parse_tracking_config({"inference": {"tracking": {
+            "enabled": True,
+            "algorithm": "hybrid",
+            "draw_predicted_center": True,
+            "render_confirmed_only": True,
+            "export_confirmed_only": True,
+        }}}, CATEGORIES)
+
+        self.assertTrue(cfg.draw_predicted_center)
+        self.assertTrue(cfg.render_confirmed_only)
+        self.assertTrue(cfg.export_confirmed_only)
+
+    def test_confirmation_policies_reject_non_hybrid_algorithms(self):
+        for key in ("render_confirmed_only", "export_confirmed_only"):
+            with self.subTest(key=key), self.assertRaisesRegex(
+                ValueError,
+                rf"inference\.tracking\.{key}.*only supported.*hybrid",
+            ):
+                vt.parse_tracking_config({"inference": {"tracking": {
+                    "algorithm": "circle",
+                    key: True,
+                }}}, CATEGORIES)
+
     def test_invalid_radius_raises(self):
         with self.assertRaises(ValueError):
             vt.parse_tracking_config({"inference": {"tracking": {"radius_pixels": 0}}}, CATEGORIES)
+
+    def test_optional_radius_and_trajectory_limits_must_be_positive(self):
+        for key in ("radius_scale", "max_radius_pixels", "trajectory_max_points"):
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, key):
+                vt.parse_tracking_config({"inference": {"tracking": {key: 0}}}, CATEGORIES)
 
     def test_invalid_min_hits_raises(self):
         with self.assertRaises(ValueError):
@@ -217,13 +253,22 @@ class BoxmotConfigTest(unittest.TestCase):
     def test_hybrid_nested_config_is_validated_and_preserved(self):
         raw = {"inference": {"tracking": {"algorithm": "hybrid", "hybrid": {
             "candidate": {"low_confidence": 0.2, "high_confidence": 0.6},
-            "hypothesis": {"beam_width": 4},
+            "hypothesis": {"lookahead_seconds": 0.25, "ambiguity_margin": 0.04},
         }}}}
 
         cfg = vt.parse_tracking_config(raw, CATEGORIES)
 
         self.assertEqual(cfg.hybrid_options["candidate"]["low_confidence"], 0.2)
-        self.assertEqual(cfg.hybrid_options["hypothesis"]["beam_width"], 4)
+        self.assertEqual(cfg.hybrid_options["hypothesis"]["lookahead_seconds"], 0.25)
+        self.assertEqual(cfg.hybrid_options["hypothesis"]["ambiguity_margin"], 0.04)
+
+    def test_hybrid_legacy_beam_width_is_explicitly_rejected(self):
+        for hybrid in ({"hypothesis": {"beam_width": 8}}, {"beam_width": 8}):
+            with self.subTest(hybrid=hybrid), self.assertRaisesRegex(ValueError, r"beam_width is unsupported"):
+                vt.parse_tracking_config({"inference": {"tracking": {
+                    "algorithm": "hybrid",
+                    "hybrid": hybrid,
+                }}}, CATEGORIES)
 
     def test_hybrid_unknown_config_key_raises(self):
         with self.assertRaisesRegex(ValueError, "unknown.*hybrid"):
@@ -368,6 +413,13 @@ class TrackVisibilityTest(unittest.TestCase):
         # null age -> always visible when confirmed
         self.assertTrue(vt.is_track_visible(track, 9999, make_config(trajectory_max_age_frames=None)))
 
+    def test_final_hybrid_confirmation_backfills_overlay_before_top_level_min_hits(self):
+        track = self._track(hits=1, last_seen=0, frames=[0])
+        cfg = make_config(algorithm="hybrid", min_hits=3, render_confirmed_only=True)
+
+        self.assertFalse(vt.is_track_visible(track, 0, cfg))
+        self.assertTrue(vt.is_track_visible(track, 0, cfg, final_confirmed=True))
+
     def test_trail_points_age_filtered(self):
         track = self._track(frames=range(0, 41))
         frames_drawn = [int(x) for (x, _y) in vt.trail_points(track, 40, make_config(trajectory_max_age_frames=10))]
@@ -383,6 +435,61 @@ class TrackVisibilityTest(unittest.TestCase):
         self.assertEqual(vt.live_center(track, 40, moving), (100.0, 50.0))  # gap 0 -> last center
         self.assertEqual(vt.live_center(track, 43, make_config(use_velocity_prediction=False)), (100.0, 50.0))  # velocity off
         self.assertEqual(vt.live_center(track, None, moving), (100.0, 50.0))  # no current frame
+
+    def test_hybrid_snapshot_center_is_not_extrapolated_twice(self):
+        track = self._track(hits=5, last_seen=40)
+        track.center_x, track.center_y = 112.0, 50.0
+        track.velocity_x, track.velocity_y = 4.0, 0.0
+        cfg = make_config(algorithm="hybrid", use_velocity_prediction=True)
+
+        self.assertEqual(vt.live_center(track, 43, cfg), (112.0, 50.0))
+
+    def test_observed_center_is_drawn_only_on_an_observation_frame(self):
+        track = self._track(last_seen=40)
+        cfg = make_config(draw_current_center=True, draw_predicted_center=False)
+
+        self.assertTrue(vt.is_observed_on_frame(track, 40))
+        self.assertTrue(vt.should_draw_observed_center(track, 40, cfg))
+        self.assertFalse(vt.is_observed_on_frame(track, 41))
+        self.assertFalse(vt.should_draw_observed_center(track, 41, cfg))
+
+    def test_predicted_center_requires_independent_opt_in(self):
+        track = self._track(last_seen=40)
+
+        self.assertFalse(vt.should_draw_predicted_center(
+            track, 41, make_config(draw_current_center=True, draw_predicted_center=False)
+        ))
+        self.assertTrue(vt.should_draw_predicted_center(
+            track, 41, make_config(draw_current_center=False, draw_predicted_center=True)
+        ))
+        self.assertFalse(vt.should_draw_predicted_center(
+            track, 40, make_config(draw_current_center=False, draw_predicted_center=True)
+        ))
+
+    def test_hybrid_predicted_center_respects_output_horizon(self):
+        cfg = make_config(
+            algorithm="hybrid",
+            draw_predicted_center=True,
+            hybrid_options={"lifecycle": {"predicted_output_seconds": 0.5}},
+        )
+        within = SimpleNamespace(
+            last_seen_frame_index=40,
+            last_timestamp=10.5,
+            last_observed_timestamp=10.0,
+        )
+        beyond = SimpleNamespace(
+            last_seen_frame_index=40,
+            last_timestamp=10.5001,
+            last_observed_timestamp=10.0,
+        )
+
+        self.assertTrue(vt.should_draw_predicted_center(within, 41, cfg))
+        self.assertFalse(vt.should_draw_predicted_center(beyond, 41, cfg))
+
+    def test_hybrid_predicted_center_without_timing_is_suppressed(self):
+        cfg = make_config(algorithm="hybrid", draw_predicted_center=True)
+
+        self.assertFalse(vt.should_draw_predicted_center(self._track(last_seen=40), 41, cfg))
 
 
 # --- O4: synthetic end-to-end video test (no RF-DETR model) -----------------
@@ -408,7 +515,7 @@ class TrackOverlayRenderingTest(unittest.TestCase):
             points=deque([(0, 10.0, 10.0), (2, 20.0, 10.0)]),
         )
 
-    def test_predicted_trajectory_off_keeps_observed_bridge_and_live_markers(self):
+    def test_predicted_trajectory_off_keeps_observed_bridge_without_predicted_dot(self):
         draw = mock.Mock()
         cfg = make_config(
             draw_predicted_trajectory=False,
@@ -426,9 +533,43 @@ class TrackOverlayRenderingTest(unittest.TestCase):
             draw.ellipse.call_args_list,
             [
                 mock.call([-20.0, -40.0, 80.0, 60.0], outline=color, width=1),
-                mock.call([27.0, 7.0, 33.0, 13.0], fill=color),
             ],
         )
+
+    def test_predicted_center_opt_in_uses_fixed_three_pixel_radius(self):
+        draw = mock.Mock()
+        cfg = make_config(
+            draw_trajectory=False,
+            draw_current_center=False,
+            draw_predicted_center=True,
+            draw_search_circle=False,
+            trajectory_width=9,
+            use_velocity_prediction=True,
+        )
+
+        inference_runner.draw_track_overlays(draw, [self._predicted_track()], cfg, [1], current_frame_index=4)
+
+        color = inference_runner.track_color(1)
+        draw.ellipse.assert_called_once_with([27.0, 7.0, 33.0, 13.0], fill=color)
+
+    def test_taper_reaches_configured_width_without_changing_center_radius(self):
+        draw = mock.Mock()
+        track = self._predicted_track()
+        track.last_seen_frame_index = 2
+        cfg = make_config(
+            draw_predicted_trajectory=False,
+            trajectory_taper=True,
+            trajectory_width=4,
+            draw_current_center=True,
+            draw_predicted_center=False,
+            draw_search_circle=False,
+        )
+
+        inference_runner.draw_track_overlays(draw, [track], cfg, [1], current_frame_index=2)
+
+        self.assertEqual([call.kwargs["width"] for call in draw.line.call_args_list], [4])
+        color = inference_runner.track_color(1)
+        draw.ellipse.assert_called_once_with([17.0, 7.0, 23.0, 13.0], fill=color)
 
     def test_predicted_trajectory_on_restores_live_head(self):
         draw = mock.Mock()
@@ -506,21 +647,41 @@ def _track_ids_by_frame(rows):
     return {row["frame_index"]: row["track_id"] for row in rows if row.get("category_id") == 1}
 
 
+def _video_frame_count(path):
+    import cv2
+
+    capture = cv2.VideoCapture(str(path))
+    try:
+        return int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    finally:
+        capture.release()
+
+
 class SyntheticVideoTrackingTest(unittest.TestCase):
-    def _run(self, tmp, batch_size):
+    @staticmethod
+    def _pipeline_options(pipeline):
+        if pipeline == "streaming":
+            return {"streaming": True, "batch_size": 4}
+        if pipeline == "one_pass":
+            return {"streaming": False, "batch_size": 1}
+        if pipeline == "batched":
+            return {"streaming": False, "batch_size": 4}
+        raise AssertionError(f"unknown test pipeline {pipeline}")
+
+    def _run(self, tmp, pipeline):
         video_path = Path(tmp) / "clip.mp4"
         _write_synthetic_video(video_path)
-        output_dir = Path(tmp) / f"out_{batch_size}"
+        output_dir = Path(tmp) / f"out_{pipeline}"
         output_dir.mkdir(parents=True, exist_ok=True)
         item = inference_runner.SourceItem(source=str(video_path), kind="video", is_url=False, local_path=video_path)
         video_cfg = {
-            "batch_size": batch_size,
             "detection_fps": None,
             "start_time": 0,
             "end_time": "all",
             "max_seconds": "all",
             "output_fps": None,
             "render_skipped_frames": True,
+            **self._pipeline_options(pipeline),
         }
         tracking_config = inference_runner.video_tracking.parse_tracking_config(
             {"inference": {"tracking": {"enabled": True, "algorithm": "circle", "radius_pixels": 80}}}, CATEGORIES
@@ -533,20 +694,20 @@ class SyntheticVideoTrackingTest(unittest.TestCase):
             )
         return rows, target
 
-    def _run_hybrid(self, tmp, batch_size):
+    def _run_hybrid(self, tmp, pipeline):
         video_path = Path(tmp) / "clip.mp4"
         _write_synthetic_video(video_path)
-        output_dir = Path(tmp) / f"hybrid_{batch_size}"
+        output_dir = Path(tmp) / f"hybrid_{pipeline}"
         output_dir.mkdir(parents=True, exist_ok=True)
         item = inference_runner.SourceItem(source=str(video_path), kind="video", is_url=False, local_path=video_path)
         video_cfg = {
-            "batch_size": batch_size,
             "detection_fps": None,
             "start_time": 0,
             "end_time": "all",
             "max_seconds": "all",
             "output_fps": None,
             "render_skipped_frames": True,
+            **self._pipeline_options(pipeline),
         }
         tracking_config = inference_runner.video_tracking.parse_tracking_config(
             {"inference": {"tracking": {
@@ -569,34 +730,46 @@ class SyntheticVideoTrackingTest(unittest.TestCase):
             )
         return rows, states, target
 
-    def test_hybrid_one_pass_and_batched_commit_all_frames_with_stable_ids(self):
+    def test_hybrid_streaming_one_pass_and_batched_have_identical_commits(self):
         with tempfile.TemporaryDirectory() as tmp:
-            one_rows, one_states, one_video = self._run_hybrid(tmp, 1)
-            batch_rows, batch_states, batch_video = self._run_hybrid(tmp, 4)
-            self.assertTrue(one_video.exists() and batch_video.exists())
+            results = {
+                pipeline: self._run_hybrid(tmp, pipeline)
+                for pipeline in ("streaming", "one_pass", "batched")
+            }
+            self.assertTrue(all(video.exists() for _rows, _states, video in results.values()))
+            self.assertTrue(all(_video_frame_count(video) == len(SCRIPT) for _rows, _states, video in results.values()))
 
-        one_ids = _track_ids_by_frame(one_rows)
-        batch_ids = _track_ids_by_frame(batch_rows)
-        self.assertEqual(set(one_ids), set(SCRIPT))
-        self.assertEqual(one_ids, batch_ids)
-        self.assertEqual(set(one_ids.values()), {1})
-        self.assertTrue(one_states and batch_states)
-        self.assertEqual({row["frame_index"] for row in one_states}, set(SCRIPT))
+        ids_by_pipeline = {
+            pipeline: _track_ids_by_frame(rows)
+            for pipeline, (rows, _states, _video) in results.items()
+        }
+        self.assertEqual(set(ids_by_pipeline["streaming"]), set(SCRIPT))
+        self.assertEqual(ids_by_pipeline["streaming"], ids_by_pipeline["one_pass"])
+        self.assertEqual(ids_by_pipeline["streaming"], ids_by_pipeline["batched"])
+        self.assertEqual(set(ids_by_pipeline["streaming"].values()), {1})
+        for rows, states, _video in results.values():
+            self.assertTrue(rows and states)
+            self.assertEqual({row["frame_index"] for row in states}, set(SCRIPT))
 
-    def test_one_pass_and_batched_match_and_track_is_stable(self):
+    def test_streaming_one_pass_and_batched_match_and_track_is_stable(self):
         with tempfile.TemporaryDirectory() as tmp:
-            one_pass_rows, one_pass_video = self._run(tmp, batch_size=1)
-            batched_rows, batched_video = self._run(tmp, batch_size=4)
+            results = {
+                pipeline: self._run(tmp, pipeline)
+                for pipeline in ("streaming", "one_pass", "batched")
+            }
 
-            one_pass_ids = _track_ids_by_frame(one_pass_rows)
-            batched_ids = _track_ids_by_frame(batched_rows)
-
-            self.assertEqual(set(one_pass_ids), set(SCRIPT))  # every scripted frame produced a tracked ball
-            self.assertEqual(set(one_pass_ids.values()), {1})  # one ball -> one stable id
-            self.assertEqual(one_pass_ids, batched_ids)  # one-pass and batched agree
-            self.assertTrue(one_pass_video.exists() and one_pass_video.stat().st_size > 0)
-            self.assertTrue(batched_video.exists() and batched_video.stat().st_size > 0)
-            self.assertTrue(all(row.get("track_id") is not None for row in one_pass_rows if row["category_id"] == 1))
+            ids_by_pipeline = {
+                pipeline: _track_ids_by_frame(rows)
+                for pipeline, (rows, _video) in results.items()
+            }
+            self.assertEqual(set(ids_by_pipeline["streaming"]), set(SCRIPT))
+            self.assertEqual(set(ids_by_pipeline["streaming"].values()), {1})
+            self.assertEqual(ids_by_pipeline["streaming"], ids_by_pipeline["one_pass"])
+            self.assertEqual(ids_by_pipeline["streaming"], ids_by_pipeline["batched"])
+            for rows, video in results.values():
+                self.assertTrue(video.exists() and video.stat().st_size > 0)
+                self.assertEqual(_video_frame_count(video), len(SCRIPT))
+                self.assertTrue(all(row.get("track_id") is not None for row in rows if row["category_id"] == 1))
 
     def test_sahi_recheck_filter_runs_before_tracker_and_render(self):
         class RecordingTracker:
@@ -732,7 +905,45 @@ class SyntheticVideoTrackingTest(unittest.TestCase):
         self.assertTrue(all(path.startswith("memory://") for path in captured["paths"]))
         self.assertEqual(len(captured["sources"]), 3)
 
-    def test_streaming_advances_tracker_on_detection_gaps(self):
+    def test_legacy_video_pipelines_honor_save_video_false(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            video_path = Path(tmp) / "clip.mp4"
+            _write_synthetic_video(video_path, frames=3)
+            item = inference_runner.SourceItem(
+                source=str(video_path), kind="video", is_url=False, local_path=video_path
+            )
+            for pipeline in ("one_pass", "batched"):
+                with self.subTest(pipeline=pipeline):
+                    output_dir = Path(tmp) / f"json_only_{pipeline}"
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    with mock.patch.object(
+                        inference_runner.evaluator, "predict_image", _fake_predict_image
+                    ), mock.patch.object(
+                        inference_runner.evaluator,
+                        "predict_images_rfdetr",
+                        _fake_predict_images_rfdetr,
+                    ):
+                        _rows, target, _next_id = inference_runner.predict_video_file(
+                            item,
+                            1,
+                            None,
+                            {},
+                            CATEGORIES,
+                            output_dir,
+                            [],
+                            {
+                                **self._pipeline_options(pipeline),
+                                "save_video": False,
+                                "start_time": 0,
+                                "end_time": "all",
+                                "max_seconds": "all",
+                            },
+                        )
+
+                    self.assertIsNone(target)
+                    self.assertFalse((output_dir / "videos").exists())
+
+    def test_all_video_pipelines_advance_tracker_on_detection_gaps(self):
         class RecordingTracker:
             def __init__(self):
                 self.calls = []
@@ -742,47 +953,53 @@ class SyntheticVideoTrackingTest(unittest.TestCase):
                 self.calls.append((frame_index, len(predictions), frame is not None))
                 return [dict(row) for row in predictions]
 
-        tracker = RecordingTracker()
         with tempfile.TemporaryDirectory() as tmp:
             video_path = Path(tmp) / "clip.mp4"
             _write_synthetic_video(video_path, frames=6)
-            output_dir = Path(tmp) / "gaps"
-            output_dir.mkdir(parents=True, exist_ok=True)
             item = inference_runner.SourceItem(
                 source=str(video_path), kind="video", is_url=False, local_path=video_path
             )
-            with mock.patch.object(
-                inference_runner.evaluator,
-                "predict_images_rfdetr",
-                _fake_predict_images_rfdetr,
-            ), mock.patch.object(
-                inference_runner,
-                "create_tracker",
-                return_value=tracker,
-            ):
-                inference_runner.predict_video_file(
-                    item,
-                    1,
-                    None,
-                    {},
-                    CATEGORIES,
-                    output_dir,
-                    [],
-                    {
-                        "batch_size": 2,
-                        "streaming": True,
-                        "save_video": False,
+            for pipeline in ("streaming", "one_pass", "batched"):
+                with self.subTest(pipeline=pipeline):
+                    output_dir = Path(tmp) / f"gaps_{pipeline}"
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    tracker = RecordingTracker()
+                    video_cfg = {
+                        **self._pipeline_options(pipeline),
+                        "save_video": pipeline != "streaming",
                         "detection_fps": 15,
                         "start_time": 0,
                         "end_time": "all",
                         "max_seconds": "all",
-                    },
-                    inference_runner.video_tracking.TrackingConfig(enabled=True),
-                )
+                    }
+                    with mock.patch.object(
+                        inference_runner.evaluator,
+                        "predict_image",
+                        _fake_predict_image,
+                    ), mock.patch.object(
+                        inference_runner.evaluator,
+                        "predict_images_rfdetr",
+                        _fake_predict_images_rfdetr,
+                    ), mock.patch.object(
+                        inference_runner,
+                        "create_tracker",
+                        return_value=tracker,
+                    ):
+                        inference_runner.predict_video_file(
+                            item,
+                            1,
+                            None,
+                            {},
+                            CATEGORIES,
+                            output_dir,
+                            [],
+                            video_cfg,
+                            inference_runner.video_tracking.TrackingConfig(enabled=True),
+                        )
 
-        self.assertEqual([frame for frame, _, _ in tracker.calls], list(range(6)))
-        self.assertEqual([count for _, count, _ in tracker.calls], [1, 0, 1, 0, 1, 0])
-        self.assertTrue(all(has_frame for _, _, has_frame in tracker.calls))
+                    self.assertEqual([frame for frame, _, _ in tracker.calls], list(range(6)))
+                    self.assertEqual([count for _, count, _ in tracker.calls], [1, 0, 1, 0, 1, 0])
+                    self.assertTrue(all(has_frame for _, _, has_frame in tracker.calls))
 
     def test_streaming_queue_backpressure_flushes_before_detection_batch_is_full(self):
         observed_batch_lengths = []

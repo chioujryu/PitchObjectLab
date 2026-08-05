@@ -295,6 +295,8 @@ inference:
     draw_trajectory: true
     # Extend the observed trail to the live predicted center during detection gaps. Options: true, false.
     draw_predicted_trajectory: false
+    # Draw a live predicted center during detection gaps; Hybrid also limits it to predicted_output_seconds. Options: true, false.
+    draw_predicted_center: false
     # Maximum retained/rendered trajectory points. Options: null or positive integer.
     trajectory_max_points: 30
     # Expire trail points after this many source frames. Options: null or positive integer.
@@ -305,8 +307,12 @@ inference:
     trajectory_per_track_color: true
     # Taper old-to-new trajectory segments. Options: true, false.
     trajectory_taper: true
-    # Draw the current tracked center. Options: true, false.
+    # Draw the current frame's real observed center as a fixed 3px-radius dot. Options: true, false.
     draw_current_center: true
+    # Hide target-class bbox, label, center, and trail when a Hybrid track never confirms. Hybrid-only; must remain false for other algorithms. Options: true, false.
+    render_confirmed_only: false
+    # Filter unconfirmed target-class detections from predictions.jsonl and football_predictions.jsonl only. Hybrid-only; must remain false for other algorithms. Options: true, false.
+    export_confirmed_only: false
     # Circle-only search-radius overlay. Options: true, false.
     draw_search_circle: false
     # Include track ID in labels. Options: true, false.

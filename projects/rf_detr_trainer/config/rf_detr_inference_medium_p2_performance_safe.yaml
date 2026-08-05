@@ -36,6 +36,14 @@ inference:
   tracking:
     enabled: true
     algorithm: hybrid
+    # Draw a live predicted center during detection gaps, bounded by Hybrid predicted_output_seconds. Options: true, false.
+    draw_predicted_center: false
+    # Render only target-class detections belonging to tracks that eventually confirm. Hybrid-only. Options: true, false.
+    render_confirmed_only: true
+    # Filter unconfirmed target-class detections from the two formal detection JSONL files. Hybrid-only. Options: true, false.
+    export_confirmed_only: false
+    # Trajectory line width in pixels. Options: positive integer.
+    trajectory_width: 4
     hybrid:
       cmc:
         processing_scale: 1.0

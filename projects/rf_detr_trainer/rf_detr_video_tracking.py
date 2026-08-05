@@ -139,7 +139,7 @@ def _as_positive_float(value: Any, default: float, field_name: str) -> float:
 # provided by the boxmot adapter (rf_detr_boxmot_tracker.BoxmotTracker).
 _HYBRID_OPTION_GROUPS = {
     "candidate": {"low_confidence", "high_confidence", "new_track_confidence", "low_require_recheck"},
-    "hypothesis": {"lookahead_seconds", "beam_width", "ambiguity_margin"},
+    "hypothesis": {"lookahead_seconds", "ambiguity_margin"},
     "lifecycle": {"confirmed_hits", "confirmation_window", "lost_seconds", "predicted_output_seconds"},
     "association": {
         "high_gate_pixels", "low_gate_pixels", "mahalanobis_gate", "weight_mahalanobis", "weight_center",
@@ -164,12 +164,18 @@ def _validate_hybrid_options(raw: Any) -> Dict[str, Any]:
         raise ValueError("inference.tracking.hybrid must be a mapping")
     copied: Dict[str, Any] = {}
     for group, values in raw.items():
+        if group == "beam_width":
+            raise ValueError("inference.tracking.hybrid.beam_width is unsupported; remove it")
         if group not in _HYBRID_OPTION_GROUPS:
             raise ValueError(f"unknown inference.tracking.hybrid.{group}")
         if not isinstance(values, Mapping):
             raise ValueError(f"inference.tracking.hybrid.{group} must be a mapping")
         unknown = set(values) - _HYBRID_OPTION_GROUPS[group]
         if unknown:
+            if group == "hypothesis" and "beam_width" in unknown:
+                raise ValueError(
+                    "inference.tracking.hybrid.hypothesis.beam_width is unsupported; remove it"
+                )
             raise ValueError(f"unknown inference.tracking.hybrid.{group}.{sorted(unknown)[0]}")
         copied[group] = dict(values)
     return copied
@@ -201,9 +207,17 @@ class TrackingConfig:
     trajectory_width: int = 2
     trajectory_per_track_color: bool = True
     trajectory_taper: bool = True
+    # Observed and predicted center dots are intentionally independent.  The
+    # former is drawn only on frames with a real observation; the latter opts
+    # in to extrapolated dots during detection gaps.
     draw_current_center: bool = True
+    draw_predicted_center: bool = False
     draw_search_circle: bool = False
     label_track_id: bool = True
+    # Hybrid-only publication policies.  They default off so older external
+    # YAML files retain their previous render/export behaviour.
+    render_confirmed_only: bool = False
+    export_confirmed_only: bool = False
     # Algorithm selector: "circle" (this module) or boxmot-backed trackers.
     algorithm: str = "circle"
     # Shared boxmot ReID / camera-motion settings (only used by boxmot algorithms).
@@ -309,10 +323,24 @@ def _history_maxlen(cfg: TrackingConfig) -> int:
     return DEFAULT_HISTORY_LIMIT
 
 
-def is_track_visible(track: TrackedBall, current_frame_index: Optional[int], cfg: TrackingConfig) -> bool:
-    """Whether a track's overlay should be drawn: confirmed and seen within trajectory_max_age_frames."""
-    if track.hits < cfg.min_hits:
+def is_track_visible(
+    track: TrackedBall,
+    current_frame_index: Optional[int],
+    cfg: TrackingConfig,
+    *,
+    final_confirmed: bool = False,
+) -> bool:
+    """Whether a track's overlay is inside its confirmation and lifetime limits."""
+    if track.hits < cfg.min_hits and not (
+        cfg.algorithm == "hybrid" and cfg.render_confirmed_only and final_confirmed
+    ):
         return False
+    if cfg.algorithm == "hybrid" and not is_observed_on_frame(track, current_frame_index):
+        lifecycle = cfg.hybrid_options.get("lifecycle", {})
+        horizon = float(lifecycle.get("predicted_output_seconds", 0.50))
+        elapsed = _seconds_since_observed(track)
+        if elapsed is None or elapsed > horizon + 1.0e-9:
+            return False
     if cfg.trajectory_max_age_frames is None or current_frame_index is None:
         return True
     return current_frame_index - track.last_seen_frame_index <= cfg.trajectory_max_age_frames
@@ -332,9 +360,66 @@ def trail_points(track: TrackedBall, current_frame_index: Optional[int], cfg: Tr
 
 def live_center(track: TrackedBall, current_frame_index: Optional[int], cfg: TrackingConfig) -> Tuple[float, float]:
     """Current drawn position: velocity-extrapolated through a detection gap, else the last detected center."""
-    if current_frame_index is None:
+    if current_frame_index is None or cfg.algorithm == "hybrid":
+        # Hybrid snapshots already contain the motion model's state for this
+        # exact frame; applying the circle tracker's frame extrapolation again
+        # would double-predict the center.
         return track.center_x, track.center_y
     return predicted_center(track, cfg, current_frame_index - track.last_seen_frame_index)
+
+
+def is_observed_on_frame(track: Any, current_frame_index: Optional[int]) -> bool:
+    """Return whether ``track`` has a real observation on the rendered frame.
+
+    A missing frame index is treated as the current observation for backwards
+    compatibility with still-image and legacy callers that do not have a video
+    frame counter.
+    """
+    if current_frame_index is None:
+        return True
+    return int(track.last_seen_frame_index) == int(current_frame_index)
+
+
+def should_draw_observed_center(
+    track: Any,
+    current_frame_index: Optional[int],
+    cfg: TrackingConfig,
+) -> bool:
+    """Whether the real-observation center dot should be drawn on this frame."""
+    return bool(cfg.draw_current_center) and is_observed_on_frame(track, current_frame_index)
+
+
+def _seconds_since_observed(track: Any) -> Optional[float]:
+    """Read Hybrid prediction age from a live track or immutable render snapshot."""
+    explicit = getattr(track, "seconds_since_observed", None)
+    if explicit is not None:
+        return max(0.0, float(explicit))
+    current_timestamp = getattr(track, "last_timestamp", None)
+    observed_timestamp = getattr(track, "last_observed_timestamp", None)
+    if current_timestamp is None or observed_timestamp is None:
+        return None
+    return max(0.0, float(current_timestamp) - float(observed_timestamp))
+
+
+def should_draw_predicted_center(
+    track: Any,
+    current_frame_index: Optional[int],
+    cfg: TrackingConfig,
+) -> bool:
+    """Whether an extrapolated center dot should be drawn on this frame.
+
+    All trackers require the explicit ``draw_predicted_center`` opt-in.  Hybrid
+    predictions are additionally bounded by ``predicted_output_seconds``.  A
+    Hybrid snapshot without timing metadata is conservatively suppressed.
+    """
+    if not cfg.draw_predicted_center or is_observed_on_frame(track, current_frame_index):
+        return False
+    if cfg.algorithm != "hybrid":
+        return True
+    lifecycle = cfg.hybrid_options.get("lifecycle", {})
+    horizon = float(lifecycle.get("predicted_output_seconds", 0.50))
+    elapsed = _seconds_since_observed(track)
+    return elapsed is not None and elapsed <= horizon + 1.0e-9
 
 
 def _category_name_to_id(categories: Sequence[Mapping[str, Any]]) -> Dict[str, int]:
@@ -357,7 +442,10 @@ def parse_tracking_config(
             target_ids = {name_to_id["football"]}
 
     radius_pixels = _as_float(raw.get("radius_pixels"), 80.0, "radius_pixels")
+    radius_scale = _as_optional_float(raw.get("radius_scale"), "radius_scale")
+    max_radius_pixels = _as_optional_float(raw.get("max_radius_pixels"), "max_radius_pixels")
     trajectory_width = _as_int(raw.get("trajectory_width"), 2, "trajectory_width")
+    trajectory_max_points = _as_optional_int(raw.get("trajectory_max_points", 30), "trajectory_max_points")
     min_hits = _as_int(raw.get("min_hits"), 1, "min_hits")
     max_missing_frames = _as_optional_int(raw.get("max_missing_frames", 30), "max_missing_frames")
     radius_growth = _as_float(raw.get("radius_growth_per_missing_frame"), 0.0, "radius_growth_per_missing_frame")
@@ -366,8 +454,14 @@ def parse_tracking_config(
 
     if radius_pixels <= 0:
         raise ValueError("inference.tracking.radius_pixels must be > 0")
+    if radius_scale is not None and radius_scale <= 0:
+        raise ValueError("inference.tracking.radius_scale must be null or a positive number")
+    if max_radius_pixels is not None and max_radius_pixels <= 0:
+        raise ValueError("inference.tracking.max_radius_pixels must be null or a positive number")
     if trajectory_width <= 0:
         raise ValueError("inference.tracking.trajectory_width must be > 0")
+    if trajectory_max_points is not None and trajectory_max_points <= 0:
+        raise ValueError("inference.tracking.trajectory_max_points must be all/null or a positive integer")
     if min_hits < 1:
         raise ValueError("inference.tracking.min_hits must be >= 1")
     if max_missing_frames is not None and max_missing_frames < 0:
@@ -385,6 +479,19 @@ def parse_tracking_config(
             f"inference.tracking.algorithm must be one of {list(ALLOWED_ALGORITHMS)}, got {algorithm!r}"
         )
     hybrid_options = _validate_hybrid_options(raw.get("hybrid"))
+    render_confirmed_only = _as_bool(raw.get("render_confirmed_only"), False)
+    export_confirmed_only = _as_bool(raw.get("export_confirmed_only"), False)
+    if algorithm != "hybrid" and (render_confirmed_only or export_confirmed_only):
+        enabled_keys = [
+            key
+            for key, enabled in (
+                ("render_confirmed_only", render_confirmed_only),
+                ("export_confirmed_only", export_confirmed_only),
+            )
+            if enabled
+        ]
+        joined = " and ".join(f"inference.tracking.{key}" for key in enabled_keys)
+        raise ValueError(f"{joined} is only supported when inference.tracking.algorithm is 'hybrid'")
     cmc_method = _as_optional_str(raw.get("cmc_method", "ecc"))
     if cmc_method is not None and cmc_method.casefold() not in _ALLOWED_CMC_METHODS:
         raise ValueError(
@@ -400,23 +507,26 @@ def parse_tracking_config(
         enabled=_as_bool(raw.get("enabled"), False),
         target_class_ids=target_ids,
         radius_pixels=radius_pixels,
-        radius_scale=_as_optional_float(raw.get("radius_scale"), "radius_scale"),
+        radius_scale=radius_scale,
         radius_growth_per_missing_frame=radius_growth,
-        max_radius_pixels=_as_optional_float(raw.get("max_radius_pixels"), "max_radius_pixels"),
+        max_radius_pixels=max_radius_pixels,
         max_missing_frames=max_missing_frames,
         min_hits=min_hits,
         use_velocity_prediction=_as_bool(raw.get("use_velocity_prediction"), False),
         velocity_smoothing=velocity_smoothing,
         draw_trajectory=_as_bool(raw.get("draw_trajectory"), True),
         draw_predicted_trajectory=_as_bool(raw.get("draw_predicted_trajectory"), False),
-        trajectory_max_points=_as_optional_int(raw.get("trajectory_max_points", 30), "trajectory_max_points"),
+        trajectory_max_points=trajectory_max_points,
         trajectory_max_age_frames=trajectory_max_age_frames,
         trajectory_width=trajectory_width,
         trajectory_per_track_color=_as_bool(raw.get("trajectory_per_track_color"), True),
         trajectory_taper=_as_bool(raw.get("trajectory_taper"), True),
         draw_current_center=_as_bool(raw.get("draw_current_center"), True),
+        draw_predicted_center=_as_bool(raw.get("draw_predicted_center"), False),
         draw_search_circle=_as_bool(raw.get("draw_search_circle"), False),
         label_track_id=_as_bool(raw.get("label_track_id"), True),
+        render_confirmed_only=render_confirmed_only,
+        export_confirmed_only=export_confirmed_only,
         algorithm=algorithm,
         reid_weights=_as_optional_str(raw.get("reid_weights")),
         reid_device=_as_optional_str(raw.get("reid_device")),
