@@ -215,7 +215,7 @@ output:
 inference:
   # Explicit image/video/folder/HTTP(S) inputs. Options: list of supported sources.
   sources:
-    - /home/new_users/zhiyu/datasets/soccer/raw/raw_video/1984090406020124673.mp4
+    - /mnt/data/Datasets/Datasets/Football/xbotgo_football_data_0608/videos/2042525152494694401.mp4
   # Recurse into folder sources. Options: true, false.
   recursive: true
   # Maximum discovered sources after type caps. Options: all, null, or positive integer.
@@ -246,6 +246,30 @@ inference:
     target_class_ids: []
     # Category names to export when IDs are empty. Options: name list.
     target_class_names: [football]
+  # Canonical V2 video bundle for VLM training and offline full-video inference. Options: mapping.
+  canonical_output:
+    # Produce canonical_v2 metadata, frame, track, and clean-media artifacts for video sources. Options: true, false.
+    enabled: true
+    # Bundle directory inside the run output. Options: relative directory name or path.
+    directory: canonical_v2
+    # FFmpeg executable used to create clean clips. Options: auto for PATH discovery, or an executable path.
+    ffmpeg_path: auto
+    # FFprobe executable used for stream metadata and validation. Options: auto for PATH discovery, or an executable path.
+    ffprobe_path: auto
+    # Clean, overlay-free selected-video encoding settings. Options: mapping.
+    media:
+      # Output video encoder. Options: an FFmpeg encoder such as libx264.
+      video_codec: libx264
+      # Constant-rate-factor quality value; lower is higher quality. Options: integer supported by the encoder.
+      crf: 18
+      # Video encoder speed/compression tradeoff. Options: an FFmpeg preset such as medium.
+      preset: medium
+      # Broadly compatible output pixel format. Options: an FFmpeg pixel format such as yuv420p.
+      pixel_format: yuv420p
+      # Audio encoder used when the source has audio. Options: an FFmpeg encoder such as aac.
+      audio_codec: aac
+      # Audio bitrate used when the source has audio. Options: FFmpeg bitrate string such as 192k.
+      audio_bitrate: 192k
   # Video segment, sampling, batching, and rendering settings. Options: mapping.
   video:
     # Detect every source frame. Options: null or positive FPS.
@@ -253,9 +277,9 @@ inference:
     # Detection-frame batch size; null inherits inference.batch_size, while SAHI model calls remain batch 4.
     batch_size: null
     # Begin each video at its first frame. Options: seconds, MM:SS, HH:MM:SS.
-    start_time: 00:15:00
+    start_time: null
     # Continue through each video end. Options: all, null, seconds, MM:SS, HH:MM:SS.
-    end_time: 00:16:00
+    end_time: null
     # Process the entire selected range. Options: all, null, or positive duration.
     max_seconds: all
     # Preserve each input video's FPS. Options: null or positive FPS.
@@ -519,7 +543,7 @@ sahi:
   # Keep slice merging class-aware. Options: true, false.
   postprocess_class_agnostic: false
   # Real RF-DETR batch used by first-stage slices and recheck crops. Options: positive integer.
-  batch_size: 4
+  batch_size: 8
   # Target-class centered second-pass verification. Options: mapping.
   recheck:
     # Enable centered football verification. Options: true, false.

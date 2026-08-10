@@ -105,6 +105,30 @@ inference:
     target_class_ids: []
     # Category names to export when IDs are empty. Empty defaults to football. Options: names such as [football].
     target_class_names: [football]
+  # Canonical V2 video bundle for VLM training and offline full-video inference. Options: mapping.
+  canonical_output:
+    # Produce canonical_v2 metadata, frame, track, and clean-media artifacts for video sources. Options: true, false.
+    enabled: true
+    # Bundle directory inside the run output. Options: relative directory name or path.
+    directory: canonical_v2
+    # FFmpeg executable used to create clean clips. Options: auto for PATH discovery, or an executable path.
+    ffmpeg_path: auto
+    # FFprobe executable used for stream metadata and validation. Options: auto for PATH discovery, or an executable path.
+    ffprobe_path: auto
+    # Clean, overlay-free selected-video encoding settings. Options: mapping.
+    media:
+      # Output video encoder. Options: an FFmpeg encoder such as libx264.
+      video_codec: libx264
+      # Constant-rate-factor quality value; lower is higher quality. Options: integer supported by the encoder.
+      crf: 18
+      # Video encoder speed/compression tradeoff. Options: an FFmpeg preset such as medium.
+      preset: medium
+      # Broadly compatible output pixel format. Options: an FFmpeg pixel format such as yuv420p.
+      pixel_format: yuv420p
+      # Audio encoder used when the source has audio. Options: an FFmpeg encoder such as aac.
+      audio_codec: aac
+      # Audio bitrate used when the source has audio. Options: FFmpeg bitrate string such as 192k.
+      audio_bitrate: 192k
   video:
     detection_fps: null
     batch_size: null

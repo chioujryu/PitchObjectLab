@@ -774,9 +774,11 @@ uv run python inference_rf_detr_model.py --config config/rf_detr_inference.yaml 
 uv run python inference_rf_detr_model.py --config config/rf_detr_inference.yaml --source D:/clips/match.mp4 --yes
 ```
 
-Each run writes rendered media, `predictions.jsonl`, `football_predictions.jsonl`,
-`class_colors.json`, an `inference_summary.json`, and a config snapshot into the
-output folder.
+Each run keeps writing the legacy rendered media, `predictions.jsonl`,
+`football_predictions.jsonl`, `class_colors.json`, `inference_summary.json`, and
+a config snapshot into the output folder. Video sources additionally produce
+Canonical Video Output V2 bundles by default; this is an additive interface and
+does not change the legacy JSONL schemas.
 
 Video inference defaults to a bounded, single-decode streaming pipeline:
 
@@ -790,10 +792,12 @@ inference:
 
 Decoded frames are passed directly to the batched evaluator in memory, then
 tracked, rendered, and encoded in source order. This removes the former JPEG
-frame cache and second complete video decode. Set `save_video: false` or
-`--no-save-video` for JSON-only inference. When `detection_fps` skips model
-frames, enabled trackers are still advanced on every source frame so their age
-and motion state remain in video-frame units.
+frame cache and second complete video decode. `save_video: false` or
+`--no-save-video` disables only the annotated video; the Canonical V2 clean clip
+is controlled separately. For a truly JSON-only run, use both
+`--no-save-video --no-canonical-output`. When `detection_fps` skips model frames,
+enabled trackers are still advanced on every source frame so their age and
+motion state remain in video-frame units.
 
 `inference_summary.json` and `run_timing.json` separate decode, frame
 conversion, crop, host preprocessing, H2D, resize/normalize, forward,
@@ -840,6 +844,163 @@ categories before the confirmation prompt or any output is created. For
 numeric-only class metadata, set `target_class_ids` explicitly. The summaries
 report `football_prediction_count` and `football_predictions_file`; the
 pre-run estimate includes the additional JSONL file.
+
+### Canonical Video Output V2
+
+Canonical V2 is the frame-complete, VLM-facing video interface. It is enabled by
+default for every video inference pipeline (one-pass, batched, and streaming)
+and every tracker. Image and temporal inference do not create Canonical
+bundles. Configure the exporter under `inference.canonical_output`:
+
+```yaml
+inference:
+  canonical_output:
+    enabled: true
+    directory: canonical_v2
+    ffmpeg_path: auto
+    ffprobe_path: auto
+    media:
+      video_codec: libx264
+      crf: 18
+      preset: medium
+      pixel_format: yuv420p
+      audio_codec: aac
+      audio_bitrate: 192k
+```
+
+The equivalent CLI controls are `--canonical-output` /
+`--no-canonical-output`, `--canonical-output-dir DIR`,
+`--ffmpeg-path PATH`, and `--ffprobe-path PATH`. CLI values override YAML.
+`inference.video.save_video` and `--save-video` control only the annotated
+rendered video; disabling them does not disable `media.mp4`.
+Use `--no-save-video --no-canonical-output` together for a truly JSON-only run.
+
+Every selected source video gets an independent bundle:
+
+```text
+canonical_v2/
+  manifest.json
+  <video_id>/
+    metadata.json
+    frames.jsonl
+    tracks.jsonl
+    media.mp4
+```
+
+All documents and JSONL rows carry `schema_version: "2.0.0"`. `video_id` is a
+stable hash of the source and requested selected range; track IDs are scoped to
+that `video_id`, not to the full inference run. The run-level `manifest.json`
+lists only fully published bundles using relative paths. Each bundle is first
+written under a `.partial` directory, validated, and atomically renamed; the
+manifest is updated last, so an interrupted export is not presented as valid.
+
+`metadata.json` is the authoritative video-level record. Its top-level objects
+are `source`, `selected_segment`, `video`, `processing`, `audio`, `timestamps`,
+`coordinate_convention`, `categories`, `producer`, `tracker`, `artifacts`,
+`annotated_output`, and `clean_media`, together with `schema_version` and
+`video_id`. They record:
+
+- decoded and display width/height, rational and float FPS, time base, CFR/VFR
+  status, codec, rotation, pixel format, and probe provenance;
+- the requested and actual selected range, source/decoded/detection/clean-media
+  frame counts, start/end frame and timestamp, and durations;
+- detection frame interval, requested/effective detection FPS, annotated output
+  FPS, timestamp source/fallback counts, detector checkpoint/config, and
+  category mapping;
+- audio presence and selected stream, tracker algorithm, offline
+  lookahead/backfill settings, and the reliable observed/predicted/CMC
+  capabilities exposed by that tracker; and
+- relative artifact paths plus post-encode clean-media validation results.
+
+`frames.jsonl` contains exactly one row per actually decoded frame in the
+selected segment, including empty frames and frames on which the detector did
+not run. The row contract is:
+
+```text
+schema_version, video_id,
+segment_frame_index, source_frame_index,
+source_timestamp_seconds, segment_timestamp_seconds, timestamp_source,
+segment_progress, detection_ran,
+detections[], track_states[], camera_motion
+```
+
+`segment_frame_index` is the primary zero-based index. Decoder timestamps are
+preferred; a missing, invalid, or non-monotonic value falls back to nominal
+`source_frame_index / FPS`, and `timestamp_source` identifies the choice on
+each row. `detections` contains every final detector class. Hybrid rows preserve
+the committed detector candidates before the optional legacy
+`export_confirmed_only` filter. A track state refers to an observed detection by
+`detection_index`; predicted-only states use `null` and never invent a detector
+score. `camera_motion` is `null` for trackers without a reliable transform.
+Hybrid may provide the previous-to-current affine, pixel translation, scale,
+clockwise rotation, success/inlier diagnostics, method, processing scale, and
+failure reason.
+
+Each detection has:
+
+```text
+detection_index, category_id, category_name, score,
+bbox_xyxy_pixels, bbox_xyxy_normalized,
+center_pixels, center_normalized,
+area_pixels, area_normalized,
+was_clipped, in_frame, attributes
+```
+
+Each track state adds `track_id`, `provenance` (`observed` or `predicted`),
+`status`, `hits`, `age_frames`, `seconds_since_observed`, the same geometry
+fields, and a `motion` object. Motion is calculated in image space with the
+actual timestamp delta and includes pixel/normalized velocity and speed,
+clockwise direction plus an eight-way direction label, acceleration, and bbox
+log-area change. The first usable point, non-positive time deltas, and unknown
+frame gaps use `null` motion components rather than a fabricated zero.
+
+Canonical boxes use continuous edge coordinates
+`[x1, y1, x2, y2]`. Width and height are `x2 - x1` and `y2 - y1`; there is no
+inclusive-pixel `+1`. Pixel coordinates retain their original out-of-frame
+values so clipping is auditable. Normalized bbox edges and centers divide by
+the decoded frame width/height and are clamped to `[0, 1]`; normalized area is
+relative to frame area. Signed normalized motion values are scale conversions,
+not probabilities, and are not clamped.
+
+`tracks.jsonl` has one row per video-scoped track. The row stores category
+IDs/names, start/end frame and time, duration, point/observed/predicted counts,
+maximum frame/time gap, detector-score statistics, pixel/normalized path
+length, and pixel/normalized net displacement. Its ordered `points` repeat
+center, provenance, lifecycle, score, and motion information, but deliberately
+do not duplicate the full bbox history already available in `frames.jsonl`.
+
+Canonical output is an offline contract. In particular, Hybrid fixed-delay
+lookahead and tentative-frame backfill are committed in original frame order,
+so a row can reflect evidence from a later source frame. Do not treat these
+rows as causal online predictions. Generic trackers export observed states
+universally and predicted geometry only when their stable adapter exposes it;
+unsupported values stay `null` and are declared in the metadata capabilities.
+All speed and displacement fields are image-space values, not pitch/world
+coordinates or physical ball speed.
+
+Canonical video export requires FFmpeg and the configured video/audio encoders.
+`auto` resolves executables from `PATH`; an explicit executable path is also
+accepted. FFprobe enriches rational-FPS, VFR, container, rotation, and audio
+metadata when available, with OpenCV/FFmpeg fallback provenance otherwise.
+Before creating a bundle, the runner validates the required executable and
+encoders. `media.mp4` is an exact re-encode of the actually processed selected
+range with reset timestamps, no boxes or overlays, and the source's
+default/first audio stream when present. If that audio stream ends before the
+selected video range, the exporter pads only the missing tail with silence so
+the clean clip remains synchronized. Sources without audio are recorded as
+`has_audio: false`. Dimensions, decoded frame count, duration, and audio/video
+synchronization are checked after encoding.
+
+The dry-run and confirmation estimate includes the manifest plus four files per
+video and a content-dependent clean-media disk/time estimate.
+`inference_summary.json` reports the Canonical manifest path and
+video/frame/track/media counts.
+
+The existing `predictions.jsonl`, `football_predictions.jsonl`, and
+`track_states.jsonl` retain their schemas and coordinate semantics:
+`predictions.jsonl` keeps COCO top-left `bbox = [x, y, width, height]`, and
+`football_predictions.jsonl` keeps center-based `xywh`. Consumers should opt
+into Canonical V2 rather than reinterpreting those legacy fields.
 
 When `inference.mode: sahi` and `sahi.recheck.enabled: true`,
 `sahi.recheck.fused_confidence_threshold` is the final minimum score for every

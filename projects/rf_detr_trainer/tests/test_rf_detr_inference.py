@@ -402,6 +402,79 @@ class RfDetrInferenceTest(unittest.TestCase):
             disabled_estimate["estimated_total_files"] + 1,
         )
 
+    def test_canonical_output_estimates_manifest_four_bundle_files_and_media_time(self):
+        item = inference_runner.SourceItem(
+            source="fixture.mp4", kind="video", is_url=False, local_path=None
+        )
+        common_inference = {
+            "video": {"max_seconds": 1, "save_video": False},
+            "football_output": {"enabled": False},
+        }
+        disabled = {
+            "runtime": {"time_estimate": {"enabled": False}},
+            "inference": {**common_inference, "canonical_output": {"enabled": False}},
+        }
+        enabled = {
+            "runtime": {"time_estimate": {"enabled": False}},
+            "inference": {**common_inference, "canonical_output": {"enabled": True}},
+        }
+
+        disabled_estimate = inference_runner.estimate_outputs([item], Path("runs/disabled"), disabled)
+        enabled_estimate = inference_runner.estimate_outputs([item], Path("runs/enabled"), enabled)
+
+        self.assertEqual(
+            enabled_estimate["estimated_total_files"],
+            disabled_estimate["estimated_total_files"] + 5,
+        )
+        self.assertTrue(enabled_estimate["canonical_v2"]["enabled"])
+        self.assertEqual(enabled_estimate["canonical_v2"]["video_bundles"], 1)
+        self.assertGreater(enabled_estimate["canonical_v2"]["estimated_bytes"], 0)
+        self.assertGreater(enabled_estimate["canonical_v2"]["estimated_transcode_seconds"], 0)
+
+    def test_temporal_mode_excludes_canonical_video_estimate(self):
+        item = inference_runner.SourceItem(
+            source="fixture.mp4", kind="video", is_url=False, local_path=None
+        )
+        config = {
+            "model": {
+                "motion": {
+                    "enabled": True,
+                    "type": "tracknet_v5",
+                    "temporal": {"mode": "real"},
+                }
+            },
+            "inference": {
+                "video": {"max_seconds": 1},
+                "canonical_output": {"enabled": True},
+            },
+        }
+
+        estimate = inference_runner.estimate_outputs([item], Path("runs/temporal"), config)
+
+        self.assertFalse(estimate["canonical_v2"]["enabled"])
+        self.assertEqual(estimate["canonical_v2"]["video_bundles"], 0)
+
+    def test_decoded_timestamp_fallback_is_strictly_monotonic(self):
+        class Capture:
+            def __init__(self, milliseconds):
+                self.milliseconds = milliseconds
+
+            def get(self, _property):
+                return self.milliseconds
+
+        cv2_stub = SimpleNamespace(CAP_PROP_POS_MSEC=1)
+        timestamp, source = inference_runner.decoded_frame_timestamp(
+            Capture(0.0), cv2_stub, 30, 30.0, 1.1
+        )
+        self.assertEqual(source, "nominal_fps")
+        self.assertAlmostEqual(timestamp, 1.1 + 1.0 / 30.0)
+
+        timestamp, source = inference_runner.decoded_frame_timestamp(
+            Capture(1200.0), cv2_stub, 31, 30.0, 1.1
+        )
+        self.assertEqual(source, "decoder_pts")
+        self.assertAlmostEqual(timestamp, 1.2)
+
     def test_stage_timing_summary_includes_sahi_and_recheck_ratios(self):
         model = SimpleNamespace()
         model._rf_detr_workload_counters = {"model_batches": 3}
@@ -688,6 +761,49 @@ class RfDetrInferenceTest(unittest.TestCase):
         # is the per-preset safety setting above, not a frozen file count.
         self.assertGreaterEqual(trajectory_presets, 17)
 
+    def test_all_standalone_inference_presets_declare_canonical_v2_defaults(self):
+        config_dir = PROJECT_DIR / "config"
+        expected = {
+            "enabled": True,
+            "directory": "canonical_v2",
+            "ffmpeg_path": "auto",
+            "ffprobe_path": "auto",
+            "media": {
+                "video_codec": "libx264",
+                "crf": 18,
+                "preset": "medium",
+                "pixel_format": "yuv420p",
+                "audio_codec": "aac",
+                "audio_bitrate": "192k",
+            },
+        }
+        standalone_paths = []
+        overlay_paths = []
+
+        for path in sorted(config_dir.glob("rf_detr_inference*.yaml")):
+            raw_text = path.read_text(encoding="utf-8")
+            if "\nextends:" in raw_text:
+                overlay_paths.append(path.name)
+                with self.subTest(config=path.name):
+                    config = inference_runner.load_yaml(path)
+                    self.assertEqual(config["inference"]["canonical_output"], expected)
+                continue
+            standalone_paths.append(path.name)
+            with self.subTest(config=path.name):
+                config = inference_runner.load_yaml(path)
+                self.assertEqual(config["inference"]["canonical_output"], expected)
+                self.assertEqual(raw_text.count("\n  canonical_output:\n"), 1)
+
+        self.assertEqual(len(standalone_paths), 19)
+        self.assertEqual(
+            overlay_paths,
+            [
+                "rf_detr_inference_medium_p2_performance_fast.yaml",
+                "rf_detr_inference_medium_p2_performance_safe.yaml",
+                "rf_detr_inference_smoke_temporal_tracknet_v5.yaml",
+            ],
+        )
+
     def test_all_tracking_presets_explicitly_declare_confirmation_render_controls(self):
         config_dir = PROJECT_DIR / "config"
         tracking_paths = []
@@ -849,6 +965,32 @@ class RfDetrInferenceTest(unittest.TestCase):
         config = {}
         inference_runner.apply_cli_overrides(config, self._cli_args())
         self.assertNotIn("tracking", config.get("inference", {}))
+
+    def test_cli_canonical_output_overrides_are_applied_together(self):
+        config = {}
+        inference_runner.apply_cli_overrides(
+            config,
+            self._cli_args(
+                canonical_output=False,
+                canonical_output_dir="vlm_packets",
+                ffmpeg_path="/opt/media/ffmpeg",
+                ffprobe_path="/opt/media/ffprobe",
+            ),
+        )
+        self.assertEqual(
+            config["inference"]["canonical_output"],
+            {
+                "enabled": False,
+                "directory": "vlm_packets",
+                "ffmpeg_path": "/opt/media/ffmpeg",
+                "ffprobe_path": "/opt/media/ffprobe",
+            },
+        )
+
+    def test_cli_without_canonical_flags_adds_no_empty_mapping(self):
+        config = {}
+        inference_runner.apply_cli_overrides(config, self._cli_args())
+        self.assertNotIn("canonical_output", config.get("inference", {}))
 
     def test_cli_selects_tensorrt_bf16_and_artifact_options(self):
         config = {

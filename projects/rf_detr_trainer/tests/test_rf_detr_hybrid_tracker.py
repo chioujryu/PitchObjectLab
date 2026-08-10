@@ -129,6 +129,31 @@ class HybridFootballTrackerTest(unittest.TestCase):
         self.assertEqual(set(state["motion_model_probabilities"]), {"constant_velocity", "constant_acceleration"})
         self.assertIn("association", state)
         self.assertEqual(frame["cmc"]["method"], "identity")
+        self.assertEqual(frame["cmc_affine"], [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+
+    def test_cmc_affine_is_preserved_on_delayed_committed_packets(self):
+        tracker = self.make_tracker(lookahead_seconds=0.10)
+        identity = np.asarray([[1, 0, 0], [0, 1, 0]], dtype=np.int64)
+        previous_to_current = np.asarray([[1, 0, 4], [0, 1, -2]], dtype=np.int64)
+        diagnostic = {"method": "mock", "success": True, "reason": None, "inliers": 10}
+
+        with patch.object(
+            tracker._cmc,
+            "estimate",
+            side_effect=[(identity, diagnostic), (previous_to_current, diagnostic)],
+        ):
+            self.assertEqual(tracker.step(0, 0.0, None, []), [])
+            committed = tracker.step(1, 0.10, None, [])
+
+        self.assertEqual(committed[0]["cmc_affine"], [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+        self.assertEqual(
+            tracker.latest_frame()["cmc_affine"],
+            [[1.0, 0.0, 4.0], [0.0, 1.0, -2.0]],
+        )
+        self.assertEqual(
+            tracker.flush()[0]["cmc_affine"],
+            [[1.0, 0.0, 4.0], [0.0, 1.0, -2.0]],
+        )
 
     def test_nearby_stationary_balls_do_not_churn_ids_under_default_ambiguity_policy(self):
         tracker = self.make_tracker(lookahead_seconds=0.0)

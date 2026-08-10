@@ -411,6 +411,10 @@ class HybridFootballTracker:
                 "track_states": states,
                 "track_snapshots": snapshots,
                 "cmc": cmc_diagnostic,
+                "cmc_affine": [
+                    [float(value) for value in row]
+                    for row in np.asarray(affine, dtype=np.float64).reshape(2, 3)
+                ],
         }
         self._latest = frame_result
         sequence_index = self._processed_count

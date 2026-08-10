@@ -657,6 +657,34 @@ def _video_frame_count(path):
         capture.release()
 
 
+class _RecordingCanonicalVideo:
+    def __init__(self, start_kwargs):
+        self.start_kwargs = dict(start_kwargs)
+        self.frames = []
+        self.finalize_kwargs = None
+
+    def write_frame(self, **kwargs):
+        self.frames.append(dict(kwargs))
+
+    def finalize(self, **kwargs):
+        self.finalize_kwargs = dict(kwargs)
+        return {"frame_count": len(self.frames)}
+
+
+class _RecordingCanonicalRun:
+    def __init__(self):
+        self.videos = []
+        self.abort_count = 0
+
+    def start_video(self, **kwargs):
+        video = _RecordingCanonicalVideo(kwargs)
+        self.videos.append(video)
+        return video
+
+    def abort_active(self):
+        self.abort_count += 1
+
+
 class SyntheticVideoTrackingTest(unittest.TestCase):
     @staticmethod
     def _pipeline_options(pipeline):
@@ -694,14 +722,14 @@ class SyntheticVideoTrackingTest(unittest.TestCase):
             )
         return rows, target
 
-    def _run_hybrid(self, tmp, pipeline):
+    def _run_hybrid(self, tmp, pipeline, canonical_run=None, detection_fps=None):
         video_path = Path(tmp) / "clip.mp4"
         _write_synthetic_video(video_path)
         output_dir = Path(tmp) / f"hybrid_{pipeline}"
         output_dir.mkdir(parents=True, exist_ok=True)
         item = inference_runner.SourceItem(source=str(video_path), kind="video", is_url=False, local_path=video_path)
         video_cfg = {
-            "detection_fps": None,
+            "detection_fps": detection_fps,
             "start_time": 0,
             "end_time": "all",
             "max_seconds": "all",
@@ -726,7 +754,18 @@ class SyntheticVideoTrackingTest(unittest.TestCase):
             inference_runner.evaluator, "predict_images_rfdetr", _fake_predict_images_rfdetr
         ):
             rows, target, _ = inference_runner.predict_video_file(
-                item, 1, None, {}, CATEGORIES, output_dir, [], video_cfg, tracking_config, "cpu", states
+                item,
+                1,
+                None,
+                {},
+                CATEGORIES,
+                output_dir,
+                [],
+                video_cfg,
+                tracking_config,
+                "cpu",
+                states,
+                canonical_run=canonical_run,
             )
         return rows, states, target
 
@@ -751,6 +790,57 @@ class SyntheticVideoTrackingTest(unittest.TestCase):
             self.assertTrue(rows and states)
             self.assertEqual({row["frame_index"] for row in states}, set(SCRIPT))
 
+    def test_hybrid_canonical_commits_keep_order_predictions_and_cmc_affine(self):
+        results = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            for pipeline in ("streaming", "one_pass", "batched"):
+                canonical_run = _RecordingCanonicalRun()
+                self._run_hybrid(
+                    tmp,
+                    pipeline,
+                    canonical_run=canonical_run,
+                    detection_fps=15,
+                )
+                self.assertEqual(canonical_run.abort_count, 0)
+                self.assertEqual(len(canonical_run.videos), 1)
+                canonical_video = canonical_run.videos[0]
+                frames = canonical_video.frames
+                self.assertEqual(
+                    [row["segment_frame_index"] for row in frames], list(range(len(SCRIPT)))
+                )
+                self.assertEqual(
+                    [row["detection_ran"] for row in frames],
+                    [True, False, True, False, True, False],
+                )
+                self.assertEqual(
+                    [len(row["detections"]) for row in frames], [1, 0, 1, 0, 1, 0]
+                )
+                self.assertEqual(
+                    [[state["observation"] for state in row["track_states"]] for row in frames],
+                    [["observed"], [], ["observed"], ["predicted"], ["observed"], ["predicted"]],
+                )
+                for row in frames:
+                    motion = row["camera_motion"]
+                    self.assertIsNotNone(motion)
+                    affine = motion["affine_previous_to_current"]
+                    self.assertEqual(len(affine), 2)
+                    self.assertTrue(all(len(values) == 3 for values in affine))
+                results[pipeline] = [
+                    (
+                        row["segment_frame_index"],
+                        row["source_frame_index"],
+                        round(float(row["source_timestamp_seconds"]), 6),
+                        row["timestamp_source"],
+                        row["detection_ran"],
+                        len(row["detections"]),
+                        [state["observation"] for state in row["track_states"]],
+                    )
+                    for row in frames
+                ]
+
+        self.assertEqual(results["streaming"], results["one_pass"])
+        self.assertEqual(results["streaming"], results["batched"])
+
     def test_streaming_one_pass_and_batched_match_and_track_is_stable(self):
         with tempfile.TemporaryDirectory() as tmp:
             results = {
@@ -770,6 +860,107 @@ class SyntheticVideoTrackingTest(unittest.TestCase):
                 self.assertTrue(video.exists() and video.stat().st_size > 0)
                 self.assertEqual(_video_frame_count(video), len(SCRIPT))
                 self.assertTrue(all(row.get("track_id") is not None for row in rows if row["category_id"] == 1))
+
+    def test_canonical_packets_cover_every_frame_and_match_all_video_pipelines(self):
+        results = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            video_path = Path(tmp) / "canonical_clip.mp4"
+            _write_synthetic_video(video_path)
+            item = inference_runner.SourceItem(
+                source=str(video_path), kind="video", is_url=False, local_path=video_path
+            )
+            tracking_config = inference_runner.video_tracking.parse_tracking_config(
+                {"inference": {"tracking": {
+                    "enabled": True,
+                    "algorithm": "circle",
+                    "radius_pixels": 80,
+                    "use_velocity_prediction": True,
+                }}},
+                CATEGORIES,
+            )
+            for pipeline in ("streaming", "one_pass", "batched"):
+                output_dir = Path(tmp) / f"canonical_{pipeline}"
+                output_dir.mkdir(parents=True, exist_ok=True)
+                canonical_run = _RecordingCanonicalRun()
+                video_cfg = {
+                    **self._pipeline_options(pipeline),
+                    "save_video": False,
+                    "detection_fps": 15,
+                    "start_time": 0,
+                    "end_time": "all",
+                    "max_seconds": "all",
+                }
+                with mock.patch.object(
+                    inference_runner.evaluator, "predict_image", _fake_predict_image
+                ), mock.patch.object(
+                    inference_runner.evaluator,
+                    "predict_images_rfdetr",
+                    _fake_predict_images_rfdetr,
+                ):
+                    _rows, target, _next_id = inference_runner.predict_video_file(
+                        item,
+                        1,
+                        None,
+                        {},
+                        CATEGORIES,
+                        output_dir,
+                        [],
+                        video_cfg,
+                        tracking_config,
+                        canonical_run=canonical_run,
+                    )
+
+                self.assertIsNone(target)
+                self.assertEqual(canonical_run.abort_count, 0)
+                self.assertEqual(len(canonical_run.videos), 1)
+                canonical_video = canonical_run.videos[0]
+                self.assertIsNotNone(canonical_video.finalize_kwargs)
+                self.assertIsNone(canonical_video.finalize_kwargs["annotated_output"])
+                self.assertEqual(canonical_video.start_kwargs["width"], 64)
+                self.assertEqual(canonical_video.start_kwargs["height"], 64)
+                frames = canonical_video.frames
+                self.assertEqual(
+                    [row["segment_frame_index"] for row in frames], list(range(len(SCRIPT)))
+                )
+                self.assertEqual(
+                    [row["source_frame_index"] for row in frames], list(range(len(SCRIPT)))
+                )
+                self.assertEqual(
+                    [row["detection_ran"] for row in frames],
+                    [True, False, True, False, True, False],
+                )
+                self.assertEqual(
+                    [len(row["detections"]) for row in frames], [1, 0, 1, 0, 1, 0]
+                )
+                self.assertEqual(
+                    [state["observation"] for row in frames for state in row["track_states"]],
+                    ["observed", "predicted", "observed", "predicted", "observed", "predicted"],
+                )
+                self.assertTrue(
+                    all(
+                        "score" not in state
+                        for row in frames
+                        for state in row["track_states"]
+                        if state["observation"] == "predicted"
+                    )
+                )
+                timestamps = [row["source_timestamp_seconds"] for row in frames]
+                self.assertTrue(all(right > left for left, right in zip(timestamps, timestamps[1:])))
+                results[pipeline] = [
+                    (
+                        row["segment_frame_index"],
+                        row["source_frame_index"],
+                        round(float(row["source_timestamp_seconds"]), 6),
+                        row["timestamp_source"],
+                        row["detection_ran"],
+                        len(row["detections"]),
+                        [state["observation"] for state in row["track_states"]],
+                    )
+                    for row in frames
+                ]
+
+        self.assertEqual(results["streaming"], results["one_pass"])
+        self.assertEqual(results["streaming"], results["batched"])
 
     def test_sahi_recheck_filter_runs_before_tracker_and_render(self):
         class RecordingTracker:

@@ -49,6 +49,7 @@ from PIL import Image, ImageDraw, ImageFont  # noqa: E402
 from tqdm import tqdm  # noqa: E402
 
 import rf_detr_runtime as trainer  # noqa: E402
+import rf_detr_canonical_output as canonical_output  # noqa: E402
 import rf_detr_video_tracking as video_tracking  # noqa: E402
 from projects.object_detection_dataset_evaluator import object_detection_dataset_evaluator as evaluator  # noqa: E402
 
@@ -196,6 +197,17 @@ def apply_cli_overrides(config: MutableMapping[str, Any], args: argparse.Namespa
         inference.setdefault("video", {})["streaming"] = bool(args.video_streaming)
     if getattr(args, "save_video", None) is not None:
         inference.setdefault("video", {})["save_video"] = bool(args.save_video)
+    canonical_overrides = {
+        "enabled": getattr(args, "canonical_output", None),
+        "directory": getattr(args, "canonical_output_dir", None),
+        "ffmpeg_path": getattr(args, "ffmpeg_path", None),
+        "ffprobe_path": getattr(args, "ffprobe_path", None),
+    }
+    if any(value is not None for value in canonical_overrides.values()):
+        canonical_output = inference.setdefault("canonical_output", {})
+        for key, value in canonical_overrides.items():
+            if value is not None:
+                canonical_output[key] = bool(value) if key == "enabled" else value
     if getattr(args, "cmc_processing_scale", None) is not None:
         if not 0.0 < float(args.cmc_processing_scale) <= 1.0:
             raise ValueError("--cmc-processing-scale must be in the range (0, 1].")
@@ -437,6 +449,8 @@ def estimate_video_work(item: SourceItem, video_cfg: Mapping[str, Any]) -> Dict[
         "output_frames": output_frames,
         "detection_frames": detection_frames,
         "input_fps": input_fps,
+        "source_num_frames": frame_count,
+        "source_duration_seconds": (frame_count / input_fps) if frame_count > 0 else None,
         "width": width,
         "height": height,
         "metadata_source": metadata_source,
@@ -620,9 +634,32 @@ def estimate_outputs(items: Sequence[SourceItem], output_dir: Path, config: Mapp
         output_files += 1
     if bool((config.get("inference", {}).get("tracking", {}) or {}).get("enabled", False)):
         output_files += 1  # tracking_summary.json
+    canonical_cfg = dict((config.get("inference", {}).get("canonical_output", {}) or {}))
+    canonical_enabled = (
+        bool(canonical_cfg.get("enabled", True))
+        and video_count > 0
+        and not trainer.temporal_motion_enabled(config)
+    )
+    canonical_estimated_bytes = 0
+    if canonical_enabled:
+        # One run manifest plus metadata/frames/tracks/clean media per video.
+        output_files += 1 + 4 * video_count
+        for work in video_work:
+            frame_total = max(0, int(work["output_frames"]))
+            width = max(1, int(work["width"]))
+            height = max(1, int(work["height"]))
+            # JSONL includes an empty-frame base row even when no detector runs.
+            json_bytes = frame_total * 640
+            # CRF output is content-dependent. This pixel-rate estimate is intentionally rough.
+            media_bytes = max(1_000_000, int(width * height * frame_total * 0.02))
+            canonical_estimated_bytes += json_bytes + media_bytes + 100_000
     tensorrt_artifacts = trainer.estimate_tensorrt_cache_artifacts(config)
     output_files += int(tensorrt_artifacts["file_count"])
-    estimated_bytes = max(local_bytes, output_files * 500_000) + int(tensorrt_artifacts["bytes"])
+    estimated_bytes = (
+        max(local_bytes, output_files * 500_000)
+        + canonical_estimated_bytes
+        + int(tensorrt_artifacts["bytes"])
+    )
     estimate = {
         "output_dir": str(output_dir),
         "sources": len(items),
@@ -638,13 +675,24 @@ def estimate_outputs(items: Sequence[SourceItem], output_dir: Path, config: Mapp
         "estimated_model_batches": model_batches,
         "estimated_sahi_slice_inputs": slice_inputs,
         "estimated_recheck_input_cap": recheck_input_cap,
+        "canonical_v2": {
+            "enabled": canonical_enabled,
+            "video_bundles": video_count if canonical_enabled else 0,
+            "estimated_bytes": canonical_estimated_bytes,
+            "estimated_disk_usage": trainer.format_bytes(canonical_estimated_bytes),
+        },
         "tensorrt_cache": tensorrt_artifacts,
         "estimated_total_files": output_files,
         "estimated_disk_usage": trainer.format_bytes(estimated_bytes),
-        "note": "URL/rendered-video sizes and first-run TensorRT artifacts in the configured cache are conservative estimates.",
+        "note": "URL/rendered/canonical-media sizes and first-run TensorRT artifacts are rough content-dependent estimates.",
     }
     settings = trainer.runtime_time_estimate_settings(config)
-    render_seconds = output_frames * trainer.positive_float_setting(settings, "default_video_render_seconds_per_frame")
+    per_frame_media_seconds = trainer.positive_float_setting(
+        settings, "default_video_render_seconds_per_frame"
+    )
+    render_seconds = output_frames * per_frame_media_seconds if save_video else 0.0
+    canonical_media_seconds = output_frames * per_frame_media_seconds if canonical_enabled else 0.0
+    estimate["canonical_v2"]["estimated_transcode_seconds"] = canonical_media_seconds
     trainer.add_runtime_estimate(
         estimate=estimate,
         config=config,
@@ -660,7 +708,11 @@ def estimate_outputs(items: Sequence[SourceItem], output_dir: Path, config: Mapp
             "video_work": video_work,
             "model_work": combined_model_work,
         },
-        extra_seconds=render_seconds + float(tensorrt_artifacts.get("estimated_build_seconds", 0) or 0),
+        extra_seconds=(
+            render_seconds
+            + canonical_media_seconds
+            + float(tensorrt_artifacts.get("estimated_build_seconds", 0) or 0)
+        ),
     )
     return estimate
 
@@ -1633,6 +1685,117 @@ def build_video_row(
     row["video_effective_end_seconds"] = frame_window.effective_end_seconds
     return row
 
+
+def decoded_frame_timestamp(
+    capture: Any,
+    cv2_module: Any,
+    absolute_frame_index: int,
+    input_fps: float,
+    previous_timestamp: Optional[float],
+) -> Tuple[float, str]:
+    """Return a monotonic decoder timestamp with an explicit nominal fallback."""
+    nominal = float(absolute_frame_index) / max(0.001, float(input_fps))
+    raw_milliseconds = float(capture.get(cv2_module.CAP_PROP_POS_MSEC) or 0.0)
+    decoded = raw_milliseconds / 1000.0
+    valid = math.isfinite(decoded) and decoded >= 0.0
+    if absolute_frame_index > 0 and decoded == 0.0:
+        valid = False
+    if previous_timestamp is not None and decoded <= previous_timestamp:
+        valid = False
+    if valid:
+        return decoded, "decoder_pts"
+    if previous_timestamp is not None:
+        nominal = max(nominal, previous_timestamp + 1.0 / max(0.001, float(input_fps)))
+    return nominal, "nominal_fps"
+
+
+def canonical_track_states_for_frame(
+    frame_predictions: Sequence[Mapping[str, Any]],
+    tracker: Any,
+    tracking_config: Optional[Any],
+    categories: Sequence[Mapping[str, Any]],
+    absolute_frame_index: int,
+    input_fps: float,
+) -> List[Dict[str, Any]]:
+    """Build tracker-agnostic observed states plus reliable circle predictions.
+
+    BoxMOT adapters intentionally expose only associated observations because
+    their unmatched internal state is not part of the stable adapter API.
+    """
+    id_to_name = {
+        int(category["id"]): str(category.get("name", category["id"]))
+        for category in categories
+    }
+    states: List[Dict[str, Any]] = []
+    observed_track_ids: set[int] = set()
+    for detection_index, prediction in enumerate(frame_predictions):
+        track_id = prediction.get("track_id")
+        if track_id is None:
+            continue
+        track_id = int(track_id)
+        observed_track_ids.add(track_id)
+        bbox = [float(value) for value in prediction.get("bbox", [])[:4]]
+        if len(bbox) == 4:
+            center = [bbox[0] + bbox[2] / 2.0, bbox[1] + bbox[3] / 2.0]
+        else:
+            center = [
+                float(prediction.get("track_center_x") or 0.0),
+                float(prediction.get("track_center_y") or 0.0),
+            ]
+        category_id = int(prediction.get("category_id", -1))
+        confirmed = bool(
+            prediction.get("track_final_confirmed", prediction.get("track_confirmed", False))
+        )
+        states.append(
+            {
+                "track_id": track_id,
+                "category_id": category_id,
+                "category_name": id_to_name.get(category_id, str(category_id)),
+                "status": prediction.get("track_status") or ("confirmed" if confirmed else "tentative"),
+                "observation": "observed",
+                "bbox": bbox if len(bbox) == 4 else None,
+                "center": center,
+                "detection_index": detection_index,
+                "hits": prediction.get("track_hits"),
+                "age_frames": prediction.get("track_age_frames"),
+                "seconds_since_observed": 0.0,
+                "final_confirmed": confirmed,
+            }
+        )
+
+    if (
+        tracker is None
+        or tracking_config is None
+        or str(getattr(tracking_config, "algorithm", "")).casefold() != "circle"
+    ):
+        return states
+    target_ids = sorted(int(value) for value in getattr(tracking_config, "target_class_ids", set()))
+    category_id = target_ids[0] if len(target_ids) == 1 else None
+    for track in getattr(tracker, "tracks", ()):  # Circle exposes a stable stdlib state object.
+        track_id = int(track.track_id)
+        if track_id in observed_track_ids or int(track.last_seen_frame_index) >= absolute_frame_index:
+            continue
+        elapsed_frames = absolute_frame_index - int(track.last_seen_frame_index)
+        center_x, center_y = video_tracking.predicted_center(track, tracking_config, elapsed_frames)
+        confirmed = int(track.hits) >= int(getattr(tracking_config, "min_hits", 1))
+        states.append(
+            {
+                "track_id": track_id,
+                "category_id": category_id,
+                "category_name": id_to_name.get(category_id) if category_id is not None else None,
+                "status": "lost" if confirmed else "tentative",
+                "observation": "predicted",
+                "bbox": None,
+                "center": [float(center_x), float(center_y)],
+                "detection_index": None,
+                "hits": int(track.hits),
+                "age_frames": absolute_frame_index - int(track.first_frame_index) + 1,
+                "seconds_since_observed": elapsed_frames / max(0.001, float(input_fps)),
+                "final_confirmed": confirmed,
+            }
+        )
+    return states
+
 def is_hybrid_tracker(tracker: Any) -> bool:
     """Whether a tracker uses delayed step/flush commits."""
     return tracker is not None and tracker.__class__.__name__ == "HybridFootballTracker"
@@ -1645,6 +1808,8 @@ def collect_hybrid_committed(
     source: str,
     input_fps: float,
     frame_window: VideoFrameWindow,
+    canonical_video_writer: Optional[Any] = None,
+    canonical_frame_meta: Optional[MutableMapping[int, Mapping[str, Any]]] = None,
 ) -> None:
     """Attach video metadata only after hybrid frames are committed."""
     for packet in packets:
@@ -1661,21 +1826,46 @@ def collect_hybrid_committed(
                     frame_window,
                 )
             )
-        if tracking_state_rows is None:
-            continue
-        for state in packet.get("track_states", []):
-            row = dict(state)
-            row.update(
-                source=source,
-                frame_index=absolute_frame_index,
+        if tracking_state_rows is not None:
+            for state in packet.get("track_states", []):
+                row = dict(state)
+                row.update(
+                    source=source,
+                    frame_index=absolute_frame_index,
+                    segment_frame_index=segment_frame_index,
+                    timestamp_seconds=absolute_frame_index / input_fps,
+                    segment_timestamp_seconds=segment_frame_index / input_fps,
+                    cmc=dict(packet.get("cmc", {})),
+                )
+                if packet.get("hypothesis"):
+                    row["hypothesis"] = dict(packet["hypothesis"])
+                tracking_state_rows.append(row)
+        if canonical_video_writer is not None:
+            if canonical_frame_meta is None:
+                raise RuntimeError("Hybrid Canonical V2 export requires frame metadata")
+            meta = canonical_frame_meta.pop(absolute_frame_index, None)
+            if meta is None:
+                raise RuntimeError(
+                    f"Hybrid tracker committed frame {absolute_frame_index} without Canonical metadata"
+                )
+            cmc = dict(packet.get("cmc", {}))
+            cmc_affine = packet.get("cmc_affine")
+            camera_motion = None
+            if cmc or cmc_affine is not None:
+                camera_motion = {
+                    **cmc,
+                    "affine_previous_to_current": cmc_affine,
+                }
+            canonical_video_writer.write_frame(
                 segment_frame_index=segment_frame_index,
-                timestamp_seconds=absolute_frame_index / input_fps,
-                segment_timestamp_seconds=segment_frame_index / input_fps,
-                cmc=dict(packet.get("cmc", {})),
+                source_frame_index=absolute_frame_index,
+                source_timestamp_seconds=float(meta["source_timestamp_seconds"]),
+                timestamp_source=str(meta["timestamp_source"]),
+                detection_ran=bool(meta["detection_ran"]),
+                detections=hybrid_packet_detections(packet),
+                track_states=list(packet.get("track_states", [])),
+                camera_motion=camera_motion,
             )
-            if packet.get("hypothesis"):
-                row["hypothesis"] = dict(packet["hypothesis"])
-            tracking_state_rows.append(row)
 
 
 def consume_hybrid_committed(
@@ -1691,6 +1881,8 @@ def consume_hybrid_committed(
     categories: Sequence[Mapping[str, Any]],
     render_ids: Sequence[int],
     tracking_config: Any,
+    canonical_video_writer: Optional[Any] = None,
+    canonical_frame_meta: Optional[MutableMapping[int, Mapping[str, Any]]] = None,
 ) -> Tuple[float, float]:
     """Publish and render committed Hybrid packets against their original frames.
 
@@ -1707,6 +1899,8 @@ def consume_hybrid_committed(
         source,
         input_fps,
         frame_window,
+        canonical_video_writer,
+        canonical_frame_meta,
     )
     render_seconds = 0.0
     encode_seconds = 0.0
@@ -1761,6 +1955,7 @@ def predict_video_file_one_pass(
     tracking_config: Optional[Any] = None,
     tracker_device: str = "cpu",
     tracking_state_rows: Optional[List[Dict[str, Any]]] = None,
+    canonical_run: Optional[Any] = None,
 ) -> Tuple[List[Dict[str, Any]], Optional[Path], int]:
     import cv2
 
@@ -1779,6 +1974,27 @@ def predict_video_file_one_pass(
     frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     frame_window = video_frame_window(frame_count, input_fps, video_cfg)
     frame_limit = frame_window.output_frames
+    try:
+        canonical_video = (
+            canonical_run.start_video(
+                source=item.source,
+                source_path=item.local_path,
+                width=width,
+                height=height,
+                input_fps=input_fps,
+                source_frame_count=frame_count,
+                frame_window=frame_window,
+                detection_fps=detection_fps,
+                frame_interval=frame_interval,
+                output_fps=output_fps,
+                tracking_config=tracking_config,
+            )
+            if canonical_run is not None
+            else None
+        )
+    except Exception:
+        capture.release()
+        raise
     if frame_window.start_frame > 0 and not capture.set(cv2.CAP_PROP_POS_FRAMES, frame_window.start_frame):
         capture.release()
         raise RuntimeError(f"Could not seek video for one-pass inference: {item.local_path}")
@@ -1812,6 +2028,8 @@ def predict_video_file_one_pass(
         raise
     hybrid_tracking = is_hybrid_tracker(tracker)
     hybrid_frame_buffer: Dict[int, Tuple[Any, bool]] = {}
+    canonical_frame_meta: Dict[int, Mapping[str, Any]] = {}
+    previous_canonical_timestamp: Optional[float] = None
     iterator = tqdm(total=frame_limit, desc=f"Inference video {item.local_path.name}", unit="frame")
     segment_frame_index = 0
     absolute_frame_index = frame_window.start_frame
@@ -1824,6 +2042,14 @@ def predict_video_file_one_pass(
             if not ok:
                 break
             should_detect = segment_frame_index % frame_interval == 0
+            source_timestamp, timestamp_source = decoded_frame_timestamp(
+                capture,
+                cv2,
+                absolute_frame_index,
+                input_fps,
+                previous_canonical_timestamp,
+            )
+            previous_canonical_timestamp = source_timestamp
             detected: List[Dict[str, Any]] = []
             if should_detect:
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -1847,6 +2073,12 @@ def predict_video_file_one_pass(
                 detected = filter_final_inference_predictions(detected, prediction_config)
                 image_id += 1
             if hybrid_tracking:
+                if canonical_video is not None:
+                    canonical_frame_meta[absolute_frame_index] = {
+                        "source_timestamp_seconds": source_timestamp,
+                        "timestamp_source": timestamp_source,
+                        "detection_ran": should_detect,
+                    }
                 if writer is not None:
                     hybrid_frame_buffer[absolute_frame_index] = (
                         frame,
@@ -1854,7 +2086,7 @@ def predict_video_file_one_pass(
                     )
                 committed = tracker.step(
                     absolute_frame_index,
-                    absolute_frame_index / input_fps,
+                    source_timestamp,
                     frame,
                     detected,
                 )
@@ -1870,6 +2102,8 @@ def predict_video_file_one_pass(
                     categories=categories,
                     render_ids=render_ids,
                     tracking_config=tracking_config,
+                    canonical_video_writer=canonical_video,
+                    canonical_frame_meta=canonical_frame_meta,
                 )
             else:
                 if tracker is not None:
@@ -1903,6 +2137,25 @@ def predict_video_file_one_pass(
                             )
                 if should_detect or tracker is not None:
                     last_predictions = frame_predictions
+                if canonical_video is not None:
+                    canonical_detections = frame_predictions if should_detect else []
+                    canonical_video.write_frame(
+                        segment_frame_index=segment_frame_index,
+                        source_frame_index=absolute_frame_index,
+                        source_timestamp_seconds=source_timestamp,
+                        timestamp_source=timestamp_source,
+                        detection_ran=should_detect,
+                        detections=canonical_detections,
+                        track_states=canonical_track_states_for_frame(
+                            canonical_detections,
+                            tracker,
+                            tracking_config,
+                            categories,
+                            absolute_frame_index,
+                            input_fps,
+                        ),
+                        camera_motion=None,
+                    )
                 if writer is not None and (should_detect or render_skipped):
                     pil_frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
                     rendered: Optional[Image.Image] = None
@@ -1939,9 +2192,13 @@ def predict_video_file_one_pass(
                 categories=categories,
                 render_ids=render_ids,
                 tracking_config=tracking_config,
+                canonical_video_writer=canonical_video,
+                canonical_frame_meta=canonical_frame_meta,
             )
             if hybrid_frame_buffer:
                 raise RuntimeError("Hybrid tracker flush did not commit every buffered source frame")
+            if canonical_frame_meta:
+                raise RuntimeError("Hybrid tracker flush did not commit every Canonical frame")
 
     finally:
         iterator.close()
@@ -1949,6 +2206,8 @@ def predict_video_file_one_pass(
         if writer is not None:
             writer.release()
         shutil.rmtree(frame_cache_dir, ignore_errors=True)
+    if canonical_video is not None:
+        canonical_video.finalize(annotated_output=target)
     return all_predictions, target, image_id
 
 
@@ -1965,6 +2224,7 @@ def predict_video_file_batched(
     tracking_config: Optional[Any] = None,
     tracker_device: str = "cpu",
     tracking_state_rows: Optional[List[Dict[str, Any]]] = None,
+    canonical_run: Optional[Any] = None,
 ) -> Tuple[List[Dict[str, Any]], Optional[Path], int]:
     """Batch RF-DETR detection frames, then render the selected video range."""
     import cv2
@@ -1984,6 +2244,27 @@ def predict_video_file_batched(
     frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     frame_window = video_frame_window(frame_count, input_fps, video_cfg)
     frame_limit = frame_window.output_frames
+    try:
+        canonical_video = (
+            canonical_run.start_video(
+                source=item.source,
+                source_path=item.local_path,
+                width=width,
+                height=height,
+                input_fps=input_fps,
+                source_frame_count=frame_count,
+                frame_window=frame_window,
+                detection_fps=detection_fps,
+                frame_interval=frame_interval,
+                output_fps=output_fps,
+                tracking_config=tracking_config,
+            )
+            if canonical_run is not None
+            else None
+        )
+    except Exception:
+        capture.release()
+        raise
     if frame_window.start_frame > 0 and not capture.set(cv2.CAP_PROP_POS_FRAMES, frame_window.start_frame):
         capture.release()
         raise RuntimeError(f"Could not seek video for batched detection: {item.local_path}")
@@ -2091,6 +2372,8 @@ def predict_video_file_batched(
         raise
     hybrid_tracking = is_hybrid_tracker(tracker)
     hybrid_frame_buffer: Dict[int, Tuple[Any, bool]] = {}
+    canonical_frame_meta: Dict[int, Mapping[str, Any]] = {}
+    previous_canonical_timestamp: Optional[float] = None
     last_predictions: List[Dict[str, Any]] = []
     segment_frame_index = 0
     render_iterator = tqdm(total=frame_limit, desc=f"Render video {item.local_path.name}", unit="frame")
@@ -2103,8 +2386,22 @@ def predict_video_file_batched(
                 break
             absolute_frame_index = frame_window.start_frame + segment_frame_index
             should_detect = segment_frame_index % frame_interval == 0
+            source_timestamp, timestamp_source = decoded_frame_timestamp(
+                render_capture,
+                cv2,
+                absolute_frame_index,
+                input_fps,
+                previous_canonical_timestamp,
+            )
+            previous_canonical_timestamp = source_timestamp
             detected = predictions_by_segment.get(segment_frame_index, []) if should_detect else []
             if hybrid_tracking:
+                if canonical_video is not None:
+                    canonical_frame_meta[absolute_frame_index] = {
+                        "source_timestamp_seconds": source_timestamp,
+                        "timestamp_source": timestamp_source,
+                        "detection_ran": should_detect,
+                    }
                 if writer is not None:
                     hybrid_frame_buffer[absolute_frame_index] = (
                         frame,
@@ -2112,7 +2409,7 @@ def predict_video_file_batched(
                     )
                 committed = tracker.step(
                     absolute_frame_index,
-                    absolute_frame_index / input_fps,
+                    source_timestamp,
                     frame,
                     detected,
                 )
@@ -2128,6 +2425,8 @@ def predict_video_file_batched(
                     categories=categories,
                     render_ids=render_ids,
                     tracking_config=tracking_config,
+                    canonical_video_writer=canonical_video,
+                    canonical_frame_meta=canonical_frame_meta,
                 )
             else:
                 if tracker is not None:
@@ -2159,6 +2458,25 @@ def predict_video_file_batched(
                             )
                 if should_detect or tracker is not None:
                     last_predictions = frame_predictions
+                if canonical_video is not None:
+                    canonical_detections = frame_predictions if should_detect else []
+                    canonical_video.write_frame(
+                        segment_frame_index=segment_frame_index,
+                        source_frame_index=absolute_frame_index,
+                        source_timestamp_seconds=source_timestamp,
+                        timestamp_source=timestamp_source,
+                        detection_ran=should_detect,
+                        detections=canonical_detections,
+                        track_states=canonical_track_states_for_frame(
+                            canonical_detections,
+                            tracker,
+                            tracking_config,
+                            categories,
+                            absolute_frame_index,
+                            input_fps,
+                        ),
+                        camera_motion=None,
+                    )
                 if writer is not None and (should_detect or render_skipped):
                     pil_frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
                     rendered: Optional[Image.Image] = None
@@ -2194,15 +2512,21 @@ def predict_video_file_batched(
                 categories=categories,
                 render_ids=render_ids,
                 tracking_config=tracking_config,
+                canonical_video_writer=canonical_video,
+                canonical_frame_meta=canonical_frame_meta,
             )
             if hybrid_frame_buffer:
                 raise RuntimeError("Hybrid tracker flush did not commit every buffered source frame")
+            if canonical_frame_meta:
+                raise RuntimeError("Hybrid tracker flush did not commit every Canonical frame")
     finally:
         render_iterator.close()
         render_capture.release()
         if writer is not None:
             writer.release()
         shutil.rmtree(frame_cache_dir, ignore_errors=True)
+    if canonical_video is not None:
+        canonical_video.finalize(annotated_output=target)
     return all_predictions, target, image_id
 
 
@@ -2219,6 +2543,7 @@ def predict_video_file_streaming(
     tracking_config: Optional[Any] = None,
     tracker_device: str = "cpu",
     tracking_state_rows: Optional[List[Dict[str, Any]]] = None,
+    canonical_run: Optional[Any] = None,
 ) -> Tuple[List[Dict[str, Any]], Optional[Path], int]:
     """Decode, batch, track, render, and encode a selected video range once.
 
@@ -2244,6 +2569,27 @@ def predict_video_file_streaming(
     frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     frame_window = video_frame_window(frame_count, input_fps, video_cfg)
     frame_limit = frame_window.output_frames
+    try:
+        canonical_video = (
+            canonical_run.start_video(
+                source=item.source,
+                source_path=item.local_path,
+                width=width,
+                height=height,
+                input_fps=input_fps,
+                source_frame_count=frame_count,
+                frame_window=frame_window,
+                detection_fps=detection_fps,
+                frame_interval=frame_interval,
+                output_fps=output_fps,
+                tracking_config=tracking_config,
+            )
+            if canonical_run is not None
+            else None
+        )
+    except Exception:
+        capture.release()
+        raise
     if frame_window.start_frame > 0 and not capture.set(cv2.CAP_PROP_POS_FRAMES, frame_window.start_frame):
         capture.release()
         raise RuntimeError(f"Could not seek video for streaming inference: {item.local_path}")
@@ -2283,6 +2629,7 @@ def predict_video_file_streaming(
         raise
     hybrid_tracking = is_hybrid_tracker(tracker)
     hybrid_frame_buffer: Dict[int, Tuple[Any, bool]] = {}
+    canonical_frame_meta: Dict[int, Mapping[str, Any]] = {}
     all_predictions: List[Dict[str, Any]] = []
     last_predictions: List[Dict[str, Any]] = []
     pending_frames: List[Dict[str, Any]] = []
@@ -2356,10 +2703,18 @@ def predict_video_file_streaming(
             absolute_index = int(packet["absolute_frame_index"])
             frame = packet["frame"]
             should_detect = bool(packet["should_detect"])
+            source_timestamp = float(packet["source_timestamp_seconds"])
+            timestamp_source = str(packet["timestamp_source"])
             detected = predictions_by_segment.get(segment_index, []) if should_detect else []
             frame_predictions: List[Dict[str, Any]]
             tracker_started = time.perf_counter()
             if hybrid_tracking:
+                if canonical_video is not None:
+                    canonical_frame_meta[absolute_index] = {
+                        "source_timestamp_seconds": source_timestamp,
+                        "timestamp_source": timestamp_source,
+                        "detection_ran": should_detect,
+                    }
                 if writer is not None:
                     hybrid_frame_buffer[absolute_index] = (
                         frame,
@@ -2367,7 +2722,7 @@ def predict_video_file_streaming(
                     )
                 committed = tracker.step(
                     absolute_index,
-                    absolute_index / input_fps,
+                    source_timestamp,
                     frame,
                     detected,
                 )
@@ -2384,6 +2739,8 @@ def predict_video_file_streaming(
                     categories=categories,
                     render_ids=render_ids,
                     tracking_config=tracking_config,
+                    canonical_video_writer=canonical_video,
+                    canonical_frame_meta=canonical_frame_meta,
                 )
                 stage["render_seconds"] += render_elapsed
                 stage["encode_seconds"] += encode_elapsed
@@ -2422,6 +2779,25 @@ def predict_video_file_streaming(
                 stage["tracker_seconds"] += time.perf_counter() - tracker_started
             if should_detect or tracker is not None:
                 last_predictions = frame_predictions
+            if canonical_video is not None and not hybrid_tracking:
+                canonical_detections = frame_predictions if should_detect else []
+                canonical_video.write_frame(
+                    segment_frame_index=segment_index,
+                    source_frame_index=absolute_index,
+                    source_timestamp_seconds=source_timestamp,
+                    timestamp_source=timestamp_source,
+                    detection_ran=should_detect,
+                    detections=canonical_detections,
+                    track_states=canonical_track_states_for_frame(
+                        canonical_detections,
+                        tracker,
+                        tracking_config,
+                        categories,
+                        absolute_index,
+                        input_fps,
+                    ),
+                    camera_motion=None,
+                )
 
             if writer is not None and not hybrid_tracking:
                 render_started = time.perf_counter()
@@ -2454,6 +2830,7 @@ def predict_video_file_streaming(
     iterator = tqdm(total=frame_limit, desc=f"Stream video {item.local_path.name}", unit="frame")
     segment_frame_index = 0
     absolute_frame_index = frame_window.start_frame
+    previous_canonical_timestamp: Optional[float] = None
     try:
         while True:
             if frame_limit is not None and segment_frame_index >= frame_limit:
@@ -2464,11 +2841,21 @@ def predict_video_file_streaming(
             if not ok:
                 break
             should_detect = segment_frame_index % frame_interval == 0
+            source_timestamp, timestamp_source = decoded_frame_timestamp(
+                capture,
+                cv2,
+                absolute_frame_index,
+                input_fps,
+                previous_canonical_timestamp,
+            )
+            previous_canonical_timestamp = source_timestamp
             pending_frames.append(
                 {
                     "segment_frame_index": segment_frame_index,
                     "absolute_frame_index": absolute_frame_index,
                     "should_detect": should_detect,
+                    "source_timestamp_seconds": source_timestamp,
+                    "timestamp_source": timestamp_source,
                     "frame": frame,
                 }
             )
@@ -2495,11 +2882,15 @@ def predict_video_file_streaming(
                 categories=categories,
                 render_ids=render_ids,
                 tracking_config=tracking_config,
+                canonical_video_writer=canonical_video,
+                canonical_frame_meta=canonical_frame_meta,
             )
             stage["render_seconds"] += render_elapsed
             stage["encode_seconds"] += encode_elapsed
             if hybrid_frame_buffer:
                 raise RuntimeError("Hybrid tracker flush did not commit every buffered source frame")
+            if canonical_frame_meta:
+                raise RuntimeError("Hybrid tracker flush did not commit every Canonical frame")
     finally:
         iterator.close()
         capture.release()
@@ -2522,6 +2913,8 @@ def predict_video_file_streaming(
             **cuda_memory,
             outer_batch_size=batch_size,
         )
+    if canonical_video is not None:
+        canonical_video.finalize(annotated_output=target)
     return all_predictions, target, image_id
 
 
@@ -2537,29 +2930,44 @@ def predict_video_file(
     tracking_config: Optional[Any] = None,
     tracker_device: str = "cpu",
     tracking_state_rows: Optional[List[Dict[str, Any]]] = None,
+    canonical_run: Optional[Any] = None,
 ) -> Tuple[List[Dict[str, Any]], Optional[Path], int]:
     """Predict one video with batched detection frames when configured."""
+    def abort_canonical_bundle() -> None:
+        if canonical_run is not None:
+            with contextlib.suppress(Exception):
+                canonical_run.abort_active()
+
     configured_batch = positive_batch_size(video_cfg.get("batch_size"), "inference.video.batch_size", 1)
     if bool(video_cfg.get("streaming", True)):
-        return predict_video_file_streaming(
-            item,
-            start_image_id,
-            model,
-            prediction_config,
-            categories,
-            output_dir,
-            render_ids,
-            video_cfg,
-            configured_batch,
-            tracking_config,
-            tracker_device,
-            tracking_state_rows,
-        )
+        try:
+            return predict_video_file_streaming(
+                item,
+                start_image_id,
+                model,
+                prediction_config,
+                categories,
+                output_dir,
+                render_ids,
+                video_cfg,
+                configured_batch,
+                tracking_config,
+                tracker_device,
+                tracking_state_rows,
+                canonical_run,
+            )
+        except Exception:
+            abort_canonical_bundle()
+            raise
     if configured_batch <= 1:
-        return predict_video_file_one_pass(
-            item, start_image_id, model, prediction_config, categories, output_dir, render_ids, video_cfg,
-            tracking_config, tracker_device, tracking_state_rows,
-        )
+        try:
+            return predict_video_file_one_pass(
+                item, start_image_id, model, prediction_config, categories, output_dir, render_ids, video_cfg,
+                tracking_config, tracker_device, tracking_state_rows, canonical_run,
+            )
+        except Exception:
+            abort_canonical_bundle()
+            raise
     try:
         return predict_video_file_batched(
             item,
@@ -2572,15 +2980,23 @@ def predict_video_file(
             video_cfg,
             configured_batch,
             tracking_config,
-            tracker_device, tracking_state_rows,
+            tracker_device, tracking_state_rows, canonical_run,
         )
     except RuntimeError as exc:
+        abort_canonical_bundle()
         if "batched" in str(exc).lower() or "reopen video" in str(exc).lower() or "seek video" in str(exc).lower():
             print(Fore.BLUE + Style.BRIGHT + f"Warning: batched video inference fell back to one-pass mode. {exc}")
-            return predict_video_file_one_pass(
-                item, start_image_id, model, prediction_config, categories, output_dir, render_ids, video_cfg,
-                tracking_config, tracker_device, tracking_state_rows,
-            )
+            try:
+                return predict_video_file_one_pass(
+                    item, start_image_id, model, prediction_config, categories, output_dir, render_ids, video_cfg,
+                    tracking_config, tracker_device, tracking_state_rows, canonical_run,
+                )
+            except Exception:
+                abort_canonical_bundle()
+                raise
+        raise
+    except Exception:
+        abort_canonical_bundle()
         raise
 
 
@@ -2670,8 +3086,9 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
         "--save-video",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Write rendered MP4 output; disable for JSON-only inference.",
+        help="Write rendered MP4 output; Canonical V2 clean media is controlled separately.",
     )
+    canonical_output.add_canonical_output_cli_arguments(parser)
     parser.add_argument(
         "--cmc-processing-scale",
         type=float,
@@ -2696,6 +3113,7 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
         source_config = (Path.cwd() / source_config).resolve()
     config = load_yaml(source_config)
     apply_cli_overrides(config, args)
+    canonical_cfg = canonical_output.parse_canonical_output_config(config)
     cpu_summary = cpu_runtime.validate_active_config(config, "inference", source_config)
     trainer._require_custom_architecture_checkpoint(config, "Inference")
     trainer.validate_inference_acceleration_config(config)
@@ -2723,6 +3141,16 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
     confirm = bool(config.get("runtime", {}).get("confirm_before_run", True))
     assume_yes = bool(config.get("runtime", {}).get("yes", False) or args.yes or not confirm)
     confirm_or_exit(estimate, verbose, assume_yes)
+    canonical_video_items = (
+        []
+        if trainer.temporal_motion_enabled(config)
+        else [item for item in items if item.kind == "video"]
+    )
+    canonical_toolchain = (
+        canonical_output.preflight(canonical_cfg)
+        if canonical_cfg.enabled and canonical_video_items
+        else None
+    )
     trainer.preflight_rfdetr_inference_acceleration(
         config,
         device=config.get("model", {}).get("device"),
@@ -2820,6 +3248,36 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
     image_id = 1
     video_cfg = dict(config.get("inference", {}).get("video", {}) or {})
     video_cfg["batch_size"] = video_batch_size(config)
+    canonical_run = (
+        canonical_output.CanonicalRunWriter(
+            output_dir=output_dir,
+            cfg=canonical_cfg,
+            categories=categories,
+            producer_metadata={
+                "name": "PitchObjectLab RF-DETR inference",
+                "detector": {
+                    "family": "rf-detr",
+                    "model_size": config.get("model", {}).get("size"),
+                    "checkpoint": config.get("model", {}).get("pretrain_weights"),
+                    "confidence_threshold": config.get("model", {}).get("confidence_threshold"),
+                    "inference_mode": config.get("inference", {}).get("mode"),
+                    "inference_backend": (
+                        config.get("model", {})
+                        .get("inference_optimization", {})
+                        .get("backend", "pytorch")
+                    ),
+                    "prediction_config": trainer.json_safe_value(prediction_config),
+                },
+                "config": {
+                    "snapshot": "config/merged_config.yaml",
+                    "source": str(source_config),
+                },
+            },
+            toolchain=canonical_toolchain,
+        )
+        if canonical_cfg.enabled and canonical_video_items
+        else None
+    )
     image_batch_size = inference_batch_size(config)
     pending_images: List[SourceItem] = []
 
@@ -2864,6 +3322,7 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
                 tracking_config,
                 tracker_device,
                 track_state_rows,
+                canonical_run=canonical_run,
             )
             all_predictions.extend(predictions)
             published_for_source, suppressed_for_source = filter_confirmed_hybrid_exports(
@@ -2902,6 +3361,20 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
         football_rows,
         football_output_config,
     )
+    canonical_manifest = canonical_run.finish_manifest() if canonical_run is not None else None
+    canonical_summary = {
+        "enabled": bool(canonical_cfg.enabled),
+        "manifest": (
+            (Path(str(canonical_cfg.directory)) / "manifest.json").as_posix()
+            if canonical_manifest is not None
+            else None
+        ),
+        "video_count": int(canonical_manifest.get("video_count", 0)) if canonical_manifest else 0,
+        "frame_count": int(canonical_manifest.get("frame_count", 0)) if canonical_manifest else 0,
+        "detection_count": int(canonical_manifest.get("detection_count", 0)) if canonical_manifest else 0,
+        "track_count": int(canonical_manifest.get("track_count", 0)) if canonical_manifest else 0,
+        "media_count": int(canonical_manifest.get("media_count", 0)) if canonical_manifest else 0,
+    }
     record_video_pipeline_timing(
         model,
         serialization_seconds=time.perf_counter() - serialization_started,
@@ -2917,6 +3390,7 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
             "raw_prediction_count": len(all_predictions),
             "suppressed_unconfirmed_count": suppressed_unconfirmed_count,
             **football_summary,
+            "canonical_v2": canonical_summary,
             "stage_timing": stage_timing,
         },
     )
@@ -2944,6 +3418,7 @@ def _main_impl(timing_context: Optional[MutableMapping[str, Any]] = None) -> int
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "outputs": outputs,
             "acceleration": dict(trainer.get_inference_acceleration_handle(model).metadata),
+            "canonical_v2": canonical_summary,
             "stage_timing": stage_timing,
         },
         source_config=source_config,
