@@ -215,7 +215,7 @@ output:
 inference:
   # Explicit image/video/folder/HTTP(S) inputs. Options: list of supported sources.
   sources:
-    - /mnt/data/Datasets/Datasets/Football/xbotgo_football_data_0608/videos/2042525152494694401.mp4
+    - /mnt/data/Datasets/Datasets/Football/xbotgo_football_data_0608/videos/2042520971893485569.mp4 
   # Recurse into folder sources. Options: true, false.
   recursive: true
   # Maximum discovered sources after type caps. Options: all, null, or positive integer.

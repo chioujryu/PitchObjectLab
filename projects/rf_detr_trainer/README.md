@@ -987,9 +987,12 @@ encoders. `media.mp4` is an exact re-encode of the actually processed selected
 range with reset timestamps, no boxes or overlays, and the source's
 default/first audio stream when present. If that audio stream ends before the
 selected video range, the exporter pads only the missing tail with silence so
-the clean clip remains synchronized. Sources without audio are recorded as
-`has_audio: false`. Dimensions, decoded frame count, duration, and audio/video
-synchronization are checked after encoding.
+the clean clip remains synchronized. Padding is measured on the reset audio
+timestamp timeline and trimmed to the actual processed selection endpoint,
+including when AAC decoded-sample counts differ from packet timestamp spans.
+Sources without audio are recorded as `has_audio: false`. Dimensions, decoded
+frame count, duration, and audio/video synchronization are checked after
+encoding.
 
 The dry-run and confirmation estimate includes the manifest plus four files per
 video and a content-dependent clean-media disk/time estimate.

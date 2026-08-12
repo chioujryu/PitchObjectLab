@@ -1800,10 +1800,13 @@ def transcode_clean_media(
     if has_audio:
         audio_index = audio_info.get("stream_index")
         audio_input = f"0:{int(audio_index)}" if audio_index is not None else "0:a:0"
+        # AAC packet timestamps can cover less time than their decoded sample
+        # count. Pad indefinitely, then trim in the reset PTS domain so the
+        # audio timeline reaches the selected video endpoint exactly.
         filter_parts.append(
             f"[{audio_input}]atrim=start={float(start_seconds):.12f}:"
             f"end={float(end_seconds):.12f},asetpts=PTS-STARTPTS,"
-            f"apad=whole_dur={float(selected_duration):.12f}[a]"
+            f"apad,atrim=duration={float(selected_duration):.12f}[a]"
         )
     command.extend(["-filter_complex", ";".join(filter_parts), "-map", "[v]"])
     if has_audio:

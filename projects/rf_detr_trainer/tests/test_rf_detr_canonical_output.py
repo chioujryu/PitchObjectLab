@@ -479,7 +479,8 @@ class CanonicalMediaTest(unittest.TestCase):
             filter_graph = commands[0][commands[0].index("-filter_complex") + 1]
             self.assertIn("[0:2]trim=start_frame=30:end_frame=90", filter_graph)
             self.assertIn("[0:3]atrim=start=1.000000000000", filter_graph)
-            self.assertIn("apad=whole_dur=2.000000000000", filter_graph)
+            self.assertIn("apad,atrim=duration=2.000000000000", filter_graph)
+            self.assertNotIn("whole_dur", filter_graph)
             self.assertTrue(probe_calls[0]["count_frames"])
 
     def test_transcode_pads_audio_shorter_than_selected_duration(self):
@@ -512,7 +513,8 @@ class CanonicalMediaTest(unittest.TestCase):
                 ),
             )
             filter_graph = commands[0][commands[0].index("-filter_complex") + 1]
-            self.assertIn("apad=whole_dur=3.000000000000", filter_graph)
+            self.assertIn("apad,atrim=duration=3.000000000000", filter_graph)
+            self.assertNotIn("whole_dur", filter_graph)
             self.assertEqual(result["video"]["frame_count"], 90)
             self.assertEqual(result["audio"]["duration_seconds"], 3.0)
 
@@ -543,7 +545,7 @@ class CanonicalMediaTest(unittest.TestCase):
             self.assertNotIn("[a]", commands[0])
             self.assertNotIn("-c:a", commands[0])
             filter_graph = commands[0][commands[0].index("-filter_complex") + 1]
-            self.assertNotIn("apad=", filter_graph)
+            self.assertNotIn("apad", filter_graph)
 
             def failing_runner(_command, **_kwargs):
                 return SimpleNamespace(returncode=1, stdout="", stderr="unknown encoder")
@@ -677,6 +679,94 @@ class CanonicalMediaTest(unittest.TestCase):
             self.assertEqual(output_probe["video"]["frame_count"], 90)
             self.assertAlmostEqual(output_probe["video"]["duration_seconds"], 3.0, places=3)
             self.assertAlmostEqual(output_probe["audio"]["duration_seconds"], 3.0, places=3)
+
+    def test_real_ffmpeg_repairs_compressed_audio_pts_drift(self):
+        ffmpeg = shutil.which("ffmpeg")
+        ffprobe = shutil.which("ffprobe")
+        if ffmpeg is None or ffprobe is None:
+            self.skipTest("FFmpeg and FFprobe are required for the real-media regression test")
+        try:
+            toolchain = canonical.preflight(
+                canonical.CanonicalOutputConfig(
+                    ffmpeg_path=ffmpeg,
+                    ffprobe_path=ffprobe,
+                )
+            )
+        except RuntimeError as exc:
+            self.skipTest(f"Canonical FFmpeg encoders are unavailable: {exc}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "compressed-audio-pts-source.mp4"
+            output = Path(tmp) / "media.mp4"
+            fixture_command = [
+                ffmpeg,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=160x90:rate=30:duration=3",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=1000:sample_rate=48000:duration=3",
+                "-filter_complex",
+                "[1:a:0]asetpts=PTS*0.95[a]",
+                "-map",
+                "0:v:0",
+                "-map",
+                "[a]",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                str(source),
+            ]
+            fixture_result = subprocess.run(
+                fixture_command,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if fixture_result.returncode != 0:
+                self.skipTest(f"FFmpeg lavfi fixture is unavailable: {fixture_result.stderr.strip()}")
+
+            source_probe = canonical.probe_media(
+                source,
+                ffprobe_path=toolchain.ffprobe_path or "auto",
+                ffmpeg_path=toolchain.ffmpeg_path or "auto",
+            )
+            one_frame_tolerance = 1.0 / 30.0 + 1.0e-3
+            self.assertEqual(source_probe["video"]["frame_count"], 90)
+            self.assertAlmostEqual(
+                source_probe["audio"]["duration_seconds"],
+                2.85,
+                delta=one_frame_tolerance,
+            )
+            output_probe = canonical.transcode_clean_media(
+                source,
+                output,
+                canonical.VideoSelection(0, 90, 0.0, 3.0),
+                canonical.CanonicalMediaConfig(preset="ultrafast"),
+                toolchain,
+                expected_frames=90,
+                expected_width=160,
+                expected_height=90,
+                source_probe=source_probe,
+            )
+            video_duration = output_probe["video"]["duration_seconds"]
+            audio_duration = output_probe["audio"]["duration_seconds"]
+            self.assertEqual(output_probe["video"]["frame_count"], 90)
+            self.assertAlmostEqual(video_duration, 3.0, delta=one_frame_tolerance)
+            self.assertAlmostEqual(audio_duration, 3.0, delta=one_frame_tolerance)
+            self.assertLessEqual(abs(video_duration - audio_duration), one_frame_tolerance)
 
 
 class CanonicalWriterTest(unittest.TestCase):
